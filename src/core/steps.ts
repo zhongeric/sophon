@@ -1,9 +1,9 @@
 import type { Contracts } from 'nanocode-ts'
-import { openAgent, type AgentHost, type AgentSpec, type HostTools } from './agent.ts'
+import { runTurn, submitOnce, type AgentHost, type AgentSpec, type HostTools } from './agent.ts'
 import { callRunTests, isProtected, runTestsTool, type RepoConfig } from './checks.ts'
 import { assignIds, checkFindings, parseLocation, submitFindings, type Finding } from './findings.ts'
 import type { Checker, Frozen, Guides, Repo } from './platform.ts'
-import { checkQuestions, decisions, submitQuestions, type Question } from './questions.ts'
+import { checkQuestions, decisionsFile, decisionsLine, submitQuestions, type Question } from './questions.ts'
 import { instructions, roles, type ModelChoice, type Role } from './roles.ts'
 import { allowFiles, createWorkspace, guard, readOnly } from './workspace.ts'
 
@@ -23,45 +23,9 @@ export type RunContext = {
 
 export type Range = { from: string; to: string }
 
-/**
- * Runs one agent turn to its submit tool. The submit handler writes the output to the ledger,
- * so a resumed run returns it even when the SDK replays the tool call from its receipt.
- */
-async function runTask<T>(context: RunContext, spec: AgentSpec, prompt: string, tool: string): Promise<T> {
-  const key = `output:${spec.id}`
-  const recorded = context.host.ledger.get<T>(key)
-  if (recorded !== undefined) return recorded
-  const agent = await openAgent(spec, context.host)
-  try {
-    const report = await agent.ask('task', prompt)
-    if (context.host.ledger.get(key) === undefined) {
-      if (report.status !== 'completed') throw new Error(`${spec.id}: turn ${report.status}: ${JSON.stringify(report.error ?? null)}`)
-      await agent.ask('nudge', `You ended the turn without calling ${tool}. Call tools.${tool} now.`)
-    }
-  } finally {
-    await agent.close()
-  }
-  const output = context.host.ledger.get<T>(key)
-  if (output === undefined) throw new Error(`${spec.id} did not call ${tool}`)
-  return output
-}
-
-/** A submit tool that only the root agent may call, one time, after `check` accepts the input. */
-function submitTool(context: RunContext, id: string, definition: Contracts.HostTool, check: (input: unknown) => Promise<unknown>): HostTools {
-  const key = `output:${id}`
-  return {
-    [definition.name]: {
-      definition,
-      async call(input, call) {
-        if (call.subagent) throw new Error('only the root agent submits')
-        if (context.host.ledger.get(key) !== undefined) throw new Error(`${definition.name} was already accepted`)
-        const output = await check(input)
-        context.host.ledger.put(key, output)
-        return { accepted: true }
-      },
-    },
-  }
-}
+const runTask = <T>(context: RunContext, spec: AgentSpec, prompt: string, tool: string) => runTurn<T>(context.host, spec, prompt, tool)
+const submitTool = (context: RunContext, id: string, definition: Contracts.HostTool, check: (input: unknown) => Promise<unknown>) =>
+  submitOnce(context.host, `output:${id}`, definition, check)
 
 function testTools(context: RunContext, role: Role): HostTools {
   const run = context.tests
@@ -79,15 +43,7 @@ function spec(context: RunContext, id: string, role: Role, model: ModelChoice, w
   }
 }
 
-/** The user's answers so far, as /review/decisions.md, for every agent that runs after them. */
-function decisionFiles(context: RunContext): Record<string, string> {
-  const answers = decisions(context.host.ledger)
-  if (answers.length === 0) return {}
-  const lines = answers.map((answer) => `- ${answer.question}\n  Answer: ${answer.answer}`)
-  return { '/decisions.md': `# Decisions of the user\n\nThese answers settle open points of the ask. Follow them.\n\n${lines.join('\n')}\n` }
-}
-
-const decisionsLine = (files: Record<string, string>) => ('/decisions.md' in files ? ['- Decisions of the user: /review/decisions.md'] : [])
+const decisionFiles = (context: RunContext) => decisionsFile(context.host.ledger)
 
 async function reviewInputs(context: RunContext, range: Range) {
   const patch = await context.repo.diff(range.from, range.to)

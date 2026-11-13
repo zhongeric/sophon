@@ -1,11 +1,22 @@
 {
-  // One Durable Object per PR holds the run's ledger, its repository tree and every agent session.
+  // One Durable Object per PR holds its review runs, and one per issue holds its development runs: the ledger,
+  // the repository trees and every agent session.
   "name": "agent-factory",
   "main": "src/cloudflare/worker.ts",
   "compatibility_date": "2026-10-01",
   "compatibility_flags": ["nodejs_compat"],
-  "durable_objects": { "bindings": [{ "class_name": "PullRequestRuns", "name": "PULL_REQUESTS" }] },
-  "migrations": [{ "new_sqlite_classes": ["PullRequestRuns"], "tag": "v1" }],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "PullRequestRuns", "name": "PULL_REQUESTS" },
+      { "class_name": "DevelopmentRuns", "name": "DEVELOPMENT_RUNS" }
+    ]
+  },
+  "migrations": [
+    { "new_sqlite_classes": ["PullRequestRuns"], "tag": "v1" },
+    { "new_sqlite_classes": ["DevelopmentRuns"], "tag": "v2" }
+  ],
+  // One build container for each development run. Builders' setup, checks and tests run there, never beside a secret.
+  "containers": [{ "class_name": "DevelopmentRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-1", "max_instances": 5 }],
   "rules": [{ "type": "Text", "globs": ["**/*.md", "**/*.txt"], "fallthrough": true }],
   "limits": { "cpu_ms": 300000 },
   "observability": { "enabled": true },

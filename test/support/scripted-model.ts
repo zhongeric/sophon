@@ -8,6 +8,8 @@ export type Turn = {
   role: string
   /** The output of the last cell, when the model already ran one in this turn. */
   output: string | null
+  /** The whole request body, as JSON, for scripts that answer by prompt. */
+  request: string
 }
 
 export type Script = (turn: Turn) => Reply
@@ -23,8 +25,9 @@ export function scriptedDispatch(script: Script, turns: Turn[]): Contracts.Runti
   return async (request) => {
     const body = JSON.parse(new TextDecoder().decode(request.body)) as Record<string, any>
     const provider = request.provider ?? (body.messages ? 'claude' : 'codex')
-    const role = /Agent role: ([a-z-]+)/.exec(JSON.stringify(body))?.[1] ?? 'unknown'
-    const turn: Turn = { provider, role, output: provider === 'claude' ? claudeOutput(body) : codexOutput(body) }
+    const text = JSON.stringify(body)
+    const role = /Agent role: ([a-z-]+)/.exec(text)?.[1] ?? 'unknown'
+    const turn: Turn = { provider, role, output: provider === 'claude' ? claudeOutput(body) : codexOutput(body), request: text }
     turns.push(turn)
     const reply = script(turn)
     const call = calls++

@@ -78,32 +78,28 @@ export function parseAnswers(body: string, questions: Question[]): Answer[] | nu
   })
 }
 
+/** The JSON schema of a list of questions, for every submit tool that asks the user. */
+export const questionsSchema = {
+  type: 'array',
+  items: {
+    type: 'object',
+    properties: {
+      question: { type: 'string', description: 'One decision, as a question' },
+      why: { type: 'string', description: 'Why the answer changes the work, with the file or the part of the ask' },
+      options: { type: 'array', items: { type: 'string' } },
+      recommendation: { type: 'string', description: 'The option that you recommend, word for word' },
+    },
+    required: ['question', 'why', 'options', 'recommendation'],
+    additionalProperties: false,
+  },
+}
+
 export const submitQuestions: Contracts.HostTool = {
   name: 'submit_questions',
   description:
     'Submit the questions that only the user can decide, one time. Submit an empty list when the ask settles everything. ' +
     'Each question needs at least two options, and the recommendation must be one of the options, word for word.',
-  parameters: {
-    type: 'object',
-    properties: {
-      questions: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            question: { type: 'string', description: 'One decision, as a question' },
-            why: { type: 'string', description: 'Why the answer changes the review or the fix, with the file or the part of the ask' },
-            options: { type: 'array', items: { type: 'string' } },
-            recommendation: { type: 'string', description: 'The option that you recommend, word for word' },
-          },
-          required: ['question', 'why', 'options', 'recommendation'],
-          additionalProperties: false,
-        },
-      },
-    },
-    required: ['questions'],
-    additionalProperties: false,
-  },
+  parameters: { type: 'object', properties: { questions: questionsSchema }, required: ['questions'], additionalProperties: false },
 }
 
 export function checkQuestions(input: unknown): Question[] {
@@ -140,16 +136,33 @@ export function asker(ledger: Ledger, channel: Channel, runId: string, log: (lin
     if (questions.length === 0 || !posted) return []
     const answers = await channel.answers(posted, questions)
     if (!answers) throw new PausedError(`waiting for your answers at ${channel.where(posted)}`)
+    return record(batch, answers)
+  }
+  const record = (batch: string, answers: Answer[]) => {
     ledger.put(`answers:${batch}`, answers)
     ledger.put('decisions', [...decisions(ledger), ...answers])
     return answers
   }
-  return { post, wait }
+  /** Takes every recommendation without asking, when the user said so for this run. */
+  const recommend = (batch: string, questions: Question[]): Answer[] =>
+    ledger.get<Answer[]>(`answers:${batch}`) ??
+    record(batch, questions.map((question) => ({ id: question.id, question: question.question, answer: question.recommendation, recommended: true })))
+  return { post, wait, recommend }
 }
 
 export function decisions(ledger: Ledger): Answer[] {
   return ledger.get<Answer[]>('decisions') ?? []
 }
+
+/** The user's answers so far, as /review/decisions.md, for every agent that runs after them. */
+export function decisionsFile(ledger: Ledger): Record<string, string> {
+  const answers = decisions(ledger)
+  if (answers.length === 0) return {}
+  const lines = answers.map((answer) => `- ${answer.question}\n  Answer: ${answer.answer}`)
+  return { '/decisions.md': `# Decisions of the user\n\nThese answers settle open points of the ask. Follow them.\n\n${lines.join('\n')}\n` }
+}
+
+export const decisionsLine = (files: Record<string, string>) => ('/decisions.md' in files ? ['- Decisions of the user: /review/decisions.md'] : [])
 
 /** \`edited\` is true when someone changed the comment after it was posted; anyone with write access can. */
 export type PrComment = { author: string; body: string; createdAt: string; edited?: boolean }

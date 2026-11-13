@@ -8,6 +8,7 @@
   "scripts": {
     "review": "node --disable-warning=ExperimentalWarning src/node/cli.ts",
     "remote": "node --disable-warning=ExperimentalWarning src/node/remote.ts",
+    "develop": "node --disable-warning=ExperimentalWarning src/node/develop.ts",
     "check": "tsc --noEmit && tsc --noEmit -p tsconfig.core.json && tsc --noEmit -p tsconfig.cloudflare.json",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
     "smoke": "node --disable-warning=ExperimentalWarning scripts/smoke.ts"

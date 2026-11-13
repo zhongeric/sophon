@@ -1,7 +1,8 @@
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { promisify } from 'node:util'
-import type { Frozen, Repo } from '../core/platform.ts'
+import type { Branch, Branches, Frozen, Repo } from '../core/platform.ts'
 import { withoutHostSecrets } from '../core/secrets.ts'
 import { gh } from './channels.ts'
 import { diskFileSystem } from './disk.ts'
@@ -75,6 +76,68 @@ export function gitRepo(source: GitSource, tree: string, branch: string): Repo {
       await git(tree, 'push', 'origin', `HEAD:refs/heads/${headRef}`)
       const run = gh(tree)
       if ((JSON.parse(await run(['pr', 'view', String(pr), '--json', 'isDraft'])) as { isDraft: boolean }).isDraft) await run(['pr', 'ready', String(pr)])
+    },
+  }
+}
+
+/** Where the worktree of a branch lives, under the run's directory. */
+export const worktreePath = (dir: string, name: string) => join(dir, name.replace(/\//g, '-'))
+
+async function branchExists(repo: string, name: string): Promise<boolean> {
+  try {
+    await git(repo, 'show-ref', '--verify', '--quiet', `refs/heads/${name}`)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function gitBranch(tree: string, name: string): Branch {
+  return {
+    name,
+    tree: diskFileSystem(tree),
+    head: () => currentCommit(tree),
+    diff: (from, to) => diff(tree, from, to),
+    changedFiles: (from, to) => changedFiles(tree, from, to),
+    committedFiles: () => trackedFiles(tree),
+    async pending() {
+      // Staging shows new files in the diff. The reset after it keeps the index as it was, so run_tests still sees only committed files.
+      await git(tree, 'add', '-A')
+      try {
+        const patch = await git(tree, 'diff', '--cached', '--no-color', '--no-ext-diff')
+        const names = await git(tree, 'diff', '--cached', '--name-only', '--diff-filter=ACMR')
+        return { diff: patch, changed: names.split('\n').filter(Boolean) }
+      } finally {
+        await git(tree, 'reset', '-q')
+      }
+    },
+    commit: (message) => commitAll(tree, message),
+    async merge(ref, message) {
+      await git(tree, 'merge', '--ff', '--no-edit', '-m', message, ref)
+    },
+  }
+}
+
+/** The branches of a development run, each in a worktree under `dir`. */
+export function gitBranches(repo: string, dir: string): Branches {
+  return {
+    async view(commit) {
+      const tree = join(dir, `view-${commit.slice(0, 12)}`)
+      if (!existsSync(tree)) await git(repo, 'worktree', 'add', '--detach', tree, commit)
+      return diskFileSystem(tree)
+    },
+    async branch(name, from) {
+      const tree = worktreePath(dir, name)
+      if (!existsSync(tree)) {
+        if (await branchExists(repo, name)) await git(repo, 'worktree', 'add', tree, name)
+        else await git(repo, 'worktree', 'add', '-b', name, tree, from)
+      }
+      return gitBranch(tree, name)
+    },
+    exists: (name) => branchExists(repo, name),
+    async push(branch) {
+      await git(worktreePath(dir, branch.name), 'push', 'origin', `HEAD:refs/heads/${branch.name}`)
+      return branch.head()
     },
   }
 }

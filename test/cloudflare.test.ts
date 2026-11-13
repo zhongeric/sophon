@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { developRepo, developScript, sources } from './support/develop.ts'
 import { fixed, fixtureRepo, lightFixed, scriptFor } from './support/fixture.ts'
 import { mockServices } from './support/mock-services.ts'
 import { sendWebhook, startWorker, until } from './support/wrangler.ts'
@@ -194,8 +195,60 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
 
     const finished = await resume(7)
     assert.equal(finished.status, 202)
-    assert.deepEqual(await finished.json(), { reason: 'the run is complete with PASS. Start a new run to review the PR again', resumed: false, state: 'passed' })
-    assert.deepEqual(await (await resume(8)).json(), { reason: 'the PR has no run. Start a run first', resumed: false, state: null })
+    assert.deepEqual(await finished.json(), { reason: 'the run is complete with PASS. Start a new run to try again', resumed: false, state: 'passed' })
+    assert.deepEqual(await (await resume(8)).json(), { reason: 'there is no run. Start a run first', resumed: false, state: null })
+  } finally {
+    worker.stop()
+    mock.close()
+  }
+})
+
+test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, runs the review loop there, takes its fixes, and marks the PR ready', { timeout: 300_000 }, async () => {
+  const { repo } = developRepo({
+    checks: { machine: 'test -f .setup-done' },
+    setup: 'touch .setup-done',
+    stack: 'TypeScript',
+    tests: { command: 'env -u NODE_TEST_CONTEXT node --test {tests}', pattern: '\\.test\\.ts$' },
+  })
+  const issues = { 5: { body: 'Add sub and mul next to add, with tests.', title: 'Add sub and mul' } }
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', issues, name: 'app', owner: 'acme', script: developScript({ reviewFix: true }) })
+  // FACTORY_CONTAINERS=1 runs the build machine as a real local container (it needs Docker). Else the mock is the machine.
+  const containers = process.env.FACTORY_CONTAINERS === '1'
+  const worker = await startWorker(containers ? vars(mock) : { ...vars(mock), MACHINE_URL: `${mock.url}/machine` }, { containers })
+  const on = (number: number) => mock.state.comments.filter((entry) => entry.issue === number)
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 160)]))}\nworker:\n${worker.output().slice(-4000)}`
+  try {
+    const issueComment = { action: 'created', comment: { body: '/develop', user: { login: 'eric' } }, issue: { number: 5 }, repository }
+    const started = (await (await sendWebhook(worker.url, secret, 'issue_comment', issueComment)).json()) as { run: string; started: boolean }
+    assert.equal(started.started, true)
+    const asked = await until(() => on(5).find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
+    assert.match(asked.body, /Is this the ask\?/)
+    mock.comment('eric', '/answer recommended', 5)
+    await sendWebhook(worker.url, secret, 'issue_comment', { ...issueComment, comment: { body: '/answer recommended', user: { login: 'eric' } } })
+
+    const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
+    assert.match(done.body, /^# Development run: READY/, done.body)
+    const [number, pull] = [...mock.state.pulls].find(([, entry]) => entry.head === 'factory/dev-add-sub-mul')!
+    assert.equal(pull.draft, false)
+    assert.match(pull.body, /# Ask\n\n> Add sub and mul/)
+    const branch = 'refs/heads/factory/dev-add-sub-mul'
+    assert.deepEqual([mock.fileAt(branch, 'src/sub.ts'), mock.fileAt(branch, 'src/mul.ts'), mock.fileAt(branch, 'test/run.log')], [sources.sub, sources.mul, null])
+    // The review loop's fix is on the run's branch: the branch moved to the review's commit, without force.
+    assert.equal(mock.fileAt(branch, 'test/ops.test.ts'), sources.test(6))
+    assert.match(done.body, /- Pass 1: PASS, .*fixes merged from factory\/pr-\d+-/)
+
+    // The builders ran the setup and the checks on the machine, in a copy of their branch.
+    const commands = mock.state.commands.map((entry) => entry.argv.join(' '))
+    if (!containers) assert.ok(commands.includes('bash -c touch .setup-done') && commands.includes('bash -c test -f .setup-done'), commands.join('\n'))
+    const outputs = mock.state.turns.filter((turn) => turn.role === 'builder' && turn.output).map((turn) => turn.output).join('\n')
+    assert.match(outputs, /checks: .*machine.*pass/)
+    assert.match(outputs, /checkpoint refused:.*test\/run.log/)
+
+    // The review loop ran as a review run of the new PR, and the report went to the PR and the issue.
+    assert.ok(on(number).some((entry) => entry.body.startsWith('### agent-factory: PASS')), describe())
+    assert.ok(on(number).some((entry) => entry.body.startsWith('# Development run: READY')))
+    const status = (await (await fetch(`${worker.url}/runs/acme/app/5`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: { run: string; state: string }[] }
+    assert.deepEqual(status.runs.map((run) => run.state), ['passed'])
   } finally {
     worker.stop()
     mock.close()

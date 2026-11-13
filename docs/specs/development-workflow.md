@@ -1,6 +1,7 @@
 # Spec: the development workflow
 
-Status: draft. All decisions in section 8 made on 2026-11-13. Date: 2026-11-13.
+Status: phase 1 built on the local platform (`npm run develop`). All decisions in section 8 made on 2026-11-13.
+Date: 2026-11-13.
 
 This spec defines the second workflow of agent-factory: from a confirmed ask to a PR that is ready for Eric's
 review. It also defines **profiles**, the mechanism that lets one workflow apply Eric's different rules for
@@ -58,14 +59,17 @@ Each stage below lists who does the work, what the host enforces, and where Eric
 
 ### 0. Intake
 
-- **Who:** the host, with the questions agent that the review loop already has.
-- **Input:** Eric's ask, from `npm run remote -- develop <repo> "<ask>"`, a GitHub issue that Eric labels, or a
-  `/develop` comment.
+- **Who:** the host, with a read-only intake agent.
+- **Input:** Eric's ask. Phase 1: `npm run develop -- --ask "<ask>"` on the local platform (P1, P2). Phase 3:
+  `npm run remote -- develop`, a GitHub issue that Eric labels, or a `/develop` comment.
 - **Work:** record the ask verbatim (`ALL-001`). A read-only intake agent reads the repo and the ask, and lists the
   open questions and product calls, each with a recommendation (`ALL-006`). It explores the code first instead of
   asking what the code answers.
-- **Rails:** no plan and no code until the ask is **confirmed** (`ALL-010`). Confirmation is Eric's `/answer` to the
-  intake questions, or `/confirm` when there are none. The host records which stack profiles apply (section 4).
+- **Rails:** no plan and no code until the ask is **confirmed** (`ALL-010`). The host adds three questions to the
+  intake agent's batch: "Is this the ask?" with the agent's summary, a spec or not, and one or two review passes,
+  each with the agent's recommendation and reason (P4). Eric's `/answer` to that one batch is the confirmation. A
+  free-text correction of the summary goes on, as a decision for the planner. The host records which stack profiles
+  apply (section 4).
 - **Eric:** answers the intake questions. Small hotfixes can skip confirmation when Eric marks them so (`ALL-004`).
 
 ### 1. Spec, for larger changes
@@ -107,18 +111,24 @@ Each stage below lists who does the work, what the host enforces, and where Eric
 
 ### Build
 
-- **Who:** one builder agent per task, with write access to a worktree and to a real machine (section 7).
+- **Who:** one builder agent per task, with write access to a worktree and to a real machine (section 7). The host
+  runs the plan's tasks in waves: a task starts when its dependencies are merged, and tasks whose files do not
+  overlap run at the same time, each on its own branch (`factory/task-<run>-<task>`) and worktree. The host merges
+  each wave into the run's branch, `factory/dev-<slug>` (P3). A builder can start nanocode subagents for parts of
+  its task. Only the builder checkpoints and submits.
 - **Work:** a lazy first draft: the narrowest change that meets done-looks-like (`ALL-019`). It follows the repo's
   existing patterns (`ALL-021`) and the coding rules of every matched profile at full intensity (`ALL-018`). The
   builder gets the problem, the constraints and the done criteria, never line edits (`ALL-020`).
 - **Rails:**
+  - A builder can write only the files and directories of its task, from the plan.
   - Protected paths (check config, CI workflows, the profile's own list) refuse writes, as in the review loop.
   - The host commits checkpoints when the builder asks, so new test files become runnable through `run_tests`.
   - Forbidden committed paths (`out/`, `cache/`, logs, broadcast dumps) fail the checkpoint (`ALL-067`).
   - Profile static rules run on every checkpoint (section 4.3). A violation goes back to the builder as a tool error.
   - No secrets in the builder's environment. The same allowlist as the checks applies.
-- **CI:** the host pushes the branch, opens the PR as draft, and watches CI. A red CI goes back to the same builder
-  session, inside a budget (section 9, G6). The host reports only the PR or a blocker.
+- **CI:** the host pushes the branch, opens the PR as draft, and watches CI. A red CI goes back to a builder with the
+  failure logs, inside a budget of two rounds (P5, G6). With one task, that is the same builder session. With
+  several tasks, one fixer session gets the union of their files. The host reports only the PR or a blocker.
 
 ### Split
 
@@ -282,13 +292,16 @@ The builder needs a real toolchain: `forge`, `node`, package installs. The revie
 
 - **Local (Node):** works today. The builder uses a git worktree and runs commands on this machine, with the trust
   limits in the README.
-- **Cloudflare:** the brain stays in the Durable Object. The builder's tools run on a machine attached to the run:
-  - a Cloudflare Container per run, through nanocode-ts `sandbox/cloudflare`, with one image per profile (Foundry,
-    Node), or
-  - a hand on a build box (`nc hand`).
-  
-  The Container is the default proposal: no machine to keep running, and code under review never runs beside
-  secrets. It needs Docker images for each profile and Cloudflare Containers on the account.
+- **Cloudflare:** the brain stays in the Durable Object. The builder's tools run on a machine attached to the run.
+  Eric chose a Cloudflare Container per run over a hand on a build box (2026-11-13). Built in phase 3:
+  - One `DevelopmentRuns` Durable Object per issue holds the ledger, the agent sessions, the GitHub token, and each
+    branch as a tree in SQL with in-process git. Builders keep the in-process shell and the same rails as on the
+    local platform.
+  - The container only runs commands: `setup`, checks and tests on a copy of a branch that the object syncs in.
+    It gets no secret and no git remote. One image (Node 22, git, Foundry) serves every profile for now.
+  - Pushes go through the Git Data API. The review loop runs as a review run of the new PR, in its own object.
+  - Entry: `npm run remote -- develop owner/repo#<issue>`, a `/develop` comment, or the `agent-develop` label. The
+    issue is the ask, verbatim, and its comments carry the intake and spec questions and the report.
 
 ## 8. Decisions for Eric
 
@@ -324,9 +337,24 @@ Each decision lists the conflict, the sources, the recommendation and the status
 | 10 | Layout | using, structs and enums, constants, immutables, state, events, errors, modifiers, constructor, external, public, internal, private. View and pure last inside each visibility group. |
 | 11 | Imports | Named imports everywhere, also in tests and PoCs. |
 
+### Phase 1 picks
+
+Eric accepted these on 2026-11-13.
+
+| # | Topic | Pick |
+| --- | --- | --- |
+| P1 | Entry point | `npm run develop` first. GitHub issues and `/develop` on Cloudflare come in phase 3. |
+| P2 | Platform | Phase 1 runs on the local platform. |
+| P3 | Branch and PR | The work goes to `factory/dev-<slug>` from the base. The host opens a draft PR through `gh`. |
+| P4 | Larger changes | The intake agent recommends a spec stage and one or two review passes, with a reason. Eric can overrule both in his answers. |
+| P5 | CI-fix budget | Two rounds, then a blocker. |
+| P6 | Models | Intake, spec, planner and builders on Opus 5.5. |
+| P7 | Static rules | They gate each builder checkpoint, and they are host findings in the review loop. |
+| P8 | Gaps | The defaults in section 9 apply. |
+
 ## 9. Gaps
 
-No source defines these. Each has a proposed default that Eric can replace.
+No source defines these. Eric accepted each default on 2026-11-13 (P8). He can replace any of them.
 
 | # | Gap | Proposed default |
 | --- | --- | --- |
@@ -346,7 +374,7 @@ No source defines these. Each has a proposed default that Eric can replace.
 | Phase | Scope | Exit |
 | --- | --- | --- |
 | 0 | Review loop matches D1 and D3 (done). The light loop, first profiles and static rules (done). | A real run on one of Eric's PRs. |
-| 1 | Profiles in code. Intake, plan, build, freeze, review loop, hygiene, CI, ready PR, on the local platform. Profiles `solidity`, `solidity-support`, `typescript`, `docs`. | A small real feature from ask to ready PR. |
+| 1 | Profiles in code. Intake, plan, build, freeze, review loop, hygiene, CI, ready PR, on the local platform. Profiles `solidity`, `solidity-support`, `typescript`, `docs`. Built: `npm run develop`, with parallel builders for the plan's tasks. Not yet: review thread checks in hygiene (no review bots yet), repo overrides of profiles. | A small real feature from ask to ready PR. |
 | 2 | The Auditor as a sub-workflow, PR-delta mode first. | A Solidity change with the review loop and the Auditor. |
-| 3 | The builder on Cloudflare, through a Container per run. | The phase 1 feature, run from `npm run remote`. |
+| 3 | The builder on Cloudflare, through a Container per run. Built: `DevelopmentRuns`, the build container, `/develop` on issues. | The phase 1 feature, run from `npm run remote`. |
 | 4 | The deploy workflow: dry run, Eric's `/go` for an exact scope, broadcast in chunks with a progress file, live verify, record. | A testnet deploy. |

@@ -15,6 +15,10 @@ export type RoleId =
   | 'intent'
   | 'questions'
   | 'light'
+  | 'intake'
+  | 'spec'
+  | 'planner'
+  | 'builder'
 
 /** What one specialized agent reads (its guidelines) and may do (its rails). */
 export type Role = {
@@ -67,6 +71,10 @@ export const roles: Record<RoleId, Role> = {
   intent: { id: 'intent', guides: ['shared/factory.md', 'intent.md'], stackGuides: false, tests: false },
   questions: { id: 'questions', guides: ['shared/factory.md', 'questions.md'], stackGuides: false, tests: false },
   light: { id: 'light', guides: ['shared/factory.md', 'light.md', 'anti-slop.md', 'shared/ste.md'], stackGuides: true, tests: true },
+  intake: { id: 'intake', guides: ['shared/factory.md', 'intake.md'], stackGuides: false, tests: false },
+  spec: { id: 'spec', guides: ['shared/factory.md', 'spec.md', 'shared/ste.md'], stackGuides: false, tests: false },
+  planner: { id: 'planner', guides: ['shared/factory.md', 'planner.md', 'shared/ste.md'], stackGuides: true, tests: false },
+  builder: { id: 'builder', guides: ['shared/factory.md', 'builder.md', 'shared/ste.md'], stackGuides: true, tests: true },
 }
 
 /** Every guideline file that some role or profile reads, relative to agents/. */

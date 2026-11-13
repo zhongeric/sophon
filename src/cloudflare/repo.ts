@@ -1,10 +1,10 @@
 import type { Contracts } from 'nanocode-ts'
-import { Bash, MemoryFileSystem, Mount, SqlFileSystem } from 'nanocode-ts/bash'
+import { SqlFileSystem } from 'nanocode-ts/bash'
 import type { Ledger } from '../core/ledger.ts'
 import type { Frozen, Repo } from '../core/platform.ts'
 import { StopError } from '../core/stop.ts'
 import { GitHubError, type GitHub } from './github.ts'
-import { gunzip, untar, type TarEntry } from './tar.ts'
+import { base64, encodePath, nameStatus, restoreFromGitHub, treeGit, treeWriter, writeTarball, type ChangedFile } from './trees.ts'
 
 export type PullRequest = { owner: string; repo: string; pr: number }
 
@@ -18,35 +18,10 @@ export type GitHubRepo = Repo & {
 
 type PullView = { head: { sha: string; ref: string }; base: { ref: string }; draft: boolean; node_id: string }
 type Compare = { merge_base_commit: { sha: string } }
-type ChangedFile = { filename: string; status: string; previous_filename?: string }
-type Contents = { type: 'file' | 'symlink' | 'dir' | 'submodule'; target?: string }
 
 /** GitHub lists at most this many files of a pull request. */
 const maxPullFiles = 3000
 const pageSize = 100
-
-const identity = ['-c', 'user.name=agent-factory', '-c', 'user.email=agent-factory@users.noreply.github.com', '-c', 'core.quotePath=false']
-/** Host git over a whole repository can take long, beyond the agents' 30-second shell limit. */
-const gitTimeoutMs = 10 * 60_000
-const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
-const encodePath = (path: string) => path.split('/').map(encodeURIComponent).join('/')
-
-function base64(bytes: Uint8Array): string {
-  let binary = ''
-  for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
-  return btoa(binary)
-}
-
-/** Name-status lines as [status, path] pairs; a rename gives its old path as a deletion. */
-function nameStatus(output: string): [string, string][] {
-  return output
-    .split('\n')
-    .filter(Boolean)
-    .flatMap((line): [string, string][] => {
-      const [status = '', ...paths] = line.split('\t')
-      return status.startsWith('R') ? [['D', paths[0]!], ['A', paths[1]!]] : [[status[0]!, paths[0]!]]
-    })
-}
 
 /**
  * A PR's repository in Durable Object SQL. The freeze writes the head snapshot, steps the PR's files back
@@ -67,21 +42,7 @@ export function githubRepo(options: {
   const api = `/repos/${pull.owner}/${pull.repo}`
   let scope = ledger.get<string>('tree-scope') ?? `tree:${options.runId}`
   let tree = SqlFileSystem.create(options.sql, { scope })
-  let shell: Promise<Bash.Bash> | undefined
-
-  const git = async (...args: string[]) => {
-    shell ??= Bash.create({
-      cwd: '/repo',
-      fetch: async () => {
-        throw new Error('network access is off')
-      },
-      fs: Mount.create(MemoryFileSystem.create(), { mounts: { '/repo': tree } }),
-      limits: { timeoutMs: gitTimeoutMs },
-    })
-    const result = await (await shell).exec(['git', ...identity, ...args].map(quote).join(' '))
-    if (result.exitCode !== 0) throw new Error(`git ${args[0]}: ${result.stderr || result.stdout}`)
-    return result.stdout
-  }
+  let git = treeGit(tree)
   const head = async () => (await git('rev-parse', 'HEAD')).trim()
   const snapshot = () => {
     const recorded = ledger.get<Snapshot>('snapshot')
@@ -89,38 +50,7 @@ export function githubRepo(options: {
     return recorded
   }
 
-  const parents = (path: string) => {
-    const parts = path.split('/').slice(0, -1)
-    return parts.map((_, index) => `/${parts.slice(0, index + 1).join('/')}`)
-  }
-  const remove = (path: string) => tree.remove(`/${path}`).catch(() => undefined)
-  const makeParents = async (path: string) => {
-    for (const dir of parents(path)) if (!(await tree.stat(dir))) await tree.mkdir(dir)
-  }
-  /** Writes replace the path itself, so a write never follows a symlink that the snapshot holds. */
-  const write = async (path: string, data: Uint8Array, mode = 0o644) => {
-    await remove(path)
-    await makeParents(path)
-    await tree.write(`/${path}`, data)
-    if (mode & 0o111) await tree.chmod(`/${path}`, 0o755)
-  }
-  const link = async (path: string, target: string) => {
-    await remove(path)
-    await makeParents(path)
-    await tree.symlink(target, `/${path}`)
-  }
-  const restore = async (entry: TarEntry) => {
-    if (entry.type === 'symlink') await link(entry.path, entry.target)
-    else if (entry.type === 'file') await write(entry.path, entry.data, entry.mode)
-  }
-  /** The merge-base version of a path. The raw contents API follows symlinks, so ask for the entry type first. */
-  const restoreBase = async (path: string, ref: string) => {
-    const url = `${api}/contents/${encodePath(path)}?ref=${encodeURIComponent(ref)}`
-    const entry = await gh.json<Contents>('GET', url)
-    if (entry.type === 'symlink') await link(path, entry.target ?? '')
-    else if (entry.type === 'file') await write(path, new Uint8Array(await (await gh.raw(url, 'application/vnd.github.raw')).arrayBuffer()))
-    else await remove(path)
-  }
+  const remove = (path: string) => treeWriter(tree).remove(path)
   const changedFiles = async () => {
     const files: ChangedFile[] = []
     for (let page = 1; ; page++) {
@@ -143,19 +73,13 @@ export function githubRepo(options: {
       const compare = await gh.json<Compare>('GET', `${api}/compare/${encodeURIComponent(view.base.ref)}...${view.head.sha}`)
       const mergeBase = compare.merge_base_commit.sha
       const files = await changedFiles()
-      const archive = await gh.raw(`${api}/tarball/${view.head.sha}`, 'application/vnd.github+json')
-      const entries = untar(await gunzip(archive.body!), 1)
 
       // A crashed freeze leaves a partial tree: start each attempt in a fresh scope.
       scope = `tree:${options.runId}:${Date.now()}`
       ledger.put('tree-scope', scope)
       tree = SqlFileSystem.create(options.sql, { scope })
-      shell = undefined
-      const skipped: string[] = []
-      for (const entry of entries) {
-        if (entry.type === 'file' && entry.data.length > tree.maxFileBytes) skipped.push(entry.path)
-        else await restore(entry)
-      }
+      git = treeGit(tree)
+      const { entries, skipped } = await writeTarball(gh, api, tree, view.head.sha)
       if (skipped.length > 0) options.log(`skipped ${skipped.length} files over ${tree.maxFileBytes} bytes: ${skipped.slice(0, 5).join(', ')}`)
 
       const byPath = new Map(entries.map((entry) => [entry.path, entry]))
@@ -163,8 +87,8 @@ export function githubRepo(options: {
         if (file.status === 'added' || file.status === 'copied') await remove(file.filename)
         else if (file.status === 'renamed') {
           await remove(file.filename)
-          await restoreBase(file.previous_filename!, mergeBase)
-        } else await restoreBase(file.filename, mergeBase)
+          await restoreFromGitHub(gh, api, tree, file.previous_filename!, mergeBase)
+        } else await restoreFromGitHub(gh, api, tree, file.filename, mergeBase)
       }
       await git('init', '-q')
       await git('add', '-A')
@@ -174,7 +98,7 @@ export function githubRepo(options: {
         if (file.status === 'renamed') await remove(file.previous_filename!)
         const entry = byPath.get(file.filename)
         if (file.status === 'removed' || !entry) await remove(file.filename)
-        else await restore(entry)
+        else await treeWriter(tree).restore(entry)
       }
       await git('add', '-A')
       if ((await git('status', '--porcelain')).trim() !== '') await git('commit', '-q', '-m', `head ${view.head.sha}`)
