@@ -29,12 +29,18 @@ function testTools(context: RunContext, role: Role): HostTools {
   return { run_tests: { definition: runTestsTool, call: (input) => callRunTests(context.repo, context.config, run, input) } }
 }
 
+/** Said to an agent whose role runs tests when the run has no test runner, as on Cloudflare, where CI is the only test run. */
+export const noTestRunner =
+  'This run has no run_tests tool. CI runs the tests after the host commits your change. Do not try to run tests in the shell: it cannot run them. A test that you add or change must follow the setup and the patterns of the tests around it, because nothing runs it before CI.'
+
 function spec(context: RunContext, id: string, role: Role, model: ModelChoice, workspace: Contracts.WorkspaceHost, tools: HostTools): AgentSpec {
+  const tests = testTools(context, role)
+  const base = instructions(role, { read: context.guides.read, stackGuides: context.stackGuides })
   return {
     id,
     ...model,
-    instructions: instructions(role, { read: context.guides.read, stackGuides: context.stackGuides }),
-    tools: { ...tools, ...testTools(context, role) },
+    instructions: role.tests && !tests.run_tests ? `${base}\n\n${noTestRunner}` : base,
+    tools: { ...tools, ...tests },
     workspace,
   }
 }

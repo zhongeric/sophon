@@ -29,6 +29,8 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   assert.match(outputs('bugs'), /"status\\":\\"fail/)
   assert.match(outputs('patch'), /protected: .*EACCES/)
   assert.match(outputs('patch'), /"status\\":\\"pass/)
+  // With a test runner, no agent hears that it has none.
+  assert.ok(!turns.some((turn) => turn.request.includes('This run has no run_tests tool')))
 
   const providers = (role: string) => new Set(turns.filter((turn) => turn.role === role).map((turn) => turn.provider))
   for (const role of ['minimize', 'bugs', 'anti-slop', 'patch', 'questions', 'late-rules', 'intent']) assert.deepEqual(providers(role), new Set(['claude']))

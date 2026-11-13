@@ -53,6 +53,9 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
     assert.deepEqual(providers, new Set(['codex']))
     const report = await (await fetch(`${worker.url}/runs/acme/app/7/report`, { headers: { authorization: 'Bearer admin' } })).text()
     assert.match(report, /Step 1 findings: host=0, minimize=1, rules=0, bugs=1, anti-slop=0/)
+    // Review runs on Cloudflare have no test runner: the agents that run tests elsewhere hear that CI runs them.
+    const told = (role: string) => mock.state.turns.some((turn) => turn.role === role && turn.request.includes('This run has no run_tests tool'))
+    assert.deepEqual([told('patch'), told('bugs'), told('minimize')], [true, true, false])
   } finally {
     worker.stop()
     mock.close()
