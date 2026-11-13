@@ -208,8 +208,10 @@ npm run remote -- report acme/app#123
   `ALLOWED_USERS` count. The config's `answerers` can narrow that list, never widen it.
 - The result is a PR comment with the criteria and the full report. The fixes are on `factory/<run>`.
 - The routes behind `Authorization: Bearer <ADMIN_TOKEN>`: `POST /runs/<owner>/<repo>/<pr>` starts a run
-  (body `{"ship": true}` to ship, `{"full": true}` for the full loop), `POST .../resume` wakes it, `GET /runs/<owner>/<repo>/<pr>` and `.../report`
-  return the status and the report. `npx wrangler tail` shows each agent's tool calls.
+  (body `{"ship": true}` to ship, `{"full": true}` for the full loop), `POST .../resume` wakes it and returns
+  `resumed`, the `state` of the latest run and a `reason`, `GET /runs/<owner>/<repo>/<pr>` and `.../report` return
+  the status and the report. `npm run remote -- resume` prints the state and the reason, and exits 1 when the run
+  did not wake. `npx wrangler tail` shows each agent's tool calls.
 
 ### How it works
 
