@@ -1,0 +1,15 @@
+{
+  // One Durable Object per PR holds the run's ledger, its repository tree and every agent session.
+  "name": "agent-factory",
+  "main": "src/cloudflare/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": { "bindings": [{ "class_name": "PullRequestRuns", "name": "PULL_REQUESTS" }] },
+  "migrations": [{ "new_sqlite_classes": ["PullRequestRuns"], "tag": "v1" }],
+  "rules": [{ "type": "Text", "globs": ["**/*.md", "**/*.txt"], "fallthrough": true }],
+  "limits": { "cpu_ms": 300000 },
+  "observability": { "enabled": true },
+  // Set with: npx wrangler secret put <NAME>
+  // GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, ANTHROPIC_API_KEY, OPENAI_API_KEY, TYPESAFE_API_KEY, ADMIN_TOKEN
+  "vars": { "ALLOWED_USERS": "zhongeric" }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "agent-factory",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "review": "node --disable-warning=ExperimentalWarning src/node/cli.ts",
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.core.json && tsc --noEmit -p tsconfig.cloudflare.json",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
+    "smoke": "node --disable-warning=ExperimentalWarning scripts/smoke.ts"
+  },
+  "dependencies": {
+    "nanocode-ts": "https://github.com/nanocodexyz/nanocode-ts/releases/download/build-6e2c6c2/nanocode-ts-6e2c6c2.tgz"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261113.1",
+    "@types/node": "^22.19.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.161.0"
+  }
+}
