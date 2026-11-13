@@ -11,7 +11,7 @@ import { resumeInput } from '../src/node/cli.ts'
 import { changedFiles, diff, touchedFiles } from '../src/node/git.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { fixed, fixtureRepo, gitSource, lightFixed, loopInput, memoryChannel, runLoop, script, scriptFor } from './support/fixture.ts'
-import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
+import { scriptedDispatch, type Script, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
 
@@ -239,4 +239,111 @@ test("a critical finding that the patch agent rejects goes to the user, and only
   const accepted = memoryChannel({ 'step1.patch.rejections': '/answer\nQ1: a' })
   const second = await runLoop(fixtureRepo(), 'accepted', runsDir(), { channel: accepted.channel, dispatch: scriptedDispatch(rejecting, []) })
   assert.deepEqual([criterion(second).ok, criterion(second).detail], [true, 'you accepted the rejection of bugs-001'])
+})
+
+/** Lines `export const <name><i> = <i>` for i from 0, with some values replaced. */
+const constants = (name: string, count: number, replace: Record<number, number> = {}) =>
+  Array.from({ length: count }, (_, i) => `export const ${name}${i} = ${replace[i] ?? i}\n`).join('')
+
+/** A repository whose feature branch adds about 800 lines in two directories, so that two bugs reviewers split it. */
+function largeRepo(): string {
+  const repo = mkdtempSync(join(tmpdir(), 'factory-large-'))
+  const run = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' })
+  const write = (path: string, content: string) => {
+    mkdirSync(join(repo, path, '..'), { recursive: true })
+    writeFileSync(join(repo, path), content)
+  }
+  run('init', '-q', '-b', 'main')
+  run('config', 'user.email', 'test@example.com')
+  run('config', 'user.name', 'Test')
+  run('config', 'commit.gpgsign', 'false')
+  write('.agent-factory.json', JSON.stringify({ stack: 'TypeScript', checks: { smoke: 'node -e "process.exit(0)"' } }))
+  write('src/alpha/a.ts', constants('a', 1))
+  write('src/beta/b.ts', constants('b', 1))
+  write('src/util.ts', 'export const util = 1\n')
+  run('add', '-A')
+  run('commit', '-q', '-m', 'base')
+  run('checkout', '-q', '-b', 'feature')
+  write('src/alpha/a.ts', constants('a', 400))
+  write('src/beta/b.ts', constants('b', 400))
+  write('src/util.ts', 'export const util = 2\n')
+  run('add', '-A')
+  run('commit', '-q', '-m', 'add constants')
+  return repo
+}
+
+const largeFixed = {
+  alpha: constants('a', 400, { 2: 22 }),
+  alphaFinal: constants('a', 400, { 2: 22, 3: 33 }),
+  beta: constants('b', 400, { 2: 22, 4: 44 }),
+  util: 'export const util = 3\n',
+}
+
+/**
+ * The agents of the large change. Each bugs reviewer reports a bug in its own directory. The patch agent of the
+ * beta findings needs a file of the alpha agent, so it defers that finding to the agent that runs after them.
+ */
+const largeScript: Script = ({ role, output, request }) => {
+  if (output !== null) return { text: 'done' }
+  const findings = (list: unknown[]) => `await tools.submit_findings({ findings: ${JSON.stringify(list)} })`
+  const at = (location: string, evidence: string, severity: string) => ({ location, evidence, severity, title: 'Fix the value', trigger: 'import', impact: 'wrong value', recommendation: 'fix it' })
+  const write = (path: string, content: string) => `await tools.Write({ file_path: '/repo/${path}', content: ${JSON.stringify(content)} })`
+  const log = (applied: string[], deferred: { id: string; reason: string }[] = []) =>
+    `await tools.submit_patch_log({ applied: ${JSON.stringify(applied.map((id) => ({ id, change: 'fixed' })))}, skipped: [], deferred: ${JSON.stringify(deferred)} })`
+  switch (role) {
+    case 'bugs':
+      if (request.includes('src/alpha/a.ts')) return { cell: findings([at('src/alpha/a.ts:3', 'export const a2 = 2', 'high')]) }
+      return { cell: findings([at('src/beta/b.ts:3', 'export const b2 = 2', 'medium')]) }
+    case 'anti-slop':
+      return { cell: findings([at('src/beta/b.ts:5', 'export const b4 = 4', 'info'), at('src/util.ts:1', 'export const util = 2', 'info')]) }
+    case 'questions':
+      return { cell: 'await tools.submit_questions({ questions: [] })' }
+    case 'intent':
+      return { cell: `await tools.submit_verdict({ satisfied: true, gaps: [], summary: 'the constants are correct' })` }
+    case 'patch':
+      if (request.includes('Apply the deferred findings'))
+        return { cell: [write('src/alpha/a.ts', largeFixed.alphaFinal), `await tools.submit_patch_log({ applied: [{ id: 'bugs-002', change: 'fixed a3' }], skipped: [] })`].join('\n') }
+      if (request.includes('bugs-001')) return { cell: [write('src/alpha/a.ts', largeFixed.alpha), log(['bugs-001'])].join('\n') }
+      if (request.includes('bugs-002'))
+        return {
+          cell: [
+            write('src/beta/b.ts', largeFixed.beta),
+            `try { ${write('src/alpha/a.ts', 'x')}; text('OTHER AGENT FILE WRITTEN') } catch (error) { text('refused: ' + error) }`,
+            log(['anti-001'], [{ id: 'bugs-002', reason: 'b2 also needs a3 in src/alpha/a.ts' }]),
+          ].join('\n'),
+        }
+      return { cell: [write('src/util.ts', largeFixed.util), log(['anti-002'])].join('\n') }
+    default:
+      return { cell: findings([]) }
+  }
+}
+
+test('a large change splits the bugs review across reviewers, and patch agents work on separate files at the same time', async () => {
+  const repo = largeRepo()
+  const turns: Turn[] = []
+  const result = await runLoop(repo, 'large', runsDir(), { dispatch: scriptedDispatch(largeScript, turns) })
+  assert.equal(result.pass, true, result.report)
+
+  // Two bugs reviewers, each with its share of the diff, and their findings in one list.
+  const first = (role: string) => turns.filter((turn) => turn.role === role && turn.output === null)
+  const bugs = first('bugs')
+  assert.equal(bugs.length, 2)
+  assert.ok(bugs.some((turn) => /Your files, 2 of the 3 files of the change: src\/alpha\/a\.ts, src\/util\.ts\./.test(turn.request)))
+  assert.ok(bugs.some((turn) => /Your files, 1 of the 3 files of the change: src\/beta\/b\.ts\./.test(turn.request)))
+  assert.match(result.report, /Step 1 findings: host=0, minimize=0, rules=0, bugs=2, anti-slop=2/)
+  const gateLog = readFileSync(join(result.dir, 'gate-log.txt'), 'utf8')
+  assert.match(gateLog, /FINDING bugs-001 \| track=bugs \| severity=high/)
+  assert.match(gateLog, /FINDING bugs-002 \| track=bugs \| severity=medium/)
+
+  // Three patch agents at the same time: alpha, beta with its info finding, and the other info finding. Then one for the deferred finding.
+  assert.equal(first('patch').length, 4)
+  assert.match(turns.filter((turn) => turn.role === 'patch' && turn.output).map((turn) => turn.output).join('\n'), /refused: .*EACCES/)
+  assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12} \(3 patch agents at the same time, then one for bugs-002\); applied: bugs-001 \(fixed\); anti-001 \(fixed\); anti-002 \(fixed\); bugs-002 \(fixed a3\)/)
+  const show = (path: string) => execFileSync('git', ['show', `${result.branch}:${path}`], { cwd: repo }).toString()
+  assert.deepEqual([show('src/alpha/a.ts'), show('src/beta/b.ts'), show('src/util.ts')], [largeFixed.alphaFinal, largeFixed.beta, largeFixed.util])
+  assert.deepEqual(fileLedger(join(result.dir, 'state.json')).get('groups:step1.patch'), [
+    { ids: ['bugs-001'], files: ['src/alpha/a.ts'] },
+    { ids: ['bugs-002', 'anti-001'], files: ['src/beta/b.ts'] },
+    { ids: ['anti-002'], files: ['src/util.ts'] },
+  ])
 })

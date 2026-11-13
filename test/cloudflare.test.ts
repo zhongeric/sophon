@@ -138,16 +138,23 @@ test('on Cloudflare, deleted source files and the old paths of renamed source fi
   git('commit', '-q', '-m', 'remove and rename source files')
   const mock = await mockServices(repo, {
     botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7,
-    script: ({ role, output }) => {
+    script: ({ role, output, request }) => {
       if (output !== null) return { text: 'done' }
       if (role === 'questions') return { cell: 'await tools.submit_questions({ questions: [] })' }
       if (role === 'intent') return { cell: 'await tools.submit_verdict({ satisfied: true, gaps: [], summary: "The change removes source files" })' }
-      if (role === 'patch') return {
-        cell: [
-          `await tools.Write({ file_path: '/repo/docs/v2.md', content: ${JSON.stringify(lightFixed.docs)} })`,
-          `await tools.Write({ file_path: '/repo/test/Vault.t.sol', content: ${JSON.stringify(lightFixed.test)} })`,
-          'await tools.submit_patch_log({ applied: [{ id: "host-001", change: "wrote for example" }, { id: "host-002", change: "renamed the test" }], skipped: [] })',
-        ].join('\n'),
+      if (role === 'patch') {
+        // The two host findings are in two files, so two patch agents get one each.
+        const fixes = [
+          { id: 'host-001', path: 'docs/v2.md', content: lightFixed.docs, change: 'wrote for example' },
+          { id: 'host-002', path: 'test/Vault.t.sol', content: lightFixed.test, change: 'renamed the test' },
+        ].filter((fix) => request.includes(fix.id))
+        const applied = JSON.stringify(fixes.map(({ id, change }) => ({ id, change })))
+        return {
+          cell: [
+            ...fixes.map((fix) => `await tools.Write({ file_path: '/repo/${fix.path}', content: ${JSON.stringify(fix.content)} })`),
+            `await tools.submit_patch_log({ applied: ${applied}, skipped: [], deferred: [] })`,
+          ].join('\n'),
+        }
       }
       return { cell: 'await tools.submit_findings({ findings: [] })' }
     },
@@ -161,6 +168,7 @@ test('on Cloudflare, deleted source files and the old paths of renamed source fi
     const report = await (await fetch(`${worker.url}/runs/acme/app/7/report`, { headers: { authorization: 'Bearer admin' } })).text()
     assert.match(report, /TRIAGE path=full reason=not-docs-or-tests files=[^\n`]*src\/math\.ts/)
     assert.match(report, /TRIAGE path=full reason=not-docs-or-tests files=[^\n`]*src\/removed\.ts/)
+    assert.match(report, /Step 1 patch: commit [0-9a-f]{12} \(2 patch agents at the same time\); applied: host-001 .*; host-002 /)
     assert.ok(mock.state.turns.some((turn) => turn.role === 'minimize'))
     assert.ok(!mock.state.turns.some((turn) => turn.role === 'light'))
   } finally {
