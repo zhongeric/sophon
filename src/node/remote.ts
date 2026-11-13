@@ -27,9 +27,11 @@ export function parseTarget(text: string): { owner: string; repo: string; pr: nu
 }
 
 /**
- * Gives the text to print and the exit code for the body of a resume response. A body without a boolean `resumed` gives
- * the raw text and exit 1. A body without a valid `state` and `reason`, for example `{ resumed }` from an older Worker,
- * gives the raw text and the exit code of `resumed`.
+ * Gives the text and the exit code for a resume response.
+ * A body without a boolean `resumed` gives the raw text and exit code 1.
+ * When `resumed` is a boolean, the exit code is 0 for true and 1 for false.
+ * If `state` or `reason` is missing or has an incorrect type, the function gives the raw text.
+ * For example, a Worker of an earlier version can return `{ resumed }`.
  */
 export function resumeOutcome(text: string): { code: number; text: string } {
   let body: unknown
@@ -44,7 +46,7 @@ export function resumeOutcome(text: string): { code: number; text: string } {
   const reason = 'reason' in body ? body.reason : undefined
   if (typeof reason !== 'string' || (state !== null && typeof state !== 'string')) return { code, text }
   // The state is the state before the call: a resumed run is queued or running now.
-  return { code, text: code === 0 ? `resumed: latest run was ${state ?? 'none'}: ${reason}` : `not resumed: latest run is ${state ?? 'none'}: ${reason}` }
+  return { code, text: `${body.resumed ? 'resumed: latest run was' : 'not resumed: latest run is'} ${state ?? 'none'}: ${reason}` }
 }
 
 function setting(name: string): string {
