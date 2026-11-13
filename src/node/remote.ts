@@ -9,7 +9,8 @@ Drives the Cloudflare Worker without the GitHub webhook.
 
 Commands:
   start <pr>     Start a review run on the PR (--ship: on PASS, push the fixes to the PR branch and mark it ready)
-  resume <pr>    Wake a paused run now, for example after you answered its questions
+  resume <pr>    Wake a paused run now, for example after you answered its questions, and print the state of the
+                 latest run and the reason (exit 1 when the run does not wake)
   status <pr>    Print the runs of the PR
   report <pr>    Print the report of the latest run
 
@@ -23,6 +24,23 @@ export function parseTarget(text: string): { owner: string; repo: string; pr: nu
   const match = /^(?:https:\/\/github\.com\/)?([\w.-]+)\/([\w.-]+)(?:#|\/pull\/)(\d+)\/?$/.exec(text.trim())
   if (!match) throw new StopError(`${text} is not owner/repo#123 or a GitHub PR URL`)
   return { owner: match[1]!, pr: Number(match[3]), repo: match[2]! }
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return undefined
+  }
+}
+
+/** Gives the text to print and the exit code for the body of a resume response. A body of an unknown shape gives the raw text and exit 1. */
+export function resumeOutcome(text: string): { code: number; text: string } {
+  const body = parseJson(text)
+  if (typeof body !== 'object' || body === null || !('resumed' in body) || !('state' in body) || !('reason' in body)) return { code: 1, text }
+  const { reason, resumed, state } = body
+  if (typeof resumed !== 'boolean' || typeof reason !== 'string' || (state !== null && typeof state !== 'string')) return { code: 1, text }
+  return { code: resumed ? 0 : 1, text: `${resumed ? 'resumed' : 'not resumed'}: latest run is ${state ?? 'none'}: ${reason}` }
 }
 
 function setting(name: string): string {
@@ -58,7 +76,13 @@ async function main(): Promise<number> {
   const send = requests[command]
   if (!send) throw new StopError(`unknown command ${command}\n\n${usage}`)
   const response = await send()
-  console.log(await response.text())
+  const text = await response.text()
+  if (command === 'resume' && response.ok) {
+    const outcome = resumeOutcome(text)
+    console.log(outcome.text)
+    return outcome.code
+  }
+  console.log(text)
   return response.ok ? 0 : 1
 }
 

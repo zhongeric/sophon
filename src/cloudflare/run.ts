@@ -37,6 +37,17 @@ export type Env = {
 export type StartRequest = PullRequest & { ship: boolean; by: string }
 type State = 'queued' | 'running' | 'paused' | 'passed' | 'failed' | 'error'
 type RunRow = { run: string; state: State; note: string; created: number; request: string }
+/** The result of `resume`: `state` is the state of the latest run before the call, or null when the PR has no run. */
+export type ResumeResult = { resumed: boolean; state: State | null; reason: string }
+
+/** Why `resume` does not wake the latest run, for each state that it does not wake. */
+const notResumed: Record<Exclude<State, 'paused'>, string> = {
+  error: 'the run stopped on an error. Only the admin route starts it again: use npm run remote -- resume',
+  failed: 'the run is complete with FAIL. Start a new run to review the PR again',
+  passed: 'the run is complete with PASS. Start a new run to review the PR again',
+  queued: 'the run is queued and starts on its next alarm',
+  running: 'the run is running now',
+}
 
 /** While a run works, its alarm stays this far ahead, so that a run whose isolate died restarts from its ledger. */
 const heartbeatMs = 60_000
@@ -83,17 +94,20 @@ export class PullRequestRuns extends DurableObject<Env> {
    * Wakes a paused run, for example after an answer or a CI result. With \`afterError\`, also restarts a run that
    * stopped on an error, from its ledger, once the cause is fixed. Only the admin route passes it.
    */
-  async resume(options: { afterError?: boolean } = {}): Promise<boolean> {
+  async resume(options: { afterError?: boolean } = {}): Promise<ResumeResult> {
     const latest = this.ctx.storage.sql.exec<RunRow>('select * from factory_runs order by created desc limit 1').toArray()[0]
-    if (!latest) return false
-    if (latest.state === 'error' && options.afterError) {
+    if (!latest) return { reason: 'the PR has no run. Start a run first', resumed: false, state: null }
+    const { state } = latest
+    let reason = 'woke the paused run'
+    if (state === 'error' && options.afterError) {
       const ledger = sqlLedger(this.ctx.storage.sql, latest.run)
       ledger.put('attempts', 0)
       ledger.put('restarts', 0)
       this.setState(latest.run, 'queued', 'resumed after an error')
-    } else if (latest.state !== 'paused') return false
+      reason = 'started the run again from its ledger after the error'
+    } else if (state !== 'paused') return { reason: notResumed[state], resumed: false, state }
     await this.ctx.storage.setAlarm(Date.now())
-    return true
+    return { reason, resumed: true, state }
   }
 
   status() {

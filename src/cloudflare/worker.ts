@@ -20,7 +20,7 @@ export default {
       return new Response((await runs.report()) ?? 'no report yet', { headers: { 'content-type': 'text/markdown; charset=utf-8' } })
     if (request.method === 'GET' && !action) return Response.json(await runs.status())
     // Starts and resumes for callers without the webhook, such as npm run remote.
-    if (request.method === 'POST' && action === 'resume') return accepted({ resumed: await runs.resume({ afterError: true }) })
+    if (request.method === 'POST' && action === 'resume') return accepted(await runs.resume({ afterError: true }))
     if (request.method === 'POST' && !action) {
       const options = (await request.json().catch(() => ({}))) as { ship?: boolean }
       return accepted(await runs.start({ by: allowedUsers(env)[0] ?? owner, owner, pr, repo, ship: options.ship === true }))
@@ -58,7 +58,8 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     const text = payload.comment.body.trim()
     const runs = pullRequest(env, owner, repo, payload.issue.number)
     if (/^\/review\b/.test(text)) return accepted(await runs.start({ by, owner, pr: payload.issue.number, repo, ship: /--ship\b/.test(text) }))
-    if (/^\/answer\b/.test(text)) return accepted({ resumed: await runs.resume() })
+    // The webhook body stays `{ resumed }`. Only the admin route gives the state and the reason.
+    if (/^\/answer\b/.test(text)) return accepted({ resumed: (await runs.resume()).resumed })
   }
   if (event === 'pull_request' && payload.action === 'labeled' && payload.label?.name === 'agent-review' && payload.pull_request && allowed(payload.sender?.login))
     return accepted(await pullRequest(env, owner, repo, payload.pull_request.number).start({ by: payload.sender!.login, owner, pr: payload.pull_request.number, repo, ship: false }))
