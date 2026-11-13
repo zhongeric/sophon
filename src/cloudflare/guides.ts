@@ -3,13 +3,15 @@ import anti_slop from '../../agents/anti-slop.md'
 import bugs from '../../agents/bugs.md'
 import intent from '../../agents/intent.md'
 import late_pass from '../../agents/late-pass.md'
+import light from '../../agents/light.md'
 import minimize from '../../agents/minimize.md'
 import patch from '../../agents/patch.md'
+import profiles_solidity from '../../agents/profiles/solidity.md'
+import profiles_typescript from '../../agents/profiles/typescript.md'
 import questions from '../../agents/questions.md'
 import rules from '../../agents/rules.md'
 import shared_factory from '../../agents/shared/factory.md'
 import shared_reviewer from '../../agents/shared/reviewer.md'
-import shared_solidity from '../../agents/shared/solidity.md'
 import shared_ste from '../../agents/shared/ste.md'
 import steDictionary from '../../agents/guides/ste/asd-ste100-issue-9.txt'
 import type { Guides } from '../core/platform.ts'
@@ -20,13 +22,15 @@ const texts: Record<string, string> = {
   'bugs.md': bugs,
   'intent.md': intent,
   'late-pass.md': late_pass,
+  'light.md': light,
   'minimize.md': minimize,
   'patch.md': patch,
+  'profiles/solidity.md': profiles_solidity,
+  'profiles/typescript.md': profiles_typescript,
   'questions.md': questions,
   'rules.md': rules,
   'shared/factory.md': shared_factory,
   'shared/reviewer.md': shared_reviewer,
-  'shared/solidity.md': shared_solidity,
   'shared/ste.md': shared_ste,
 }
 

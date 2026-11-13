@@ -25,7 +25,7 @@ type Contents = { type: 'file' | 'symlink' | 'dir' | 'submodule'; target?: strin
 const maxPullFiles = 3000
 const pageSize = 100
 
-const identity = ['-c', 'user.name=agent-factory', '-c', 'user.email=agent-factory@users.noreply.github.com']
+const identity = ['-c', 'user.name=agent-factory', '-c', 'user.email=agent-factory@users.noreply.github.com', '-c', 'core.quotePath=false']
 /** Host git over a whole repository can take long, beyond the agents' 30-second shell limit. */
 const gitTimeoutMs = 10 * 60_000
 const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
@@ -188,6 +188,9 @@ export function githubRepo(options: {
       return nameStatus(await git('diff', '--name-status', `${from}..${to}`))
         .filter(([status]) => status !== 'D')
         .map(([, path]) => path)
+    },
+    async touchedFiles(from, to) {
+      return [...new Set(nameStatus(await git('diff', '--name-status', `${from}..${to}`)).map(([, path]) => path))]
     },
     async committedFiles() {
       return (await git('ls-files')).split('\n').filter(Boolean)

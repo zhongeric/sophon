@@ -3,12 +3,13 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { StopError } from '../core/stop.ts'
 
-const usage = `Usage: npm run remote -- <command> <pr> [--ship]
+const usage = `Usage: npm run remote -- <command> <pr> [--ship] [--full]
 
 Drives the Cloudflare Worker without the GitHub webhook.
 
 Commands:
-  start <pr>     Start a review run on the PR (--ship: on PASS, push the fixes to the PR branch and mark it ready)
+  start <pr>     Start a review run on the PR (--ship: on PASS, push the fixes to the PR branch and mark it ready;
+                 --full: the full loop, also when triage allows the light loop)
   resume <pr>    Wake a paused run now, for example after you answered its questions, and print the state of the
                  latest run and the reason (exit 1 when the run does not wake)
   status <pr>    Print the runs of the PR
@@ -64,7 +65,7 @@ function setting(name: string): string {
 }
 
 async function main(): Promise<number> {
-  const { positionals, values } = parseArgs({ allowPositionals: true, options: { help: { short: 'h', type: 'boolean' }, ship: { type: 'boolean' } } })
+  const { positionals, values } = parseArgs({ allowPositionals: true, options: { full: { type: 'boolean' }, help: { short: 'h', type: 'boolean' }, ship: { type: 'boolean' } } })
   const [command, target] = positionals
   if (values.help || !command || !target) {
     console.log(usage)
@@ -76,7 +77,7 @@ async function main(): Promise<number> {
   const requests: Record<string, () => Promise<Response>> = {
     report: () => fetch(`${url}/report`, { headers }),
     resume: () => fetch(`${url}/resume`, { headers, method: 'POST' }),
-    start: () => fetch(url, { body: JSON.stringify({ ship: values.ship === true }), headers, method: 'POST' }),
+    start: () => fetch(url, { body: JSON.stringify({ full: values.full === true, ship: values.ship === true }), headers, method: 'POST' }),
     status: () => fetch(url, { headers }),
   }
   const send = requests[command]

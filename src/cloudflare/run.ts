@@ -6,7 +6,7 @@ import type { Ledger } from '../core/ledger.ts'
 import { apiKeyCredential, type Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { codeReviewLoop, defaultModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
+import { codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { ciChecker } from './checker.ts'
 import { githubComments } from './comments.ts'
 import { github, GitHubError, type GitHub } from './github.ts'
@@ -34,7 +34,7 @@ export type Env = {
   OPENAI_URL?: string
 }
 
-export type StartRequest = PullRequest & { ship: boolean; by: string }
+export type StartRequest = PullRequest & { ship: boolean; by: string; full?: boolean }
 type State = 'queued' | 'running' | 'paused' | 'passed' | 'failed' | 'error'
 type RunRow = { run: string; state: State; note: string; created: number; request: string }
 /** The result of `resume`: `state` is the state of the latest run before the call, or null when the PR has no run. */
@@ -188,7 +188,9 @@ export class PullRequestRuns extends DurableObject<Env> {
   }
 
   private async execute(run: string, request: StartRequest, ledger: Ledger, gh: GitHub, comments: Comments): Promise<LoopResult> {
-    const input = ledger.get<LoopInput>('input') ?? (await this.input(run, request, gh))
+    const recorded = ledger.get<LoopInput>('input')
+    // A run that started before a model role existed has no choice for it: use the default.
+    const input = recorded ? { ...recorded, models: mergeModels(recorded.models) } : await this.input(run, request, gh)
     const pull = { owner: request.owner, pr: request.pr, repo: request.repo }
     const branch = `factory/${run}`
     const log = (line: string) => console.log(`[${request.owner}/${request.repo}#${request.pr} ${run}] ${line}`)
@@ -237,11 +239,12 @@ export class PullRequestRuns extends DurableObject<Env> {
     return {
       ask: `${view.title}\n\n${view.body ?? ''}`.trim(),
       config: { ...config, guides: {} },
-      models: { step1: { ...defaultModels.step1, ...overrides.step1 }, step2: { ...defaultModels.step2, ...overrides.step2 } },
+      models: mergeModels(overrides),
       pr: request.pr,
       runId: run,
       source: `${request.owner}/${request.repo}#${request.pr}`,
       ...(request.ship ? { ship: { headRef: view.head.ref, pr: request.pr } } : {}),
+      ...(request.full ? { full: true } : {}),
     }
   }
 }

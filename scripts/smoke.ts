@@ -17,7 +17,7 @@ const context: RunContext = {
   config: input.config,
   ask: input.ask,
   stack: 'TypeScript',
-  solidity: false,
+  stackGuides: [],
   guides: run.guides,
   tests: run.checker.tests,
 }

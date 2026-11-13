@@ -13,6 +13,8 @@ export type Repo = {
   diff(from: string, to: string): Promise<string>
   /** Files that exist after the change: added, copied, modified, renamed. */
   changedFiles(from: string, to: string): Promise<string[]>
+  /** Every path that the change touches: the changed files, the deleted files, and the old path of each rename. */
+  touchedFiles(from: string, to: string): Promise<string[]>
   /** Files of the last host commit. Files that an agent created are not in it until the host commits them. */
   committedFiles(): Promise<string[]>
   /** Commits every change in the tree. Does nothing when nothing changed. */
