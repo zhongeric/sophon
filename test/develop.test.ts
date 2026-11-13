@@ -91,7 +91,8 @@ test('develop: CI that another branch ran on the same commit does not count unti
 test('develop: a run without CI blocks, and the resumed run with CI posts its new report on the PR', { timeout: 120_000 }, async () => {
   const { repo } = developRepo()
   const dir = runsDir()
-  const github = fakePulls([true])
+  // The first commit with CI is red and the fix makes it green, as in the first test: the review then passes.
+  const github = fakePulls([false, true])
   github.state.noCi = true
   const first = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls: github.pulls, runId: 'no-ci' })
   assert.equal(first.status, 'blocked', first.report)
@@ -203,7 +204,7 @@ test('develop: a branch that exists only on origin gets a new suffix', { timeout
   const original = (await git(repo, 'rev-parse', 'main')).trim()
   await git(repo, 'push', 'origin', 'main:refs/heads/factory/dev-add-sub-mul')
   await assert.rejects(git(repo, 'show-ref', '--verify', '--quiet', 'refs/heads/factory/dev-add-sub-mul'))
-  const github = fakePulls([true])
+  const github = fakePulls([false, true])
   const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript(), []), pulls: github.pulls, runId: 'remote-branch' })
   assert.equal(result.status, 'ready', result.report)
   assert.equal(result.branch, 'factory/dev-add-sub-mul-2')
