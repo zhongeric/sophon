@@ -9,7 +9,8 @@ Drives the Cloudflare Worker without the GitHub webhook.
 
 Commands:
   start <pr>     Start a review run on the PR (--ship: on PASS, push the fixes to the PR branch and mark it ready)
-  resume <pr>    Wake a paused run now, for example after you answered its questions
+  resume <pr>    Wake a paused run now, for example after you answered its questions, and print the state of the
+                 latest run and the reason (exit 1 when the run does not wake)
   status <pr>    Print the runs of the PR
   report <pr>    Print the report of the latest run
 
@@ -23,6 +24,29 @@ export function parseTarget(text: string): { owner: string; repo: string; pr: nu
   const match = /^(?:https:\/\/github\.com\/)?([\w.-]+)\/([\w.-]+)(?:#|\/pull\/)(\d+)\/?$/.exec(text.trim())
   if (!match) throw new StopError(`${text} is not owner/repo#123 or a GitHub PR URL`)
   return { owner: match[1]!, pr: Number(match[3]), repo: match[2]! }
+}
+
+/**
+ * Gives the text and the exit code for a resume response.
+ * A body without a boolean `resumed` gives the raw text and exit code 1.
+ * When `resumed` is a boolean, the exit code is 0 for true and 1 for false.
+ * If `state` or `reason` is missing or has an incorrect type, the function gives the raw text.
+ * For example, a Worker of an earlier version can return `{ resumed }`.
+ */
+export function resumeOutcome(text: string): { code: number; text: string } {
+  let body: unknown
+  try {
+    body = JSON.parse(text)
+  } catch {
+    return { code: 1, text }
+  }
+  if (typeof body !== 'object' || body === null || !('resumed' in body) || typeof body.resumed !== 'boolean') return { code: 1, text }
+  const code = body.resumed ? 0 : 1
+  const state = 'state' in body ? body.state : undefined
+  const reason = 'reason' in body ? body.reason : undefined
+  if (typeof reason !== 'string' || (state !== null && typeof state !== 'string')) return { code, text }
+  // The state is the state before the call: a resumed run is queued or running now.
+  return { code, text: `${body.resumed ? 'resumed: latest run was' : 'not resumed: latest run is'} ${state ?? 'none'}: ${reason}` }
 }
 
 function setting(name: string): string {
@@ -58,7 +82,13 @@ async function main(): Promise<number> {
   const send = requests[command]
   if (!send) throw new StopError(`unknown command ${command}\n\n${usage}`)
   const response = await send()
-  console.log(await response.text())
+  const text = await response.text()
+  if (command === 'resume' && response.ok) {
+    const outcome = resumeOutcome(text)
+    console.log(outcome.text)
+    return outcome.code
+  }
+  console.log(text)
   return response.ok ? 0 : 1
 }
 

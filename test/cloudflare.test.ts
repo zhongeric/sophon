@@ -114,14 +114,20 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
     assert.equal(mock.state.requests.filter((route) => route.endsWith('/actions/runs')).length, 1)
 
     // The webhook path does not restart a stopped run. Only the admin route does.
-    await sendWebhook(worker.url, secret, 'issue_comment', comment('eric', '/answer recommended'))
+    assert.deepEqual(await (await sendWebhook(worker.url, secret, 'issue_comment', comment('eric', '/answer recommended'))).json(), { resumed: false })
     const calls = modelCalls()
     mock.state.ciStatus = 200
-    assert.deepEqual(await (await fetch(`${worker.url}/runs/acme/app/7/resume`, { headers: admin, method: 'POST' })).json(), { resumed: true })
+    const resume = (pr: number) => fetch(`${worker.url}/runs/acme/app/${pr}/resume`, { headers: admin, method: 'POST' })
+    assert.deepEqual(await (await resume(7)).json(), { reason: 'started the run again from its ledger after the error', resumed: true, state: 'error' })
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/)
     // Only the intent check was left: the reviewers and patch agents did not run again.
     assert.ok(modelCalls() - calls <= 2, `${modelCalls() - calls} model calls after resume`)
+
+    const finished = await resume(7)
+    assert.equal(finished.status, 202)
+    assert.deepEqual(await finished.json(), { reason: 'the run is complete with PASS. Start a new run to review the PR again', resumed: false, state: 'passed' })
+    assert.deepEqual(await (await resume(8)).json(), { reason: 'the PR has no run. Start a run first', resumed: false, state: null })
   } finally {
     worker.stop()
     mock.close()
