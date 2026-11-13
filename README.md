@@ -28,11 +28,11 @@ The same workflow runs on two platforms:
 ```
 freeze ─▶ triage: light or full
 
-full:  step 1: minimize │ rules │ bugs │ anti-slop   (Opus 5.5, Sol, Fable 5.2: read-only, parallel)
-       + host findings ─▶ gate ─▶ patch (Opus 5.5) ─▶ commit
+full:  step 1: minimize │ rules │ bugs ×1-4 │ anti-slop   (Opus 5.5, Sol, Fable 5.2: read-only, parallel)
+       + host findings ─▶ gate ─▶ patch ×1-4 by file (Opus 5.5) ─▶ commit
        ─▶ step 2: late-minimize │ late-rules on the new diff   (each role on the other family)
-       + host findings ─▶ gate ─▶ patch (Sol) ─▶ commit
-       ─▶ late bugs on every fix since the freeze ─▶ gate ─▶ patch ─▶ commit
+       + host findings ─▶ gate ─▶ patch ×1-4 by file (Sol) ─▶ commit
+       ─▶ late bugs ×1-4 on every fix since the freeze ─▶ gate ─▶ patch ×1-4 by file ─▶ commit
        ─▶ checks ─▶ intent ─▶ PASS criteria ─▶ (optional) push + mark the PR ready
 
 light: host findings ─▶ gate ─▶ one reviewer that also fixes (Opus 5.5) ─▶ commit
@@ -47,6 +47,13 @@ Solidity `src/` and `script/` always get the full loop. Agent prompts and rule f
 `CLAUDE.md`, `CONTRIBUTING*`) also always get the full loop. Triage also checks deleted paths and old paths of renames.
 `--full` forces the full loop. The host writes the decision as `TRIAGE path=light|full reason=...` at the top of
 the gate log and in the report.
+
+The bugs review is the slowest track. On a diff above 600 changed lines, the host splits it across reviewers: one
+for each 600 lines, at most 4, with the files of one directory together. They run at the same time, and the host
+numbers their findings as one list. A patch step splits its findings by file across at most 4 patch agents that
+work at the same time on the same tree. Each agent writes only the files of its findings, and the files that it
+writes first. Info findings join the agent of their file, or one agent of their own. A fix that needs a file of
+another agent waits, and one more agent applies the waiting findings after the others. The host commits one time.
 
 The static rules are the mechanical rules that a program can check: a fixed pragma, named imports, no revert
 strings, no `tx.origin` or `selfdestruct`, a comment before `unchecked` and `assembly`, the two test name shapes,
@@ -68,7 +75,8 @@ resumes the run by itself.
 | Test scope; one test run at a time | `run_tests` accepts only committed test files, runs the repository's configured command, and runs one command at a time across the host. |
 | Finding schema and evidence rule | `submit_findings` rejects a finding with a missing field, a location that is not a real file and line, or a quote that is not in the file near that line (or in the diff). The agent sees the reasons and can correct the call. |
 | Findings filter | The evidence check is the noise filter. Every finding that passes it goes to the patch agent, which applies it or rejects it with a reason. A rejected critical or high finding becomes a question to you, and the run passes only if you accept the rejection. |
-| Patch: log why for each item | `submit_patch_log` must list every finding ID one time, in applied or skipped. |
+| Patch: log why for each item | `submit_patch_log` must list every finding ID one time, in applied or skipped. A patch agent beside others can also list a finding in deferred, and the agent after them must apply or skip it. |
+| Parallel patch agents do not collide | The host refuses an agent's writes to the files of another agent, and to a file that another agent wrote first (EACCES). The split and the first writes are in the ledger, so a resumed step keeps them. |
 | Light or full loop | Profile rules decide, not an agent. The light reviewer cannot write outside docs and tests. |
 | Mechanical style rules | The profiles' static rules run on the added lines before each gate. Their findings skip the evidence check, because the host quotes the line. |
 | Never weaken checks | Patch agents cannot write `.agent-factory.json` or the `protect` paths. Check commands come from the config only. The report lists patch edits outside the change and the findings. |

@@ -8,7 +8,7 @@ import { isLight, profilesById, staticFindings, triage, triageLine, type Triage 
 import type { Credentials, Provider } from '../providers.ts'
 import { asker, decisions, type Answer, type Channel } from '../questions.ts'
 import { roles, type ModelChoice } from '../roles.ts'
-import { askQuestions, intent, light, patch, review, type LightLog, type PatchLog, type PatchOutcome, type Range, type RunContext, type Verdict } from '../steps.ts'
+import { askQuestions, intent, light, patch, review, splitReview, type LightLog, type PatchLog, type PatchOutcome, type Range, type RunContext, type Verdict } from '../steps.ts'
 import { StopError } from '../stop.ts'
 
 export type LoopModels = {
@@ -126,7 +126,8 @@ export type LoopResult = { pass: boolean; criteria: Criterion[]; branch: string;
 /**
  * The code review loop, with its order and hard rules in code. Triage picks the light
  * loop for a docs or tests only change: one fresh reviewer that also fixes. Else the full loop runs: four read-only
- * reviewers, the gate, patch, a model-swapped second pass on the new diff, and a late bugs pass. The static rules of
+ * reviewers, the gate, patch, a model-swapped second pass on the new diff, and a late bugs pass. On a large diff, the
+ * bugs review splits across reviewers, and patch agents work on separate files at the same time. The static rules of
  * the matched profiles add host findings before each gate. Checks, the intent check of the full loop, and the PASS
  * criteria come last. Every step is in the ledger, so the same run ID resumes after a crash without repeating
  * finished steps.
@@ -226,8 +227,11 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     const asked = step(ledger, 'step1.questions', () => askQuestions(context, 'step1.questions', input.models.step1.questions, step1Range)).then((list) =>
       questions.post('ask', list),
     )
+    // The bugs review is the slowest track: on a large diff, the host splits it across reviewers.
     const step1 = await Promise.all(
-      step1Roles.map((id) => step(ledger, `step1.${id}`, () => review(context, `step1.${id}`, roles[id], input.models.step1[id], step1Range, ''))),
+      step1Roles.map((id) =>
+        step(ledger, `step1.${id}`, () => (id === 'bugs' ? splitReview : review)(context, `step1.${id}`, roles[id], input.models.step1[id], step1Range, '')),
+      ),
     )
     const host1 = await hostCheck('step1.host', step1Range, 'host')
     await asked
@@ -265,7 +269,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       const note =
         'This is the late bugs pass. The diff holds every fix that the patch agents applied after the review froze the change. Check that each fix is correct and breaks nothing around it.'
       const bugs = await step(ledger, 'step2.late-bugs', () =>
-        review(context, 'step2.late-bugs', roles['late-bugs'], input.models.step2['late-bugs'], range, note),
+        splitReview(context, 'step2.late-bugs', roles['late-bugs'], input.models.step2['late-bugs'], range, note),
       )
       // The step 2 patch is the one commit that no host check saw yet.
       const host3 = patch2?.changed ? await hostCheck('step2.late-bugs-host', { from: patch2.before, to: patch2.after }, 'late-bugs-host') : []
@@ -369,7 +373,10 @@ function patchLine(label: string, outcome: PatchOutcome<PatchLog | LightLog> | n
   const skipped = outcome.log.skipped.map((entry) => `${entry.id} (${entry.reason})`).join('; ') || 'none'
   const fixes = 'fixes' in outcome.log ? `; other fixes: ${outcome.log.fixes.map((fix) => `${fix.location} (${fix.change})`).join('; ') || 'none'}` : ''
   const scope = outcome.outOfScope.length ? `; edits outside the change and the findings: ${outcome.outOfScope.join(', ')}` : ''
-  return `- ${label}: ${outcome.changed ? `commit ${short(outcome.after)}` : 'no commit'}; applied: ${applied}; skipped: ${skipped}${fixes}${scope}`
+  const split = outcome.split
+    ? ` (${outcome.split.agents} patch agents at the same time${outcome.split.deferred.length ? `, then one for ${outcome.split.deferred.join(', ')}` : ''})`
+    : ''
+  return `- ${label}: ${outcome.changed ? `commit ${short(outcome.after)}` : 'no commit'}${split}; applied: ${applied}; skipped: ${skipped}${fixes}${scope}`
 }
 
 type ReportInput = {
