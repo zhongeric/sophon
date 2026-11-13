@@ -203,11 +203,13 @@ type Profile = {
 }
 ```
 
-Profiles live in agent-factory (`src/core/profiles.ts` and `agents/profiles/<id>.md`). A repo can override fields in
-`.agent-factory.json` on its base branch, so a PR cannot change its own rules.
+Profiles live in agent-factory (`src/core/profiles.ts` and `agents/profiles/<id>.md`). A profile gives the default
+checks, tests, setup and protected paths of its stack. A repo can override fields in `.agent-factory.json` on its base
+branch. The host reads both from the base branch, so a PR cannot change its own rules.
 
-The code has a part of this type now: `markers`, `files`, `light`, `guides`, `forbidden` and `rules`. The review loop
-uses them for triage, guides and host findings. Policy, checks, tests, protected paths, the machine and repo
+The code has a part of this type now: `markers`, `files`, `light`, `guides`, `forbidden`, `rules` and `defaults` (the
+checks, tests, setup and protected paths of the stack). The review loop uses them for triage, guides, host findings
+and the repository config. Policy, checks, tests, protected paths, the machine and repo
 overrides come with phase 1.
 
 ### 4.2 Resolution

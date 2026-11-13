@@ -195,6 +195,18 @@ export async function mockServices(
         response.end(git(['archive', '--format=tar.gz', `--prefix=${options.owner}-${options.name}-${sha.slice(0, 7)}/`, sha]))
         return
       }
+      if (route === `GET ${api}/contents`) {
+        // The root listing: the profiles look for their markers and lockfiles here.
+        const entries = text(['ls-tree', url.searchParams.get('ref')!])
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => {
+            const [meta = '', name = ''] = line.split('\t')
+            const [mode, type] = meta.split(' ')
+            return { name, path: name, type: type === 'tree' ? 'dir' : type === 'commit' ? 'submodule' : mode === '120000' ? 'symlink' : 'file' }
+          })
+        return json(response, 200, entries)
+      }
       if (route.startsWith(`GET ${api}/contents/`)) {
         const path = decodeURIComponent(url.pathname.slice(`${api}/contents/`.length))
         const ref = url.searchParams.get('ref')!

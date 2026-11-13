@@ -1,15 +1,17 @@
 import type { Contracts } from 'nanocode-ts'
 import type { Checker, Repo } from './platform.ts'
+import { profileDefaults, type RootFiles } from './profiles.ts'
 import { hostSecrets } from './secrets.ts'
 import { StopError } from './stop.ts'
 
 export type Check = string | { command: string; files?: string }
 
-/** The target repository's checks and rails, from .agent-factory.json. Agents cannot change it. */
+/** The target repository's checks and rails: the profile defaults, and .agent-factory.json. Agents cannot change it. */
 export type RepoConfig = {
   stack: string
   checks: Record<string, Check>
-  tests?: { pattern: string; command: string }
+  /** Null in .agent-factory.json turns off the tests that a profile gives. */
+  tests?: { pattern: string; command: string } | null
   /** A command that the host runs in each new worktree before its first check, for example npm ci. */
   setup?: string
   /** Reference material mounted read-only at /guides/<name>: name to file or directory path, on hosts with a disk. */
@@ -24,11 +26,34 @@ export type RepoConfig = {
 
 export const repoConfigFile = '.agent-factory.json'
 
-export function parseRepoConfig(text: string, source: string): RepoConfig {
-  const config = JSON.parse(text) as RepoConfig
-  if (!config.stack) throw new StopError(`${source} needs a stack, for example "TypeScript" or "Solidity+Foundry"`)
-  if (!config.checks || Object.keys(config.checks).length === 0) throw new StopError(`${source} needs at least one check`)
+/** Parses .agent-factory.json. Each field that it sets replaces the profile default of that field. */
+export function parseRepoConfig(text: string, source: string): Partial<RepoConfig> {
+  const config = JSON.parse(text) as Partial<RepoConfig>
+  if (config.checks !== undefined && (typeof config.checks !== 'object' || config.checks === null))
+    throw new StopError(`${source}: checks must be an object of named commands`)
   if (config.tests && !/\{tests?\}/.test(config.tests.command)) throw new StopError(`${source}: tests.command needs {test} or {tests}`)
+  return config
+}
+
+/**
+ * The config of a repository: the defaults of its profiles, and in place of each one, the field that
+ * .agent-factory.json sets, also when the file sets null or an empty value. The stack is "unknown" when nothing names it.
+ */
+export function resolveRepoConfig(defaults: Partial<RepoConfig>, file: Partial<RepoConfig> | null): RepoConfig {
+  const config = { ...defaults, ...file }
+  return { ...config, stack: config.stack || 'unknown', checks: config.checks ?? {} }
+}
+
+/** The config of the repository whose root is `root`: its profile defaults and its .agent-factory.json, if it has one. */
+export async function readRepoConfig(root: RootFiles, source: string): Promise<RepoConfig> {
+  const text = await root.read(repoConfigFile)
+  return resolveRepoConfig(await profileDefaults(root), text === null ? null : parseRepoConfig(text, `${repoConfigFile} ${source}`))
+}
+
+/** A host that runs the checks on a machine needs at least one check. */
+export function requireChecks(config: RepoConfig, repository: string): RepoConfig {
+  if (Object.keys(config.checks).length === 0)
+    throw new StopError(`${repository} has no checks: no profile gives default checks for its stack. Add ${repoConfigFile} with its checks (see README).`)
   return config
 }
 

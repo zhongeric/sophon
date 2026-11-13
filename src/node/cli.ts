@@ -32,7 +32,7 @@ Options:
   --ask <text>           The original ask, verbatim (default with --pr: PR title and body)
   --ask-file <path>      Read the original ask from a file
   --stack <text>         Override the stack from ${repoConfigFile}
-  --config <path>        Repository config (default: <repo>/${repoConfigFile})
+  --config <path>        Repository config over the profile defaults (default: <repo>/${repoConfigFile}, when it exists)
   --models <path>        JSON file that overrides the default models per step and role
   --run <id>             Resume a run; other target options come from its ledger
   --runs-dir <path>      Where runs live (default: <agent-factory>/runs)
@@ -119,7 +119,7 @@ type Values = Record<string, string | boolean | undefined>
 
 async function newInput(values: Values): Promise<{ input: LoopInput; source: GitSource }> {
   const repo = resolve(String(values.repo ?? process.cwd()))
-  const config = loadRepoConfig(resolve(String(values.config ?? join(repo, repoConfigFile))))
+  const config = await loadRepoConfig(repo, values.config ? resolve(String(values.config)) : undefined)
   const models = values.models ? mergeModels(JSON.parse(readFileSync(String(values.models), 'utf8')) as Partial<LoopModels>) : defaultModels
   let { base, head, ask } = { base: values.base as string | undefined, head: (values.head as string | undefined) ?? 'HEAD', ask: values.ask as string | undefined }
   if (values['ask-file']) ask = readFileSync(String(values['ask-file']), 'utf8')

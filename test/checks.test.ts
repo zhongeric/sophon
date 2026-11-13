@@ -11,7 +11,7 @@ import { fixtureRepo, gitSource } from './support/fixture.ts'
 
 test('run_tests runs only committed test files', async () => {
   const repo = fixtureRepo()
-  const config = loadRepoConfig(join(repo, '.agent-factory.json'))
+  const config = await loadRepoConfig(repo)
   const tree = gitRepo(gitSource(repo), repo, 'unused')
   const run = commandChecker(tree, config, localMachine(repo)).tests!
   writeFileSync(join(repo, 'test/new.test.ts'), "require('node:fs').writeFileSync('/tmp/ran', 'x')\n")

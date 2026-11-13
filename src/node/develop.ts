@@ -28,7 +28,8 @@ for its tasks, a draft PR, CI with two fix rounds, the code review loop, and CI 
 only when every criterion holds. You merge.
 
 Options:
-  --repo <path>          Repository (default: current directory). It needs ${repoConfigFile} and an origin on GitHub.
+  --repo <path>          Repository (default: current directory). It needs an origin on GitHub. ${repoConfigFile} is optional:
+                         without it, the profiles of the repository give the checks.
   --ask <text>           The ask, verbatim
   --ask-file <path>      Read the ask from a file
   --base <branch>        The branch to build on and to open the PR against (default: main)
@@ -121,7 +122,7 @@ type Values = Record<string, string | boolean | undefined>
 
 async function newInput(values: Values): Promise<{ input: DevelopInput; repo: string }> {
   const repo = resolve(String(values.repo ?? process.cwd()))
-  const config = loadRepoConfig(join(repo, repoConfigFile))
+  const config = await loadRepoConfig(repo)
   const ask = values['ask-file'] ? readFileSync(String(values['ask-file']), 'utf8') : (values.ask as string | undefined)
   if (!ask?.trim()) throw new StopError('give the ask with --ask or --ask-file')
   const parallel = values.parallel !== undefined ? parseParallel(String(values.parallel)) : undefined

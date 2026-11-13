@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { profiles, staticFindings, triage } from '../src/core/profiles.ts'
 import { PausedError, type Channel } from '../src/core/questions.ts'
-import { allowedModelsFrom, defaultAllowedModels, defaultModels } from '../src/core/workflows/code-review-loop.ts'
+import { allowedModelsFrom, defaultAllowedModels, defaultModels, type LoopInput } from '../src/core/workflows/code-review-loop.ts'
 import { resumeInput } from '../src/node/cli.ts'
 import { changedFiles, diff, touchedFiles } from '../src/node/git.ts'
 import { fileLedger } from '../src/node/ledger.ts'
@@ -101,7 +101,7 @@ test('a paused run without a recorded light model resumes with the default model
   const { channel, replies } = memoryChannel({ ask: null })
   await assert.rejects(runLoop(repo, 'old-models', dir, { channel, dispatch: scriptedDispatch(script, []) }), PausedError)
   const ledger = fileLedger(join(dir, 'old-models', 'state.json'))
-  const recorded = ledger.get<ReturnType<typeof loopInput>>('input')
+  const recorded = ledger.get<LoopInput>('input')
   assert.ok(recorded)
   const { light: _light, ...oldModels } = recorded.models
   ledger.put('input', { ...recorded, models: oldModels })
@@ -113,7 +113,7 @@ test('a paused run without a recorded light model resumes with the default model
   assert.deepEqual(source, gitSource(repo))
   const result = await runLoop(repo, 'old-models', dir, { channel, dispatch: scriptedDispatch(script, []), input })
   assert.equal(result.pass, true, result.report)
-  assert.deepEqual(fileLedger(join(dir, 'old-models', 'state.json')).get<ReturnType<typeof loopInput>>('input')?.models.light, defaultModels.light)
+  assert.deepEqual(fileLedger(join(dir, 'old-models', 'state.json')).get<LoopInput>('input')?.models.light, defaultModels.light)
 })
 
 test('host git returns raw Unicode paths in diffs and file lists', async () => {
@@ -156,7 +156,7 @@ test('a run that crashed right after a patch commit keeps that commit when it re
 
 test('the loop stops before any work when step 2 does not swap families', async () => {
   const repo = fixtureRepo()
-  const input = loopInput(repo, 'same-family')
+  const input = await loopInput(repo, 'same-family')
   input.models = { ...defaultModels, step2: { ...defaultModels.step2, 'late-rules': { provider: 'codex', model: 'gpt-6.1-sol' } } }
   const turns: Turn[] = []
   await assert.rejects(runLoop(repo, 'same-family', runsDir(), { dispatch: scriptedDispatch(script, turns), input }), /step 2 late-rules and step 1 rules both use codex/)
@@ -201,7 +201,7 @@ test('a run without answers pauses, and resumes without asking again or repeatin
 
 test('the loop stops before any work when a model is outside the allowed list', async () => {
   const repo = fixtureRepo()
-  const input = loopInput(repo, 'not-allowed')
+  const input = await loopInput(repo, 'not-allowed')
   input.models = { ...defaultModels, step1: { ...defaultModels.step1, 'anti-slop': { provider: 'claude', model: 'claude-sonnet-5-5' } } }
   const turns: Turn[] = []
   await assert.rejects(runLoop(repo, 'not-allowed', runsDir(), { dispatch: scriptedDispatch(script, turns), input }), /outside the allowed list .*claude-sonnet-5-5/)
@@ -212,7 +212,7 @@ test('ALLOWED_MODELS replaces the allowed list', async () => {
   assert.deepEqual(allowedModelsFrom(undefined), defaultAllowedModels)
   assert.deepEqual(allowedModelsFrom(' , '), defaultAllowedModels)
   const repo = fixtureRepo()
-  const input = loopInput(repo, 'allowed-setting')
+  const input = await loopInput(repo, 'allowed-setting')
   input.models = { ...defaultModels, step1: { ...defaultModels.step1, 'anti-slop': { provider: 'claude', model: 'claude-sonnet-5-5' } } }
   input.allowedModels = allowedModelsFrom('claude-sonnet-5-5, claude-opus-5-5')
   const turns: Turn[] = []

@@ -86,7 +86,7 @@ resumes the run by itself.
 | Open questions | A read-only questions agent runs beside the step 1 reviewers and posts its questions at once. A reviewer marks a finding that depends on your decision, and the gate holds it until you answer. Patch agents, later reviewers and the intent check read your answers. |
 | Missing key or input: stop | The run stops before it freezes anything. |
 | Ready PR, never draft | `--ship` pushes the fixes to the PR branch (no force) and marks the PR ready, only on PASS. |
-| A PR cannot change its own rails | On Cloudflare, `.agent-factory.json` comes from the base branch. Locally, it comes from your working copy. |
+| A PR cannot change its own rails | On Cloudflare, the config (the profile defaults and `.agent-factory.json`) comes from the base branch. Locally, it comes from your working copy. |
 
 ### Trust boundary
 
@@ -108,7 +108,19 @@ export ANTHROPIC_API_KEY=... OPENAI_API_KEY=...
 `--claude-plan` signs Claude requests with your `nc` Claude login instead of `ANTHROPIC_API_KEY`.
 The host never refreshes that login, because a refresh would sign `nc` out. Run `nc` once when it expires.
 
-Each target repository needs `.agent-factory.json` at its root:
+A target repository needs no setup when a profile knows its stack. The profiles whose marker files are at the root
+give the defaults:
+
+| Profile (markers) | Checks | Tests | Setup | Protected |
+| --- | --- | --- | --- | --- |
+| `solidity` (`foundry.toml`) | `forge build`, `forge fmt --check` on changed `.sol` files | `forge test --match-path {test}` for `*.t.sol` | `forge install`, when `.gitmodules` exists | `foundry.toml`, `remappings.txt` |
+| `typescript` (`package.json` and `tsconfig.json`) | the `typecheck` script (or `type-check`, `check-types`, `types`), else `tsc --noEmit`; `eslint` on changed files when it is a dependency | `vitest run` or `jest` when it is a dependency, for `*.test.*` and `*.spec.*` | the install of the lockfile's package manager: npm, pnpm or yarn | `package.json`, `tsconfig.json`, the lockfile |
+
+Every repository also protects `.github/`. When several profiles match, the checks and protected paths join, and
+the setup commands run one after the other. A local run, and a development run on Cloudflare, need at least one
+check: for another stack, add `.agent-factory.json` at the root. Each field that the file sets replaces the default
+of that field. `"tests": null` or `"setup": ""` turns a default off. For example:
+
 
 ```json
 {
@@ -209,8 +221,8 @@ npm run develop -- --repo ~/src/app --ask-file ask.md --base develop --parallel 
 npm run develop -- --run dev-20261113-201500                # resume after a pause
 ```
 
-The repository needs `.agent-factory.json` (as for the review loop), an origin on GitHub, and CI that runs on
-pull requests. The `gh` CLI must be logged in. Questions go to the terminal when it is interactive. Otherwise the
+The repository needs a config (the profile defaults or `.agent-factory.json`, as for the review loop), an origin on
+GitHub, and CI that runs on pull requests. The `gh` CLI must be logged in. Questions go to the terminal when it is interactive. Otherwise the
 intake and spec questions go to `runs/<run>/questions-<batch>.md`, and the review questions go to the PR. A run
 that waits for answers or for CI exits with status 3. Resume it with `--run <id>`.
 
@@ -229,9 +241,9 @@ journals, and a worktree for each branch under `branches/`. Each review pass is 
 - A GitHub fine-grained token for the target repositories with: Contents read and write, Pull requests read and
   write, Issues read and write, Actions read, Commit statuses read. Fine-grained tokens cannot call the Checks API,
   so the run reads CI from GitHub Actions workflow runs and commit statuses.
-- `.agent-factory.json` on each repository's base branch. Review runs use `stack`, `protect` and `answerers`, and
-  CI is their check. Development runs also use `checks`, `tests` and `setup`, on the build container. The
-  config's `env` list does not reach the container.
+- A config from each repository's base branch: the profile defaults, and `.agent-factory.json` when it exists.
+  Review runs use `stack`, `protect` and `answerers`, and CI is their check. Development runs also use `checks`,
+  `tests` and `setup`, on the build container. The config's `env` list does not reach the container.
 - CI that runs on pushes to `factory/**` branches, for example `on: { push: { branches: ['factory/**'] } }`.
   That CI runs the PR's code and the patch agents' edits with the repository's secrets. A PR author in the same
   repository can already push such a branch, so this gives no new access. Fork PRs are refused for this reason.

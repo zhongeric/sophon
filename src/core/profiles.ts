@@ -1,4 +1,12 @@
+import type { RepoConfig } from './checks.ts'
 import type { Finding, Severity } from './findings.ts'
+
+/** The files at the root of a repository tree, where markers, manifests and lockfiles are. */
+export type RootFiles = {
+  exists(name: string): Promise<boolean>
+  /** The text of a file, or null when it does not exist. */
+  read(name: string): Promise<string | null>
+}
 
 /** A mechanical rule that the host checks on each line that a change adds, before any reviewer reads the change. */
 export type StaticRule = {
@@ -27,6 +35,8 @@ export type Profile = {
   rules: StaticRule[]
   /** Sections that a plan must have, beyond its four parts. */
   planSections: string[]
+  /** The repository config of the stack, for each field that .agent-factory.json does not set. */
+  defaults?(root: RootFiles): Promise<Partial<RepoConfig>>
 }
 
 /** A comment on the line, or on the line before it. An unknown line before counts as a comment, so that the rule does not guess. */
@@ -147,6 +157,14 @@ const solidity: Profile = {
   forbidden: foundryOutput,
   planSections: ['Interfaces', 'Deployment sequence'],
   rules: solidityRules,
+  defaults: async (root) => ({
+    stack: 'Solidity+Foundry',
+    checks: { build: 'forge build', format: { command: 'forge fmt --check {files}', files: '\\.sol$' } },
+    tests: { pattern: '\\.t\\.sol$', command: 'forge test --match-path {test}' },
+    // Foundry dependencies are git submodules, and a new worktree does not have them.
+    ...((await root.exists('.gitmodules')) ? { setup: 'forge install' } : {}),
+    protect: ['foundry.toml', 'remappings.txt'],
+  }),
 }
 
 /** Tests and scripts in a Foundry repository. Deploy scripts always get the full loop. */
@@ -176,6 +194,21 @@ const soliditySupport: Profile = {
   ],
 }
 
+type PackageJson = { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> }
+
+/** The package manager that the lockfile at the root names: its lockfile, and its install, script and binary commands. */
+async function packageManager(root: RootFiles) {
+  if (await root.exists('pnpm-lock.yaml')) return { lockfile: 'pnpm-lock.yaml', install: 'pnpm install --frozen-lockfile', run: 'pnpm run', exec: 'pnpm exec' }
+  if (await root.exists('yarn.lock'))
+    return { lockfile: 'yarn.lock', install: (await root.exists('.yarnrc.yml')) ? 'yarn install --immutable' : 'yarn install --frozen-lockfile', run: 'yarn run', exec: 'yarn' }
+  if (await root.exists('package-lock.json')) return { lockfile: 'package-lock.json', install: 'npm ci --prefer-offline --no-audit --no-fund', run: 'npm run', exec: 'npx' }
+  // Without a lockfile, the install must not write one: the host commits every new file of the tree.
+  return { lockfile: null, install: 'npm install --no-package-lock --no-audit --no-fund', run: 'npm run', exec: 'npx' }
+}
+
+/** The script names that a repository uses for its typecheck, in order of preference. */
+const typecheckScripts = ['typecheck', 'type-check', 'check-types', 'types']
+
 const typescript: Profile = {
   id: 'typescript',
   markers: ['package.json', 'tsconfig.json'],
@@ -186,6 +219,29 @@ const typescript: Profile = {
   forbidden: [],
   rules: [],
   planSections: [],
+  async defaults(root) {
+    let manifest: PackageJson = {}
+    try {
+      manifest = JSON.parse((await root.read('package.json')) ?? '{}') as PackageJson
+    } catch {
+      // A package.json that does not parse gives the defaults that need no scripts.
+    }
+    const scripts = manifest.scripts ?? {}
+    const packages = { ...manifest.dependencies, ...manifest.devDependencies }
+    const manager = await packageManager(root)
+    const typecheck = typecheckScripts.find((name) => scripts[name])
+    const runner = packages.vitest ? `${manager.exec} vitest run {tests}` : packages.jest ? `${manager.exec} jest {tests}` : null
+    return {
+      stack: 'TypeScript',
+      checks: {
+        typecheck: typecheck ? `${manager.run} ${typecheck}` : `${manager.exec} tsc --noEmit`,
+        ...(packages.eslint ? { lint: { command: `${manager.exec} eslint {files}`, files: '\\.[cm]?[jt]sx?$' } } : {}),
+      },
+      ...(runner ? { tests: { pattern: '\\.(test|spec)\\.[cm]?[jt]sx?$', command: runner } } : {}),
+      setup: manager.install,
+      protect: ['package.json', 'tsconfig.json', ...(manager.lockfile ? [manager.lockfile] : [])],
+    }
+  },
 }
 
 const docs: Profile = {
@@ -213,6 +269,29 @@ export const profiles: Profile[] = [solidity, soliditySupport, typescript, docs]
 
 /** Scratch logs and environment files, in every repository. */
 const forbiddenEverywhere = [/\.log$/, /(^|\/)\.env(\.(?!(example|sample|template)$)[^/]+)?$/]
+
+/** Paths that agents never write in any repository: the CI workflows, which run with the secrets of the repository. */
+const protectedEverywhere = ['.github/']
+
+/**
+ * The repository config that the present profiles give, for each field that .agent-factory.json does not set.
+ * Checks and protected paths are the union, the setup commands run in profile order, and the first profile with
+ * tests gives the tests. Read it from the base of a change, so that a change cannot set its own rails.
+ */
+export async function profileDefaults(root: RootFiles): Promise<Partial<RepoConfig>> {
+  const present = await presentProfiles((name) => root.exists(name))
+  const parts = await Promise.all(present.map(async (profile): Promise<Partial<RepoConfig>> => (await profile.defaults?.(root)) ?? {}))
+  const stacks = parts.flatMap((part) => (part.stack ? [part.stack] : []))
+  const setups = parts.flatMap((part) => (part.setup ? [part.setup] : []))
+  const tests = parts.find((part) => part.tests)?.tests
+  return {
+    ...(stacks.length > 0 ? { stack: stacks.join(', ') } : {}),
+    checks: Object.assign({}, ...parts.map((part) => part.checks ?? {})),
+    ...(tests ? { tests } : {}),
+    ...(setups.length > 0 ? { setup: setups.join(' && ') } : {}),
+    protect: [...new Set([...protectedEverywhere, ...parts.flatMap((part) => part.protect ?? [])])],
+  }
+}
 
 export const profilesById = (ids: string[]) => profiles.filter((profile) => ids.includes(profile.id))
 
