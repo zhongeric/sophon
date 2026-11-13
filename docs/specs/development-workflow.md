@@ -1,6 +1,6 @@
 # Spec: the development workflow
 
-Status: draft. D1, D3 and D9 decided on 2026-11-13 (section 8). Date: 2026-11-13.
+Status: draft. All decisions in section 8 made on 2026-11-13. Date: 2026-11-13.
 
 This spec defines the second workflow of agent-factory: from a confirmed ask to a PR that is ready for Eric's
 review. It also defines **profiles**, the mechanism that lets one workflow apply Eric's different rules for
@@ -27,7 +27,7 @@ What the catalog shows:
   team repos, not from Eric. Section 9 lists the gaps.
 - 140 of the 205 requirements are checkable by a program. The host enforces those. The other 65 are judgment,
   and they go into role guidelines.
-- 27 conflicts exist between sources. Section 8 lists the ones that need a decision.
+- 27 conflicts exist between sources. Section 8 lists the ones that needed a decision and records each decision.
 
 ## 2. Principles
 
@@ -84,8 +84,7 @@ Each stage below lists who does the work, what the host enforces, and where Eric
 - **Rails:** the host refuses a plan without all four parts, or with a done-looks-like that has no checkable item.
   Profiles add plan sections. For example, a Solidity plan must list interfaces before implementations and the
   deployment sequence (`SOL-003`).
-- **Decision for Eric:** the skill says "all four, in parallel". This spec proposes one planner that writes all four
-  in one output, because the four constrain each other. Four parallel agents can disagree on scope. See D7.
+- **One planner, not four in parallel (D7).** Each part sets limits on the other parts.
 
 ### 3. Triage
 
@@ -274,16 +273,16 @@ Each decision lists the conflict, the sources, the recommendation and the status
 | # | Conflict | Recommendation | Status |
 | --- | --- | --- | --- |
 | D1 | **Jev keep rule.** `code-review-loop/references/jev-gate.md` keeps only `is_critical >= 0.75` (`ALL-052`). `ship-quality-code` says Jev is a noise filter, keeps findings of any severity when impact `>= 0.6` or the quality questions average `>= 0.6`, and uses severity for order only (`ALL-053`). agent-factory implements the first. | Use `ship-quality-code`. It is the newer, more specific text. Update the gate before the next real run. | **Decided: no Jev.** The evidence check filters. Patch agents apply or reject every finding. A rejected critical or high finding goes to Eric. Reviewers mark findings that need his decision. Built. |
-| D2 | **Evidence track.** Four tracks with the evidence rule in each, or a fifth Evidence reviewer. | Keep four tracks. The host's evidence check (real quotes at real lines) is stronger than a fifth agent. | Open |
+| D2 | **Evidence track.** Four tracks with the evidence rule in each, or a fifth Evidence reviewer. | Keep four tracks. The host's evidence check (real quotes at real lines) is stronger than a fifth agent. | **Decided:** Eric accepted the recommendation. |
 | D3 | **Models.** Allowed: Fable, Opus 5.5, Sol (`ALL-058`). agent-factory's defaults use Sonnet for two roles, which is not allowed. Only Sol is another family. | Step 1 on Fable and Opus 5.5 (split across tracks for variance), Step 2 on Sol. Remove Sonnet. Which Fable version? | **Decided: Fable 5.2, Opus 5.5, Sol.** Step 1: Bugs on Fable 5.2, Rules on Sol, Minimize, Anti-slop and Patch on Opus 5.5. Each step 2 role swaps family. The host refuses other models. Built. |
-| D4 | **Draft during review.** "Never draft" against "draft until PASS". | Draft while the run works, ready after PASS. | Open |
-| D5 | **Audit-fix PRs in `src/`.** "Two passes" against the full Solidity carve-out. | The stricter Solidity carve-out wins. | Open |
-| D6 | **Local test scope.** The loop runs touched tests only. The cortex rules want the full suite, Slither and coverage before every PR. | Touched tests locally, the full suite in CI. Make the cortex pre-PR list a CI requirement of the `solidity` profile. | Open |
-| D7 | **Plan in parallel.** "All four, in parallel" against one consistent plan. | One planner writes all four parts in one checked output. | Open |
-| D8 | **TDD against lazy draft.** The cortex says tests first. `implementation-workflow` says lazy first draft. | The draft includes its tests, and done-looks-like names them. Bug fixes start with a failing test (the evm-cortex bug-fix flow). | Open |
+| D4 | **Draft during review.** "Never draft" against "draft until PASS". | Draft while the run works, ready after PASS. | **Decided:** Eric accepted the recommendation. |
+| D5 | **Audit-fix PRs in `src/`.** "Two passes" against the full Solidity carve-out. | The stricter Solidity carve-out wins. | **Decided:** Eric accepted the recommendation. |
+| D6 | **Local test scope.** The loop runs touched tests only. The cortex rules want the full suite, Slither and coverage before every PR. | Touched tests locally, the full suite in CI. Make the cortex pre-PR list a CI requirement of the `solidity` profile. | **Decided:** Eric accepted the recommendation. |
+| D7 | **Plan in parallel.** "All four, in parallel" against one consistent plan. | One planner writes all four parts in one checked output. | **Decided:** Eric accepted the recommendation. |
+| D8 | **TDD against lazy draft.** The cortex says tests first. `implementation-workflow` says lazy first draft. | The draft includes its tests, and done-looks-like names them. Bug fixes start with a failing test (the evm-cortex bug-fix flow). | **Decided:** Eric accepted the recommendation. |
 | D9 | **Solidity style conflicts.** Test names (three schemes), error names (`ManagerLocked` or `Oracle_StalePrice`), event tense, immutable case, pinned compiler (0.8.24, 0.8.26, 0.8.28), NatSpec on internal functions, coverage (90% or 100%), ReentrancyGuard scope (all external calls or value paths only). | One precedence rule: repo rules > `~/.claude/rules/solidity-style-guide.md` > evm-cortex agent templates. Then the profile takes its values from the style guide, and a repo can override in its config. | **Decided**, see the D9 picks below. In `agents/shared/solidity.md` now. |
-| D10 | **Questions at once or one at a time.** The loop batches. The grilling skills ask one at a time. | Batch per stage. On an async channel, each round trip costs minutes or hours. | Open |
-| D11 | **`~/.claude/commands/auto-spec.md`** never asks Eric and skips every review. | Retire it, or never route to it. It breaks the approval rules. | Open |
+| D10 | **Questions at once or one at a time.** The loop batches. The grilling skills ask one at a time. | Batch per stage. On an async channel, each round trip costs minutes or hours. | **Decided:** Eric accepted the recommendation. |
+| D11 | **`~/.claude/commands/auto-spec.md`** never asks Eric and skips every review. | Retire it, or never route to it. It breaks the approval rules. | **Decided and done:** renamed to `auto-spec.md.retired`. |
 
 ### D9 picks
 
