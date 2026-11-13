@@ -4,10 +4,9 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import type { Jev } from '../src/core/gate.ts'
-import { PausedError } from '../src/core/questions.ts'
+import { PausedError, type Channel } from '../src/core/questions.ts'
 import { defaultModels } from '../src/core/workflows/code-review-loop.ts'
-import { fixed, fixtureRepo, jevFor, loopInput, memoryChannel, runLoop, script } from './support/fixture.ts'
+import { fixed, fixtureRepo, loopInput, memoryChannel, runLoop, script, scriptFor } from './support/fixture.ts'
 import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
@@ -28,25 +27,24 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   assert.match(outputs('patch'), /"status\\":\\"pass/)
 
   const providers = (role: string) => new Set(turns.filter((turn) => turn.role === role).map((turn) => turn.provider))
-  for (const role of ['minimize', 'rules', 'bugs', 'anti-slop', 'patch', 'questions']) assert.deepEqual(providers(role), new Set(['claude']))
-  for (const role of ['late-minimize', 'late-rules', 'late-bugs', 'intent']) assert.deepEqual(providers(role), new Set(['codex']))
+  for (const role of ['minimize', 'bugs', 'anti-slop', 'patch', 'questions', 'late-rules', 'intent']) assert.deepEqual(providers(role), new Set(['claude']))
+  for (const role of ['rules', 'late-minimize', 'late-bugs']) assert.deepEqual(providers(role), new Set(['codex']))
 
   const gateLog = readFileSync(join(result.dir, 'gate-log.txt'), 'utf8')
-  assert.match(gateLog, /# Step 1 \| model_family=claude/)
-  assert.match(gateLog, /# Step 2 \| model_family=codex/)
-  assert.match(gateLog, /FINDING bugs-001 \| keep_drop=keep .* \| ACTION=keep/)
-  assert.match(gateLog, /FINDING min-001 \| keep_drop=drop .* \| ACTION=drop reason=keep_drop/)
+  assert.match(gateLog, /# Step 1 \| model_family=claude\+codex \| minimize=claude-opus-5-5 rules=gpt-6.1-sol bugs=claude-fable-5-2/)
+  assert.match(gateLog, /# Step 2 \| model_family=codex\+claude \| late-minimize=gpt-6.1-sol late-rules=claude-fable-5-2/)
+  assert.match(gateLog, /FINDING bugs-001 \| track=bugs \| severity=critical \| ACTION=keep/)
+  assert.match(gateLog, /FINDING min-001 \| track=minimize \| severity=low \| ACTION=keep/)
+  assert.match(result.report, /skipped: min-001 \(inlining adds nothing\)/)
   assert.equal(readFileSync(join(result.dir, 'report.md'), 'utf8'), result.report)
 })
 
 test('a resumed run does not repeat finished steps', async () => {
   const repo = fixtureRepo()
   const dir = runsDir()
-  const failing: Jev = async () => {
-    throw new Error('Jev is down')
-  }
+  const down: Channel = { ...memoryChannel().channel, answers: async () => { throw new Error('the channel is down') } }
   const first: Turn[] = []
-  await assert.rejects(runLoop(repo, 'resume', dir, { dispatch: scriptedDispatch(script, first), jev: failing }), /Jev is down/)
+  await assert.rejects(runLoop(repo, 'resume', dir, { channel: down, dispatch: scriptedDispatch(script, first) }), /the channel is down/)
   assert.ok(first.some((turn) => turn.role === 'bugs'))
 
   const second: Turn[] = []
@@ -77,9 +75,9 @@ test('a run that crashed right after a patch commit keeps that commit when it re
 test('the loop stops before any work when step 2 does not swap families', async () => {
   const repo = fixtureRepo()
   const input = loopInput(repo, 'same-family')
-  input.models = { ...defaultModels, step2: { ...defaultModels.step2, 'late-rules': { provider: 'claude', model: 'claude-sonnet-5-5' } } }
+  input.models = { ...defaultModels, step2: { ...defaultModels.step2, 'late-rules': { provider: 'codex', model: 'gpt-6.1-sol' } } }
   const turns: Turn[] = []
-  await assert.rejects(runLoop(repo, 'same-family', runsDir(), { dispatch: scriptedDispatch(script, turns), input }), /step 2 late-rules and step 1 rules both use claude/)
+  await assert.rejects(runLoop(repo, 'same-family', runsDir(), { dispatch: scriptedDispatch(script, turns), input }), /step 2 late-rules and step 1 rules both use codex/)
   assert.equal(turns.length, 0)
 })
 
@@ -87,11 +85,12 @@ test('the user answers the open questions before the gate, and decides the findi
   const repo = fixtureRepo()
   const turns: Turn[] = []
   const { channel, posted } = memoryChannel({ ask: '/answer\nQ1: b', 'step1.gate': '/answer\nQ1: fix it, and keep add() as it is' })
-  const result = await runLoop(repo, 'decide', runsDir(), { channel, dispatch: scriptedDispatch(script, turns), jev: jevFor({ holdBugs: true }) })
+  const result = await runLoop(repo, 'decide', runsDir(), { channel, dispatch: scriptedDispatch(scriptFor({ holdBug: true, tests: true }), turns) })
 
   assert.equal(result.pass, true, result.report)
   assert.deepEqual(posted.map((entry) => entry.batch), ['ask', 'step1.gate'])
   assert.match(posted[1]!.questions[0]!.question, /^bugs-001 at src\/math.ts:6: Subtract b in sub. Fix it\?$/)
+  assert.match(posted[1]!.questions[0]!.why, /^Should sub throw on a negative result\?/)
   const patchOutput = turns.filter((turn) => turn.role === 'patch' && turn.output).map((turn) => turn.output).join('\n')
   // The tool output reaches the script JSON-encoded twice, so newlines and quotes arrive escaped.
   assert.match(patchOutput, /May sub return a negative number\?(\\)+n  Answer: No, throw an error/)
@@ -116,4 +115,31 @@ test('a run without answers pauses, and resumes without asking again or repeatin
   assert.equal(result.pass, true)
   assert.equal(posted.length, 1)
   for (const role of ['questions', 'minimize', 'rules', 'bugs', 'anti-slop']) assert.ok(!second.some((turn) => turn.role === role), `${role} ran again`)
+})
+
+test('the loop stops before any work when a model is outside the allowed list', async () => {
+  const repo = fixtureRepo()
+  const input = loopInput(repo, 'not-allowed')
+  input.models = { ...defaultModels, step1: { ...defaultModels.step1, 'anti-slop': { provider: 'claude', model: 'claude-sonnet-5-5' } } }
+  const turns: Turn[] = []
+  await assert.rejects(runLoop(repo, 'not-allowed', runsDir(), { dispatch: scriptedDispatch(script, turns), input }), /outside the allowed list .*claude-sonnet-5-5/)
+  assert.equal(turns.length, 0)
+})
+
+test('a critical finding that the patch agent rejects goes to Eric, and only his acceptance clears it', async () => {
+  const rejecting = scriptFor({ rejectBug: true, tests: true })
+  const criterion = (result: { criteria: { name: string; ok: boolean; detail: string }[] }) =>
+    result.criteria.find((entry) => entry.name === 'No critical or high finding left unapplied without your OK')!
+
+  const refused = memoryChannel()
+  const first = await runLoop(fixtureRepo(), 'refused', runsDir(), { channel: refused.channel, dispatch: scriptedDispatch(rejecting, []) })
+  const asked = refused.posted.find((entry) => entry.batch === 'step1.patch.rejections')
+  assert.equal(asked?.questions.length, 1)
+  assert.match(asked!.questions[0]!.question, /did not apply bugs-001 \(critical\)/)
+  assert.match(asked!.questions[0]!.why, /callers depend on the sum/)
+  assert.deepEqual([criterion(first).ok, first.pass], [false, false])
+
+  const accepted = memoryChannel({ 'step1.patch.rejections': '/answer\nQ1: a' })
+  const second = await runLoop(fixtureRepo(), 'accepted', runsDir(), { channel: accepted.channel, dispatch: scriptedDispatch(rejecting, []) })
+  assert.deepEqual([criterion(second).ok, criterion(second).detail], [true, 'you accepted the rejection of bugs-001'])
 })

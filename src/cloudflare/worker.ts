@@ -1,4 +1,4 @@
-import { verifySignature } from './github.ts'
+import { sameSecret, verifySignature } from './github.ts'
 import { allowedUsers, PullRequestRuns, type Env } from './run.ts'
 
 export { PullRequestRuns }
@@ -10,14 +10,22 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
     if (request.method === 'POST' && url.pathname === '/github/webhook') return webhook(request, env)
-    const route = /^\/runs\/([^/]+)\/([^/]+)\/(\d+)(\/report)?$/.exec(url.pathname)
-    if (request.method === 'GET' && route) {
-      if (!env.ADMIN_TOKEN || request.headers.get('authorization') !== `Bearer ${env.ADMIN_TOKEN}`) return new Response('unauthorized', { status: 401 })
-      const runs = pullRequest(env, route[1]!, route[2]!, Number(route[3]))
-      if (route[4]) return new Response((await runs.report()) ?? 'no report yet', { headers: { 'content-type': 'text/markdown; charset=utf-8' } })
-      return Response.json(await runs.status())
+    const route = /^\/runs\/([^/]+)\/([^/]+)\/(\d+)(?:\/(report|resume))?$/.exec(url.pathname)
+    if (!route) return new Response('agent-factory', { status: url.pathname === '/' ? 200 : 404 })
+    if (!env.ADMIN_TOKEN || !sameSecret(request.headers.get('authorization') ?? '', `Bearer ${env.ADMIN_TOKEN}`)) return new Response('unauthorized', { status: 401 })
+    const [, owner = '', repo = '', number, action] = route
+    const pr = Number(number)
+    const runs = pullRequest(env, owner, repo, pr)
+    if (request.method === 'GET' && action === 'report')
+      return new Response((await runs.report()) ?? 'no report yet', { headers: { 'content-type': 'text/markdown; charset=utf-8' } })
+    if (request.method === 'GET' && !action) return Response.json(await runs.status())
+    // Starts and resumes for callers without the webhook, such as npm run remote.
+    if (request.method === 'POST' && action === 'resume') return accepted({ resumed: await runs.resume() })
+    if (request.method === 'POST' && !action) {
+      const options = (await request.json().catch(() => ({}))) as { ship?: boolean }
+      return accepted(await runs.start({ by: allowedUsers(env)[0] ?? owner, owner, pr, repo, ship: options.ship === true }))
     }
-    return new Response('agent-factory', { status: url.pathname === '/' ? 200 : 404 })
+    return new Response('method not allowed', { status: 405 })
   },
 } satisfies ExportedHandler<Env>
 

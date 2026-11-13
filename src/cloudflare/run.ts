@@ -2,7 +2,6 @@ import { DurableObject } from 'cloudflare:workers'
 import { Sql } from 'nanocode-ts/cloudflare'
 import module from 'nanocode-ts/nanocode_wasm.wasm'
 import { parseRepoConfig, repoConfigFile } from '../core/checks.ts'
-import { defaultPolicy, jevClient } from '../core/gate.ts'
 import type { Ledger } from '../core/ledger.ts'
 import { apiKeyCredential, type Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError, type Comments } from '../core/questions.ts'
@@ -19,7 +18,6 @@ export type Env = {
   PULL_REQUESTS: DurableObjectNamespace<PullRequestRuns>
   GITHUB_TOKEN: string
   GITHUB_WEBHOOK_SECRET: string
-  TYPESAFE_API_KEY: string
   ANTHROPIC_API_KEY?: string
   OPENAI_API_KEY?: string
   /** GitHub logins, comma-separated, that may start runs and answer questions. */
@@ -34,7 +32,6 @@ export type Env = {
   GITHUB_API_URL?: string
   ANTHROPIC_URL?: string
   OPENAI_URL?: string
-  TYPESAFE_URL?: string
 }
 
 export type StartRequest = PullRequest & { ship: boolean; by: string }
@@ -48,7 +45,7 @@ const maxAttempts = 3
 /** Restarts of a run whose isolate died with no finished step in between, before the run stops. */
 const maxRestarts = 5
 const retryMs = 60_000
-const defaultPauseSeconds = 300
+const defaultPauseSeconds = 60
 const defaultCiTimeoutMinutes = 30
 /** GitHub refuses comments over 65,536 characters. */
 const commentLimit = 60_000
@@ -120,7 +117,9 @@ export class PullRequestRuns extends DurableObject<Env> {
         if (restarts > maxRestarts) throw new StopError(`the run died ${maxRestarts} times without finishing a step, for example on the memory or CPU limit`)
       }
       this.setState(row.run, 'running', '')
-      await once(ledger, 'announced', () => comments.post(`agent-factory started review run \`${row.run}\` for @${request.by}. Questions for you will appear here.`))
+      await once(ledger, 'announced', () =>
+        comments.post(`agent-factory started review run \`${row.run}\` for @${request.by}. Questions for you will appear here; answer them with a \`/answer\` comment.`),
+      )
       const result = await this.execute(row.run, request, ledger, gh, comments)
       this.setState(row.run, result.pass ? 'passed' : 'failed', '')
       await once(ledger, 'summary', () => comments.post(summary(row.run, result)))
@@ -180,7 +179,6 @@ export class PullRequestRuns extends DurableObject<Env> {
       credentials,
       files: sqlFiles(this.ctx.storage.sql, run),
       guides: bundledGuides,
-      jev: jevClient(this.env.TYPESAFE_API_KEY, fetch, this.env.TYPESAFE_URL),
       ledger,
       log,
       module,
@@ -212,7 +210,6 @@ export class PullRequestRuns extends DurableObject<Env> {
       ask: `${view.title}\n\n${view.body ?? ''}`.trim(),
       config: { ...config, guides: {} },
       models: { step1: { ...defaultModels.step1, ...overrides.step1 }, step2: { ...defaultModels.step2, ...overrides.step2 } },
-      policy: defaultPolicy,
       pr: request.pr,
       runId: run,
       source: `${request.owner}/${request.repo}#${request.pr}`,

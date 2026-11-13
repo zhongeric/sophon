@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Contracts } from 'nanocode-ts'
-import { defaultPolicy, type Jev, type SystemOneResponse } from '../../src/core/gate.ts'
 import type { Credentials } from '../../src/core/providers.ts'
 import { parseAnswers, type Channel, type Question } from '../../src/core/questions.ts'
 import { codeReviewLoop, defaultModels, type LoopInput } from '../../src/core/workflows/code-review-loop.ts'
@@ -81,8 +80,11 @@ const openQuestion = {
  */
 export const script = scriptFor({ tests: true })
 
-/** The scripted agents. Without `tests`, as on Cloudflare where CI runs the tests, no agent calls run_tests. */
-export function scriptFor(options: { tests: boolean }): Script {
+/**
+ * The scripted agents. Without `tests`, as on Cloudflare where CI runs the tests, no agent calls run_tests.
+ * `holdBug` marks the bug as Eric's decision. `rejectBug` makes the patch agent reject it.
+ */
+export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBug?: boolean }): Script {
   const runTests = (code: string) => (options.tests ? [code] : [])
   return ({ role, output }) => {
   if (output !== null) return { text: 'done' }
@@ -97,8 +99,17 @@ export function scriptFor(options: { tests: boolean }): Script {
         ].join('\n'),
       }
     case 'bugs':
-      return { cell: [...runTests(`text(JSON.stringify(await tools.run_tests({ tests: ['test/sub.test.ts'] })))`), findings([bug])].join('\n') }
+      return {
+        cell: [
+          ...runTests(`text(JSON.stringify(await tools.run_tests({ tests: ['test/sub.test.ts'] })))`),
+          findings([options.holdBug ? { ...bug, decision: 'Should sub throw on a negative result?', needs_decision: true } : bug]),
+        ].join('\n'),
+      }
     case 'patch':
+      if (options.rejectBug)
+        return {
+          cell: `await tools.submit_patch_log({ applied: [], skipped: [{ id: 'bugs-001', reason: 'callers depend on the sum' }, { id: 'min-001', reason: 'inlining adds nothing' }] })`,
+        }
       return {
         cell: [
           `await tools.Read({ file_path: '/repo/src/math.ts' })`,
@@ -106,7 +117,7 @@ export function scriptFor(options: { tests: boolean }): Script {
           `try { await tools.Write({ file_path: '/repo/.agent-factory.json', content: '{}' }); text('PROTECTED WRITE ALLOWED') } catch (error) { text('protected: ' + error) }`,
           ...runTests(`text(JSON.stringify(await tools.run_tests({ tests: ['test/sub.test.ts'] })))`),
           `text(JSON.stringify(await tools.Bash({ command: 'cat /review/decisions.md /review/gate-log.txt' })))`,
-          `await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'sub returns a - b' }], skipped: [] })`,
+          `await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'sub returns a - b' }], skipped: [{ id: 'min-001', reason: 'inlining adds nothing' }] })`,
         ].join('\n'),
       }
     case 'questions':
@@ -120,24 +131,6 @@ export function scriptFor(options: { tests: boolean }): Script {
   }
   }
 }
-
-/** Keeps bugs findings as critical and drops the rest. With `holdBugs`, a bugs finding needs the user's decision. */
-export function jevFor(options: { holdBugs: boolean }): Jev {
-  return async (request) => {
-    const { state, questions } = request as { state: { finding: { track: string } }; questions: Record<string, unknown> }
-    const isBug = state.finding.track === 'bugs'
-    const answers: SystemOneResponse['answers'] = {
-      keep_drop: { type: 'choice', choice: isBug ? 'keep' : 'drop', confidence: 0.9 },
-      is_critical: { type: 'noul', noul: isBug ? 0.95 : 0.1 },
-      severity: { type: 'score', score: isBug ? 3.6 : 0.5 },
-      needs_user: { type: 'noul', noul: isBug && options.holdBugs ? 0.9 : 0.05 },
-    }
-    for (const name of Object.keys(questions)) if (name.startsWith('same_as_kept_')) answers[name] = { type: 'noul', noul: 0 }
-    return { answers }
-  }
-}
-
-export const jev = jevFor({ holdBugs: false })
 
 /** A channel that answers each batch with a scripted reply: `/answer recommended` unless `replies` says otherwise, null to not answer yet. */
 export function memoryChannel(replies: Record<string, string | null> = {}) {
@@ -163,7 +156,6 @@ export function loopInput(repo: string, runId: string): LoopInput {
     ask: 'Add a sub function that subtracts b from a.',
     config: loadRepoConfig(join(repo, '.agent-factory.json')),
     models: defaultModels,
-    policy: defaultPolicy,
     runId,
     source: `${repo} main..feature`,
   }
@@ -174,7 +166,7 @@ export async function runLoop(
   repo: string,
   runId: string,
   runsDir: string,
-  options: { dispatch: Contracts.RuntimeOptions['dispatch']; jev?: Jev; channel?: Channel; input?: LoopInput },
+  options: { dispatch: Contracts.RuntimeOptions['dispatch']; channel?: Channel; input?: LoopInput },
 ) {
   const input = options.input ?? loopInput(repo, runId)
   const run = await nodeRun({ config: input.config, runId, runsDir, source: gitSource(repo) })
@@ -183,7 +175,6 @@ export async function runLoop(
     channel: options.channel ?? memoryChannel().channel,
     credentials,
     dispatch: options.dispatch,
-    jev: options.jev ?? jev,
     log: () => {},
     module,
   })

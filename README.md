@@ -18,11 +18,11 @@ The same workflow runs on two platforms:
 ## How a run works
 
 ```
-freeze ─▶ step 1: minimize │ rules │ bugs │ anti-slop   (Claude, read-only, parallel)
-       ─▶ Jev Gate ─▶ patch (Claude) ─▶ commit
-       ─▶ step 2: late-minimize │ late-rules on the new diff   (Codex, read-only)
-       ─▶ Jev Gate ─▶ patch (Codex) ─▶ commit
-       ─▶ late bugs on every fix since the freeze ─▶ Jev Gate ─▶ patch ─▶ commit
+freeze ─▶ step 1: minimize │ rules │ bugs │ anti-slop   (Opus 5.5, Sol, Fable 5.2: read-only, parallel)
+       ─▶ gate ─▶ patch (Opus 5.5) ─▶ commit
+       ─▶ step 2: late-minimize │ late-rules on the new diff   (each role on the other family)
+       ─▶ gate ─▶ patch (Sol) ─▶ commit
+       ─▶ late bugs on every fix since the freeze ─▶ gate ─▶ patch ─▶ commit
        ─▶ checks ─▶ intent ─▶ PASS criteria ─▶ (optional) push + mark the PR ready
 ```
 
@@ -40,12 +40,13 @@ resumes the run by itself.
 | Agents stay in their workspace | The agent shell is nanocode's in-process virtual bash with its own environment. Cell `fetch`, shell network and web search are off. Paths cannot leave the tree, `.git` is hidden, and writes never follow a symlink. |
 | Test scope; one test run at a time | `run_tests` accepts only committed test files, runs the repository's configured command, and runs one command at a time across the host. |
 | Finding schema and evidence rule | `submit_findings` rejects a finding with a missing field, a location that is not a real file and line, or a quote that is not in the file near that line (or in the diff). The agent sees the reasons and can correct the call. |
-| Jev Gate: all findings, kept criticals only | The host calls Jev directly with the skill's questions and thresholds (`src/gate.ts`). Patch agents see only the kept set and the gate log. |
-| Patch: log why for each item | `submit_patch_log` must list every kept ID one time, in applied or skipped. |
+| Findings filter (no Jev) | The evidence check is the noise filter. Every finding that passes it goes to the patch agent, which applies it or rejects it with a reason. A rejected critical or high finding becomes a question to you, and the run passes only if you accept the rejection. |
+| Patch: log why for each item | `submit_patch_log` must list every finding ID one time, in applied or skipped. |
 | Never weaken checks | Patch agents cannot write `.agent-factory.json` or the `protect` paths. Check commands come from the config only. The report lists patch edits outside the change and the findings. |
 | Model swap across passes | The run stops before any work if a step 2 agent uses the same family as its step 1 counterpart. The gate log records the families. |
-| No API keys in prompts or files | Keys stay in the host's dispatch and the Jev client. They go only to their own provider's origin. Check commands get an allowlisted environment, never the host's keys. |
-| Open questions (A2) | A read-only questions agent runs beside the step 1 reviewers and posts its questions at once. The gate holds each kept finding that Jev says depends on your decision, and asks you about it. Patch agents, later reviewers and the intent check read your answers. |
+| Allowed models | Fable 5.2, Opus 5.5 and Sol only (`allowedModels`). The run stops before any work on another model. |
+| No API keys in prompts or files | Keys stay in the host's dispatch. They go only to their own provider's origin. Check commands get an allowlisted environment, never the host's keys. |
+| Open questions (A2) | A read-only questions agent runs beside the step 1 reviewers and posts its questions at once. A reviewer marks a finding that depends on your decision, and the gate holds it until you answer. Patch agents, later reviewers and the intent check read your answers. |
 | Missing key or input: stop | The run stops before it freezes anything. |
 | Ready PR, never draft | `--ship` pushes the fixes to the PR branch (no force) and marks the PR ready, only on PASS. |
 | A PR cannot change its own rails | On Cloudflare, `.agent-factory.json` comes from the base branch. Locally, it comes from your working copy. |
@@ -64,7 +65,7 @@ only, and the checks are the repository's own CI.
 
 ```bash
 npm install
-export ANTHROPIC_API_KEY=... OPENAI_API_KEY=... TYPESAFE_API_KEY=...
+export ANTHROPIC_API_KEY=... OPENAI_API_KEY=...
 ```
 
 `--claude-plan` signs Claude requests with your `nc` Claude login instead of `ANTHROPIC_API_KEY`.
@@ -151,25 +152,39 @@ Each run writes:
 ```bash
 npx wrangler login
 npx wrangler deploy
-for name in GITHUB_TOKEN GITHUB_WEBHOOK_SECRET ANTHROPIC_API_KEY OPENAI_API_KEY TYPESAFE_API_KEY ADMIN_TOKEN; do
+for name in GITHUB_TOKEN GITHUB_WEBHOOK_SECRET ANTHROPIC_API_KEY OPENAI_API_KEY ADMIN_TOKEN; do
   npx wrangler secret put $name
 done
 ```
 
-Set `ALLOWED_USERS` in `wrangler.jsonc` to the GitHub logins that may start runs and answer questions. Then add
-a webhook to each repository: payload URL `https://<worker>/github/webhook`, content type `application/json`,
-the `GITHUB_WEBHOOK_SECRET`, and the events Issue comments, Pull requests, Check suites, Check runs and Statuses.
+Set `ALLOWED_USERS` in `wrangler.jsonc` to the GitHub logins that may start runs and answer questions.
+
+The webhook is optional. Without it, start runs with `npm run remote` (below); the run still picks up your
+`/answer` comments and CI results by polling. With it, `/review` comments start runs and answers take effect at
+once: add a webhook to each repository with payload URL `https://<worker>/github/webhook`, content type
+`application/json`, the `GITHUB_WEBHOOK_SECRET`, and the events Issue comments, Pull requests, Check suites,
+Check runs and Statuses.
 
 ### Use
 
-- Comment `/review` on a PR, or add the `agent-review` label. `/review --ship` also pushes the fixes to the PR
-  branch and marks it ready on PASS.
+```bash
+npm run remote -- start acme/app#123            # or a PR URL; --ship pushes the fixes and marks the PR ready on PASS
+npm run remote -- resume acme/app#123           # after you answer, instead of waiting for the next poll
+npm run remote -- status acme/app#123
+npm run remote -- report acme/app#123
+```
+
+`npm run remote` reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from `.secrets/cloudflare.env`.
+
+- With the webhook: comment `/review` on a PR, or add the `agent-review` label. `/review --ship` also pushes the
+  fixes to the PR branch and marks it ready on PASS.
 - Answer questions with a `/answer` comment, as in [Your answers](#your-answers). The webhook resumes the run at
-  once; without it, the run checks again every `PAUSE_POLL_SECONDS` (default 300). Only unedited comments from
+  once; without it, the run checks again every `PAUSE_POLL_SECONDS` (default 60). Only unedited comments from
   `ALLOWED_USERS` count. The config's `answerers` can narrow that list, never widen it.
 - The result is a PR comment with the criteria and the full report. The fixes are on `factory/<run>`.
-- `GET /runs/<owner>/<repo>/<pr>` and `.../report` return the status and the report, with
-  `Authorization: Bearer <ADMIN_TOKEN>`. `npx wrangler tail` shows each agent's tool calls.
+- The routes behind `Authorization: Bearer <ADMIN_TOKEN>`: `POST /runs/<owner>/<repo>/<pr>` starts a run
+  (body `{"ship": true}` to ship), `POST .../resume` wakes it, `GET /runs/<owner>/<repo>/<pr>` and `.../report`
+  return the status and the report. `npx wrangler tail` shows each agent's tool calls.
 
 ### How it works
 
@@ -195,9 +210,10 @@ src/core/                  platform-neutral: it typechecks without Node types (t
   agent.ts                 one isolated nanocode agent: durable session, drive loop, host tools
   steps.ts                 reviewer, patch, intent and questions steps with their submit tools
   workspace.ts             the agent shell and the rails: read-only, protected paths, no symlink writes, .git hidden
-  findings.ts gate.ts      the evidence check, and the Jev Gate with held findings
+  findings.ts gate.ts      the evidence check; the gate that holds findings for your decision
   questions.ts checks.ts   questions and /answer parsing; repository config and command checks
-src/node/                  the CLI: git worktree, local machine, terminal/file/gh channels, nc plan login
+src/node/                  the CLI: git worktree, local machine, terminal/file/gh channels, nc plan login;
+                           remote.ts drives the deployed Worker
 src/cloudflare/            the Worker, the PullRequestRuns Durable Object, the GitHub repo, CI checker, webhooks
 scripts/smoke.ts           one live reviewer against the test fixture (npm run smoke, uses --claude-plan auth)
 ```
@@ -218,5 +234,5 @@ scripts/smoke.ts           one live reviewer against the test fixture (npm run s
 ```bash
 npm run check   # types: Node, the core without Node types, and Cloudflare
 npm test        # unit tests; the full loop on Node against scripted Claude and Codex models; and the
-                # Worker under wrangler dev against local GitHub, model and Jev mocks
+                # Worker under wrangler dev against local GitHub and model mocks
 ```

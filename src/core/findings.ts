@@ -14,6 +14,10 @@ export type Finding = {
   severity: Severity
   evidence: string
   recommendation: string
+  /** The right fix depends on a product or design choice that only Eric can make. */
+  needs_decision?: boolean
+  /** That choice, in one sentence. Required with needs_decision. */
+  decision?: string
 }
 
 type Submitted = Omit<Finding, 'id' | 'track'>
@@ -46,6 +50,11 @@ export const submitFindings: Contracts.HostTool = {
             severity: { type: 'string', enum: [...severities] },
             evidence: { type: 'string', description: 'A short code quote that you read at the location. Join separate fragments with ...' },
             recommendation: { type: 'string', description: 'A concrete fix direction' },
+            needs_decision: {
+              type: 'boolean',
+              description: 'True only when the right fix depends on a product or design choice that the ask and the decisions leave open',
+            },
+            decision: { type: 'string', description: 'With needs_decision: the choice that Eric must make, in one sentence' },
           },
           required: [...fields],
           additionalProperties: false,
@@ -85,6 +94,7 @@ async function checkFinding(item: Record<string, unknown>, sources: Sources): Pr
   if (missing.length > 0) return [`missing ${missing.join(', ')}`]
   const finding = item as Submitted
   if (!severities.includes(finding.severity)) return [`severity must be one of ${severities.join(', ')}`]
+  if (finding.needs_decision && !finding.decision?.trim()) return ['needs_decision needs the decision, in one sentence']
 
   const location = parseLocation(finding.location)
   if (!location) return [`location "${finding.location}" is not path:line or path:start-end`]

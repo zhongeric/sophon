@@ -4,7 +4,6 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, promisify } from 'node:util'
 import { repoConfigFile } from '../core/checks.ts'
-import { defaultPolicy, jevClient } from '../core/gate.ts'
 import type { Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError, type Channel } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
@@ -37,7 +36,6 @@ Options:
   --models <path>        JSON file that overrides the default models per step and role
   --run <id>             Resume a run; other target options come from its ledger
   --runs-dir <path>      Where runs live (default: <agent-factory>/runs)
-  --allow-high           Also send high findings that pass the high bar to the patch agents
   --claude-plan          Sign Claude requests with the nc Claude login instead of ANTHROPIC_API_KEY
   --ship                 With --pr, on PASS: push the fixes to the PR branch and mark it ready
   --wait <minutes>       With --pr, how long to wait for answers before the run pauses (default 60)
@@ -46,13 +44,12 @@ Questions for you go to the PR as a comment with --pr, to the terminal when it i
 and to a file in the run directory otherwise. A run that waits for answers exits with status 3;
 resume it with --run <id> after you answer.
 
-Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, TYPESAFE_API_KEY`
+Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY`
 
 async function main(): Promise<number> {
   const { values } = parseArgs({
     allowPositionals: true,
     options: {
-      'allow-high': { type: 'boolean' },
       ask: { type: 'string' },
       'ask-file': { type: 'string' },
       base: { type: 'string' },
@@ -79,8 +76,6 @@ async function main(): Promise<number> {
 
   const credentials: Credentials = {}
   for (const provider of providersOf(input.models)) credentials[provider] = credential(provider, { claudePlan: values['claude-plan'] })
-  const typesafeKey = process.env.TYPESAFE_API_KEY
-  if (!typesafeKey) throw new StopError('the Jev Gate needs TYPESAFE_API_KEY; the loop does not invent keep or drop decisions')
 
   const wasm = fileURLToPath(import.meta.resolve('nanocode-ts/nanocode_wasm.wasm'))
   const waitMs = Number(values.wait ?? defaultWaitMinutes) * 60_000
@@ -92,7 +87,6 @@ async function main(): Promise<number> {
       ...run,
       channel: await channel(input, source.repo, run.dir, waitMs),
       credentials,
-      jev: jevClient(typesafeKey),
       log: (line) => console.error(`[${new Date().toTimeString().slice(0, 8)}] ${line}`),
       module: await WebAssembly.compile(readFileSync(wasm)),
     })
@@ -147,7 +141,6 @@ async function newInput(values: Values): Promise<{ input: LoopInput; source: Git
     ask,
     config,
     models,
-    policy: { ...defaultPolicy, allowHigh: Boolean(values['allow-high']) },
     runId: `${stamp}-${headSha}`,
     source: `${repo} ${base}..${head}`,
     ...(values.stack ? { stack: String(values.stack) } : {}),

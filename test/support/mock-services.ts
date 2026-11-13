@@ -1,19 +1,18 @@
 import { execFileSync } from 'node:child_process'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import type { Jev } from '../../src/core/gate.ts'
 import { scriptedDispatch, type Script, type Turn } from './scripted-model.ts'
 
 export type MockComment = { id: number; user: { login: string }; body: string; created_at: string; html_url: string }
 type TreeEntry = { path: string; mode: string; type: string; sha: string | null }
 
 /**
- * GitHub, Anthropic, OpenAI and TypeSafe on one local port, for the Cloudflare host under wrangler dev.
+ * GitHub, Anthropic and OpenAI on one local port, for the Cloudflare host under wrangler dev.
  * GitHub answers from a local fixture repository and records comments, blobs, trees, commits and refs.
  */
 export async function mockServices(
   repo: string,
-  options: { owner: string; name: string; pr: number; script: Script; jev: Jev; botLogin: string; headRepo?: string },
+  options: { owner: string; name: string; pr: number; script: Script; botLogin: string; headRepo?: string },
 ) {
   const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, maxBuffer: 64 * 1024 * 1024 })
   const headSha = git('rev-parse', 'feature').toString().trim()
@@ -67,7 +66,6 @@ export async function mockServices(
         response.end(await reply.text())
         return
       }
-      if (route === 'POST /v1/systemone') return json(response, 200, await options.jev(JSON.parse(body.toString())))
       if (route === 'POST /graphql') return json(response, 200, { data: {} })
       if (route === `GET ${api}/pulls/${options.pr}`)
         return json(response, 200, {

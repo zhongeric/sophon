@@ -1,7 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { CheckResult, RepoConfig } from '../checks.ts'
 import type { Finding } from '../findings.ts'
-import { findingQuestion, gate, settle, type GateResult, type Jev, type Policy } from '../gate.ts'
+import { acceptRejection, findingQuestion, gate, rejectionQuestion, settle, type GateResult } from '../gate.ts'
 import { step, type Ledger } from '../ledger.ts'
 import type { AgentStore, Checker, Files, Frozen, Guides, Repo } from '../platform.ts'
 import type { Credentials, Provider } from '../providers.ts'
@@ -15,22 +15,36 @@ export type LoopModels = {
   step2: Record<'late-minimize' | 'late-rules' | 'late-bugs' | 'patch' | 'intent', ModelChoice>
 }
 
+/** Eric's allowed models for review and build: Fable, Opus 5.5 and Sol. */
+export const allowedModels = ['claude-fable-5-2', 'claude-opus-5-5', 'gpt-6.1-sol']
+
+const fable: ModelChoice = { provider: 'claude', model: 'claude-fable-5-2' }
+const opus: ModelChoice = { provider: 'claude', model: 'claude-opus-5-5' }
+const sol: ModelChoice = { provider: 'codex', model: 'gpt-6.1-sol' }
+
+/** Step 1 spreads the tracks over the three models for variance. Each step 2 role swaps the family of its step 1 counterpart. */
 export const defaultModels: LoopModels = {
   step1: {
-    minimize: { provider: 'claude', model: 'claude-fable-5-5' },
-    rules: { provider: 'claude', model: 'claude-sonnet-5-5' },
-    bugs: { provider: 'claude', model: 'claude-fable-5-5', thinking: 'high' },
-    'anti-slop': { provider: 'claude', model: 'claude-sonnet-5-5' },
-    patch: { provider: 'claude', model: 'claude-opus-5-5', thinking: 'high' },
-    questions: { provider: 'claude', model: 'claude-sonnet-5-5' },
+    minimize: opus,
+    rules: sol,
+    bugs: { ...fable, thinking: 'high' },
+    'anti-slop': opus,
+    patch: { ...opus, thinking: 'high' },
+    questions: opus,
   },
   step2: {
-    'late-minimize': { provider: 'codex', model: 'gpt-6.1-sol' },
-    'late-rules': { provider: 'codex', model: 'gpt-6.1-sol' },
-    'late-bugs': { provider: 'codex', model: 'gpt-6.1-sol', thinking: 'high' },
-    patch: { provider: 'codex', model: 'gpt-6.1-sol', thinking: 'high' },
-    intent: { provider: 'codex', model: 'gpt-6.1-sol' },
+    'late-minimize': sol,
+    'late-rules': fable,
+    'late-bugs': { ...sol, thinking: 'high' },
+    patch: { ...sol, thinking: 'high' },
+    intent: opus,
   },
+}
+
+export function checkAllowedModels(models: LoopModels): void {
+  const used = [...Object.values(models.step1), ...Object.values(models.step2)].map((choice) => choice.model)
+  const refused = [...new Set(used.filter((model) => !allowedModels.includes(model)))]
+  if (refused.length > 0) throw new StopError(`models outside the allowed list (${allowedModels.join(', ')}): ${refused.join(', ')}`)
 }
 
 /** The model-swap rule: every step 2 agent uses another model family than its step 1 counterpart. */
@@ -60,7 +74,6 @@ export type LoopInput = {
   runId: string
   config: RepoConfig
   models: LoopModels
-  policy: Policy
   /** The PR under review, when there is one. Questions go to it. */
   pr?: number
   /** On PASS, push the fixes to the PR branch (fast-forward only) and mark the PR ready. */
@@ -79,7 +92,6 @@ export type LoopDeps = {
   store: AgentStore
   guides: Guides
   credentials: Credentials
-  jev: Jev
   dispatch?: Contracts.RuntimeOptions['dispatch']
   log(line: string): void
 }
@@ -89,11 +101,12 @@ export type LoopResult = { pass: boolean; criteria: Criterion[]; branch: string;
 
 /**
  * The code review loop of the code-review-loop skill, with its order and hard rules in code:
- * freeze, four read-only reviewers, Jev Gate, patch, a model-swapped second pass on the new diff,
+ * freeze, four read-only reviewers, the gate, patch, a model-swapped second pass on the new diff,
  * a late bugs pass, checks, an intent check, and the PASS criteria. Every step is in the ledger,
  * so the same run ID resumes after a crash without repeating finished steps.
  */
 export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<LoopResult> {
+  checkAllowedModels(input.models)
   checkFamilySwap(input.models)
   const missing = providersOf(input.models).filter((provider) => !deps.credentials[provider])
   if (missing.length > 0) throw new StopError(`no credential for ${missing.join(', ')}`)
@@ -119,11 +132,10 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   const questions = asker(ledger, deps.channel, input.runId, deps.log)
   const gateLog = 'gate-log.txt'
   const runGate = async (name: string, header: string, findings: Finding[]): Promise<GateResult> => {
-    const userDecisions = decisions(ledger).map(({ question, answer }) => ({ question, answer }))
-    const judged = await step(ledger, name, () => gate(findings, input.ask, userDecisions, deps.jev, input.policy))
+    const judged = await step(ledger, name, async () => gate(findings))
     let result = judged
     if (judged.held.length > 0) {
-      // A held finding depends on a decision that only the user can make: ask before it reaches a patch agent.
+      // A held finding depends on a decision that only Eric can make: ask before it reaches a patch agent.
       await questions.post(name, judged.held.map((finding, index) => findingQuestion(finding, `Q${index + 1}`)))
       const answers = await questions.wait(name)
       result = settle(judged, answers.map((answer, index) => ({ id: judged.held[index]!.id, answer: answer.answer })))
@@ -132,8 +144,25 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       deps.files.append(gateLog, [header, ...result.log, ''].join('\n'))
       ledger.put(`logged:${name}`, true)
     }
-    deps.log(`${name}: kept ${result.kept.length} of ${findings.length} findings`)
+    deps.log(`${name}: ${result.kept.length} of ${findings.length} findings go to the patch agent`)
     return result
+  }
+
+  // A patch agent may reject a finding with a reason. A rejected critical or high finding goes to Eric.
+  const rejections: { id: string; accepted: boolean }[] = []
+  const runPatch = async (name: string, model: ModelChoice, result: GateResult, message: string): Promise<PatchOutcome> => {
+    const outcome = await step(ledger, name, () => patch(context, name, model, result.kept, result.log, message))
+    const rejected = (outcome.log?.skipped ?? []).flatMap((entry) => {
+      const finding = result.kept.find((item) => item.id === entry.id)
+      return finding && (finding.severity === 'critical' || finding.severity === 'high') ? [{ finding, reason: entry.reason }] : []
+    })
+    if (rejected.length > 0) {
+      const batch = `${name}.rejections`
+      await questions.post(batch, rejected.map(({ finding, reason }, index) => rejectionQuestion(finding, reason, `Q${index + 1}`)))
+      const answers = await questions.wait(batch)
+      rejections.push(...rejected.map(({ finding }, index) => ({ accepted: answers[index]?.answer === acceptRejection, id: finding.id })))
+    }
+    return outcome
   }
 
   // Step 1: four read-only reviewers in parallel on the frozen change.
@@ -148,9 +177,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   await asked
   await questions.wait('ask')
   const gate1 = await runGate('step1.gate', familyHeader('Step 1', input.models.step1), step1.flat())
-  const patch1 = await step(ledger, 'step1.patch', () =>
-    patch(context, 'step1.patch', input.models.step1.patch, gate1.kept, gate1.log, `agent-factory: apply step 1 review fixes (${input.runId})`),
-  )
+  const patch1 = await runPatch('step1.patch', input.models.step1.patch, gate1, `agent-factory: apply step 1 review fixes (${input.runId})`)
 
   // Step 2: swapped model family, on the new diff only.
   let gate2: GateResult | null = null
@@ -164,9 +191,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       ),
     )
     gate2 = await runGate('step2.gate', familyHeader('Step 2', input.models.step2), late.flat())
-    patch2 = await step(ledger, 'step2.patch', () =>
-      patch(context, 'step2.patch', input.models.step2.patch, gate2!.kept, gate2!.log, `agent-factory: apply step 2 review fixes (${input.runId})`),
-    )
+    patch2 = await runPatch('step2.patch', input.models.step2.patch, gate2, `agent-factory: apply step 2 review fixes (${input.runId})`)
   }
 
   // Late bugs pass over every fix since the freeze.
@@ -181,9 +206,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       review(context, 'step2.late-bugs', roles['late-bugs'], input.models.step2['late-bugs'], range, note),
     )
     gate3 = await runGate('step2.late-bugs-gate', familyHeader('Step 2 late bugs', { 'late-bugs': input.models.step2['late-bugs'] }), bugs)
-    patch3 = await step(ledger, 'step2.late-bugs-patch', () =>
-      patch(context, 'step2.late-bugs-patch', input.models.step2.patch, gate3!.kept, gate3!.log, `agent-factory: apply late bugs fixes (${input.runId})`),
-    )
+    patch3 = await runPatch('step2.late-bugs-patch', input.models.step2.patch, gate3, `agent-factory: apply late bugs fixes (${input.runId})`)
     current = patch3.after
   }
 
@@ -192,8 +215,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   const checks = await step(ledger, 'checks', () => deps.checker.checks(finalChanges))
   const verdict = await step(ledger, 'intent', () => intent(context, 'intent', input.models.step2.intent, { from: frozen.base, to: current }))
 
-  const patches = [patch1, patch2, patch3].filter((outcome): outcome is PatchOutcome => outcome !== null)
-  const criteria = evaluate({ gateLog: deps.files.exists(gateLog), checks, verdict, patches, step2Ran: patch1.changed })
+  const criteria = evaluate({ checks, gateLog: deps.files.exists(gateLog), rejections, step2Ran: patch1.changed, verdict })
   const pass = criteria.every((criterion) => criterion.ok)
   if (pass && input.ship) {
     const { pr, headRef } = input.ship
@@ -225,9 +247,9 @@ function familyHeader(label: string, models: Record<string, ModelChoice>): strin
   return `# ${label} | model_family=${families} | ${list}`
 }
 
-function evaluate(run: { gateLog: boolean; checks: CheckResult[]; verdict: Verdict; patches: PatchOutcome[]; step2Ran: boolean }): Criterion[] {
+function evaluate(run: { gateLog: boolean; checks: CheckResult[]; verdict: Verdict; rejections: { id: string; accepted: boolean }[]; step2Ran: boolean }): Criterion[] {
   const failed = run.checks.filter((check) => check.status === 'fail')
-  const skipped = run.patches.flatMap((outcome) => outcome.log?.skipped ?? [])
+  const refused = run.rejections.filter((rejection) => !rejection.accepted)
   return [
     {
       name: 'Step 1 and Step 2 ran with context-free reviewers',
@@ -243,9 +265,14 @@ function evaluate(run: { gateLog: boolean; checks: CheckResult[]; verdict: Verdi
     },
     { name: 'Intent reviewer affirms the original ask', ok: run.verdict.satisfied, detail: run.verdict.satisfied ? run.verdict.summary : run.verdict.gaps.join('; ') },
     {
-      name: 'No remaining kept criticals',
-      ok: skipped.length === 0,
-      detail: skipped.length === 0 ? 'the patch agents applied every kept finding' : `skipped: ${skipped.map((entry) => entry.id).join(', ')}`,
+      name: 'No critical or high finding left unapplied without your OK',
+      ok: refused.length === 0,
+      detail:
+        refused.length > 0
+          ? `you did not accept the rejection of ${refused.map((rejection) => rejection.id).join(', ')}`
+          : run.rejections.length > 0
+            ? `you accepted the rejection of ${run.rejections.map((rejection) => rejection.id).join(', ')}`
+            : 'the patch agents applied every critical and high finding',
     },
   ]
 }

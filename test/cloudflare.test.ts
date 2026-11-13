@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { fixed, fixtureRepo, jev, scriptFor } from './support/fixture.ts'
+import { fixed, fixtureRepo, scriptFor } from './support/fixture.ts'
 import { mockServices } from './support/mock-services.ts'
 import { sendWebhook, startWorker, until } from './support/wrangler.ts'
 
@@ -17,14 +17,12 @@ const vars = (mock: { url: string }) => ({
   OPENAI_API_KEY: 'openai-key',
   OPENAI_URL: `${mock.url}/v1`,
   PAUSE_POLL_SECONDS: '2',
-  TYPESAFE_API_KEY: 'typesafe-key',
-  TYPESAFE_URL: `${mock.url}/v1/systemone`,
 })
 const comment = (login: string, body: string) => ({ action: 'created', comment: { body, user: { login } }, issue: { number: 7, pull_request: {} }, repository })
 
 test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, and pushes the fixes', { timeout: 240_000 }, async () => {
   const repo = fixtureRepo()
-  const mock = await mockServices(repo, { botLogin: 'factory-bot', jev, name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
   const worker = await startWorker(vars(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 120)))}\nrequests: ${mock.state.requests.slice(-15).join(', ')}\nworker:\n${worker.output().slice(-3000)}`
   try {
@@ -58,7 +56,7 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
 
 test('on Cloudflare, a fork PR stops before any work, because its fixes would run in this repository CI', { timeout: 120_000 }, async () => {
   const repo = fixtureRepo()
-  const mock = await mockServices(repo, { botLogin: 'factory-bot', headRepo: 'mallory/app', jev, name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', headRepo: 'mallory/app', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
   const worker = await startWorker(vars(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}`
   try {
@@ -67,6 +65,31 @@ test('on Cloudflare, a fork PR stops before any work, because its fixes would ru
     assert.match(stopped.body, /fork PRs are not supported/)
     assert.equal(mock.state.turns.length, 0)
     assert.equal(mock.state.refs.size, 0)
+  } finally {
+    worker.stop()
+    mock.close()
+  }
+})
+
+test('on Cloudflare, the admin route starts a run, and the run picks up the answer without the webhook', { timeout: 180_000 }, async () => {
+  const repo = fixtureRepo()
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  const worker = await startWorker(vars(mock))
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 120)))}`
+  const admin = { authorization: 'Bearer admin', 'content-type': 'application/json' }
+  try {
+    assert.equal((await fetch(`${worker.url}/runs/acme/app/7`, { method: 'POST' })).status, 401)
+    const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: admin, method: 'POST' })).json()) as { run: string; started: boolean }
+    assert.equal(started.started, true)
+    const again = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin, method: 'POST' })).json()) as { run: string; started: boolean }
+    assert.deepEqual(again, { run: started.run, started: false })
+
+    await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
+    assert.match(mock.state.comments[0]!.body, /for @Eric/)
+    mock.comment('eric', '/answer recommended')
+    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
+    assert.match(done.body, /agent-factory: PASS/)
+    assert.match(done.body, /May sub return a negative number\? \*\*Yes, return -2\*\* \(recommended\)/)
   } finally {
     worker.stop()
     mock.close()

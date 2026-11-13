@@ -44,6 +44,7 @@ test('the evidence rule rejects missing fields, unknown files, and quotes that a
         { ...finding, severity: 'urgent' },
         { ...finding, evidence: '}' },
         { ...finding, evidence: 'emit Withdrawn(amount)' },
+        { ...finding, needs_decision: true },
       ],
     },
     sources,
@@ -55,6 +56,7 @@ test('the evidence rule rejects missing fields, unknown files, and quotes that a
     'findings[3]: severity must be one of critical, high, medium, low, info',
     'findings[4]: evidence "}" is too short: quote at least 8 non-space characters of code',
     'findings[5]: evidence "emit Withdrawn(amount)" is not in src/Vault.ts near line 2, or in its diff. Quote code that you read.',
+    'findings[6]: needs_decision needs the decision, in one sentence',
   ])
 })
 

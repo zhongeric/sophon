@@ -46,9 +46,13 @@ export async function verifySignature(secret: string, body: string, signature: s
   if (!signature?.startsWith('sha256=')) return false
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { hash: 'SHA-256', name: 'HMAC' }, false, ['sign'])
   const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(body)))
-  const expected = `sha256=${[...mac].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
-  if (expected.length !== signature.length) return false
+  return sameSecret(signature, `sha256=${[...mac].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`)
+}
+
+/** Compares a presented secret with the expected one in time that does not depend on where they differ. */
+export function sameSecret(presented: string, expected: string): boolean {
+  if (presented.length !== expected.length) return false
   let difference = 0
-  for (let index = 0; index < expected.length; index++) difference |= expected.charCodeAt(index) ^ signature.charCodeAt(index)
+  for (let index = 0; index < expected.length; index++) difference |= expected.charCodeAt(index) ^ presented.charCodeAt(index)
   return difference === 0
 }

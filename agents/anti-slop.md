@@ -27,7 +27,7 @@ Goal: remove AI residue and shipping noise. Use this checklist as a hard rule. E
 - Snapshot or golden tests that only freeze noise.
 - Tests that duplicate coverage without a distinct failure mode.
 - Over-mocked unit tests that never run the real path.
-- Vague Foundry test names (`test_stuff`, `test1`) instead of `test_{action}_{scenario}`.
+- Vague Foundry test names (`test_stuff`, `test1`) instead of `test_{action}_{scenario}`, or the branching tree form `test_{Function}_{WhenCondition}_{outcome}`.
 
 ## Docs and PR text
 
