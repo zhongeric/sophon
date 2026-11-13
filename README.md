@@ -140,7 +140,8 @@ Each run writes:
 - A Cloudflare account on **Workers Paid**. The Worker bundle is 5.3 MB gzipped (the Free plan allows 3 MB),
   and a run uses up to 5 minutes of CPU per alarm (`limits.cpu_ms`).
 - A GitHub fine-grained token for the target repositories with: Contents read and write, Pull requests read and
-  write, Issues read and write, Checks read, Commit statuses read.
+  write, Issues read and write, Actions read, Commit statuses read. Fine-grained tokens cannot call the Checks API,
+  so the run reads CI from GitHub Actions workflow runs and commit statuses.
 - `.agent-factory.json` on each repository's base branch. On Cloudflare only `stack`, `protect` and
   `answerers` matter; the checks are CI.
 - CI that runs on pushes to `factory/**` branches, for example `on: { push: { branches: ['factory/**'] } }`.
@@ -162,8 +163,8 @@ Set `ALLOWED_USERS` in `wrangler.jsonc` to the GitHub logins that may start runs
 The webhook is optional. Without it, start runs with `npm run remote` (below); the run still picks up your
 `/answer` comments and CI results by polling. With it, `/review` comments start runs and answers take effect at
 once: add a webhook to each repository with payload URL `https://<worker>/github/webhook`, content type
-`application/json`, the `GITHUB_WEBHOOK_SECRET`, and the events Issue comments, Pull requests, Check suites,
-Check runs and Statuses.
+`application/json`, the `GITHUB_WEBHOOK_SECRET`, and the events Issue comments, Pull requests, Workflow runs
+and Statuses.
 
 ### Use
 

@@ -38,6 +38,7 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
     await sendWebhook(worker.url, secret, 'issue_comment', comment('eric', '/answer\nQ1: b'))
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/, done.body)
+    assert.match(done.body, /CI \(push\): pass/)
     assert.match(done.body, /May sub return a negative number\? \*\*No, throw an error\*\*/)
     assert.equal(mock.fileAt(`refs/heads/factory/${started.run}`, 'src/math.ts'), fixed)
 
@@ -90,6 +91,37 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/)
     assert.match(done.body, /May sub return a negative number\? \*\*Yes, return -2\*\* \(recommended\)/)
+  } finally {
+    worker.stop()
+    mock.close()
+  }
+})
+
+test('on Cloudflare, a missing permission stops the run at once, and resume continues it from the ledger', { timeout: 180_000 }, async () => {
+  const repo = fixtureRepo()
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  mock.state.ciStatus = 403
+  const worker = await startWorker(vars(mock))
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}`
+  const admin = { authorization: 'Bearer admin' }
+  const modelCalls = () => mock.state.requests.filter((route) => route.startsWith('POST /v1/')).length
+  try {
+    await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin, method: 'POST' })
+    await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
+    mock.comment('eric', '/answer recommended')
+    const stopped = await until(() => mock.state.comments.find((entry) => entry.body.includes('stopped run')), 120_000, describe)
+    assert.match(stopped.body, /HTTP 403.* Check the permissions of GITHUB_TOKEN\. .*npm run remote -- resume acme\/app#7/)
+    assert.equal(mock.state.requests.filter((route) => route.endsWith('/actions/runs')).length, 1)
+
+    // The webhook path does not restart a stopped run. Only the admin route does.
+    await sendWebhook(worker.url, secret, 'issue_comment', comment('eric', '/answer recommended'))
+    const calls = modelCalls()
+    mock.state.ciStatus = 200
+    assert.deepEqual(await (await fetch(`${worker.url}/runs/acme/app/7/resume`, { headers: admin, method: 'POST' })).json(), { resumed: true })
+    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
+    assert.match(done.body, /agent-factory: PASS/)
+    // Only the intent check was left: the reviewers and patch agents did not run again.
+    assert.ok(modelCalls() - calls <= 2, `${modelCalls() - calls} model calls after resume`)
   } finally {
     worker.stop()
     mock.close()

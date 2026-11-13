@@ -27,6 +27,8 @@ export async function mockServices(
     commits: new Map<string, { tree: string; parents: string[]; message: string }>(),
     refs: new Map<string, string>(),
     requests: [] as string[],
+    /** The HTTP status of the workflow-runs endpoint, so that a test can withhold the Actions permission. */
+    ciStatus: 200,
   }
   let ids = 0
   const comment = (login: string, body: string): MockComment => {
@@ -145,11 +147,12 @@ export async function mockServices(
         state.refs.set(`refs/${url.pathname.slice(`${api}/git/refs/`.length)}`, JSON.parse(body.toString()).sha)
         return json(response, 200, {})
       }
-      if (route.endsWith('/check-runs'))
-        return json(response, 200, {
-          check_runs: Number(url.searchParams.get('page') ?? 1) === 1 ? [{ conclusion: 'success', html_url: 'https://ci.example.com/1', name: 'ci', status: 'completed' }] : [],
-          total_count: 1,
-        })
+      if (route === `GET ${api}/actions/runs` && state.ciStatus !== 200) return json(response, state.ciStatus, { message: 'Resource not accessible by personal access token' })
+      if (route === `GET ${api}/actions/runs`) {
+        const run = (id: number, conclusion: string) => ({ conclusion, event: 'push', html_url: `https://github.com/ci/${id}`, id, name: 'CI', status: 'completed', workflow_id: 1 })
+        // An earlier failed run of the same workflow and event, then its successful rerun: only the latest counts.
+        return json(response, 200, { total_count: 2, workflow_runs: Number(url.searchParams.get('page') ?? 1) === 1 ? [run(1, 'failure'), run(2, 'success')] : [] })
+      }
       if (route.endsWith('/status')) return json(response, 200, { statuses: [] })
       json(response, 404, { message: `mock has no route ${route}` })
     } catch (error) {

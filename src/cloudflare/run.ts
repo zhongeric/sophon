@@ -79,10 +79,19 @@ export class PullRequestRuns extends DurableObject<Env> {
     return { run, started: true }
   }
 
-  /** Wakes a paused run, for example after an answer or a CI result. */
-  async resume(): Promise<boolean> {
-    const active = this.active()
-    if (!active || active.state !== 'paused') return false
+  /**
+   * Wakes a paused run, for example after an answer or a CI result. With \`afterError\`, also restarts a run that
+   * stopped on an error, from its ledger, once the cause is fixed. Only the admin route passes it.
+   */
+  async resume(options: { afterError?: boolean } = {}): Promise<boolean> {
+    const latest = this.ctx.storage.sql.exec<RunRow>('select * from factory_runs order by created desc limit 1').toArray()[0]
+    if (!latest) return false
+    if (latest.state === 'error' && options.afterError) {
+      const ledger = sqlLedger(this.ctx.storage.sql, latest.run)
+      ledger.put('attempts', 0)
+      ledger.put('restarts', 0)
+      this.setState(latest.run, 'queued', 'resumed after an error')
+    } else if (latest.state !== 'paused') return false
     await this.ctx.storage.setAlarm(Date.now())
     return true
   }
@@ -133,9 +142,14 @@ export class PullRequestRuns extends DurableObject<Env> {
         const attempts = (ledger.get<number>('attempts') ?? 0) + 1
         ledger.put('attempts', attempts)
         console.error(`[${row.run}] attempt ${attempts} failed`, error)
-        if (error instanceof StopError || attempts >= maxAttempts) {
+        // A refused credential or permission does not fix itself: stop at once instead of retrying.
+        const permanent = error instanceof StopError || (error instanceof GitHubError && (error.status === 401 || error.status === 403))
+        if (permanent || attempts >= maxAttempts) {
           this.setState(row.run, 'error', message)
-          await comments.post(`agent-factory stopped run \`${row.run}\`: ${message}`).catch(() => undefined)
+          const hint = error instanceof GitHubError ? ' Check the permissions of GITHUB_TOKEN.' : ''
+          await comments
+            .post(`agent-factory stopped run \`${row.run}\`: ${message}${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${request.owner}/${request.repo}#${request.pr}\`.`)
+            .catch(() => undefined)
         } else {
           this.setState(row.run, 'queued', `attempt ${attempts} failed: ${message}`)
           next = Date.now() + retryMs

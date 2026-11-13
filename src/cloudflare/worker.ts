@@ -20,7 +20,7 @@ export default {
       return new Response((await runs.report()) ?? 'no report yet', { headers: { 'content-type': 'text/markdown; charset=utf-8' } })
     if (request.method === 'GET' && !action) return Response.json(await runs.status())
     // Starts and resumes for callers without the webhook, such as npm run remote.
-    if (request.method === 'POST' && action === 'resume') return accepted({ resumed: await runs.resume() })
+    if (request.method === 'POST' && action === 'resume') return accepted({ resumed: await runs.resume({ afterError: true }) })
     if (request.method === 'POST' && !action) {
       const options = (await request.json().catch(() => ({}))) as { ship?: boolean }
       return accepted(await runs.start({ by: allowedUsers(env)[0] ?? owner, owner, pr, repo, ship: options.ship === true }))
@@ -39,10 +39,11 @@ type Payload = {
   label?: { name: string }
   check_suite?: { head_branch: string | null; pull_requests: { number: number }[] }
   check_run?: { check_suite: { head_branch: string | null; pull_requests: { number: number }[] } }
+  workflow_run?: { head_branch: string | null; pull_requests: { number: number }[] }
   branches?: { name: string }[]
 }
 
-/** GitHub webhooks: `/review` and the agent-review label start a run; `/answer` and CI results wake a paused run. */
+/** GitHub webhooks: `/review` and the agent-review label start a run; `/answer` and CI results (workflow runs, statuses) wake a paused run. */
 async function webhook(request: Request, env: Env): Promise<Response> {
   const body = await request.text()
   if (!(await verifySignature(env.GITHUB_WEBHOOK_SECRET, body, request.headers.get('x-hub-signature-256')))) return new Response('bad signature', { status: 401 })
@@ -61,8 +62,8 @@ async function webhook(request: Request, env: Env): Promise<Response> {
   }
   if (event === 'pull_request' && payload.action === 'labeled' && payload.label?.name === 'agent-review' && payload.pull_request && allowed(payload.sender?.login))
     return accepted(await pullRequest(env, owner, repo, payload.pull_request.number).start({ by: payload.sender!.login, owner, pr: payload.pull_request.number, repo, ship: false }))
-  if (event === 'check_suite' || event === 'check_run' || event === 'status') {
-    const suite = payload.check_suite ?? payload.check_run?.check_suite
+  if (event === 'workflow_run' || event === 'check_suite' || event === 'check_run' || event === 'status') {
+    const suite = payload.workflow_run ?? payload.check_suite ?? payload.check_run?.check_suite
     const branches = suite ? [suite.head_branch ?? ''] : (payload.branches ?? []).map((branch) => branch.name)
     const prs = new Set([...(suite?.pull_requests ?? []).map((pull) => pull.number), ...branches.flatMap((branch) => /^factory\/pr-(\d+)-/.exec(branch)?.[1] ?? []).map(Number)])
     for (const pr of prs) await pullRequest(env, owner, repo, pr).resume()
