@@ -81,6 +81,13 @@ test('a comment POST does not retry a 502 or a network error', async () => {
   assert.equal(lost.calls.length, 1)
 })
 
+test('a comment POST on a repository with a Git Data name does not retry a 502', async () => {
+  const { calls, client, waits } = scripted(answer(502), answer(201))
+  await assert.rejects(client.json('POST', '/repos/git/refs/issues/7/comments', { body: 'x' }), { status: 502 })
+  assert.equal(calls.length, 1)
+  assert.deepEqual(waits, [])
+})
+
 test('the GraphQL POST does not retry a 502', async () => {
   const { calls, client, waits } = scripted(answer(502), answer(200, { data: {} }))
   await assert.rejects(client.graphql('query { viewer { login } }', {}), { status: 502 })
@@ -117,12 +124,46 @@ test('a 429 with x-ratelimit-remaining 0 is retried', async () => {
   assert.deepEqual(waits, [1_000])
 })
 
-test('a rate limit with x-ratelimit-reset waits until the reset time', async () => {
-  const reset = Math.ceil(Date.now() / 1_000) + 10
-  const { client, waits } = scripted(answer(403, {}, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(reset) }), answer(200))
-  await client.json('GET', '/repos/acme/app')
-  assert.equal(waits.length, 1)
-  assert.ok(waits[0]! > 8_000 && waits[0]! <= 11_000, `waited ${waits[0]} ms`)
+test('an exhausted rate limit with a reset more than 60 seconds away throws at once', async (t) => {
+  t.mock.method(Date, 'now', () => 1_700_000_000_000)
+  for (const status of [403, 429]) {
+    const { calls, client, waits } = scripted(answer(status, {}, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1700000120' }), answer(200))
+    await assert.rejects(client.json('GET', '/repos/acme/app'), { rateLimited: true, status })
+    assert.equal(calls.length, 1)
+    assert.deepEqual(waits, [])
+  }
+})
+
+test('an exhausted rate limit waits until the reset, with the backoff as the minimum', async (t) => {
+  t.mock.method(Date, 'now', () => 1_700_000_000_000)
+  for (const [reset, wait] of [['1700000005', 5_000], ['1699999999', 1_000], ['invalid', 1_000]] as const) {
+    const { calls, client, waits } = scripted(answer(403, {}, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': reset }), answer(200, { ok: true }))
+    assert.deepEqual(await client.json('GET', '/repos/acme/app'), { ok: true })
+    assert.equal(calls.length, 2)
+    assert.deepEqual(waits, [wait])
+  }
+})
+
+test('retry-after takes precedence over an exhausted rate-limit reset', async (t) => {
+  t.mock.method(Date, 'now', () => 1_700_000_000_000)
+  const { calls, client, waits } = scripted(answer(403, {}, { 'retry-after': '5', 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1700000120' }), answer(200, { ok: true }))
+  assert.deepEqual(await client.json('GET', '/repos/acme/app'), { ok: true })
+  assert.equal(calls.length, 2)
+  assert.deepEqual(waits, [5_000])
+})
+
+test('a rate limit with retry-after 0 still waits the backoff', async () => {
+  const { calls, client, waits } = scripted(answer(403, {}, { 'retry-after': '0' }), answer(429, {}, { 'retry-after': '0' }), answer(200, { ok: true }))
+  assert.deepEqual(await client.json('GET', '/repos/acme/app'), { ok: true })
+  assert.equal(calls.length, 3)
+  assert.deepEqual(waits, [1_000, 2_000])
+})
+
+test('invalid retry-after values use the backoff', async () => {
+  const { calls, client, waits } = scripted(answer(403, {}, { 'retry-after': 'invalid' }), answer(429, {}, { 'retry-after': 'Infinity' }), answer(200, { ok: true }))
+  assert.deepEqual(await client.json('GET', '/repos/acme/app'), { ok: true })
+  assert.equal(calls.length, 3)
+  assert.deepEqual(waits, [1_000, 2_000])
 })
 
 test('a comment POST retries a rate limit', async () => {

@@ -31,27 +31,28 @@ const maxRateLimitWaitMs = 60_000
 /** The server errors that the client retries. Other 5xx answers fail at once. */
 const transientStatuses = new Set([500, 502, 503, 504])
 /** The Git Data object writes. A repeated write makes no duplicate, so the client retries them. */
-const gitObjectPath = /\/git\/(blobs|trees|commits|refs)(\/|$)/
+const gitObjectPath = /^\/repos\/[^/]+\/[^/]+\/git\/(blobs|trees|commits|refs)(\/|$)/
 
-export type GitHubOptions = {
+type GitHubOptions = {
   /** Waits between tries. Tests replace it so that they do not wait in real time. */
   sleep?: (ms: number) => Promise<void>
 }
 
 const backoff = (tryNumber: number) => backoffMs * 2 ** (tryNumber - 1)
 
-/** The wait in milliseconds that a rate-limit answer asks for, or undefined when the answer is not a rate limit. */
+/** The wait in milliseconds that a rate-limit answer gives, or undefined when the answer is not a rate limit. */
 function rateLimitWait(response: Response, tryNumber: number): number | undefined {
   if (response.status !== 403 && response.status !== 429) return undefined
   const retryAfter = response.headers.get('retry-after')
   const exhausted = response.headers.get('x-ratelimit-remaining') === '0'
   if (retryAfter === null && !exhausted) return undefined
-  const seconds = Number(retryAfter)
-  if (retryAfter !== null && retryAfter.trim() !== '' && Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000
-  const reset = response.headers.get('x-ratelimit-reset')
-  const resetSeconds = Number(reset)
-  if (exhausted && reset !== null && reset.trim() !== '' && Number.isFinite(resetSeconds)) return Math.max(0, resetSeconds * 1_000 - Date.now())
-  return backoff(tryNumber)
+  if (retryAfter === null && exhausted) {
+    const reset = Number(response.headers.get('x-ratelimit-reset'))
+    if (Number.isFinite(reset)) return Math.max(backoff(tryNumber), reset * 1_000 - Date.now())
+  }
+  // The minimum wait is the backoff, also when retry-after gives 0 seconds.
+  const seconds = Number(retryAfter ?? '')
+  return Math.max(backoff(tryNumber), Number.isFinite(seconds) ? seconds * 1_000 : 0)
 }
 
 export function github(token: string, api = 'https://api.github.com', fetcher: typeof fetch = fetch, options: GitHubOptions = {}): GitHub {
