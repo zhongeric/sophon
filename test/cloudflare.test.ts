@@ -203,7 +203,11 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
   }
 })
 
-test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, runs the review loop there, takes its fixes, and marks the PR ready', { timeout: 300_000 }, async () => {
+for (const ciEvent of ['workflow_run', 'empty_workflow_run', 'status'] as const) {
+  test(`on Cloudflare, /develop on an issue builds on the machine, opens a PR, runs the review loop there, takes its fixes, and marks the PR ready (${ciEvent})`, { timeout: 300_000 }, () => developmentWakeup(ciEvent))
+}
+
+async function developmentWakeup(ciEvent: 'workflow_run' | 'empty_workflow_run' | 'status') {
   const { repo } = developRepo({
     checks: { machine: 'test -f .setup-done' },
     setup: 'touch .setup-done',
@@ -212,20 +216,44 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
   })
   const issues = { 5: { body: 'Add sub and mul next to add, with tests.', title: 'Add sub and mul' } }
   const mock = await mockServices(repo, { botLogin: 'factory-bot', issues, name: 'app', owner: 'acme', script: developScript({ reviewFix: true }) })
+  mock.state.ciPending = true
   // FACTORY_CONTAINERS=1 runs the build machine as a real local container (it needs Docker). Else the mock is the machine.
   const containers = process.env.FACTORY_CONTAINERS === '1'
-  const worker = await startWorker(containers ? vars(mock) : { ...vars(mock), MACHINE_URL: `${mock.url}/machine` }, { containers })
+  const bindings = { ...vars(mock), PAUSE_POLL_SECONDS: '3600' }
+  const worker = await startWorker(containers ? bindings : { ...bindings, MACHINE_URL: `${mock.url}/machine` }, { containers })
   const on = (number: number) => mock.state.comments.filter((entry) => entry.issue === number)
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 160)]))}\nworker:\n${worker.output().slice(-4000)}`
+  const status = async () => (await (await fetch(`${worker.url}/runs/acme/app/5`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: { run: string; state: string; note: string }[] }
   try {
-    const issueComment = { action: 'created', comment: { body: '/develop', user: { login: 'eric' } }, issue: { number: 5 }, repository }
+    const refused = await fetch(`${worker.url}/develop/acme/app/5`, {
+      method: 'POST', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, body: JSON.stringify({ parallel: 0 }),
+    })
+    assert.equal(refused.status, 400)
+    assert.match(await refused.text(), /--parallel must be an integer of 1 or more/)
+    assert.deepEqual((await status()).runs, [])
+    assert.equal(mock.state.turns.length, 0)
+
+    // An invalid comment option uses the default and does not stop the run without a comment.
+    const issueComment = { action: 'created', comment: { body: '/develop --parallel two', user: { login: 'eric' } }, issue: { number: 5 }, repository }
     const started = (await (await sendWebhook(worker.url, secret, 'issue_comment', issueComment)).json()) as { run: string; started: boolean }
     assert.equal(started.started, true)
     const asked = await until(() => on(5).find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
     assert.match(asked.body, /Is this the ask\?/)
+    await until(async () => (await status()).runs.find((run) => run.state === 'paused'), 30_000, describe)
     mock.comment('eric', '/answer recommended', 5)
     await sendWebhook(worker.url, secret, 'issue_comment', { ...issueComment, comment: { body: '/answer recommended', user: { login: 'eric' } } })
 
+    await until(async () => (await status()).runs.find((run) => run.state === 'paused' && run.note.startsWith('waiting for CI')), 120_000, describe)
+    const opened = [...mock.state.pulls].find(([, entry]) => entry.head === 'factory/dev-add-sub-mul')
+    assert.ok(opened, describe())
+    mock.state.ciPending = false
+    const payload = ciEvent === 'status'
+      ? { branches: [{ name: opened[1].head }], repository, state: 'success' }
+      : { action: 'completed', repository, workflow_run: { head_branch: opened[1].head, pull_requests: ciEvent === 'workflow_run' ? [{ number: opened[0] }] : [] } }
+    const woke = await sendWebhook(worker.url, secret, ciEvent === 'status' ? 'status' : 'workflow_run', payload)
+    assert.deepEqual(await woke.json(), { woke: [opened[0]] })
+
+    // CI and the end of the review must wake this run before its one-hour poll.
     const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
     assert.match(done.body, /^# Development run: READY/, done.body)
     const [number, pull] = [...mock.state.pulls].find(([, entry]) => entry.head === 'factory/dev-add-sub-mul')!
@@ -247,10 +275,9 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     // The review loop ran as a review run of the new PR, and the report went to the PR and the issue.
     assert.ok(on(number).some((entry) => entry.body.startsWith('### agent-factory: PASS')), describe())
     assert.ok(on(number).some((entry) => entry.body.startsWith('# Development run: READY')))
-    const status = (await (await fetch(`${worker.url}/runs/acme/app/5`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: { run: string; state: string }[] }
-    assert.deepEqual(status.runs.map((run) => run.state), ['passed'])
+    assert.deepEqual((await status()).runs.map((run) => run.state), ['passed'])
   } finally {
     worker.stop()
     mock.close()
   }
-})
+}

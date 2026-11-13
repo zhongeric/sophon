@@ -1,8 +1,8 @@
-import { readCi } from '../core/ci.ts'
+import { logTailChars, readCi } from '../core/ci.ts'
 import type { PullRequests } from '../core/platform.ts'
 import type { GitHub } from './github.ts'
 
-const logTailChars = 6_000
+const reason = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 /** The PRs and CI of a repository through the GitHub REST and GraphQL APIs. */
 export function githubPulls(gh: GitHub, owner: string, repo: string, baseRef: string): PullRequests {
@@ -26,10 +26,23 @@ export function githubPulls(gh: GitHub, owner: string, repo: string, baseRef: st
     async failureLog(job) {
       if (job.run === null) return `No log: see ${job.url}`
       type Job = { id: number; name: string; conclusion: string | null }
-      const { jobs } = await gh.json<{ jobs: Job[] }>('GET', `${api}/actions/runs/${job.run}/jobs?per_page=100`)
+      // The run can be in progress, GitHub can have deleted the log, or the token can have no Actions read permission.
+      let jobs: Job[]
+      try {
+        jobs = (await gh.json<{ jobs: Job[] }>('GET', `${api}/actions/runs/${job.run}/jobs?per_page=100`)).jobs
+      } catch (error) {
+        return `No log: see ${job.url} (${reason(error)})`.slice(0, logTailChars)
+      }
       const logs: string[] = []
-      for (const failed of jobs.filter((entry) => entry.conclusion === 'failure'))
-        logs.push(`### ${failed.name}\n${(await (await gh.raw(`${api}/actions/jobs/${failed.id}/logs`, 'application/vnd.github+json')).text()).slice(-logTailChars)}`)
+      for (const failed of jobs.filter((entry) => entry.conclusion === 'failure')) {
+        let log: string
+        try {
+          log = (await (await gh.raw(`${api}/actions/jobs/${failed.id}/logs`, 'application/vnd.github+json')).text()).slice(-logTailChars)
+        } catch (error) {
+          log = `No log: see ${job.url} (${reason(error)})`.slice(0, logTailChars)
+        }
+        logs.push(`### ${failed.name}\n${log}`)
+      }
       return logs.join('\n\n') || `No failed job log: see ${job.url}`
     },
   }

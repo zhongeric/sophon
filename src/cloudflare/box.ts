@@ -1,6 +1,7 @@
 import type { Machine } from '../core/checks.ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { tar, type TarEntry } from './tar.ts'
+import { base64 } from './trees.ts'
 
 /** The result of one command: its exit code, or null when the host killed it, and the end of its output. */
 export type BoxResult = { exit_code: number | null; output: string }
@@ -17,7 +18,7 @@ export type Box = {
 
 const outputTailChars = 20_000
 /** The environment of every command: the toolchain on PATH, nothing from the host. */
-export const boxEnv = {
+const boxEnv = {
   HOME: '/root',
   LANG: 'C.UTF-8',
   PATH: '/root/.foundry/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
@@ -78,9 +79,7 @@ export function httpBox(url: string): Box {
   return {
     async start() {},
     async exec(argv, { cwd, env, stdin, timeoutMs }) {
-      let binary = ''
-      for (let offset = 0; stdin && offset < stdin.length; offset += 0x8000) binary += String.fromCharCode(...stdin.subarray(offset, offset + 0x8000))
-      const body = { argv, cwd, env, stdin: stdin ? btoa(binary) : null, timeoutMs }
+      const body = { argv, cwd, env, stdin: stdin ? base64(stdin) : null, timeoutMs }
       const response = await fetch(url, { body: JSON.stringify(body), headers: { 'content-type': 'application/json' }, method: 'POST' })
       if (!response.ok) throw new Error(`the machine at ${url} answered HTTP ${response.status}: ${await response.text()}`)
       return (await response.json()) as BoxResult

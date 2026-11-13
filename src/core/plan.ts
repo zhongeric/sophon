@@ -166,8 +166,14 @@ export const submitPlan: Contracts.HostTool = {
   },
 }
 
-/** Refuses a plan without its four parts, its required sections, or tasks that the host can schedule. */
-export function checkPlan(input: unknown, sections: string[]): Plan {
+/** A task file without a leading `./` and without repeated slashes, so that it matches the paths of the repository. */
+const normalizeFile = (path: string) => path.trim().replace(/\/{2,}/g, '/').replace(/^(\.\/)+(?=.)/, '')
+
+/**
+ * Refuses a plan without its four parts, its required sections, or tasks that the host can schedule.
+ * Refuses task files that are protected. Returns the plan with the task files normalized.
+ */
+export function checkPlan(input: unknown, sections: string[], isProtectedPath: (path: string) => boolean = () => false): Plan {
   const plan = input as Plan
   const filled = (list: unknown) => Array.isArray(list) && list.length > 0 && list.every((item) => typeof item === 'string' && item.trim() !== '')
   const problems: string[] = []
@@ -177,7 +183,7 @@ export function checkPlan(input: unknown, sections: string[]): Plan {
   if (!Array.isArray(plan?.done) || !plan.done.some((item) => item?.check?.trim() && item.command?.trim())) problems.push('done needs at least one check with a command')
   for (const name of sections)
     if (!plan?.sections?.some((section) => section.name.trim().toLowerCase() === name.toLowerCase() && section.text.trim())) problems.push(`the plan needs the section "${name}"`)
-  const tasks = Array.isArray(plan?.tasks) ? plan.tasks : []
+  const tasks = (Array.isArray(plan?.tasks) ? plan.tasks : []).map((task) => (filled(task?.files) ? { ...task, files: task.files.map(normalizeFile) } : task))
   if (tasks.length === 0 || tasks.length > maxTasks) problems.push(`give 1 to ${maxTasks} tasks`)
   const ids = tasks.map((task) => task?.id)
   for (const task of tasks) {
@@ -185,13 +191,17 @@ export function checkPlan(input: unknown, sections: string[]): Plan {
     if (ids.indexOf(task.id) !== ids.lastIndexOf(task.id)) problems.push(`task "${task.id}": the ID is not unique`)
     if (!task.title?.trim() || !task.work?.trim()) problems.push(`task "${task.id}": title and work are required`)
     if (!filled(task.files)) problems.push(`task "${task.id}": files is empty`)
-    else for (const path of task.files) if (/^\/|(^|\/)\.\.(\/|$)/.test(path)) problems.push(`task "${task.id}": "${path}" must be relative to the repository root, without ..`)
+    else
+      for (const path of task.files) {
+        if (/^\/|(^|\/)\.\.?(\/|$)/.test(path)) problems.push(`task "${task.id}": "${path}" must be relative to the repository root, without . or .., and not the root`)
+        else if (isProtectedPath(path)) problems.push(`task "${task.id}": "${path}" is protected, and only the user can change it`)
+      }
     if (!Array.isArray(task.depends_on)) problems.push(`task "${task.id}": depends_on must be a list`)
     else for (const id of task.depends_on) if (!ids.includes(id)) problems.push(`task "${task.id}": depends on the unknown task "${id}"`)
   }
   if (problems.length === 0 && waves(tasks, maxTasks).flat().length < tasks.length) problems.push('the tasks depend on each other in a cycle')
   if (problems.length > 0) throw new Error(problems.join('\n'))
-  return plan
+  return { ...plan, tasks }
 }
 
 /** True when `path` is the scope entry or inside it. */

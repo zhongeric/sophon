@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { commandChecker, parseRepoConfig, type RepoConfig } from '../core/checks.ts'
-import type { AgentStore, Files, Guides, PullRequests } from '../core/platform.ts'
+import type { AgentStore, Checker, Files, Guides, PullRequests } from '../core/platform.ts'
 import type { Credentials } from '../core/providers.ts'
 import type { Channel } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
@@ -120,6 +120,8 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
   const branchesDir = join(dir, 'branches')
   mkdirSync(branchesDir, { recursive: true })
   const host = { credentials: options.credentials, dispatch: options.dispatch, log: options.log, module: options.module }
+  // One checker for each worktree, so that its setup runs one time in this process and not again for each build phase.
+  const checkers = new Map<string, Checker>()
   return {
     ...host,
     dir,
@@ -130,7 +132,11 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
     channel: options.channel,
     branches: gitBranches(options.repo, branchesDir),
     pulls: options.pulls,
-    checker: (branch) => commandChecker(branch, input.config, localMachine(worktreePath(branchesDir, branch.name))),
+    checker(branch) {
+      const checker = checkers.get(branch.name) ?? commandChecker(branch, input.config, localMachine(worktreePath(branchesDir, branch.name)))
+      checkers.set(branch.name, checker)
+      return checker
+    },
     async review({ runId, ask, head, full, pr }) {
       const source = { repo: options.repo, base: input.base, head }
       const run = await nodeRun({ config: input.config, runId, runsDir: options.runsDir, source })

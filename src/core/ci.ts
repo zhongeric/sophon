@@ -4,6 +4,9 @@ export type CiJob = { name: string; url: string; done: boolean; ok: boolean; run
 type WorkflowRun = { id: number; workflow_id: number; event: string; name: string; status: string; conclusion: string | null; html_url: string; created_at: string }
 type Status = { context: string; state: string; target_url: string | null; created_at: string }
 
+/** The most characters of a failed CI log that a builder gets. */
+export const logTailChars = 6_000
+
 const passing = new Set(['success', 'neutral', 'skipped'])
 const pageSize = 100
 

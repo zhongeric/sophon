@@ -30,55 +30,50 @@ function agent(context: DevelopContext, id: string, role: Role, model: ModelChoi
 const readerWorkspace = (context: DevelopContext, tree: FileSystem.FileSystem, review: Record<string, string>) =>
   createWorkspace({ repo: readOnly(guard(tree)), review: { '/ask.md': context.ask, ...decisionsFile(context.host.ledger), ...review }, guides: context.guides.mounts })
 
-/** A read-only agent that reads the ask and the repository, and returns its summary, the route and its questions. */
-export async function intake(context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem): Promise<Intake> {
-  const workspace = await readerWorkspace(context, tree, {})
-  const tools = submitOnce(context.host, `output:${id}`, submitIntake, async (input) => checkIntake(input))
-  const prompt = [
-    'Read this new ask and the repository. Nobody has planned or written code yet.',
-    '',
-    '- The ask: /review/ask.md',
-    '- The repository: /repo, at the base commit',
-    '',
-    'Call submit_intake one time.',
-  ].join('\n')
-  return runTurn(context.host, agent(context, id, roles.intake, model, workspace, tools), prompt, 'submit_intake')
+/** One read-only agent on the base tree. It reads the files in `lines`, and calls `tool` one time with output that `check` accepts. */
+type Reader<T> = { role: Role; tool: Contracts.HostTool; check: (input: unknown) => T; lines: string[]; review?: Record<string, string> }
+
+async function reader<T>(context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem, spec: Reader<T>): Promise<T> {
+  const workspace = await readerWorkspace(context, tree, spec.review ?? {})
+  const tools = submitOnce(context.host, `output:${id}`, spec.tool, async (input) => spec.check(input))
+  const prompt = [...spec.lines, '- The repository: /repo, at the base commit', '', `Call ${spec.tool.name} one time.`].join('\n')
+  return runTurn(context.host, agent(context, id, spec.role, model, workspace, tools), prompt, spec.tool.name)
 }
+
+/** A read-only agent that reads the ask and the repository, and returns its summary, the route and its questions. */
+export const intake = (context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem): Promise<Intake> =>
+  reader(context, id, model, tree, {
+    role: roles.intake,
+    tool: submitIntake,
+    check: checkIntake,
+    lines: ['Read this new ask and the repository. Nobody has planned or written code yet.', '', '- The ask: /review/ask.md'],
+  })
 
 /** A read-only agent that writes the spec of a larger change, and the decisions that the user can overrule. */
-export async function writeSpec(context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem): Promise<Spec> {
-  const workspace = await readerWorkspace(context, tree, {})
-  const tools = submitOnce(context.host, `output:${id}`, submitSpec, async (input) => checkSpec(input))
-  const prompt = [
-    'Write the spec of this confirmed ask.',
-    '',
-    '- The ask: /review/ask.md',
-    '- Decisions of the user: /review/decisions.md',
-    '- The repository: /repo, at the base commit',
-    '',
-    'Call submit_spec one time.',
-  ].join('\n')
-  return runTurn(context.host, agent(context, id, roles.spec, model, workspace, tools), prompt, 'submit_spec')
-}
+export const writeSpec = (context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem): Promise<Spec> =>
+  reader(context, id, model, tree, {
+    role: roles.spec,
+    tool: submitSpec,
+    check: checkSpec,
+    lines: ['Write the spec of this confirmed ask.', '', '- The ask: /review/ask.md', '- Decisions of the user: /review/decisions.md'],
+  })
 
 /** The planner: one read-only agent that writes the four plan parts, the profile sections and the tasks (D7). */
-export async function plan(context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem, sections: string[], spec: string | null): Promise<Plan> {
-  const review = { '/plan-sections.txt': sections.join('\n'), ...(spec ? { '/spec.md': spec } : {}) }
-  const workspace = await readerWorkspace(context, tree, review)
-  const tools = submitOnce(context.host, `output:${id}`, submitPlan, async (input) => checkPlan(input, sections))
-  const prompt = [
-    'Plan this confirmed ask.',
-    '',
-    '- The ask: /review/ask.md',
-    '- Decisions of the user: /review/decisions.md',
-    ...(spec ? ['- The spec: /review/spec.md'] : []),
-    `- Required sections: /review/plan-sections.txt (${sections.length ? sections.join(', ') : 'none'})`,
-    '- The repository: /repo, at the base commit',
-    '',
-    'Call submit_plan one time.',
-  ].join('\n')
-  return runTurn(context.host, agent(context, id, roles.planner, model, workspace, tools), prompt, 'submit_plan')
-}
+export const plan = (context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem, sections: string[], spec: string | null): Promise<Plan> =>
+  reader(context, id, model, tree, {
+    role: roles.planner,
+    tool: submitPlan,
+    check: (input) => checkPlan(input, sections, (path) => isProtected(context.config, path)),
+    review: { '/plan-sections.txt': sections.join('\n'), ...(spec ? { '/spec.md': spec } : {}) },
+    lines: [
+      'Plan this confirmed ask.',
+      '',
+      '- The ask: /review/ask.md',
+      '- Decisions of the user: /review/decisions.md',
+      ...(spec ? ['- The spec: /review/spec.md'] : []),
+      `- Required sections: /review/plan-sections.txt (${sections.length ? sections.join(', ') : 'none'})`,
+    ],
+  })
 
 export type BuildLog = { summary: string; changes: { path: string; why: string }[]; tests: string[]; blocked: string }
 
@@ -143,42 +138,74 @@ export type BuildTask = {
  * The host refuses a completed log with uncommitted work. A blocked log can report uncommitted work.
  */
 export async function build(context: DevelopContext, task: BuildTask): Promise<BuildLog> {
-  const { branch, checker } = task
+  const { branch } = task
   const startKey = `start:${task.turn.key}`
   const start = context.host.ledger.get<string>(startKey) ?? (await branch.head())
   context.host.ledger.put(startKey, start)
 
-  const tools: HostTools = {
+  const tools = buildTools(context, task, start)
+  const repo = allowFiles(guard(branch.tree, (path) => isProtected(context.config, path)), (path) => inScope(path, task.scope))
+  const decided = decisionsFile(context.host.ledger)
+  const workspace = await createWorkspace({ repo, review: { ...task.review, ...decided }, guides: context.guides.mounts })
+  const prompt = [task.prompt, ...decisionsLine(decided)].join('\n')
+  return runTurn(context.host, agent(context, task.id, roles.builder, task.model, workspace, tools, true), prompt, 'submit_build_log', task.turn)
+}
+
+/** The tools of one builder turn share one command queue. */
+export function buildTools(context: Pick<DevelopContext, 'host' | 'config'>, task: BuildTask, start: string) {
+  const { branch, checker } = task
+  // The tools that read or change the index of the branch, or run commands in its tree, run one at a time.
+  let queue: Promise<unknown> = Promise.resolve()
+  const serial = <T>(work: () => Promise<T>): Promise<T> => {
+    const next = queue.then(work)
+    queue = next.catch(() => undefined)
+    return next
+  }
+  const rootOnly = (name: string, call: { subagent: unknown }) => {
+    if (call.subagent) throw new Error(`only the root agent calls ${name}`)
+  }
+
+  const tools = {
     checkpoint: {
       definition: checkpointTool,
-      async call(input) {
-        const pending = await branch.pending()
-        if (pending.changed.length === 0 && pending.diff.trim() === '') throw new Error('nothing to commit')
-        // A command, for example a test run or the setup, can change files outside the scope of the builder.
-        const outside = [...pending.changed, ...pending.removed].filter((path) => !inScope(path, task.scope))
-        if (outside.length > 0)
-          throw new Error(`checkpoint refused: these changes are outside the files of the task, and only the user can commit them: ${outside.join(', ')}. If the task needs them, say so in blocked.`)
-        const problems = staticFindings(pending.diff, pending.changed, task.active).map(
-          (finding) => `${finding.location}: ${finding.title}. ${finding.recommendation}. Line: ${finding.evidence}`,
-        )
-        if (problems.length > 0) throw new Error(`checkpoint refused:\n${problems.join('\n')}`)
-        const message = String((input as { message?: unknown }).message ?? '').trim() || 'checkpoint'
-        await branch.commit(`${task.label}: ${message}`)
-        return { commit: (await branch.head()).slice(0, 12), files: pending.changed }
+      async call(input: unknown, call: { subagent: unknown }) {
+        rootOnly('checkpoint', call)
+        return serial(async () => {
+          const pending = await branch.pending()
+          if (pending.changed.length === 0 && pending.diff.trim() === '') throw new Error('nothing to commit')
+          // A command, for example a test run or the setup, can change files outside the scope of the builder, or protected files.
+          const touched = [...pending.changed, ...pending.removed]
+          const locked = touched.filter((path) => isProtected(context.config, path))
+          if (locked.length > 0)
+            throw new Error(`checkpoint refused: these files are protected, and only the user can change them: ${locked.join(', ')}. If the task needs them, say so in blocked.`)
+          const outside = touched.filter((path) => !inScope(path, task.scope))
+          if (outside.length > 0)
+            throw new Error(`checkpoint refused: these changes are outside the files of the task, and only the user can commit them: ${outside.join(', ')}. If the task needs them, say so in blocked.`)
+          const problems = staticFindings(pending.diff, pending.changed, task.active).map(
+            (finding) => `${finding.location}: ${finding.title}. ${finding.recommendation}. Line: ${finding.evidence}`,
+          )
+          if (problems.length > 0) throw new Error(`checkpoint refused:\n${problems.join('\n')}`)
+          const message = String((input as { message?: unknown }).message ?? '').trim() || 'checkpoint'
+          await branch.commit(`${task.label}: ${message}`)
+          return { commit: (await branch.head()).slice(0, 12), files: pending.changed }
+        })
       },
     },
     run_checks: {
       definition: runChecksTool,
-      async call() {
-        const changed = [...new Set([...(await branch.changedFiles(task.base, await branch.head())), ...(await branch.pending()).changed])]
-        const results = await checker.checks(changed)
-        return results.map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-toolOutputTailChars) }))
+      async call(_input: unknown, call: { subagent: unknown }) {
+        rootOnly('run_checks', call)
+        return serial(async () => {
+          const changed = [...new Set([...(await branch.changedFiles(task.base, await branch.head())), ...(await branch.pending()).changed])]
+          const results = await checker.checks(changed)
+          return results.map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-toolOutputTailChars) }))
+        })
       },
     },
     ...(context.config.tests && checker.tests
-      ? { run_tests: { definition: runTestsTool, call: (input: unknown) => callRunTests(branch, context.config, checker.tests!, input) } }
+      ? { run_tests: { definition: runTestsTool, call: (input: unknown) => serial(() => callRunTests(branch, context.config, checker.tests!, input)) } }
       : {}),
-    ...submitOnce(context.host, task.turn.key, submitBuildLog, async (input) => {
+    ...submitOnce(context.host, task.turn.key, submitBuildLog, (input) => serial(async () => {
       const log = input as BuildLog
       if (!log?.summary?.trim() || !Array.isArray(log.changes) || !Array.isArray(log.tests) || typeof log.blocked !== 'string')
         throw new Error('summary, changes, tests and blocked are required')
@@ -191,11 +218,7 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       const missing = changed.filter((path) => !log.changes.some((change) => change.path.replace(/^\/repo\//, '') === path))
       if (missing.length > 0) throw new Error(`list every changed file in changes: missing ${missing.join(', ')}`)
       return log
-    }),
+    })),
   }
-  const repo = allowFiles(guard(branch.tree, (path) => isProtected(context.config, path)), (path) => inScope(path, task.scope))
-  const decided = decisionsFile(context.host.ledger)
-  const workspace = await createWorkspace({ repo, review: { ...task.review, ...decided }, guides: context.guides.mounts })
-  const prompt = [task.prompt, ...decisionsLine(decided)].join('\n')
-  return runTurn(context.host, agent(context, task.id, roles.builder, task.model, workspace, tools, true), prompt, 'submit_build_log', task.turn)
+  return tools
 }

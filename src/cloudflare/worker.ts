@@ -1,12 +1,14 @@
+import { parseParallel } from '../core/plan.ts'
+import { StopError } from '../core/stop.ts'
 import { DevelopmentRuns, type DevelopRequest } from './develop.ts'
-import { sameSecret, verifySignature } from './github.ts'
+import { github, sameSecret, verifySignature } from './github.ts'
 import { allowedUsers, PullRequestRuns, type Env } from './run.ts'
+import { objectName } from './runs.ts'
 
 export { DevelopmentRuns, PullRequestRuns }
 
-const key = (owner: string, repo: string, number: number) => `${owner}/${repo}#${number}`.toLowerCase()
-const pullRequest = (env: Env, owner: string, repo: string, pr: number) => env.PULL_REQUESTS.get(env.PULL_REQUESTS.idFromName(key(owner, repo, pr)))
-const issue = (env: Env, owner: string, repo: string, number: number) => env.DEVELOPMENT_RUNS.get(env.DEVELOPMENT_RUNS.idFromName(key(owner, repo, number)))
+const pullRequest = (env: Env, owner: string, repo: string, pr: number) => env.PULL_REQUESTS.get(env.PULL_REQUESTS.idFromName(objectName(owner, repo, pr)))
+const issue = (env: Env, owner: string, repo: string, number: number) => env.DEVELOPMENT_RUNS.get(env.DEVELOPMENT_RUNS.idFromName(objectName(owner, repo, number)))
 const accepted = (body: unknown) => Response.json(body, { status: 202 })
 
 /** The review runs of a PR, or the development runs of an issue. GitHub numbers both in one sequence, so a number is one or the other. */
@@ -17,23 +19,46 @@ async function runsOf(env: Env, owner: string, repo: string, number: number) {
 
 type DevelopOptions = Pick<DevelopRequest, 'base' | 'hotfix' | 'full' | 'parallel'>
 
-/** The options of a development run, from the admin route's body or from the words after /develop. */
+/**
+ * The options of a development run, from the admin route's body or from the words after /develop.
+ * Stops on a --parallel value that the CLIs refuse.
+ */
 function developOptions(source: { base?: unknown; hotfix?: unknown; full?: unknown; parallel?: unknown }): DevelopOptions {
   return {
     ...(typeof source.base === 'string' && source.base ? { base: source.base } : {}),
     ...(source.hotfix === true ? { hotfix: true } : {}),
     ...(source.full === true ? { full: true } : {}),
-    ...(Number(source.parallel) >= 1 ? { parallel: Math.floor(Number(source.parallel)) } : {}),
+    ...(source.parallel !== undefined ? { parallel: parseParallel(String(source.parallel)) } : {}),
   }
 }
 
-const commandOptions = (text: string): DevelopOptions =>
-  developOptions({
+function commandOptions(text: string): DevelopOptions {
+  const parallel = /--parallel\s+(\S+)/.exec(text)?.[1]
+  const options = developOptions({
     base: /--base\s+(\S+)/.exec(text)?.[1],
     full: /--full\b/.test(text),
     hotfix: /--hotfix\b/.test(text),
-    parallel: /--parallel\s+(\d+)/.exec(text)?.[1],
   })
+  if (parallel !== undefined) {
+    try {
+      options.parallel = parseParallel(parallel)
+    } catch (error) {
+      if (!(error instanceof StopError)) throw error
+      // An invalid comment option uses the default. The admin route refuses an invalid option.
+    }
+  }
+  return options
+}
+
+/** The options, or a 400 answer with the cause. */
+function optionsOrRefusal(read: () => DevelopOptions): DevelopOptions | Response {
+  try {
+    return read()
+  } catch (error) {
+    if (error instanceof StopError) return new Response(error.message, { status: 400 })
+    throw error
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -46,8 +71,10 @@ export default {
     const by = allowedUsers(env)[0] ?? owner
     if (kind === 'develop') {
       if (request.method !== 'POST' || action) return new Response('method not allowed', { status: 405 })
-      const options = (await request.json().catch(() => ({}))) as Record<string, unknown>
-      return accepted(await issue(env, owner, repo, Number(number)).start({ by, issue: Number(number), owner, repo, ...developOptions(options) }))
+      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+      const options = optionsOrRefusal(() => developOptions(body))
+      if (options instanceof Response) return options
+      return accepted(await issue(env, owner, repo, Number(number)).start({ by, issue: Number(number), owner, repo, ...options }))
     }
     const pr = Number(number)
     if (request.method === 'POST' && !action) {
@@ -102,7 +129,9 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       if (/^\/answer\b/.test(text)) return accepted({ resumed: (await runs.resume()).resumed })
     } else {
       const runs = issue(env, owner, repo, number)
-      if (/^\/develop\b/.test(text)) return accepted(await runs.start({ by, issue: number, owner, repo, ...commandOptions(text) }))
+      if (/^\/develop\b/.test(text)) {
+        return accepted(await runs.start({ by, issue: number, owner, repo, ...commandOptions(text) }))
+      }
       if (/^\/answer\b/.test(text)) return accepted({ resumed: (await runs.resume()).resumed })
     }
   }
@@ -114,7 +143,28 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     const suite = payload.workflow_run ?? payload.check_suite ?? payload.check_run?.check_suite
     const branches = suite ? [suite.head_branch ?? ''] : (payload.branches ?? []).map((branch) => branch.name)
     const prs = new Set([...(suite?.pull_requests ?? []).map((pull) => pull.number), ...branches.flatMap((branch) => /^factory\/pr-(\d+)-/.exec(branch)?.[1] ?? []).map(Number)])
-    for (const pr of prs) await pullRequest(env, owner, repo, pr).resume()
+    // Development branch names have no PR number. Some CI webhooks have no PR numbers.
+    const developmentBranches = suite?.pull_requests.length ? [] : branches.filter((branch) => branch.startsWith('factory/dev-'))
+    const gh = github(env.GITHUB_TOKEN, env.GITHUB_API_URL)
+    for (const branch of new Set(developmentBranches)) {
+      for (let page = 1; ; page++) {
+        const pulls = await gh.json<unknown>('GET', `/repos/${owner}/${repo}/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=open&per_page=100&page=${page}`)
+        if (!Array.isArray(pulls)) throw new Error('GitHub returned an invalid PR list')
+        for (const number of pulls.map((pull: unknown) => {
+          if (typeof pull !== 'object' || pull === null || !('number' in pull) || typeof pull.number !== 'number' || !Number.isSafeInteger(pull.number) || pull.number < 1)
+            throw new Error('GitHub returned an invalid PR number')
+          return pull.number
+        })) prs.add(number)
+        if (pulls.length < 100) break
+      }
+    }
+    for (const pr of prs) {
+      const runs = pullRequest(env, owner, repo, pr)
+      await runs.resume()
+      // The development run that opened the PR waits for the same CI.
+      const linked = await runs.linkedIssue()
+      if (linked !== null) await issue(env, owner, repo, linked).resume()
+    }
     return accepted({ woke: [...prs] })
   }
   return accepted({ ignored: event })

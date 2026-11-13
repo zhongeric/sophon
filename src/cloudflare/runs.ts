@@ -59,6 +59,9 @@ const defaultPauseSeconds = 60
 /** How long CI can take, when CI_TIMEOUT_MINUTES does not say. */
 export const defaultCiTimeoutMinutes = 30
 
+/** The name of the Durable Object of a PR or an issue. */
+export const objectName = (owner: string, repo: string, number: number) => `${owner}/${repo}#${number}`.toLowerCase()
+
 export function allowedUsers(env: Env): string[] {
   return env.ALLOWED_USERS.split(',')
     .map((login) => login.trim())
@@ -97,6 +100,8 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
   protected abstract announcement(run: string, request: Request): string
   /** Runs the work, or resumes it from the ledger. Returns whether it passed, and the comment for the end of the run. */
   protected abstract execute(run: string, request: Request, ledger: Ledger, gh: GitHub, comments: Comments): Promise<{ passed: boolean; summary: string }>
+  /** Runs after a run ends with PASS, FAIL or an error. */
+  protected async ended(_request: Request): Promise<void> {}
 
   async start(request: Request): Promise<{ run: string; started: boolean }> {
     const active = this.active()
@@ -190,8 +195,11 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       clearInterval(heartbeat)
       this.busy = false
     }
-    if (next === null) await this.ctx.storage.deleteAlarm()
-    else await this.ctx.storage.setAlarm(next)
+    if (next !== null) await this.ctx.storage.setAlarm(next)
+    else {
+      await this.ctx.storage.deleteAlarm()
+      await this.ended(request).catch((error: unknown) => console.error(`[${row.run}] after the end of the run`, error))
+    }
   }
 
   protected active(): RunRow | undefined {

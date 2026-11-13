@@ -46,6 +46,7 @@ export async function mockServices(
     commands: [] as { argv: string[]; cwd: string }[],
     /** The HTTP status of the workflow-runs endpoint, so that a test can withhold the Actions permission. */
     ciStatus: 200,
+    ciPending: false,
   }
   let next = Math.max(100, ...pulls.keys(), ...issues.keys())
   let ids = 0
@@ -265,7 +266,7 @@ export async function mockServices(
       if (route === `GET ${api}/actions/runs` && state.ciStatus !== 200) return json(response, state.ciStatus, { message: 'Resource not accessible by personal access token' })
       if (route === `GET ${api}/actions/runs`) {
         const created_at = new Date().toISOString()
-        const run = (id: number, conclusion: string) => ({ conclusion, created_at, event: 'push', html_url: `https://github.com/ci/${id}`, id, name: 'CI', status: 'completed', workflow_id: 1 })
+        const run = (id: number, conclusion: string) => ({ conclusion: state.ciPending ? null : conclusion, created_at, event: 'push', html_url: `https://github.com/ci/${id}`, id, name: 'CI', status: state.ciPending ? 'in_progress' : 'completed', workflow_id: 1 })
         // An earlier failed run of the same workflow and event, then its successful rerun: only the latest counts.
         return json(response, 200, { total_count: 2, workflow_runs: Number(url.searchParams.get('page') ?? 1) === 1 ? [run(1, 'failure'), run(2, 'success')] : [] })
       }
@@ -286,5 +287,5 @@ export async function mockServices(
       return null
     }
   }
-  return { close: () => server.close(), comment, fileAt, headSha: shaOf('feature'), machineRoot, state, url }
+  return { close: () => server.close(), comment, fileAt, headSha: shaOf('feature'), state, url }
 }

@@ -1,8 +1,6 @@
-import { readCi } from '../core/ci.ts'
+import { logTailChars, readCi } from '../core/ci.ts'
 import type { PullRequests } from '../core/platform.ts'
 import { gh } from './channels.ts'
-
-const logTailChars = 6_000
 
 /** The PRs and CI of the repository at `repo`, through the gh CLI and its login. */
 export function ghPullRequests(repo: string, baseRef: string): PullRequests {

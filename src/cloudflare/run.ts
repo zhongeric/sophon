@@ -2,14 +2,15 @@ import { Sql } from 'nanocode-ts/cloudflare'
 import module from 'nanocode-ts/nanocode_wasm.wasm'
 import { parseRepoConfig, repoConfigFile, type RepoConfig } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
-import { commentChannel, commentLimit, type Comments } from '../core/questions.ts'
+import { commentChannel, cutComment, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { ciChecker } from './checker.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubRepo, type PullRequest } from './repo.ts'
-import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
+import type { ReviewOutcome } from './review.ts'
+import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, objectName, Runs } from './runs.ts'
 import { sqlFiles, sqlLedger } from './storage.ts'
 
 export { allowedUsers, type Env } from './runs.ts'
@@ -18,7 +19,7 @@ export { allowedUsers, type Env } from './runs.ts'
 export type StartRequest = PullRequest & { ship: boolean; by: string; full?: boolean; ask?: string }
 
 /** A finished review as the development workflow needs it: the fixes as a commit on GitHub. */
-export type ReviewOutcome = { waiting: string } | (LoopResult & { waiting?: undefined })
+export type { ReviewOutcome } from './review.ts'
 
 /** The rails of a repository from its base branch, so that a PR or a run cannot change its own. */
 export async function baseConfig(gh: GitHub, owner: string, repo: string, ref: string): Promise<RepoConfig> {
@@ -33,10 +34,34 @@ export async function baseConfig(gh: GitHub, owner: string, repo: string, ref: s
   return { ...parseRepoConfig(text, `${repoConfigFile} on ${ref}`), guides: {} }
 }
 
+const linkKey = 'development-issue'
+
 /** The review runs of one PR. */
 export class PullRequestRuns extends Runs<StartRequest> {
   protected number(request: StartRequest) {
     return request.pr
+  }
+
+  /** Records the issue whose development run opened this PR, so that CI webhooks and the end of a review run wake that run. */
+  async link(issue: number): Promise<void> {
+    await this.ctx.storage.put(linkKey, issue)
+  }
+
+  /** The issue whose development run opened this PR, or null. */
+  async linkedIssue(): Promise<number | null> {
+    return (await this.ctx.storage.get<number>(linkKey)) ?? null
+  }
+
+  /** The ask that started this review run. */
+  ask(run: string): string | undefined {
+    const row = this.row(run)
+    return row ? (JSON.parse(row.request) as StartRequest).ask : undefined
+  }
+
+  /** The development run that opened this PR waits for its review run, so the end of a review run wakes it. */
+  protected override async ended(request: StartRequest): Promise<void> {
+    const issue = await this.linkedIssue()
+    if (issue !== null) await this.env.DEVELOPMENT_RUNS.get(this.env.DEVELOPMENT_RUNS.idFromName(objectName(request.owner, request.repo, issue))).resume()
   }
 
   protected runName(request: StartRequest, stamp: string) {
@@ -115,7 +140,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
 }
 
 function summary(run: string, result: LoopResult): string {
-  const report = result.report.length > commentLimit ? `${result.report.slice(0, commentLimit)}\n\n(cut)` : result.report
+  const report = cutComment(result.report, 'cut')
   return [
     `### agent-factory: ${result.pass ? 'PASS' : 'FAIL'} (run \`${run}\`)`,
     '',

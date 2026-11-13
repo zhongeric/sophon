@@ -33,8 +33,11 @@ export function parseRepoConfig(text: string, source: string): RepoConfig {
 }
 
 export function isProtected(config: RepoConfig, path: string): boolean {
-  const relative = path.replace(/^\/+/, '')
-  return [repoConfigFile, ...(config.protect ?? [])].some((entry) => relative === entry || relative.startsWith(`${entry.replace(/\/$/, '')}/`))
+  const relative = path.replace(/^\/+/, '').replace(/\/$/, '')
+  return [repoConfigFile, ...(config.protect ?? [])].some((entry) => {
+    const protectedPath = entry.replace(/\/$/, '')
+    return relative === protectedPath || relative.startsWith(`${protectedPath}/`)
+  })
 }
 
 export type CheckResult = {
@@ -95,9 +98,14 @@ export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine)
   const setup = async (): Promise<CheckResult | null> => {
     if (!config.setup) return null
     ready ??= run('setup', config.setup).then((result) => (result.status === 'pass' ? null : result))
-    const failed = await ready
-    if (failed) ready = null
-    return failed
+    try {
+      const failed = await ready
+      if (failed) ready = null
+      return failed
+    } catch (error) {
+      ready = null
+      throw error
+    }
   }
   const runTests = async (tests: string[]): Promise<CheckResult[]> => {
     if (!config.tests || tests.length === 0) return []

@@ -64,10 +64,33 @@ test('the setup command runs one time before the first check, and a failed setup
   assert.deepEqual(commands, ['npm ci', 'npm ci'])
 })
 
+test('a setup command that throws runs again at the next check', async () => {
+  const repo = fixtureRepo()
+  const commands: string[] = []
+  let throws = true
+  const checker = commandChecker(gitRepo(gitSource(repo), repo, 'unused'), { stack: 'TypeScript', checks: { smoke: 'true' }, setup: 'npm ci' }, {
+    async run(command: string) {
+      commands.push(command)
+      if (command === 'npm ci' && throws) {
+        throws = false
+        throw new Error('container lost')
+      }
+      return { exit_code: 0, output: '' }
+    },
+  })
+  await assert.rejects(checker.checks([]), /container lost/)
+  assert.deepEqual((await checker.checks([])).map(({ name, status }) => [name, status]), [['smoke', 'pass'], ['tests', 'skipped']])
+  assert.deepEqual(commands, ['npm ci', 'npm ci', 'true'])
+})
+
 test('the config file and its protect entries are protected', () => {
   const config = { stack: 'TypeScript', checks: { smoke: 'true' }, protect: ['ci/', 'package.json'] }
   assert.equal(isProtected(config, '/.agent-factory.json'), true)
   assert.equal(isProtected(config, '/ci/check.sh'), true)
+  assert.equal(isProtected(config, '/ci'), true)
+  assert.equal(isProtected(config, '/ci/'), true)
   assert.equal(isProtected(config, '/package.json'), true)
+  assert.equal(isProtected(config, '/package.json/'), true)
+  assert.equal(isProtected(config, '/cider'), false)
   assert.equal(isProtected(config, '/src/package.json'), false)
 })

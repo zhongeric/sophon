@@ -7,8 +7,8 @@ import { parseParallel } from '../core/plan.ts'
 import type { Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
-import { defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
+import { defaultModels, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
+import { checkModelOverrides, defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
 import { credential } from './credentials.ts'
 import { git } from './git.ts'
@@ -70,11 +70,13 @@ async function main(): Promise<number> {
     return 0
   }
   const runsDir = resolve(values['runs-dir'] ?? fileURLToPath(new URL('../../runs/', import.meta.url)))
+  const waitMinutes = values.wait === undefined ? defaultWaitMinutes : Number(values.wait)
+  if (!Number.isFinite(waitMinutes) || waitMinutes <= 0) throw new StopError(`--wait must be a number of minutes greater than 0, not ${JSON.stringify(values.wait)}`)
   const { input, repo } = values.run ? resumeInput(runsDir, values.run) : await newInput(values)
 
   const credentials: Credentials = {}
   for (const provider of developProviders(input.models)) credentials[provider] = credential(provider, { claudePlan: values['claude-plan'] })
-  const waitMs = Number(values.wait ?? defaultWaitMinutes) * 60_000
+  const waitMs = waitMinutes * 60_000
   const interactive = process.stdin.isTTY === true
   const terminal = terminalChannel(process.stdin, process.stderr)
   const run = gh(repo)
@@ -129,7 +131,9 @@ async function newInput(values: Values): Promise<{ input: DevelopInput; repo: st
   await git(repo, 'fetch', 'origin', baseRef)
   const base = (await git(repo, 'rev-parse', '--verify', `origin/${baseRef}^{commit}`)).trim()
   type Overrides = { develop?: Partial<DevelopModels>; review?: Partial<LoopModels> }
-  const overrides = values.models ? (JSON.parse(readFileSync(String(values.models), 'utf8')) as Overrides) : {}
+  const overrides = values.models
+    ? checkModelOverrides<Overrides>(JSON.parse(readFileSync(String(values.models), 'utf8')), { develop: defaultDevelopModels, review: defaultModels }, String(values.models))
+    : {}
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
   const input: DevelopInput = {
     ask,

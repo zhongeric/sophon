@@ -1,6 +1,6 @@
 # Spec: the development workflow
 
-Status: phase 1 built on the local platform (`npm run develop`). All decisions in section 8 made on 2026-11-13.
+Status: phases 1 and 3 built (`npm run develop`, `npm run remote -- develop`). All decisions in section 8 made on 2026-11-13.
 Date: 2026-11-13.
 
 This spec defines the second workflow of agent-factory: from a confirmed ask to a PR that is ready for Eric's

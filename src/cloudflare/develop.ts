@@ -3,17 +3,18 @@ import module from 'nanocode-ts/nanocode_wasm.wasm'
 import { commandChecker } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Branch } from '../core/platform.ts'
-import { commentChannel, commentLimit, PausedError, type Comments } from '../core/questions.ts'
+import { commentChannel, cutComment, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { mergeModels, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
-import { defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels, type ReviewRequest } from '../core/workflows/develop.ts'
+import { defaultModels, mergeModels, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
+import { checkModelOverrides, defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels, type ReviewRequest } from '../core/workflows/develop.ts'
 import { boxMachine, containerBox, httpBox, syncWithSetup, type Box } from './box.ts'
 import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubPulls } from './pulls.ts'
+import { developmentReview } from './review.ts'
 import { baseConfig } from './run.ts'
-import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
+import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, objectName, Runs } from './runs.ts'
 import { sqlFiles } from './storage.ts'
 import { encodePath } from './trees.ts'
 
@@ -58,6 +59,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       const sync = () => syncWithSetup(box, this.synced, branch.tree, dir, { command: setup, timeoutMs: setupTimeoutMs })
       return commandChecker(branch, { ...input.config, setup: undefined }, boxMachine(box, dir, sync))
     }
+    const pulls = githubPulls(gh, owner, repo, input.baseRef)
     const result = await develop(input, {
       branches: sqlBranches({ gh, ledger, log, owner, repo, run, sql }),
       channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, pollMs: 0, waitMs: 0 }),
@@ -69,14 +71,21 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       ledger,
       log,
       module,
-      pulls: githubPulls(gh, owner, repo, input.baseRef),
+      pulls: {
+        ...pulls,
+        // The object of the new PR wakes this run on CI webhooks and at the end of its review run.
+        open: async (pull) => {
+          const opened = await pulls.open(pull)
+          await this.pullRequests(owner, repo, opened.number).link(request.issue)
+          return opened
+        },
+      },
       review: (review) => this.review(request, ledger, review),
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
     // A run that waits for the user, for example for CI, stops on an error, so that the admin resume starts it again from its ledger.
     if (result.resume) throw new StopError(result.resume)
-    const summary = result.report.length > commentLimit ? `${result.report.slice(0, commentLimit)}\n\n(cut: see the report of run \`${run}\`)` : result.report
-    return { passed: result.status === 'ready', summary }
+    return { passed: result.status === 'ready', summary: cutComment(result.report, `cut: see the report of run \`${run}\``) }
   }
 
   private box(): Box {
@@ -85,19 +94,15 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => this.synced.clear() })
   }
 
+  private pullRequests(owner: string, repo: string, pr: number) {
+    return this.env.PULL_REQUESTS.get(this.env.PULL_REQUESTS.idFromName(objectName(owner, repo, pr)))
+  }
+
   /** The review loop runs as a review run of the new PR, in that PR's own object, as a /review would. */
   private async review(request: DevelopRequest, ledger: Ledger, review: ReviewRequest): Promise<LoopResult> {
     const { owner, repo } = request
-    const runs = this.env.PULL_REQUESTS.get(this.env.PULL_REQUESTS.idFromName(`${owner}/${repo}#${review.pr}`.toLowerCase()))
-    const key = `review-run:${review.runId}`
-    let run = ledger.get<string>(key)
-    if (!run) {
-      run = (await runs.start({ ask: review.ask, by: request.by, full: review.full, owner, pr: review.pr, repo, ship: false })).run
-      ledger.put(key, run)
-    }
-    const outcome = await runs.outcome(run)
-    if (outcome.waiting !== undefined) throw new PausedError(outcome.waiting)
-    return outcome
+    const runs = this.pullRequests(owner, repo, review.pr)
+    return developmentReview(runs, ledger, review, { by: request.by, owner, repo })
   }
 
   /** The run's input: the issue is the ask, verbatim. The checks and rails come from the base branch. */
@@ -108,7 +113,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     const baseRef = request.base ?? (await gh.json<{ default_branch: string }>('GET', api)).default_branch
     const base = (await gh.json<{ object: { sha: string } }>('GET', `${api}/git/ref/heads/${encodePath(baseRef)}`)).object.sha
     type Overrides = Partial<LoopModels> & { develop?: Partial<DevelopModels> }
-    const overrides = this.env.MODELS ? (JSON.parse(this.env.MODELS) as Overrides) : {}
+    const overrides = this.env.MODELS ? checkModelOverrides<Overrides>(JSON.parse(this.env.MODELS), { ...defaultModels, develop: defaultDevelopModels }, 'MODELS') : {}
     return {
       ask: `${issue.title}\n\n${issue.body ?? ''}`.trim(),
       base,

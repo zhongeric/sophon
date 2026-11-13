@@ -6,8 +6,8 @@ import { step, type Ledger } from '../ledger.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
 import type { AgentStore, Branch, Branches, Checker, Files, Guides, PullRequests } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
-import type { Credentials, Provider } from '../providers.ts'
-import { asker, commentLimit, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
+import { defaultEndpoints, type Credentials, type Provider } from '../providers.ts'
+import { asker, cutComment, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
 import { allowedModels, checkAllowedModels, checkFamilySwap, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
@@ -82,6 +82,38 @@ export function developProviders(models: DevelopInput['models']): Set<Provider> 
   return new Set([...providersOf(models.review), ...Object.values(models.develop).map((choice) => choice.provider)])
 }
 
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+
+/**
+ * Checks model overrides from user input against the shape of `defaults`. Each key must be in `defaults`, and each role
+ * needs a provider, a model, and an optional thinking level. Returns the overrides, or stops with each problem.
+ */
+export function checkModelOverrides<T>(value: unknown, defaults: object, source: string): T {
+  const providers = Object.keys(defaultEndpoints)
+  const problems: string[] = []
+  const walk = (entry: unknown, shape: unknown, where: string): void => {
+    if (!isRecord(entry)) {
+      problems.push(`${where} must be an object`)
+      return
+    }
+    if (isRecord(shape) && 'provider' in shape) {
+      const { provider, model, thinking, ...rest } = entry
+      if (typeof provider !== 'string' || !providers.includes(provider)) problems.push(`${where}.provider must be one of ${providers.join(', ')}`)
+      if (typeof model !== 'string' || !model.trim()) problems.push(`${where}.model must be a model name`)
+      if (thinking !== undefined && (typeof thinking !== 'string' || !thinking.trim())) problems.push(`${where}.thinking must be a thinking level, for example "high"`)
+      for (const key of Object.keys(rest)) problems.push(`${where}: unknown key "${key}"`)
+      return
+    }
+    for (const [key, inner] of Object.entries(entry)) {
+      if (isRecord(shape) && key in shape) walk(inner, shape[key], `${where}.${key}`)
+      else problems.push(`${where}: unknown key "${key}"`)
+    }
+  }
+  walk(value, defaults, source)
+  if (problems.length > 0) throw new StopError(`invalid model overrides:\n${problems.join('\n')}`)
+  return value as T
+}
+
 export function checkDevelopModels(models: DevelopModels): void {
   const refused = [...new Set(Object.values(models).map((choice) => choice.model))].filter((model) => !allowedModels.includes(model))
   if (refused.length > 0) throw new StopError(`models outside the allowed list (${allowedModels.join(', ')}): ${refused.join(', ')}`)
@@ -127,7 +159,7 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
     deps.files.write('report.md', report)
     // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
     if (state.pr && ledger.get('commented') !== report) {
-      await pulls.comment(state.pr.number, report.length > commentLimit ? `${report.slice(0, commentLimit)}\n\n(cut: see report.md of run ${input.runId})` : report)
+      await pulls.comment(state.pr.number, cutComment(report, `cut: see report.md of run ${input.runId}`))
       ledger.put('commented', report)
     }
     ledger.put('result', { status, pr: state.pr, branch: state.branch })

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { isProtected } from '../src/core/checks.ts'
 import { checkIntake, checkPlan, checkSpec, frozenAsk, parseParallel, route, routeQuestions, waves, type Plan, type PlanTask } from '../src/core/plan.ts'
 
 const intake = { title: 'Add sub', summary: 'Adds sub() to src/math.ts.', slug: 'add-sub', larger: false, passes: 1, reason: 'One small function.', questions: [] }
@@ -66,6 +67,17 @@ test('the host refuses tasks that it cannot schedule', () => {
   )
   assert.throws(() => checkPlan({ ...plan, tasks: [task('a', ['a'], ['b']), task('b', ['b'], ['a'])] }, []), /cycle/)
   assert.throws(() => checkPlan({ ...plan, tasks: [] }, []), /give 1 to 8 tasks/)
+})
+
+test('the host normalizes task files, and refuses the root and protected files', () => {
+  assert.deepEqual(checkPlan({ ...plan, tasks: [task('sub', ['./src//sub.ts', 'test/'])] }, []).tasks[0]!.files, ['src/sub.ts', 'test/'])
+  for (const path of ['.', './', 'src/./sub.ts'])
+    assert.throws(() => checkPlan({ ...plan, tasks: [task('sub', [path])] }, []), /must be relative to the repository root, without \. or \.\., and not the root/, path)
+  const protectedPath = (path: string) => isProtected({ stack: 'TypeScript', checks: { smoke: 'true' }, protect: ['.github/'] }, path)
+  assert.throws(
+    () => checkPlan({ ...plan, tasks: [task('sub', ['./.agent-factory.json', '.github/workflows/ci.yml', '.github'])] }, [], protectedPath),
+    (error: Error) => ['".agent-factory.json" is protected', '".github/workflows/ci.yml" is protected', '".github" is protected'].every((part) => error.message.includes(part)),
+  )
 })
 
 test('a wave holds ready tasks whose files do not overlap, up to the limit', () => {

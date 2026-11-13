@@ -290,7 +290,8 @@ npm run remote -- report acme/app#123
   runs `setup`. The container gets no secret and no git remote, so code under development never runs beside a
   token. It stops after 30 minutes without a command, and the next copy starts again from the full tree.
 - Pushes go through the Git Data API. The review loop runs as a review run of the new PR, in that PR's object,
-  as a `/review` would. The development run waits for it, then takes its fixes from GitHub.
+  as a `/review` would. The development run waits for it, then takes its fixes from GitHub. The CI webhooks of
+  the new PR and the end of its review run wake the development run early.
 
 ## Layout
 

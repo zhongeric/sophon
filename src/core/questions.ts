@@ -170,6 +170,9 @@ export type PrComment = { author: string; body: string; createdAt: string; edite
 /** GitHub refuses comments over 65,536 characters. A longer text is cut at this length. */
 export const commentLimit = 60_000
 
+/** The text, cut at `commentLimit` with `note` at the end when it is longer. */
+export const cutComment = (text: string, note: string) => (text.length > commentLimit ? `${text.slice(0, commentLimit)}\n\n(${note})` : text)
+
 /** The comments of one PR, on any platform. `at` is the comment's creation time, from the same clock as the replies. */
 export type Comments = {
   post(body: string): Promise<{ url: string; at: string }>
