@@ -3,11 +3,12 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { repoConfigFile } from '../core/checks.ts'
+import { parseParallel } from '../core/plan.ts'
 import type { Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { allowedModelsFrom, mergeModels, providersOf, type LoopModels } from '../core/workflows/code-review-loop.ts'
-import { defaultDevelopModels, develop, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
+import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
+import { defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
 import { credential } from './credentials.ts'
 import { git } from './git.ts'
@@ -72,8 +73,7 @@ async function main(): Promise<number> {
   const { input, repo } = values.run ? resumeInput(runsDir, values.run) : await newInput(values)
 
   const credentials: Credentials = {}
-  const providers = new Set([...providersOf(input.models.review), ...Object.values(input.models.develop).map((choice) => choice.provider)])
-  for (const provider of providers) credentials[provider] = credential(provider, { claudePlan: values['claude-plan'] })
+  for (const provider of developProviders(input.models)) credentials[provider] = credential(provider, { claudePlan: values['claude-plan'] })
   const waitMs = Number(values.wait ?? defaultWaitMinutes) * 60_000
   const interactive = process.stdin.isTTY === true
   const terminal = terminalChannel(process.stdin, process.stderr)
@@ -124,6 +124,7 @@ async function newInput(values: Values): Promise<{ input: DevelopInput; repo: st
   const config = loadRepoConfig(join(repo, repoConfigFile))
   const ask = values['ask-file'] ? readFileSync(String(values['ask-file']), 'utf8') : (values.ask as string | undefined)
   if (!ask?.trim()) throw new StopError('give the ask with --ask or --ask-file')
+  const parallel = values.parallel !== undefined ? parseParallel(String(values.parallel)) : undefined
   const baseRef = String(values.base ?? 'main')
   await git(repo, 'fetch', 'origin', baseRef)
   const base = (await git(repo, 'rev-parse', '--verify', `origin/${baseRef}^{commit}`)).trim()
@@ -141,7 +142,7 @@ async function newInput(values: Values): Promise<{ input: DevelopInput; repo: st
     source: `${repo} on ${baseRef}`,
     ...(values.hotfix ? { hotfix: true } : {}),
     ...(values.full ? { full: true } : {}),
-    ...(values.parallel ? { parallel: Math.max(1, Number(values.parallel)) } : {}),
+    ...(parallel !== undefined ? { parallel } : {}),
   }
   return { input, repo }
 }

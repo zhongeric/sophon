@@ -238,7 +238,7 @@ for name in GITHUB_TOKEN GITHUB_WEBHOOK_SECRET ANTHROPIC_API_KEY OPENAI_API_KEY 
 done
 ```
 
-`ALLOWED_USERS` is the GitHub logins, comma-separated, that may start runs and answer questions. Without it, no one
+`ALLOWED_USERS` is the GitHub logins, comma-separated, that can start runs and answer questions. Without it, no one
 can. `ALLOWED_MODELS` replaces the allowed models, as on the local platform.
 
 Put the STE dictionary in `agents/guides/ste` before you deploy ([how](agents/guides/ste/README.md)). The Worker

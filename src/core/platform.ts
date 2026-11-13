@@ -30,14 +30,13 @@ export type Branch = {
   readonly name: string
   readonly tree: FileSystem.FileSystem
   head(): Promise<string>
-  diff(from: string, to: string): Promise<string>
   changedFiles(from: string, to: string): Promise<string[]>
   committedFiles(): Promise<string[]>
-  /** The uncommitted changes against the last commit, new files included: their diff, and the paths that exist after them. */
-  pending(): Promise<{ diff: string; changed: string[] }>
+  /** The uncommitted changes against the last commit, new files included: their diff, the paths that exist after them, and the deleted paths. */
+  pending(): Promise<{ diff: string; changed: string[]; removed: string[] }>
   /** Commits every uncommitted change. Does nothing when nothing changed. */
   commit(message: string): Promise<void>
-  /** Brings in the commits of a branch or commit: a fast-forward when it can, else a merge commit. */
+  /** Brings the changes of a branch or commit into this branch, in one or more commits. */
   merge(ref: string, message: string): Promise<void>
 }
 

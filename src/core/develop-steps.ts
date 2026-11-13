@@ -85,7 +85,7 @@ export type BuildLog = { summary: string; changes: { path: string; why: string }
 const checkpointTool: Contracts.HostTool = {
   name: 'checkpoint',
   description:
-    'Commit your changes. The host first checks the lines that you added against the static rules of the stack, and the paths against the paths that no change may commit. ' +
+    'Commit your changes. The host first checks that every changed path is in the files of the task, the lines that you added against the static rules of the stack, and the paths against the paths that no change may commit. ' +
     'It refuses the commit and lists each problem when one fails. Fix them and call again. A new test file runs with run_tests only after a checkpoint.',
   parameters: { type: 'object', properties: { message: { type: 'string', description: 'What this commit does, in a few words' } }, required: ['message'], additionalProperties: false },
 }
@@ -123,7 +123,7 @@ export type BuildTask = {
   turn: { request: string; key: string }
   model: ModelChoice
   branch: Branch
-  /** The files and directories that the builder may write. */
+  /** The files and directories that the builder can write. */
   scope: string[]
   /** The profiles whose static rules gate each checkpoint. */
   active: Profile[]
@@ -137,9 +137,10 @@ export type BuildTask = {
 }
 
 /**
- * One builder turn: an agent that may write only its scope of the branch, commits through checkpoint, runs the
- * checks and its tests, and submits a build log. The host refuses a checkpoint that breaks a static rule or adds
- * a forbidden path, and a log with uncommitted work.
+ * One builder turn. The agent can write only the files in its scope of the branch.
+ * The agent commits through checkpoint, runs the checks and its tests, and submits a build log.
+ * The host refuses a checkpoint that breaks a static rule or adds a forbidden path.
+ * The host refuses a completed log with uncommitted work. A blocked log can report uncommitted work.
  */
 export async function build(context: DevelopContext, task: BuildTask): Promise<BuildLog> {
   const { branch, checker } = task
@@ -153,6 +154,10 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       async call(input) {
         const pending = await branch.pending()
         if (pending.changed.length === 0 && pending.diff.trim() === '') throw new Error('nothing to commit')
+        // A command, for example a test run or the setup, can change files outside the scope of the builder.
+        const outside = [...pending.changed, ...pending.removed].filter((path) => !inScope(path, task.scope))
+        if (outside.length > 0)
+          throw new Error(`checkpoint refused: these changes are outside the files of the task, and only the user can commit them: ${outside.join(', ')}. If the task needs them, say so in blocked.`)
         const problems = staticFindings(pending.diff, pending.changed, task.active).map(
           (finding) => `${finding.location}: ${finding.title}. ${finding.recommendation}. Line: ${finding.evidence}`,
         )
@@ -177,9 +182,9 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       const log = input as BuildLog
       if (!log?.summary?.trim() || !Array.isArray(log.changes) || !Array.isArray(log.tests) || typeof log.blocked !== 'string')
         throw new Error('summary, changes, tests and blocked are required')
+      if (log.blocked.trim()) return log
       const pending = await branch.pending()
       if (pending.changed.length > 0 || pending.diff.trim() !== '') throw new Error(`checkpoint first: uncommitted changes in ${pending.changed.join(', ') || 'deleted files'}`)
-      if (log.blocked.trim()) return log
       const head = await branch.head()
       const changed = head === start ? [] : await branch.changedFiles(start, head)
       if (changed.length === 0) throw new Error('no commits since the task started: checkpoint your work, or say in blocked why you cannot finish')

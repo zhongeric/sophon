@@ -10,6 +10,8 @@ export type BoxResult = { exit_code: number | null; output: string }
  * `cwd` is relative to the machine's root. The machine never gets the host's secrets.
  */
 export type Box = {
+  /** Starts the machine when it does not run. A machine that starts is empty. */
+  start(): Promise<void>
   exec(argv: string[], options: { cwd: string; env: Record<string, string>; stdin?: Uint8Array; timeoutMs: number }): Promise<BoxResult>
 }
 
@@ -50,8 +52,10 @@ export function containerBox(container: ContainerHandle, options: { inactivityMs
     await container.setInactivityTimeout(options.inactivityMs)
   }
   return {
+    start: ready,
     async exec(argv, { cwd, env, stdin, timeoutMs }) {
       await ready()
+      const started = Date.now()
       const seconds = String(Math.ceil(timeoutMs / 1_000))
       const process = await container.exec(['timeout', '-k', '10', seconds, ...argv], {
         cwd: `/${cwd}`,
@@ -61,7 +65,10 @@ export function containerBox(container: ContainerHandle, options: { inactivityMs
         ...(stdin ? { stdin: new Blob([new Uint8Array(stdin)]).stream() } : {}),
       })
       const [output, code] = await Promise.all([tail(process.stdout), process.exitCode])
-      return code === 124 || code === 137 ? { exit_code: null, output: `${output}\n[host] killed after ${timeoutMs} ms` } : { exit_code: code, output }
+      // timeout gives 124, or 137 when its SIGKILL follows. A 137 before the time limit is another kill, for example for memory.
+      if (code === 124 || (code === 137 && Date.now() - started >= timeoutMs)) return { exit_code: null, output: `${output}\n[host] killed after ${timeoutMs} ms` }
+      if (code === 137) return { exit_code: code, output: `${output}\n[host] the command was killed before its time limit, possibly because it used too much memory` }
+      return { exit_code: code, output }
     },
   }
 }
@@ -69,6 +76,7 @@ export function containerBox(container: ContainerHandle, options: { inactivityMs
 /** A machine behind an HTTP endpoint that runs one command for each POST, for local tests of the Worker. */
 export function httpBox(url: string): Box {
   return {
+    async start() {},
     async exec(argv, { cwd, env, stdin, timeoutMs }) {
       let binary = ''
       for (let offset = 0; stdin && offset < stdin.length; offset += 0x8000) binary += String.fromCharCode(...stdin.subarray(offset, offset + 0x8000))
@@ -120,6 +128,28 @@ export async function syncTree(box: Box, tree: FileSystem.FileSystem, dir: strin
     await run(['tar', '-x', '-f', '-'], dir, tar(entries))
   }
   return next
+}
+
+/**
+ * Makes a directory of the machine hold `tree`, for the next command. `synced` holds what each directory got from
+ * the last sync. The machine starts before the sync reads `synced`. A machine that starts is empty, and its start
+ * clears `synced`. The sync then copies all of the tree and runs the setup again.
+ */
+export async function syncWithSetup(
+  box: Box,
+  synced: Map<string, Map<string, string>>,
+  tree: FileSystem.FileSystem,
+  dir: string,
+  setup: { command: string | undefined; timeoutMs: number },
+): Promise<void> {
+  await box.start()
+  const last = synced.get(dir) ?? null
+  const next = await syncTree(box, tree, dir, last)
+  if (!last && setup.command) {
+    const result = await box.exec(['bash', '-c', setup.command], { cwd: dir, env: boxEnv, timeoutMs: setup.timeoutMs })
+    if (result.exit_code !== 0) throw new Error(`the setup command failed: ${result.output.slice(-2000)}`)
+  }
+  synced.set(dir, next)
 }
 
 /** Runs the checks of one branch on the machine, after the branch's tree is copied to its directory there. */

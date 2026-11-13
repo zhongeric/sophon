@@ -6,8 +6,8 @@ import { step, type Ledger } from '../ledger.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
 import type { AgentStore, Branch, Branches, Checker, Files, Guides, PullRequests } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
-import type { Credentials } from '../providers.ts'
-import { asker, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
+import type { Credentials, Provider } from '../providers.ts'
+import { asker, commentLimit, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
 import { checkAllowedModels, checkFamilySwap, defaultAllowedModels, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
@@ -42,7 +42,7 @@ export type DevelopInput = {
 
 export type ReviewRequest = { runId: string; ask: string; head: string; full: boolean; pr: number }
 
-/** What the platform supplies. Only the local platform has it today: builders need a real toolchain. */
+/** What the platform supplies. */
 export type DevelopDeps = {
   module: WebAssembly.Module
   ledger: Ledger
@@ -59,26 +59,30 @@ export type DevelopDeps = {
   checker(branch: Branch): Checker
   /** Runs the code review loop on a commit of the run's branch. */
   review(request: ReviewRequest): Promise<LoopResult>
-  /** How long to look for CI before the run pauses, how often, and how long CI may take to start. */
+  /** How long to look for CI before the run pauses, how often, and how long CI can take to start. */
   ci: { waitMs: number; pollMs: number; startMs: number }
   log(line: string): void
 }
 
 export type DevelopStatus = 'ready' | 'failed' | 'blocked' | 'stopped'
-export type DevelopResult = { status: DevelopStatus; pr: { number: number; url: string } | null; branch: string | null; report: string }
+/** `resume` says what the user does before the same run can go on, for example add CI. It is null when a new run is necessary. */
+export type DevelopResult = { status: DevelopStatus; pr: { number: number; url: string } | null; branch: string | null; report: string; resume: string | null }
 
 /** CI-fix rounds after the build, then a blocker (G6). */
 export const ciFixRounds = 2
-/** How long CI may take to start for a push of a commit that already has finished CI. */
+/** How long CI can take to start for a push of a commit that already has finished CI. */
 const ciGraceMs = 3 * 60_000
 /** The most that GitHub's clock and the host's clock can differ. */
 const clockSkewMs = 30_000
 const defaultParallel = 3
-/** GitHub refuses comments over 65,536 characters. */
-const commentLimit = 60_000
 
 type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failures: string }
 type Review = { pass: boolean; head: string; final: string; branch: string; report: string }
+
+/** The providers of every model that a development run uses: the development roles and the review loop. */
+export function developProviders(models: DevelopInput['models']): Set<Provider> {
+  return new Set([...providersOf(models.review), ...Object.values(models.develop).map((choice) => choice.provider)])
+}
 
 export function checkDevelopModels(models: DevelopModels, allowed = defaultAllowedModels): void {
   const refused = [...new Set(Object.values(models).map((choice) => choice.model))].filter((model) => !allowed.includes(model))
@@ -96,8 +100,7 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
   checkAllowedModels(input.models.review, input.allowedModels)
   checkFamilySwap(input.models.review)
   checkDevelopModels(input.models.develop, input.allowedModels)
-  const providers = new Set([...providersOf(input.models.review), ...Object.values(input.models.develop).map((choice) => choice.provider)])
-  const missing = [...providers].filter((provider) => !deps.credentials[provider])
+  const missing = [...developProviders(input.models)].filter((provider) => !deps.credentials[provider])
   if (missing.length > 0) throw new StopError(`no credential for ${missing.join(', ')}`)
 
   const { ledger, branches, pulls } = deps
@@ -121,15 +124,16 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
 
   // What the report shows. Each stage fills its part.
   const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [] }
-  const finish = async (status: DevelopStatus, criteria: Criterion[], note: string): Promise<DevelopResult> => {
+  const finish = async (status: DevelopStatus, criteria: Criterion[], note: string, resumable = false): Promise<DevelopResult> => {
     const report = renderReport(state, status, criteria, note, decisions(ledger))
     deps.files.write('report.md', report)
-    if (state.pr && !ledger.get('commented')) {
+    // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
+    if (state.pr && ledger.get('commented') !== report) {
       await pulls.comment(state.pr.number, report.length > commentLimit ? `${report.slice(0, commentLimit)}\n\n(cut: see report.md of run ${input.runId})` : report)
-      ledger.put('commented', true)
+      ledger.put('commented', report)
     }
     ledger.put('result', { status, pr: state.pr, branch: state.branch })
-    return { status, pr: state.pr, branch: state.branch, report }
+    return { status, pr: state.pr, branch: state.branch, report, resume: resumable ? note : null }
   }
 
   // 0. Intake: no plan and no code until the user confirms the ask.
@@ -240,7 +244,7 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
     if (log.blocked.trim()) return finish('blocked', [], `The CI fix is blocked: ${log.blocked}`)
     ci = await waitCi(`ci.build.${round}`, await publish())
   }
-  if (ci.state === 'none') return finish('blocked', [], noCi(ci.sha))
+  if (ci.state === 'none') return finish('blocked', [], noCi(ci.sha), true)
   if (ci.state === 'fail') return finish('blocked', [], `CI is still red on ${ci.sha.slice(0, 12)} after ${ciFixRounds} fix rounds.`)
 
   // 4 and 5. Freeze and the review loop, once or twice. The frozen package is the ask, the decisions and the plan.
@@ -262,11 +266,12 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
     if (!review.pass) break
   }
 
-  // 7 and 8. Hygiene and CI on the final head. Fixes after the review would skip it, so a red CI here fails the run.
+  // 7 and 8. Hygiene and CI on the final head. Fixes after the review do not pass through the review.
+  // Thus, a red CI here fails the run.
   const reviewed = state.reviews.length === routed.passes && state.reviews.every((review) => review.pass)
   const final = await publish()
   const finalCi = !reviewed ? null : final === ci.sha ? ci : await waitCi('ci.final', final)
-  if (finalCi?.state === 'none') return finish('blocked', [], noCi(final))
+  if (finalCi?.state === 'none') return finish('blocked', [], noCi(final), true)
   const changed = await dev.changedFiles(input.base, final)
   const forbidden = forbiddenPaths(changed, active)
   const solidity = active.find((profile) => profile.id === 'solidity')

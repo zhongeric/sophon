@@ -25,5 +25,5 @@
   "observability": { "enabled": true }
   // Set with: npx wrangler secret put <NAME>
   // GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, ANTHROPIC_API_KEY, OPENAI_API_KEY, ADMIN_TOKEN, and ALLOWED_USERS: the GitHub
-  // logins, comma-separated, that may start runs and answer questions.
+  // logins, comma-separated, that can start runs and answer questions.
 }
