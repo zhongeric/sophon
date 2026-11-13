@@ -38,7 +38,7 @@ export type StartRequest = PullRequest & { ship: boolean; by: string }
 type State = 'queued' | 'running' | 'paused' | 'passed' | 'failed' | 'error'
 type RunRow = { run: string; state: State; note: string; created: number; request: string }
 /** The result of `resume`: `state` is the state of the latest run before the call, or null when the PR has no run. */
-export type ResumeResult = { resumed: boolean; state: State | null; reason: string }
+type ResumeResult = { resumed: boolean; state: State | null; reason: string }
 
 /** Why `resume` does not wake the latest run, for each state that it does not wake. */
 const notResumed: Record<Exclude<State, 'paused'>, string> = {

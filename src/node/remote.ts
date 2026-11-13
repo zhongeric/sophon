@@ -26,21 +26,25 @@ export function parseTarget(text: string): { owner: string; repo: string; pr: nu
   return { owner: match[1]!, pr: Number(match[3]), repo: match[2]! }
 }
 
-function parseJson(text: string): unknown {
-  try {
-    return JSON.parse(text)
-  } catch {
-    return undefined
-  }
-}
-
-/** Gives the text to print and the exit code for the body of a resume response. A body of an unknown shape gives the raw text and exit 1. */
+/**
+ * Gives the text to print and the exit code for the body of a resume response. A body without a boolean `resumed` gives
+ * the raw text and exit 1. A body without a valid `state` and `reason`, for example `{ resumed }` from an older Worker,
+ * gives the raw text and the exit code of `resumed`.
+ */
 export function resumeOutcome(text: string): { code: number; text: string } {
-  const body = parseJson(text)
-  if (typeof body !== 'object' || body === null || !('resumed' in body) || !('state' in body) || !('reason' in body)) return { code: 1, text }
-  const { reason, resumed, state } = body
-  if (typeof resumed !== 'boolean' || typeof reason !== 'string' || (state !== null && typeof state !== 'string')) return { code: 1, text }
-  return { code: resumed ? 0 : 1, text: `${resumed ? 'resumed' : 'not resumed'}: latest run is ${state ?? 'none'}: ${reason}` }
+  let body: unknown
+  try {
+    body = JSON.parse(text)
+  } catch {
+    return { code: 1, text }
+  }
+  if (typeof body !== 'object' || body === null || !('resumed' in body) || typeof body.resumed !== 'boolean') return { code: 1, text }
+  const code = body.resumed ? 0 : 1
+  const state = 'state' in body ? body.state : undefined
+  const reason = 'reason' in body ? body.reason : undefined
+  if (typeof reason !== 'string' || (state !== null && typeof state !== 'string')) return { code, text }
+  // The state is the state before the call: a resumed run is queued or running now.
+  return { code, text: code === 0 ? `resumed: latest run was ${state ?? 'none'}: ${reason}` : `not resumed: latest run is ${state ?? 'none'}: ${reason}` }
 }
 
 function setting(name: string): string {

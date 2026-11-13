@@ -10,7 +10,7 @@ test('a PR is owner/repo#number or its GitHub URL', () => {
 
 test('resume exits 0 when the run woke', () => {
   const body = JSON.stringify({ reason: 'woke the paused run', resumed: true, state: 'paused' })
-  assert.deepEqual(resumeOutcome(body), { code: 0, text: 'resumed: latest run is paused: woke the paused run' })
+  assert.deepEqual(resumeOutcome(body), { code: 0, text: 'resumed: latest run was paused: woke the paused run' })
 })
 
 test('resume exits 1 and prints the state and the reason when the run did not wake', () => {
@@ -23,7 +23,13 @@ test('resume exits 1 and prints none when the PR has no run', () => {
   assert.deepEqual(resumeOutcome(body), { code: 1, text: 'not resumed: latest run is none: the PR has no run. Start a run first' })
 })
 
-test('resume exits 1 and prints the raw text when the body has an unknown shape', () => {
-  for (const body of ['{"resumed":true}', '{"reason":"x","resumed":"yes","state":null}', '{"reason":"x","resumed":true,"state":3}', 'null', 'not json'])
+test('resume exits 1 and prints the raw text when the body has no boolean resumed', () => {
+  for (const body of ['{"reason":"x","resumed":"yes","state":null}', '{"reason":"x","state":null}', 'null', 'not json'])
     assert.deepEqual(resumeOutcome(body), { code: 1, text: body })
+})
+
+test('resume prints the raw text and takes the exit code from resumed when the state or the reason is missing', () => {
+  assert.deepEqual(resumeOutcome('{"resumed":true}'), { code: 0, text: '{"resumed":true}' })
+  assert.deepEqual(resumeOutcome('{"resumed":false}'), { code: 1, text: '{"resumed":false}' })
+  assert.deepEqual(resumeOutcome('{"reason":"x","resumed":true,"state":3}'), { code: 0, text: '{"reason":"x","resumed":true,"state":3}' })
 })
