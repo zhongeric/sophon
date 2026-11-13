@@ -254,7 +254,7 @@ export async function light(
   context: RunContext,
   id: string,
   model: ModelChoice,
-  options: { kept: Finding[]; gateLog: string[]; reason: string; message: string; allow(path: string): boolean },
+  options: { kept: Finding[]; gateLog: string[]; message: string; allow(path: string): boolean },
 ): Promise<PatchOutcome<LightLog>> {
   const before = await editBase(context, id)
   const range = { from: context.frozen.base, to: context.frozen.head }
@@ -280,7 +280,7 @@ export async function light(
     '- Gate log: /review/gate-log.txt',
     `- Stack: ${context.stack}`,
     '',
-    `Triage: ${options.reason}. The host refuses your writes outside docs and tests.`,
+    'Triage: docs or tests only. The host refuses your writes outside docs and tests.',
     '',
     'Edit the files in /repo. Then call submit_light_log one time.',
   ].join('\n')

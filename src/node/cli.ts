@@ -104,14 +104,15 @@ async function main(): Promise<number> {
   return result.pass ? 0 : 1
 }
 
-function resumeInput(runsDir: string, runId: string): { input: LoopInput; source: GitSource } {
+export function resumeInput(runsDir: string, runId: string): { input: LoopInput; source: GitSource } {
   const path = join(runsDir, runId, 'state.json')
   if (!existsSync(path)) throw new StopError(`no run ${runId} in ${runsDir}`)
   const ledger = fileLedger(path)
   const input = ledger.get<LoopInput>('input')
   const source = ledger.get<GitSource>('git')
   if (!input || !source) throw new StopError(`run ${runId} has no recorded input`)
-  return { input, source }
+  // A run that started before a model role existed has no choice for it: use the default.
+  return { input: { ...input, models: mergeModels(input.models) }, source }
 }
 
 type Values = Record<string, string | boolean | undefined>
@@ -163,11 +164,12 @@ async function channel(input: LoopInput, repo: string, runDir: string, waitMs: n
   return process.stdin.isTTY ? terminalChannel(process.stdin, process.stderr) : fileChannel(runDir)
 }
 
-main().then(
-  (code) => process.exit(code),
-  (error: unknown) => {
-    if (error instanceof StopError) console.error(`stop: ${error.message}`)
-    else console.error(error)
-    process.exit(2)
-  },
-)
+if (fileURLToPath(import.meta.url) === process.argv[1])
+  main().then(
+    (code) => process.exit(code),
+    (error: unknown) => {
+      if (error instanceof StopError) console.error(`stop: ${error.message}`)
+      else console.error(error)
+      process.exit(2)
+    },
+  )

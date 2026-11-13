@@ -130,8 +130,9 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   ledger.put('input', input)
   const frozen = await step(ledger, 'freeze', () => repo.freeze())
   const stack = input.stack ?? input.config.stack
-  const frozenChanges = await repo.changedFiles(frozen.base, frozen.head)
-  const triaged = await step(ledger, 'triage', () => triage(frozenChanges, async (path) => (await repo.tree.stat(`/${path}`)) !== null, input.full === true))
+  // Triage also sees deleted files and the old path of each rename, so that a removal of code gets the full loop.
+  const touched = await repo.touchedFiles(frozen.base, frozen.head)
+  const triaged = await step(ledger, 'triage', () => triage(touched, async (path) => (await repo.tree.stat(`/${path}`)) !== null, input.full === true))
   const active = profilesById(triaged.profiles)
   const context: RunContext = {
     host: { module: deps.module, store: deps.store, ledger, credentials: deps.credentials, dispatch: deps.dispatch, log: deps.log },
@@ -144,7 +145,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     guides: deps.guides,
     tests: deps.checker.tests,
   }
-  deps.log(`froze ${frozen.head.slice(0, 12)} over base ${frozen.base.slice(0, 12)}: ${frozenChanges.length} files, ${frozen.location}`)
+  deps.log(`froze ${frozen.head.slice(0, 12)} over base ${frozen.base.slice(0, 12)}: ${touched.length} files, ${frozen.location}`)
   deps.log(triageLine(triaged))
 
   const questions = asker(ledger, deps.channel, input.runId, deps.log)
@@ -170,7 +171,6 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     return result
   }
 
-  // The static rules of the matched profiles, as findings of the rules track. The host quotes the line, so they skip the evidence check.
   const hostCheck = (name: string, range: Range, prefix: string) =>
     step(ledger, name, async () =>
       assignIds(staticFindings(await repo.diff(range.from, range.to), await repo.changedFiles(range.from, range.to), active), 'rules', prefix),
@@ -203,7 +203,6 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
         gateLog: gated.log,
         kept: gated.kept,
         message: `agent-factory: apply light review fixes (${input.runId})`,
-        reason: triaged.reason,
       }),
     )
     return { current: outcome.after, step2Ran: false, steps: [`- Host findings: ${found.length}`, gateLine('Light gate', gated), patchLine('Light review', outcome)] }

@@ -90,9 +90,14 @@ Each stage below lists who does the work, what the host enforces, and where Eric
 
 - **Who:** the host, with profile rules. There is no Jev (D1).
 - **Rails:** the light loop applies when every matched profile allows it and the diff matches the profile's light
-  rule, for example "docs or tests only, no behavior change". Else the full loop applies. Solidity `src/` always gets
-  the full loop (`SOL-004`). The host writes `TRIAGE path=light reason=docs-or-tests-only` (or `path=full reason=...`) in
-  the gate log and the PR description. The host checks triage again at freeze (`ALL-017`).
+  rule, for example "docs or tests only, no behavior change". Else the full loop applies.
+
+  Solidity `src/` and `script/` always get the full loop (`SOL-004`).
+  Agent prompts under `agents/` and rule files named `AGENTS.md`, `CLAUDE.md` or `CONTRIBUTING*` also get the full loop.
+  The rule files can be at any directory level. Triage checks deleted paths and old paths of renames.
+
+  The host writes `TRIAGE path=light reason=docs-or-tests-only` (or `path=full reason=...`) in the gate log and the PR description.
+  The host checks triage again at freeze (`ALL-017`).
 - **Light loop:** one context-free reviewer that also fixes, on Opus 5.5. It makes only anti-slop and STE fixes, and
   applies or rejects the host findings. The host refuses its writes outside docs and tests, so the change cannot grow
   into behavior. No step 2, no intent check. Checks must be green.
@@ -208,13 +213,13 @@ commit, before any reviewer sees the code. Reviewers then spend their judgment o
 
 | Rule | Check | Catalog |
 | --- | --- | --- |
-| Fixed pragma | no `pragma solidity ^` or `>=` in `src/` | `SOL-007` |
-| Custom errors only | no `require(..., "...")` | `SOL-011` |
-| Named imports | no `import "..."` without braces | `SOL-008` |
-| Forbidden constructs | no `tx.origin` auth, `selfdestruct`, `abi.encodePacked` with dynamic types | `SOL-023` |
+| Fixed pragma | no floating pragma in `src/**/*.sol`, `test/**/*.sol` or `script/**/*.sol` | `SOL-007` |
+| Custom errors only | no `require(..., "...")` or `revert("...")` in `src/**/*.sol` | `SOL-011` |
+| Named imports | no imports without braces in `src/**/*.sol`, `test/**/*.sol` or `script/**/*.sol` | `SOL-008` |
+| Forbidden constructs | no `tx.origin` or `selfdestruct` in `src/**/*.sol`. Planned: `abi.encodePacked` with dynamic types | `SOL-023` |
 | NatSpec on public and external | the evm-cortex `natspec-enforcer` logic | `SOL-016` |
-| Test names | plain `^test_[a-z][A-Za-z0-9]*_[a-z][A-Za-z0-9]*$`, or branching tree `^test_[A-Z][A-Za-z0-9]*(_(When\|Given)[A-Z][A-Za-z0-9]*)+_(succeeds\|revertsWith[A-Z][A-Za-z0-9]*)$`, and the same shapes for `testFuzz_` and `testFork_` (D9.1) | `SOL-042` |
-| `unchecked` has a reason | a comment on the line before | `SOL-014` |
+| Test names in `test/**/*.sol` and `script/**/*.sol` | plain `^test_[a-z][A-Za-z0-9]*_[a-z][A-Za-z0-9]*$`, or branching tree `^test_[A-Z][A-Za-z0-9]*(_(When\|Given)[A-Z][A-Za-z0-9]*)+_(succeeds\|revertsWith[A-Z][A-Za-z0-9]*)$`, and the same shapes for `testFuzz_`, `testFork_` and `invariant_` (D9.1) | `SOL-042` |
+| `unchecked` and `assembly` have a reason | a comment on the same line or the line before, in `src/**/*.sol` | `SOL-014` |
 | No excess output | `forbiddenInDiff` globs | `ALL-067` |
 | Builds clean | `forge build --deny-warnings`, `forge fmt --check` | `SOL-032` |
 
@@ -222,9 +227,16 @@ Your evm-cortex hooks already implement several of these checks, but `~/.claude/
 The profile can run the same code as host checks.
 
 The review loop runs these rules now, on the lines that each reviewed diff adds: fixed pragma, custom errors, named
-imports, `tx.origin`, `selfdestruct`, test names, a reason before `unchecked` and `assembly`, and forbidden paths. The
-`docs` profile adds one rule: no Latin abbreviations. Each break becomes a `host-NNN` finding of the rules track. Not
-built yet: `abi.encodePacked` with dynamic types and NatSpec, because they need a Solidity parser.
+imports, `tx.origin`, `selfdestruct`, test names, a reason before `unchecked` and `assembly`, and forbidden paths.
+Solidity rules apply only when `foundry.toml` exists.
+Tests and scripts use only the pragma, named import and test name rules.
+The `docs` profile checks `.md`, `.mdx` and `.rst` files for Latin abbreviations.
+
+Forbidden paths include `.log` and `.env` files in every repository, except `.env.example`, `.env.sample` and `.env.template`.
+Foundry repositories also forbid `out/`, `cache/` and `broadcast/`.
+Each break becomes a `host-NNN` finding of the rules track.
+
+Not built yet: `abi.encodePacked` with dynamic types and NatSpec, because they need a Solidity parser.
 
 ### 4.4 First profiles
 
@@ -234,7 +246,7 @@ built yet: `abi.encodePacked` with dynamic types and NatSpec, because they need 
 | `solidity-support` | `test/**/*.sol`, `script/**/*.sol` | light path allowed, except deploy scripts: review loop on every change (`SOL-054`) | same | Tests and scripts in a Foundry repo. |
 | `typescript` | `package.json` + `tsconfig.json` | light path allowed | typecheck, lint, tests of changed files | Thin. Needs G1 and G3. |
 | `nextjs-frontend` | `next.config.*` | light path allowed | typecheck, lint, build | App Router rules (`FE-009`), UI copy rules. Needs G2. |
-| `docs` | `**/*.md` outside code | light path, STE and anti-slop only | none | |
+| `docs` | `.md`, `.mdx` and `.rst` files | light path, STE and anti-slop only, except agent prompts and rule files | none | `agents/**`, `AGENTS.md`, `CLAUDE.md` and `CONTRIBUTING*` always get the full loop. Triage includes deleted paths and old paths of renames. |
 | `ci-infra` | `.github/**` | full loop, Eric approves the merge | none | Token scope often blocks these (step 8). |
 
 ## 5. Roles

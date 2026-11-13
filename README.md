@@ -35,8 +35,10 @@ Triage comes from the **profiles** in `src/core/profiles.ts`, one for each stack
 `solidity-support` (Foundry tests and scripts), `typescript` and `docs`. A profile applies when its marker files
 exist, for example `foundry.toml`. It gives the guides for its files, the paths that a change must not commit,
 and static rules. The light loop runs only when every changed file is docs or tests of a profile that allows it.
-Solidity `src/` and `script/` always get the full loop. `--full` forces the full loop. The host writes the
-decision as `TRIAGE path=light|full reason=...` at the top of the gate log and in the report.
+Solidity `src/` and `script/` always get the full loop. Agent prompts and rule files (`agents/`, `AGENTS.md`,
+`CLAUDE.md`, `CONTRIBUTING*`) also always get the full loop. Triage also checks deleted paths and old paths of renames.
+`--full` forces the full loop. The host writes the decision as `TRIAGE path=light|full reason=...` at the top of
+the gate log and in the report.
 
 The static rules are the mechanical rules that a program can check: a fixed pragma, named imports, no revert
 strings, no `tx.origin` or `selfdestruct`, a comment before `unchecked` and `assembly`, the two test name shapes,

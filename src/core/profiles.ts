@@ -3,8 +3,8 @@ import type { Finding, Severity } from './findings.ts'
 /** A mechanical rule that the host checks on each line that a change adds, before any reviewer reads the change. */
 export type StaticRule = {
   id: string
-  /** True when the added line breaks the rule. `previous` is the line before it, or null when the diff does not show it. */
-  breaks(line: string, previous: string | null): boolean
+  /** True when the added line breaks the rule. `previous` is null when unknown. `source` has no comments. */
+  breaks(line: string, previous: string | null, source: string): boolean
   title: string
   impact: string
   recommendation: string
@@ -30,6 +30,38 @@ export type Profile = {
 /** A comment on the line, or on the line before it. An unknown line before counts as a comment, so that the rule does not guess. */
 const commented = (line: string, previous: string | null) => /\/\/|\/\*/.test(line) || previous === null || /^\s*(\/\/|\/?\*)/.test(previous)
 
+/** Remove comments outside string literals. Keep code after a closed block comment. */
+const code = (line: string, blockComment: boolean) => {
+  let source = ''
+  let quote = ''
+  for (let i = 0; i < line.length; i++) {
+    const char = line.charAt(i)
+    if (blockComment) {
+      if (line.startsWith('*/', i)) {
+        blockComment = false
+        i++
+      }
+    } else if (quote) {
+      source += char
+      if (char === '\\' && i + 1 < line.length) source += line.charAt(++i)
+      else if (char === quote) quote = ''
+    } else if (line.startsWith('//', i)) {
+      break
+    } else if (line.startsWith('/*', i)) {
+      blockComment = true
+      source += ' '
+      i++
+    } else if (line.startsWith('*/', i)) {
+      source += ' '
+      i++
+    } else {
+      source += char
+      if (char === '"' || char === "'") quote = char
+    }
+  }
+  return { source, blockComment }
+}
+
 const testPrefix = '(?:test|testFuzz|testFork|invariant)_'
 /** Plain `test_{action}_{scenario}`, or branching tree `test_{Function}_{WhenCondition}[_{WhenCondition}...]_{outcome}` (D9). */
 const testNames = [
@@ -48,7 +80,7 @@ const pragma: StaticRule = {
 
 const namedImports: StaticRule = {
   id: 'sol-wildcard-import',
-  breaks: (line) => /^\s*import\s+(?!\{)/.test(line),
+  breaks: (line) => /^\s*import\b(?!\s*\{)/.test(line),
   title: 'Use a named import',
   impact: 'A wildcard import brings every symbol of the file into scope, and hides where each name comes from',
   recommendation: 'Import only the names that the file uses: `import {Name} from "...";`',
@@ -58,6 +90,52 @@ const namedImports: StaticRule = {
 const solidityGuides = ['profiles/solidity.md']
 const foundryOutput = [/^out\//, /^cache\//, /^broadcast\//]
 
+/** The Solidity rules for src/ files in a Foundry repository. */
+const solidityRules: StaticRule[] = [
+  pragma,
+  namedImports,
+  {
+    id: 'sol-revert-string',
+    breaks: (_line, _previous, source) => /\brequire\s*\(.*,\s*"|\brevert\s*\(\s*"/.test(source),
+    title: 'Replace the revert string with a custom error',
+    impact: 'A revert string costs more gas than a custom error, and breaks the custom error convention',
+    recommendation: 'Declare a custom error in the interface, and use `if (...) revert ErrorName();`',
+    severity: 'medium',
+  },
+  {
+    id: 'sol-tx-origin',
+    breaks: (_line, _previous, source) => /\btx\.origin\b/.test(source),
+    title: 'Do not use tx.origin',
+    impact: 'Authorization with tx.origin lets a malicious contract act for each user who calls it',
+    recommendation: 'Use msg.sender',
+    severity: 'high',
+  },
+  {
+    id: 'sol-selfdestruct',
+    breaks: (_line, _previous, source) => /\bselfdestruct\s*\(/.test(source),
+    title: 'Remove selfdestruct',
+    impact: 'selfdestruct is deprecated, and it can remove code that users and other contracts depend on',
+    recommendation: 'Remove the call. If the contract must stop, add an explicit pause or shutdown path',
+    severity: 'high',
+  },
+  {
+    id: 'sol-unchecked-reason',
+    breaks: (line, previous) => /\bunchecked\s*\{/.test(line) && !commented(line, previous),
+    title: 'Give the reason for the unchecked block',
+    impact: 'A reader cannot see why the arithmetic cannot overflow, so a later change can break that condition',
+    recommendation: 'Add a comment on the line before the block that says why overflow is not possible',
+    severity: 'low',
+  },
+  {
+    id: 'sol-assembly-reason',
+    breaks: (line, previous) => /\bassembly\b[^;]*\{/.test(line) && !commented(line, previous),
+    title: 'Give the safety reason for the assembly block',
+    impact: 'Inline assembly skips the compiler safety checks, and nothing tells a reader why the block is safe',
+    recommendation: 'Add a comment on the line before the block that says why the block is safe',
+    severity: 'low',
+  },
+]
+
 const solidity: Profile = {
   id: 'solidity',
   markers: ['foundry.toml'],
@@ -65,50 +143,7 @@ const solidity: Profile = {
   light: null,
   guides: solidityGuides,
   forbidden: foundryOutput,
-  rules: [
-    pragma,
-    namedImports,
-    {
-      id: 'sol-revert-string',
-      breaks: (line) => /\brequire\s*\(.*,\s*"|\brevert\s*\(\s*"/.test(line),
-      title: 'Replace the revert string with a custom error',
-      impact: 'A revert string costs more gas than a custom error, and breaks the custom error convention',
-      recommendation: 'Declare a custom error in the interface, and use `if (...) revert ErrorName();`',
-      severity: 'medium',
-    },
-    {
-      id: 'sol-tx-origin',
-      breaks: (line) => /\btx\.origin\b/.test(line),
-      title: 'Do not use tx.origin',
-      impact: 'Authorization with tx.origin lets a malicious contract act for each user who calls it',
-      recommendation: 'Use msg.sender',
-      severity: 'high',
-    },
-    {
-      id: 'sol-selfdestruct',
-      breaks: (line) => /\bselfdestruct\s*\(/.test(line),
-      title: 'Remove selfdestruct',
-      impact: 'selfdestruct is deprecated, and it can remove code that users and other contracts depend on',
-      recommendation: 'Remove the call. If the contract must stop, add an explicit pause or shutdown path',
-      severity: 'high',
-    },
-    {
-      id: 'sol-unchecked-reason',
-      breaks: (line, previous) => /\bunchecked\s*\{/.test(line) && !commented(line, previous),
-      title: 'Give the reason for the unchecked block',
-      impact: 'A reader cannot see why the arithmetic cannot overflow, so a later change can break that condition',
-      recommendation: 'Add a comment on the line before the block that says why overflow is not possible',
-      severity: 'low',
-    },
-    {
-      id: 'sol-assembly-reason',
-      breaks: (line, previous) => /\bassembly\b[^;]*\{/.test(line) && !commented(line, previous),
-      title: 'Give the safety reason for the assembly block',
-      impact: 'Inline assembly skips the compiler safety checks, and nothing tells a reader why the block is safe',
-      recommendation: 'Add a comment on the line before the block that says why the block is safe',
-      severity: 'low',
-    },
-  ],
+  rules: solidityRules,
 }
 
 /** Tests and scripts in a Foundry repository. Deploy scripts always get the full loop. */
@@ -141,9 +176,10 @@ const typescript: Profile = {
   id: 'typescript',
   markers: ['package.json', 'tsconfig.json'],
   files: /\.[cm]?[jt]sx?$/,
-  light: /(^|\/)(test|tests|__tests__)\/|\.(test|spec)\.[cm]?[jt]sx?$/,
+  /** Test directories only at the repository or package root, so that production code in a directory named test gets the full loop. */
+  light: /^(packages\/[^/]+\/)?(test|tests)\/|(^|\/)__tests__\/|\.(test|spec)\.[cm]?[jt]sx?$/,
   guides: ['profiles/typescript.md'],
-  forbidden: [/(^|\/)node_modules\//],
+  forbidden: [],
   rules: [],
 }
 
@@ -151,7 +187,8 @@ const docs: Profile = {
   id: 'docs',
   markers: [],
   files: /\.(mdx?|rst)$/i,
-  light: /./,
+  /** Agent prompts and repository rule files change the behavior of agents, so they always get the full loop. */
+  light: /^(?!agents\/)(?!(.*\/)?(AGENTS\.md|CLAUDE\.md|CONTRIBUTING[^/]*)$)/i,
   guides: [],
   forbidden: [],
   rules: [
@@ -160,7 +197,7 @@ const docs: Profile = {
       breaks: (line) => /\b(e\.g|i\.e|etc)\./i.test(line),
       title: 'Replace the Latin abbreviation',
       impact: 'STE does not allow Latin abbreviations, and many readers do not know them',
-      recommendation: 'Write "for example", "that is" or "and more", or give the full list',
+      recommendation: 'Write "for example", "that is" or "and so on", or give the full list',
       severity: 'low',
     },
   ],
@@ -191,11 +228,13 @@ export type Triage = {
   guides: string[]
 }
 
+/** `changed` holds every path that the change touches, also deleted paths and the old path of a rename. */
 export async function triage(changed: string[], exists: (path: string) => Promise<boolean>, full: boolean): Promise<Triage> {
   const present: Profile[] = []
   for (const profile of profiles) if ((await Promise.all(profile.markers.map(exists))).every(Boolean)) present.push(profile)
   const governing = present.filter((profile) => changed.some((path) => profile.files.test(path)))
-  const resolved = { profiles: present.map((profile) => profile.id), guides: [...new Set(governing.flatMap((profile) => profile.guides))] }
+  const guides = governing.flatMap((profile) => profile.guides)
+  const resolved = { profiles: present.map((profile) => profile.id), guides: [...new Set(guides)] }
   const behavior = changed.filter((path) => !isLight(path, present))
   if (full) return { ...resolved, path: 'full', reason: 'full-asked', files: [] }
   if (changed.length === 0) return { ...resolved, path: 'full', reason: 'empty-diff', files: [] }
@@ -207,6 +246,11 @@ export function triageLine(result: Triage): string {
   const more = result.files.length > 5 ? `,+${result.files.length - 5}` : ''
   const files = result.files.length > 0 ? ` files=${result.files.slice(0, 5).join(',')}${more}` : ''
   return `TRIAGE path=${result.path} reason=${result.reason}${files} profiles=${result.profiles.join(',') || 'none'}`
+}
+
+/** The path of a `+++` line. Host git uses core.quotePath=false and adds a tab after a path with a space. */
+function diffPath(raw: string): string {
+  return raw.replace(/\t$/, '').replace(/^b\//, '')
 }
 
 /**
@@ -232,6 +276,7 @@ export function staticFindings(diff: string, changed: string[], active: Profile[
   let header = false
   let line = 0
   let previous: string | null = null
+  let blockComment = false
   for (const text of diff.split('\n')) {
     if (text.startsWith('diff --git ')) {
       header = true
@@ -243,19 +288,22 @@ export function staticFindings(diff: string, changed: string[], active: Profile[
       header = false
       line = Number(hunk[1])
       previous = null
+      blockComment = false
       continue
     }
     if (header) {
       if (text.startsWith('+++ ')) {
-        path = text.slice(4).replace(/^b\//, '')
+        path = diffPath(text.slice(4))
         rules = active.filter((profile) => profile.files.test(path)).flatMap((profile) => profile.rules)
       }
       continue
     }
-    if (text.startsWith('+')) {
+    if (text.startsWith('+') || text.startsWith(' ')) {
       const content = text.slice(1)
-      for (const rule of rules)
-        if (rule.breaks(content, previous))
+      const parsed = code(content, blockComment)
+      blockComment = parsed.blockComment
+      for (const rule of text.startsWith('+') ? rules : [])
+        if (rule.breaks(content, previous, parsed.source))
           findings.push({
             location: `${path}:${line}`,
             title: rule.title,
@@ -265,9 +313,7 @@ export function staticFindings(diff: string, changed: string[], active: Profile[
             evidence: content.trim(),
             recommendation: rule.recommendation,
           })
-    }
-    if (text.startsWith('+') || text.startsWith(' ')) {
-      previous = text.slice(1)
+      previous = content
       line++
     }
   }

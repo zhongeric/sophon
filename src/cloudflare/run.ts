@@ -174,7 +174,9 @@ export class PullRequestRuns extends DurableObject<Env> {
   }
 
   private async execute(run: string, request: StartRequest, ledger: Ledger, gh: GitHub, comments: Comments): Promise<LoopResult> {
-    const input = ledger.get<LoopInput>('input') ?? (await this.input(run, request, gh))
+    const recorded = ledger.get<LoopInput>('input')
+    // A run that started before a model role existed has no choice for it: use the default.
+    const input = recorded ? { ...recorded, models: mergeModels(recorded.models) } : await this.input(run, request, gh)
     const pull = { owner: request.owner, pr: request.pr, repo: request.repo }
     const branch = `factory/${run}`
     const log = (line: string) => console.log(`[${request.owner}/${request.repo}#${request.pr} ${run}] ${line}`)
