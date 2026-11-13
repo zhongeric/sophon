@@ -15,10 +15,13 @@ async function freePort(): Promise<number> {
   return port
 }
 
-/** The real Worker under wrangler dev, in local mode, with `vars` as its bindings and a fresh Durable Object store. */
-export async function startWorker(vars: Record<string, string>) {
+/**
+ * The real Worker under wrangler dev, in local mode, with `vars` as its bindings and a fresh Durable Object store.
+ * Without `containers`, a test gives the Worker a machine over HTTP (MACHINE_URL), so that it needs no Docker.
+ */
+export async function startWorker(vars: Record<string, string>, options: { containers?: boolean } = {}) {
   const port = await freePort()
-  const args = ['wrangler', 'dev', '--local', '--port', String(port), '--inspector-port', String(await freePort()), '--persist-to', mkdtempSync(join(tmpdir(), 'factory-do-'))]
+  const args = ['wrangler', 'dev', '--local', `--enable-containers=${options.containers === true}`, '--port', String(port), '--inspector-port', String(await freePort()), '--persist-to', mkdtempSync(join(tmpdir(), 'factory-do-'))]
   for (const [name, value] of Object.entries(vars)) args.push('--var', `${name}:${value}`)
   const env: NodeJS.ProcessEnv = { ...process.env, WRANGLER_SEND_METRICS: 'false', NO_COLOR: '1' }
   for (const name of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NODE_USE_ENV_PROXY']) delete env[name]

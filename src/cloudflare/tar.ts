@@ -61,3 +61,61 @@ export function untar(bytes: Uint8Array, strip: number): TarEntry[] {
   }
   return entries
 }
+
+/** One PAX record: "<length> <key>=<value>\n", where the length counts its own digits too. */
+function paxRecord(key: string, value: string): string {
+  const body = ` ${key}=${value}\n`
+  const size = new TextEncoder().encode(body).length
+  let length = size + String(size).length
+  if (String(length).length !== String(size).length) length = size + String(length).length
+  return `${length}${body}`
+}
+
+/** A tar archive of the entries, with PAX headers for long paths and link targets. GNU tar and busybox tar read it. */
+export function tar(entries: TarEntry[]): Uint8Array {
+  const encoder = new TextEncoder()
+  const chunks: Uint8Array[] = []
+  const header = (name: string, type: string, size: number, mode: number, target: string) => {
+    const bytes = new Uint8Array(block)
+    const put = (text: string, start: number, length: number) => bytes.set(encoder.encode(text).subarray(0, length), start)
+    const number = (value: number, start: number, length: number) => put(`${value.toString(8).padStart(length - 1, '0')}\0`, start, length)
+    put(name, 0, 100)
+    number(mode & 0o7777, 100, 8)
+    number(0, 108, 8)
+    number(0, 116, 8)
+    number(size, 124, 12)
+    number(0, 136, 12)
+    bytes.fill(0x20, 148, 156)
+    put(type, 156, 1)
+    put(target, 157, 100)
+    put('ustar\0', 257, 6)
+    put('00', 263, 2)
+    put(`${bytes.reduce((sum, byte) => sum + byte, 0).toString(8).padStart(6, '0')}\0 `, 148, 8)
+    return bytes
+  }
+  const push = (data: Uint8Array) => {
+    chunks.push(data)
+    const padding = (block - (data.length % block)) % block
+    if (padding) chunks.push(new Uint8Array(padding))
+  }
+  for (const entry of entries) {
+    const long = encoder.encode(entry.path).length > 99 || encoder.encode(entry.target).length > 99
+    if (long) {
+      const records = encoder.encode(paxRecord('path', entry.path) + (entry.target ? paxRecord('linkpath', entry.target) : ''))
+      chunks.push(header('PaxHeader', 'x', records.length, 0o644, ''))
+      push(records)
+    }
+    const type = entry.type === 'directory' ? '5' : entry.type === 'symlink' ? '2' : '0'
+    const data = entry.type === 'file' ? entry.data : new Uint8Array()
+    chunks.push(header(entry.path.slice(0, 99), type, data.length, entry.mode, entry.target.slice(0, 99)))
+    if (data.length) push(data)
+  }
+  chunks.push(new Uint8Array(block * 2))
+  const archive = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0))
+  let offset = 0
+  for (const chunk of chunks) {
+    archive.set(chunk, offset)
+    offset += chunk.length
+  }
+  return archive
+}

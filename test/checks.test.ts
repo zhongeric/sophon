@@ -42,6 +42,28 @@ test('the checker never passes host secrets, even when the config asks for them'
   assert.ok(!seen[0]?.includes('ANTHROPIC_API_KEY'))
 })
 
+test('the setup command runs one time before the first check, and a failed setup is the only result', async () => {
+  const repo = fixtureRepo()
+  const commands: string[] = []
+  const machine = (setupExit: number) => ({
+    async run(command: string) {
+      commands.push(command)
+      return { exit_code: command === 'npm ci' ? setupExit : 0, output: command === 'npm ci' && setupExit ? 'no network' : '' }
+    },
+  })
+  const config = { stack: 'TypeScript', checks: { smoke: 'true' }, setup: 'npm ci' }
+  const checker = commandChecker(gitRepo(gitSource(repo), repo, 'unused'), config, machine(0))
+  await checker.checks([])
+  await checker.checks([])
+  assert.deepEqual(commands, ['npm ci', 'true', 'true'])
+
+  commands.length = 0
+  const broken = commandChecker(gitRepo(gitSource(repo), repo, 'unused'), config, machine(1))
+  assert.deepEqual((await broken.checks([])).map(({ name, status, output }) => [name, status, output]), [['setup', 'fail', 'no network']])
+  await broken.checks([])
+  assert.deepEqual(commands, ['npm ci', 'npm ci'])
+})
+
 test('the config file and its protect entries are protected', () => {
   const config = { stack: 'TypeScript', checks: { smoke: 'true' }, protect: ['ci/', 'package.json'] }
   assert.equal(isProtected(config, '/.agent-factory.json'), true)

@@ -2,9 +2,10 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { parseTarget, resumeOutcome } from '../src/node/remote.ts'
 
-test('a PR is owner/repo#number or its GitHub URL', () => {
+test('a PR or an issue is owner/repo#number or its GitHub URL', () => {
   assert.deepEqual(parseTarget('acme/app#7'), { owner: 'acme', pr: 7, repo: 'app' })
   assert.deepEqual(parseTarget('https://github.com/acme/my.app/pull/12/'), { owner: 'acme', pr: 12, repo: 'my.app' })
+  assert.deepEqual(parseTarget('https://github.com/acme/app/issues/5'), { owner: 'acme', pr: 5, repo: 'app' })
   assert.throws(() => parseTarget('acme/app'), /not owner\/repo#123/)
 })
 

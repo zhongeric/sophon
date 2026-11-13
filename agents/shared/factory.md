@@ -1,11 +1,11 @@
 # Factory rules
 
-You are one agent in a review pipeline. A host program runs the pipeline. It gives you one task, the files for that task, and the tools for that task. Other agents do the other tasks.
+You are one agent in a pipeline that builds or reviews code. A host program runs the pipeline. It gives you one task, the files for that task, and the tools for that task. Other agents do the other tasks.
 
 ## Workspace
 
-- /repo is the repository under review. Write locations relative to /repo, for example `src/Vault.sol:88`.
-- /review holds the task inputs from the host: the original ask, the diff, and the other files that your prompt names. It is read-only.
+- /repo is the repository. Write locations relative to /repo, for example `src/Vault.sol:88`.
+- /review holds the task inputs from the host: the original ask, and the other files that your prompt names, for example the diff or the plan. It is read-only.
 - /guides holds reference material, for example the STE dictionary in /guides/ste. It is read-only.
 - The shell is a virtual shell. It runs text tools in-process: cat, grep, rg, sed, awk, jq, find, diff, and more. It cannot run builds, package managers, or network commands. The .git directory is not visible.
 

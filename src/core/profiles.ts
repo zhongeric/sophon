@@ -25,6 +25,8 @@ export type Profile = {
   /** Paths that a change must not add or modify, for example build output. */
   forbidden: RegExp[]
   rules: StaticRule[]
+  /** Sections that a plan must have, beyond its four parts. */
+  planSections: string[]
 }
 
 /** A comment on the line, or on the line before it. An unknown line before counts as a comment, so that the rule does not guess. */
@@ -143,6 +145,7 @@ const solidity: Profile = {
   light: null,
   guides: solidityGuides,
   forbidden: foundryOutput,
+  planSections: ['Interfaces', 'Deployment sequence'],
   rules: solidityRules,
 }
 
@@ -154,6 +157,7 @@ const soliditySupport: Profile = {
   light: /^test\//,
   guides: solidityGuides,
   forbidden: foundryOutput,
+  planSections: [],
   rules: [
     pragma,
     namedImports,
@@ -181,6 +185,7 @@ const typescript: Profile = {
   guides: ['profiles/typescript.md'],
   forbidden: [],
   rules: [],
+  planSections: [],
 }
 
 const docs: Profile = {
@@ -191,6 +196,7 @@ const docs: Profile = {
   light: /^(?!agents\/)(?!(.*\/)?(AGENTS\.md|CLAUDE\.md|CONTRIBUTING[^/]*)$)/i,
   guides: [],
   forbidden: [],
+  planSections: [],
   rules: [
     {
       id: 'docs-latin',
@@ -209,6 +215,19 @@ export const profiles: Profile[] = [solidity, soliditySupport, typescript, docs]
 const forbiddenEverywhere = [/\.log$/, /(^|\/)\.env(\.(?!(example|sample|template)$)[^/]+)?$/]
 
 export const profilesById = (ids: string[]) => profiles.filter((profile) => ids.includes(profile.id))
+
+/** The profiles whose marker files all exist in the repository. */
+export async function presentProfiles(exists: (path: string) => Promise<boolean>): Promise<Profile[]> {
+  const present: Profile[] = []
+  for (const profile of profiles) if ((await Promise.all(profile.markers.map(exists))).every(Boolean)) present.push(profile)
+  return present
+}
+
+/** The changed paths that no change may commit: build output, scratch logs, environment files. */
+export function forbiddenPaths(changed: string[], active: Profile[]): string[] {
+  const forbidden = [...forbiddenEverywhere, ...active.flatMap((profile) => profile.forbidden)]
+  return changed.filter((path) => forbidden.some((pattern) => pattern.test(path)))
+}
 
 /** A file may take the light loop only when a profile governs it, and every profile that governs it allows it. */
 export function isLight(path: string, active: Profile[]): boolean {
@@ -230,8 +249,7 @@ export type Triage = {
 
 /** `changed` holds every path that the change touches, also deleted paths and the old path of a rename. */
 export async function triage(changed: string[], exists: (path: string) => Promise<boolean>, full: boolean): Promise<Triage> {
-  const present: Profile[] = []
-  for (const profile of profiles) if ((await Promise.all(profile.markers.map(exists))).every(Boolean)) present.push(profile)
+  const present = await presentProfiles(exists)
   const governing = present.filter((profile) => changed.some((path) => profile.files.test(path)))
   const guides = governing.flatMap((profile) => profile.guides)
   const resolved = { profiles: present.map((profile) => profile.id), guides: [...new Set(guides)] }
@@ -259,8 +277,7 @@ function diffPath(raw: string): string {
  */
 export function staticFindings(diff: string, changed: string[], active: Profile[]): Omit<Finding, 'id' | 'track'>[] {
   const findings: Omit<Finding, 'id' | 'track'>[] = []
-  const forbidden = [...forbiddenEverywhere, ...active.flatMap((profile) => profile.forbidden)]
-  for (const path of changed.filter((path) => forbidden.some((pattern) => pattern.test(path))))
+  for (const path of forbiddenPaths(changed, active))
     findings.push({
       location: `${path}:1`,
       title: `Remove ${path} from the change`,

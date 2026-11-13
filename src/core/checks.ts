@@ -10,6 +10,8 @@ export type RepoConfig = {
   stack: string
   checks: Record<string, Check>
   tests?: { pattern: string; command: string }
+  /** A command that the host runs in each new worktree before its first check, for example npm ci. */
+  setup?: string
   /** Reference material mounted read-only at /guides/<name>: name to file or directory path, on hosts with a disk. */
   guides?: Record<string, string>
   protect?: string[]
@@ -56,12 +58,15 @@ const toolOutputTailChars = 8_000
 const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
 const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes)
 
-async function exists(repo: Repo, path: string): Promise<boolean> {
+/** The parts of a repository that the checks read. */
+type Tree = Pick<Repo, 'tree' | 'committedFiles'>
+
+async function exists(repo: Tree, path: string): Promise<boolean> {
   return (await repo.tree.stat(`/${path}`)) !== null
 }
 
 /** The test files that the change touches, and the test files that mention a changed source file. */
-export async function targetedTests(repo: Repo, config: RepoConfig, changed: string[]): Promise<string[]> {
+export async function targetedTests(repo: Tree, config: RepoConfig, changed: string[]): Promise<string[]> {
   if (!config.tests) return []
   const pattern = new RegExp(config.tests.pattern)
   const tests = (await repo.committedFiles()).filter((path) => pattern.test(path))
@@ -79,14 +84,25 @@ export async function targetedTests(repo: Repo, config: RepoConfig, changed: str
 }
 
 /** Checks that run the configured commands on a machine. Commands come from the config only. */
-export function commandChecker(repo: Repo, config: RepoConfig, machine: Machine): Checker {
+export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine): Checker {
   const env = [...checkEnv, ...(config.env ?? [])].filter((name) => !hostSecrets.includes(name))
   const run = async (name: string, command: string): Promise<CheckResult> => {
     const result = await machine.run(command, { env, timeoutMs: config.timeout_ms ?? defaultTimeoutMs })
     return { name, command, status: result.exit_code === 0 ? 'pass' : 'fail', ...result }
   }
+  // The setup runs one time for each checker, which is one worktree. A failed setup runs again at the next check.
+  let ready: Promise<CheckResult | null> | null = null
+  const setup = async (): Promise<CheckResult | null> => {
+    if (!config.setup) return null
+    ready ??= run('setup', config.setup).then((result) => (result.status === 'pass' ? null : result))
+    const failed = await ready
+    if (failed) ready = null
+    return failed
+  }
   const runTests = async (tests: string[]): Promise<CheckResult[]> => {
     if (!config.tests || tests.length === 0) return []
+    const failed = await setup()
+    if (failed) return [failed]
     const command = config.tests.command
     if (command.includes('{tests}')) return [await run('tests', command.replace('{tests}', tests.map(quote).join(' ')))]
     const results: CheckResult[] = []
@@ -95,6 +111,8 @@ export function commandChecker(repo: Repo, config: RepoConfig, machine: Machine)
   }
   return {
     async checks(changed) {
+      const failed = await setup()
+      if (failed) return [failed]
       const results: CheckResult[] = []
       for (const [name, check] of Object.entries(config.checks)) {
         const { command, files } = typeof check === 'string' ? { command: check, files: undefined } : check
@@ -131,7 +149,7 @@ export const runTestsTool: Contracts.HostTool = {
 }
 
 /** The run_tests tool: only committed files that match the test pattern. */
-export async function callRunTests(repo: Repo, config: RepoConfig, run: NonNullable<Checker['tests']>, input: unknown): Promise<unknown> {
+export async function callRunTests(repo: Pick<Repo, 'committedFiles'>, config: RepoConfig, run: NonNullable<Checker['tests']>, input: unknown): Promise<unknown> {
   if (!config.tests) throw new Error('this repository has no test command')
   const requested = ((input as { tests?: unknown }).tests ?? []) as unknown[]
   const pattern = new RegExp(config.tests.pattern)

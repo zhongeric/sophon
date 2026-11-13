@@ -125,6 +125,53 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
   }
 }
 
+/**
+ * Runs one agent turn to its submit tool. The submit handler writes the output to the ledger under `turn.key`,
+ * so a resumed run returns it even when the SDK replays the tool call from its receipt. A follow-up turn in the
+ * same session uses another request ID and key.
+ */
+export async function runTurn<T>(
+  host: AgentHost,
+  spec: AgentSpec,
+  prompt: string,
+  tool: string,
+  turn: { request: string; key: string } = { request: 'task', key: `output:${spec.id}` },
+): Promise<T> {
+  const recorded = host.ledger.get<T>(turn.key)
+  if (recorded !== undefined) return recorded
+  const agent = await openAgent(spec, host)
+  try {
+    const report = await agent.ask(turn.request, prompt)
+    if (host.ledger.get(turn.key) === undefined) {
+      if (report.status !== 'completed') throw new Error(`${spec.id}: turn ${report.status}: ${JSON.stringify(report.error ?? null)}`)
+      // The first turn keeps the nudge request ID of earlier runs, so that their journals resume.
+      const nudge = turn.request === 'task' ? 'nudge' : `${turn.request}-nudge`
+      await agent.ask(nudge, `You ended the turn without calling ${tool}. Call tools.${tool} now.`)
+    }
+  } finally {
+    await agent.close()
+  }
+  const output = host.ledger.get<T>(turn.key)
+  if (output === undefined) throw new Error(`${spec.id} did not call ${tool}`)
+  return output
+}
+
+/** A submit tool that only the root agent may call, one time, after `check` accepts the input. */
+export function submitOnce(host: AgentHost, key: string, definition: Contracts.HostTool, check: (input: unknown) => Promise<unknown>): HostTools {
+  return {
+    [definition.name]: {
+      definition,
+      async call(input, call) {
+        if (call.subagent) throw new Error('only the root agent submits')
+        if (host.ledger.get(key) !== undefined) throw new Error(`${definition.name} was already accepted`)
+        const output = await check(input)
+        host.ledger.put(key, output)
+        return { accepted: true }
+      },
+    },
+  }
+}
+
 /** A one-line progress note for the events worth showing: tool calls and turn ends. */
 function describe(logged: Contracts.LoggedEvent): string | null {
   const event = logged.event as { type?: string; status?: string; event?: { type?: string; payload?: Record<string, unknown> } }
