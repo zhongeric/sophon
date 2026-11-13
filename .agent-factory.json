@@ -1,0 +1,20 @@
+{
+  "stack": "TypeScript",
+  "checks": {
+    "typecheck": "npm run check"
+  },
+  "tests": {
+    "pattern": "^test/[^/]+\\.test\\.ts$",
+    "command": "node --disable-warning=ExperimentalWarning --test {tests}"
+  },
+  "protect": [
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "tsconfig.core.json",
+    "tsconfig.cloudflare.json",
+    "wrangler.jsonc",
+    ".gitignore",
+    ".github/"
+  ]
+}
