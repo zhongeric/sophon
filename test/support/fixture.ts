@@ -20,8 +20,17 @@ export const credentials: Credentials = {
 
 export const fixed = 'export function add(a: number, b: number): number {\n  return a + b\n}\n\nexport function sub(a: number, b: number): number {\n  return a - b\n}\n'
 
-/** A repository whose feature branch adds a sub() that adds, with a test that catches it. */
-export function fixtureRepo(): string {
+/** The fixes of the scripted light agent. */
+export const lightFixed = {
+  docs: 'version 2, for example the second release\n',
+  test: '// SPDX-License-Identifier: MIT\npragma solidity 0.8.28;\n\nimport {Test} from "forge-std/Test.sol";\n\ncontract VaultTest is Test {\n    function test_deposit_succeeds() public {}\n}\n',
+}
+
+/**
+ * A repository whose feature branch adds a sub() that adds, with a test that catches it. With `light`, a Foundry
+ * repository whose feature branch only changes docs and a test, with a Latin abbreviation and a vague test name.
+ */
+export function fixtureRepo(options: { light?: boolean } = {}): string {
   const repo = mkdtempSync(join(tmpdir(), 'factory-repo-'))
   const run = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' })
   const write = (path: string, content: string) => {
@@ -45,9 +54,17 @@ export function fixtureRepo(): string {
       tests: { pattern: '\\.test\\.ts$', command: 'env -u NODE_TEST_CONTEXT node --test {tests}' },
     }),
   )
+  if (options.light) write('foundry.toml', '[profile.default]\nsolc = "0.8.28"\n')
   run('add', '-A')
   run('commit', '-q', '-m', 'base')
   run('checkout', '-q', '-b', 'feature')
+  if (options.light) {
+    write('docs/v2.md', 'version 2, e.g. the second release\n')
+    write('test/Vault.t.sol', lightFixed.test.replace('test_deposit_succeeds', 'testStuff'))
+    run('add', '-A')
+    run('commit', '-q', '-m', 'document v2')
+    return repo
+  }
   write('src/math.ts', fixed.replace('a - b', 'a + b'))
   unlinkSync(join(repo, 'docs/current.md'))
   symlinkSync('v2.md', join(repo, 'docs/current.md'))
@@ -126,6 +143,15 @@ export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBu
       }
     case 'intent':
       return { cell: `await tools.submit_verdict({ satisfied: true, gaps: [], summary: 'sub subtracts b from a' })` }
+    case 'light':
+      return {
+        cell: [
+          `try { await tools.Write({ file_path: '/repo/src/math.ts', content: 'x' }); text('CODE WRITE ALLOWED') } catch (error) { text('code refused: ' + error) }`,
+          `await tools.Write({ file_path: '/repo/docs/v2.md', content: ${JSON.stringify(lightFixed.docs)} })`,
+          `await tools.Write({ file_path: '/repo/test/Vault.t.sol', content: ${JSON.stringify(lightFixed.test)} })`,
+          `await tools.submit_light_log({ applied: [{ id: 'host-001', change: 'wrote for example' }, { id: 'host-002', change: 'renamed testStuff to test_deposit_succeeds' }], skipped: [], fixes: [{ location: 'docs/v2.md:1', change: 'kept the release name' }] })`,
+        ].join('\n'),
+      }
     default:
       return { cell: findings([]) }
   }

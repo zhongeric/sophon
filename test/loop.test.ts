@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { PausedError, type Channel } from '../src/core/questions.ts'
 import { defaultModels } from '../src/core/workflows/code-review-loop.ts'
-import { fixed, fixtureRepo, loopInput, memoryChannel, runLoop, script, scriptFor } from './support/fixture.ts'
+import { fixed, fixtureRepo, lightFixed, loopInput, memoryChannel, runLoop, script, scriptFor } from './support/fixture.ts'
 import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
@@ -37,6 +37,27 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   assert.match(gateLog, /FINDING min-001 \| track=minimize \| severity=low \| ACTION=keep/)
   assert.match(result.report, /skipped: min-001 \(inlining adds nothing\)/)
   assert.equal(readFileSync(join(result.dir, 'report.md'), 'utf8'), result.report)
+})
+
+test('a docs and tests only change takes the light loop: host findings, one reviewer that fixes, checks', async () => {
+  const repo = fixtureRepo({ light: true })
+  const turns: Turn[] = []
+  const result = await runLoop(repo, 'light', runsDir(), { dispatch: scriptedDispatch(script, turns) })
+
+  assert.equal(result.pass, true, result.report)
+  assert.deepEqual([...new Set(turns.map((turn) => `${turn.role}:${turn.provider}`))], ['light:claude'])
+  const show = (path: string) => execFileSync('git', ['show', `${result.branch}:${path}`], { cwd: repo }).toString()
+  assert.deepEqual([show('docs/v2.md'), show('test/Vault.t.sol')], [lightFixed.docs, lightFixed.test])
+  assert.match(turns.filter((turn) => turn.output).map((turn) => turn.output).join('\n'), /code refused: .*EACCES/)
+
+  const gateLog = readFileSync(join(result.dir, 'gate-log.txt'), 'utf8')
+  assert.match(gateLog, /^TRIAGE path=light reason=docs-or-tests-only profiles=solidity,solidity-support,docs\n/)
+  assert.match(gateLog, /# Light \| model_family=claude \| light=claude-opus-5-5/)
+  assert.match(gateLog, /FINDING host-001 \| track=rules \| severity=low \| ACTION=keep/)
+  assert.match(gateLog, /FINDING host-002 \| track=rules \| severity=low \| ACTION=keep/)
+  assert.match(result.report, /^# Code review loop \(light\): PASS/)
+  assert.match(result.report, /Light review: commit [0-9a-f]{12}; applied: host-001 \(wrote for example\); host-002 .*; other fixes: docs\/v2.md:1/)
+  assert.doesNotMatch(result.report, /## Intent/)
 })
 
 test('a resumed run does not repeat finished steps', async () => {

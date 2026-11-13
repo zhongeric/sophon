@@ -7,7 +7,7 @@ import { repoConfigFile } from '../core/checks.ts'
 import type { Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError, type Channel } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { codeReviewLoop, defaultModels, providersOf, type LoopInput, type LoopModels } from '../core/workflows/code-review-loop.ts'
+import { codeReviewLoop, defaultModels, mergeModels, providersOf, type LoopInput, type LoopModels } from '../core/workflows/code-review-loop.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
 import { credential } from './credentials.ts'
 import { git, type GitSource } from './git.ts'
@@ -37,6 +37,7 @@ Options:
   --run <id>             Resume a run; other target options come from its ledger
   --runs-dir <path>      Where runs live (default: <agent-factory>/runs)
   --claude-plan          Sign Claude requests with the nc Claude login instead of ANTHROPIC_API_KEY
+  --full                 Run the full loop, also when triage allows the light loop for a docs or tests only change
   --ship                 With --pr, on PASS: push the fixes to the PR branch and mark it ready
   --wait <minutes>       With --pr, how long to wait for answers before the run pauses (default 60)
 
@@ -55,6 +56,7 @@ async function main(): Promise<number> {
       base: { type: 'string' },
       'claude-plan': { type: 'boolean' },
       config: { type: 'string' },
+      full: { type: 'boolean' },
       head: { type: 'string' },
       help: { short: 'h', type: 'boolean' },
       models: { type: 'string' },
@@ -146,6 +148,7 @@ async function newInput(values: Values): Promise<{ input: LoopInput; source: Git
     ...(values.stack ? { stack: String(values.stack) } : {}),
     ...(prNumber ? { pr: prNumber } : {}),
     ...(ship ? { ship } : {}),
+    ...(values.full ? { full: true } : {}),
   }
   return { input, source: { base, head, repo } }
 }
@@ -158,10 +161,6 @@ async function channel(input: LoopInput, repo: string, runDir: string, waitMs: n
     return commentChannel({ answerers, comments: ghComments(run, input.pr), pollMs, waitMs })
   }
   return process.stdin.isTTY ? terminalChannel(process.stdin, process.stderr) : fileChannel(runDir)
-}
-
-function mergeModels(overrides: Partial<LoopModels>): LoopModels {
-  return { step1: { ...defaultModels.step1, ...overrides.step1 }, step2: { ...defaultModels.step2, ...overrides.step2 } }
 }
 
 main().then(

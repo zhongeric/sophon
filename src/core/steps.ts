@@ -5,7 +5,7 @@ import { assignIds, checkFindings, parseLocation, submitFindings, type Finding }
 import type { Checker, Frozen, Guides, Repo } from './platform.ts'
 import { checkQuestions, decisions, submitQuestions, type Question } from './questions.ts'
 import { instructions, roles, type ModelChoice, type Role } from './roles.ts'
-import { createWorkspace, guard, readOnly } from './workspace.ts'
+import { allowFiles, createWorkspace, guard, readOnly } from './workspace.ts'
 
 /** What every step of one review run shares. */
 export type RunContext = {
@@ -15,7 +15,8 @@ export type RunContext = {
   config: RepoConfig
   ask: string
   stack: string
-  solidity: boolean
+  /** The guides of the profiles that govern the changed files. */
+  stackGuides: string[]
   guides: Guides
   tests: Checker['tests']
 }
@@ -72,7 +73,7 @@ function spec(context: RunContext, id: string, role: Role, model: ModelChoice, w
   return {
     id,
     ...model,
-    instructions: instructions(role, { read: context.guides.read, solidity: context.solidity }),
+    instructions: instructions(role, { read: context.guides.read, stackGuides: context.stackGuides }),
     tools: { ...tools, ...testTools(context, role) },
     workspace,
   }
@@ -137,7 +138,7 @@ export async function review(context: RunContext, id: string, role: Role, model:
 }
 
 export type PatchLog = { applied: { id: string; change: string }[]; skipped: { id: string; reason: string }[] }
-export type PatchOutcome = { before: string; after: string; changed: boolean; log: PatchLog | null; outOfScope: string[] }
+export type PatchOutcome<Log extends PatchLog = PatchLog> = { before: string; after: string; changed: boolean; log: Log | null; outOfScope: string[] }
 
 const submitPatchLog: Contracts.HostTool = {
   name: 'submit_patch_log',
@@ -176,23 +177,41 @@ export function checkPatchLog(input: unknown, kept: Finding[]): PatchLog {
   return log
 }
 
+/** The commit that an editing step starts from, recorded so that a resumed step compares against the same commit. */
+async function editBase(context: RunContext, id: string): Promise<string> {
+  const key = `before:${id}`
+  const before = context.host.ledger.get<string>(key) ?? (await context.repo.head())
+  context.host.ledger.put(key, before)
+  return before
+}
+
+/** Runs one editing agent to its submit tool, commits its changes, and lists the files that it touched outside the change and the findings. */
+async function edit<Log extends PatchLog>(context: RunContext, before: string, agent: AgentSpec, prompt: string, tool: string, kept: Finding[], message: string): Promise<PatchOutcome<Log>> {
+  const { repo } = context
+  const log = await runTask<Log>(context, agent, prompt, tool)
+  await repo.commit(message)
+  const after = await repo.head()
+  const touched = after === before ? [] : await repo.changedFiles(before, after)
+  const allowed = new Set([
+    ...(await repo.changedFiles(context.frozen.base, context.frozen.head)),
+    ...kept.map((finding) => parseLocation(finding.location)!.path),
+  ])
+  return { before, after, changed: after !== before, log, outOfScope: touched.filter((path) => !allowed.has(path)) }
+}
+
 /** A fresh patch agent that may edit /repo, except protected files, to apply only the kept findings. The host commits. */
 export async function patch(context: RunContext, id: string, model: ModelChoice, kept: Finding[], gateLog: string[], message: string): Promise<PatchOutcome> {
-  const { repo } = context
-  const beforeKey = `before:${id}`
-  const before = context.host.ledger.get<string>(beforeKey) ?? (await repo.head())
-  context.host.ledger.put(beforeKey, before)
+  const before = await editBase(context, id)
   if (kept.length === 0) return { before, after: before, changed: false, log: null, outOfScope: [] }
 
-  const current = await repo.diff(context.frozen.base, before)
   const review = {
     '/ask.md': context.ask,
     '/kept-findings.json': JSON.stringify(kept, null, 2),
     '/gate-log.txt': gateLog.join('\n'),
-    '/diff.patch': current,
+    '/diff.patch': await context.repo.diff(context.frozen.base, before),
     ...decisionFiles(context),
   }
-  const workspace = await createWorkspace({ repo: guard(repo.tree, (path) => isProtected(context.config, path)), review, guides: context.guides.mounts })
+  const workspace = await createWorkspace({ repo: guard(context.repo.tree, (path) => isProtected(context.config, path)), review, guides: context.guides.mounts })
   const tools = submitTool(context, id, submitPatchLog, async (input) => checkPatchLog(input, kept))
   const prompt = [
     'Apply the kept findings.',
@@ -205,16 +224,67 @@ export async function patch(context: RunContext, id: string, model: ModelChoice,
     '',
     'Edit the files in /repo. Then call submit_patch_log one time.',
   ].join('\n')
-  const log = await runTask<PatchLog>(context, spec(context, id, roles.patch, model, workspace, tools), prompt, 'submit_patch_log')
+  return edit(context, before, spec(context, id, roles.patch, model, workspace, tools), prompt, 'submit_patch_log', kept, message)
+}
 
-  await repo.commit(message)
-  const after = await repo.head()
-  const touched = after === before ? [] : await repo.changedFiles(before, after)
-  const allowed = new Set([
-    ...(await repo.changedFiles(context.frozen.base, context.frozen.head)),
-    ...kept.map((finding) => parseLocation(finding.location)!.path),
-  ])
-  return { before, after, changed: after !== before, log, outOfScope: touched.filter((path) => !allowed.has(path)) }
+export type LightLog = PatchLog & { fixes: { location: string; change: string }[] }
+
+const entries = (fields: string[]) => ({
+  type: 'array',
+  items: { type: 'object', properties: Object.fromEntries(fields.map((field) => [field, { type: 'string' }])), required: fields, additionalProperties: false },
+})
+
+const submitLightLog: Contracts.HostTool = {
+  name: 'submit_light_log',
+  description:
+    'Record what you did. List every host finding ID exactly one time: in applied, with the change, or in skipped, with the reason. List each other fix in fixes, with its location (path:line) and the change.',
+  parameters: {
+    type: 'object',
+    properties: { applied: entries(['id', 'change']), skipped: entries(['id', 'reason']), fixes: entries(['location', 'change']) },
+    required: ['applied', 'skipped', 'fixes'],
+    additionalProperties: false,
+  },
+}
+
+/**
+ * The light loop for a change that only touches docs and tests: one fresh agent reviews the change and fixes it,
+ * and applies or rejects the host findings. The host refuses its writes outside docs and tests, and commits.
+ */
+export async function light(
+  context: RunContext,
+  id: string,
+  model: ModelChoice,
+  options: { kept: Finding[]; gateLog: string[]; reason: string; message: string; allow(path: string): boolean },
+): Promise<PatchOutcome<LightLog>> {
+  const before = await editBase(context, id)
+  const range = { from: context.frozen.base, to: context.frozen.head }
+  const inputs = await reviewInputs(context, range)
+  const review = { ...inputs.files, '/host-findings.json': JSON.stringify(options.kept, null, 2), '/gate-log.txt': options.gateLog.join('\n') }
+  const repo = allowFiles(guard(context.repo.tree, (path) => isProtected(context.config, path)), options.allow)
+  const workspace = await createWorkspace({ repo, review, guides: context.guides.mounts })
+  const tools = submitTool(context, id, submitLightLog, async (input) => {
+    const log = checkPatchLog(input, options.kept) as LightLog
+    if (!Array.isArray(log.fixes) || log.fixes.some((fix) => typeof fix?.location !== 'string' || typeof fix.change !== 'string'))
+      throw new Error('fixes must be an array of { location, change }')
+    return log
+  })
+  const kept = options.kept.map((finding) => finding.id).join(', ')
+  const prompt = [
+    'Review this change, and fix it.',
+    '',
+    '- Original ask: /review/ask.md',
+    ...decisionsLine(review),
+    `- Diff: /review/diff.patch, from ${range.from.slice(0, 12)} to ${range.to.slice(0, 12)}`,
+    `- Changed files: /review/changed-files.txt (${inputs.changed.length} files)`,
+    `- Host findings: /review/host-findings.json (${kept || 'none'})`,
+    '- Gate log: /review/gate-log.txt',
+    `- Stack: ${context.stack}`,
+    '',
+    `Triage: ${options.reason}. The host refuses your writes outside docs and tests.`,
+    '',
+    'Edit the files in /repo. Then call submit_light_log one time.',
+  ].join('\n')
+  return edit(context, before, spec(context, id, roles.light, model, workspace, tools), prompt, 'submit_light_log', options.kept, options.message)
 }
 
 export type Verdict = { satisfied: boolean; gaps: string[]; summary: string }

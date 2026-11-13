@@ -22,8 +22,8 @@ export default {
     // Starts and resumes for callers without the webhook, such as npm run remote.
     if (request.method === 'POST' && action === 'resume') return accepted({ resumed: await runs.resume({ afterError: true }) })
     if (request.method === 'POST' && !action) {
-      const options = (await request.json().catch(() => ({}))) as { ship?: boolean }
-      return accepted(await runs.start({ by: allowedUsers(env)[0] ?? owner, owner, pr, repo, ship: options.ship === true }))
+      const options = (await request.json().catch(() => ({}))) as { ship?: boolean; full?: boolean }
+      return accepted(await runs.start({ by: allowedUsers(env)[0] ?? owner, full: options.full === true, owner, pr, repo, ship: options.ship === true }))
     }
     return new Response('method not allowed', { status: 405 })
   },
@@ -57,7 +57,7 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     if (!allowed(by)) return accepted({ ignored: 'not an allowed user' })
     const text = payload.comment.body.trim()
     const runs = pullRequest(env, owner, repo, payload.issue.number)
-    if (/^\/review\b/.test(text)) return accepted(await runs.start({ by, owner, pr: payload.issue.number, repo, ship: /--ship\b/.test(text) }))
+    if (/^\/review\b/.test(text)) return accepted(await runs.start({ by, full: /--full\b/.test(text), owner, pr: payload.issue.number, repo, ship: /--ship\b/.test(text) }))
     if (/^\/answer\b/.test(text)) return accepted({ resumed: await runs.resume() })
   }
   if (event === 'pull_request' && payload.action === 'labeled' && payload.label?.name === 'agent-review' && payload.pull_request && allowed(payload.sender?.login))

@@ -18,13 +18,30 @@ The same workflow runs on two platforms:
 ## How a run works
 
 ```
-freeze ─▶ step 1: minimize │ rules │ bugs │ anti-slop   (Opus 5.5, Sol, Fable 5.2: read-only, parallel)
-       ─▶ gate ─▶ patch (Opus 5.5) ─▶ commit
+freeze ─▶ triage: light or full
+
+full:  step 1: minimize │ rules │ bugs │ anti-slop   (Opus 5.5, Sol, Fable 5.2: read-only, parallel)
+       + host findings ─▶ gate ─▶ patch (Opus 5.5) ─▶ commit
        ─▶ step 2: late-minimize │ late-rules on the new diff   (each role on the other family)
-       ─▶ gate ─▶ patch (Sol) ─▶ commit
+       + host findings ─▶ gate ─▶ patch (Sol) ─▶ commit
        ─▶ late bugs on every fix since the freeze ─▶ gate ─▶ patch ─▶ commit
        ─▶ checks ─▶ intent ─▶ PASS criteria ─▶ (optional) push + mark the PR ready
+
+light: host findings ─▶ gate ─▶ one reviewer that also fixes (Opus 5.5) ─▶ commit
+       ─▶ checks ─▶ PASS criteria ─▶ (optional) push + mark the PR ready
 ```
+
+Triage comes from the **profiles** in `src/core/profiles.ts`, one for each stack: `solidity` (`src/**/*.sol`),
+`solidity-support` (Foundry tests and scripts), `typescript` and `docs`. A profile applies when its marker files
+exist, for example `foundry.toml`. It gives the guides for its files, the paths that a change must not commit,
+and static rules. The light loop runs only when every changed file is docs or tests of a profile that allows it.
+Solidity `src/` and `script/` always get the full loop. `--full` forces the full loop. The host writes the
+decision as `TRIAGE path=light|full reason=...` at the top of the gate log and in the report.
+
+The static rules are the mechanical rules that a program can check: a fixed pragma, named imports, no revert
+strings, no `tx.origin` or `selfdestruct`, a comment before `unchecked` and `assembly`, the two test name shapes,
+no Latin abbreviations in docs, and no build output, logs or `.env` files in the change. The host checks the lines
+that the change adds, and gives each break to the patch agent as a `host-NNN` finding of the rules track.
 
 Each agent is a fresh nanocode session with its own journal scope. Each step's result goes into the run's
 ledger before the next step starts. A resumed run returns the recorded results of finished steps, and an
@@ -42,6 +59,8 @@ resumes the run by itself.
 | Finding schema and evidence rule | `submit_findings` rejects a finding with a missing field, a location that is not a real file and line, or a quote that is not in the file near that line (or in the diff). The agent sees the reasons and can correct the call. |
 | Findings filter (no Jev) | The evidence check is the noise filter. Every finding that passes it goes to the patch agent, which applies it or rejects it with a reason. A rejected critical or high finding becomes a question to you, and the run passes only if you accept the rejection. |
 | Patch: log why for each item | `submit_patch_log` must list every finding ID one time, in applied or skipped. |
+| Light or full loop | Profile rules decide, not an agent. The light reviewer cannot write outside docs and tests. |
+| Mechanical style rules | The profiles' static rules run on the added lines before each gate. Their findings skip the evidence check, because the host quotes the line. |
 | Never weaken checks | Patch agents cannot write `.agent-factory.json` or the `protect` paths. Check commands come from the config only. The report lists patch edits outside the change and the findings. |
 | Model swap across passes | The run stops before any work if a step 2 agent uses the same family as its step 1 counterpart. The gate log records the families. |
 | Allowed models | Fable 5.2, Opus 5.5 and Sol only (`allowedModels`). The run stops before any work on another model. |
@@ -108,6 +127,7 @@ npm run review -- --repo ~/src/app --pr 123                 # base, head and ask
 npm run review -- --repo ~/src/app --base main --ask-file ask.md
 npm run review -- --run 20261113-101500-1a2b3c4d             # resume
 npm run review -- --repo ~/src/app --pr 123 --ship          # on PASS, push the fixes and mark the PR ready
+npm run review -- --repo ~/src/app --pr 123 --full          # the full loop, also for a docs or tests only change
 ```
 
 ### Your answers
@@ -125,13 +145,14 @@ The fixes stay on a local branch, `factory/<run>`, in a worktree at `runs/<run>/
 
 Each run writes:
 
-- `report.md`: PASS or FAIL, the criteria, each step, the checks and the intent verdict
-- `gate-log.txt`: one line per finding in the skill's format, with the model family of each step
+- `report.md`: PASS or FAIL, the triage line, the criteria, each step, the checks and the intent verdict
+- `gate-log.txt`: the triage line, then one line per finding in the skill's format, with the model family of each step
 - `state.json`: the ledger, with every finding, gate decision, patch log and turn report
 - `agents/<step>.events.jsonl` and `agents/<step>.sqlite`: each agent's event log and journal
 
 `--models file.json` overrides models per step and role, for example
 `{ "step1": { "bugs": { "provider": "claude", "model": "claude-opus-5-5", "thinking": "high" } } }`.
+The light loop's model is `light`.
 
 ## Cloudflare
 
@@ -170,6 +191,7 @@ and Statuses.
 
 ```bash
 npm run remote -- start acme/app#123            # or a PR URL; --ship pushes the fixes and marks the PR ready on PASS
+npm run remote -- start acme/app#123 --full     # the full loop, also for a docs or tests only change
 npm run remote -- resume acme/app#123           # after you answer, instead of waiting for the next poll
 npm run remote -- status acme/app#123
 npm run remote -- report acme/app#123
@@ -178,13 +200,13 @@ npm run remote -- report acme/app#123
 `npm run remote` reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from `.secrets/cloudflare.env`.
 
 - With the webhook: comment `/review` on a PR, or add the `agent-review` label. `/review --ship` also pushes the
-  fixes to the PR branch and marks it ready on PASS.
+  fixes to the PR branch and marks it ready on PASS. `/review --full` forces the full loop.
 - Answer questions with a `/answer` comment, as in [Your answers](#your-answers). The webhook resumes the run at
   once; without it, the run checks again every `PAUSE_POLL_SECONDS` (default 60). Only unedited comments from
   `ALLOWED_USERS` count. The config's `answerers` can narrow that list, never widen it.
 - The result is a PR comment with the criteria and the full report. The fixes are on `factory/<run>`.
 - The routes behind `Authorization: Bearer <ADMIN_TOKEN>`: `POST /runs/<owner>/<repo>/<pr>` starts a run
-  (body `{"ship": true}` to ship), `POST .../resume` wakes it, `GET /runs/<owner>/<repo>/<pr>` and `.../report`
+  (body `{"ship": true}` to ship, `{"full": true}` for the full loop), `POST .../resume` wakes it, `GET /runs/<owner>/<repo>/<pr>` and `.../report`
   return the status and the report. `npx wrangler tail` shows each agent's tool calls.
 
 ### How it works
@@ -203,13 +225,15 @@ npm run remote -- report acme/app#123
 ## Layout
 
 ```
-agents/                    guidelines, one file per role, and shared rules (factory, reviewer, STE, Solidity)
+agents/                    guidelines, one file per role, and shared rules (factory, reviewer, STE)
+agents/profiles/           the guides of each profile (Solidity, TypeScript)
 agents/guides/ste/         the STE dictionary, mounted at /guides/ste
 src/core/                  platform-neutral: it typechecks without Node types (tsconfig.core.json)
   workflows/               the code review loop
+  profiles.ts              profiles: triage, guides, forbidden paths and static rules for each stack
   platform.ts              what a platform supplies: Repo, Checker, Files, AgentStore, Guides
   agent.ts                 one isolated nanocode agent: durable session, drive loop, host tools
-  steps.ts                 reviewer, patch, intent and questions steps with their submit tools
+  steps.ts                 reviewer, patch, light, intent and questions steps with their submit tools
   workspace.ts             the agent shell and the rails: read-only, protected paths, no symlink writes, .git hidden
   findings.ts gate.ts      the evidence check; the gate that holds findings for your decision
   questions.ts checks.ts   questions and /answer parsing; repository config and command checks
@@ -228,6 +252,7 @@ scripts/smoke.ts           one live reviewer against the test fixture (npm run s
 - On Cloudflare, agents cannot run tests during their turns (`run_tests` is local only); CI checks the result.
 - On Cloudflare, in-process git reads a symlink as its target's content, so a PR that only retargets a symlink
   shows no change to the reviewers. The fixes never change a symlink.
+- Triage uses profile rules, not a Jev chore score (D1). The light reviewer also applies the host findings.
 - Not built yet: the review bot loop after the PR is ready, and the Auditor workflow.
 
 ## Development

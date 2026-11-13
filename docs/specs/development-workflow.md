@@ -91,8 +91,11 @@ Each stage below lists who does the work, what the host enforces, and where Eric
 - **Who:** the host, with profile rules. There is no Jev (D1).
 - **Rails:** the light loop applies when every matched profile allows it and the diff matches the profile's light
   rule, for example "docs or tests only, no behavior change". Else the full loop applies. Solidity `src/` always gets
-  the full loop (`SOL-004`). The host writes `TRIAGE path=light reason=docs-only` (or `path=full reason=...`) in the gate
-  log and the PR description. The host checks triage again at freeze (`ALL-017`).
+  the full loop (`SOL-004`). The host writes `TRIAGE path=light reason=docs-or-tests-only` (or `path=full reason=...`) in
+  the gate log and the PR description. The host checks triage again at freeze (`ALL-017`).
+- **Light loop:** one context-free reviewer that also fixes, on Opus 5.5. It makes only anti-slop and STE fixes, and
+  applies or rejects the host findings. The host refuses its writes outside docs and tests, so the change cannot grow
+  into behavior. No step 2, no intent check. Checks must be green.
 - **Count of review passes** comes from the change type table in `ship-quality-code` step 5 and from Eric's words:
   "heavy" means x2 with several reviewers (`ALL-061`), "double loop" means x2 then Auditor (`ALL-062`), "no code
   review loop" is a waiver that only Eric can give (`ALL-005`).
@@ -181,8 +184,12 @@ type Profile = {
 }
 ```
 
-Profiles live in agent-factory (`profiles/<id>.ts` and `agents/profiles/<id>/*.md`). A repo can override fields in
+Profiles live in agent-factory (`src/core/profiles.ts` and `agents/profiles/<id>.md`). A repo can override fields in
 `.agent-factory.json` on its base branch, so a PR cannot change its own rules.
+
+The code has a part of this type now: `markers`, `files`, `light`, `guides`, `forbidden` and `rules`. The review loop
+uses them for triage, guides and host findings. Policy, checks, tests, protected paths, the machine and repo
+overrides come with phase 1.
 
 ### 4.2 Resolution
 
@@ -213,6 +220,11 @@ commit, before any reviewer sees the code. Reviewers then spend their judgment o
 
 Your evm-cortex hooks already implement several of these checks, but `~/.claude/settings.json` does not enable them.
 The profile can run the same code as host checks.
+
+The review loop runs these rules now, on the lines that each reviewed diff adds: fixed pragma, custom errors, named
+imports, `tx.origin`, `selfdestruct`, test names, a reason before `unchecked` and `assembly`, and forbidden paths. The
+`docs` profile adds one rule: no Latin abbreviations. Each break becomes a `host-NNN` finding of the rules track. Not
+built yet: `abi.encodePacked` with dynamic types and NatSpec, because they need a Solidity parser.
 
 ### 4.4 First profiles
 
@@ -280,7 +292,7 @@ Each decision lists the conflict, the sources, the recommendation and the status
 | D6 | **Local test scope.** The loop runs touched tests only. The cortex rules want the full suite, Slither and coverage before every PR. | Touched tests locally, the full suite in CI. Make the cortex pre-PR list a CI requirement of the `solidity` profile. | **Decided:** Eric accepted the recommendation. |
 | D7 | **Plan in parallel.** "All four, in parallel" against one consistent plan. | One planner writes all four parts in one checked output. | **Decided:** Eric accepted the recommendation. |
 | D8 | **TDD against lazy draft.** The cortex says tests first. `implementation-workflow` says lazy first draft. | The draft includes its tests, and done-looks-like names them. Bug fixes start with a failing test (the evm-cortex bug-fix flow). | **Decided:** Eric accepted the recommendation. |
-| D9 | **Solidity style conflicts.** Test names (three schemes), error names (`ManagerLocked` or `Oracle_StalePrice`), event tense, immutable case, pinned compiler (0.8.24, 0.8.26, 0.8.28), NatSpec on internal functions, coverage (90% or 100%), ReentrancyGuard scope (all external calls or value paths only). | One precedence rule: repo rules > `~/.claude/rules/solidity-style-guide.md` > evm-cortex agent templates. Then the profile takes its values from the style guide, and a repo can override in its config. | **Decided**, see the D9 picks below. In `agents/shared/solidity.md` now. |
+| D9 | **Solidity style conflicts.** Test names (three schemes), error names (`ManagerLocked` or `Oracle_StalePrice`), event tense, immutable case, pinned compiler (0.8.24, 0.8.26, 0.8.28), NatSpec on internal functions, coverage (90% or 100%), ReentrancyGuard scope (all external calls or value paths only). | One precedence rule: repo rules > `~/.claude/rules/solidity-style-guide.md` > evm-cortex agent templates. Then the profile takes its values from the style guide, and a repo can override in its config. | **Decided**, see the D9 picks below. In `agents/profiles/solidity.md` now. |
 | D10 | **Questions at once or one at a time.** The loop batches. The grilling skills ask one at a time. | Batch per stage. On an async channel, each round trip costs minutes or hours. | **Decided:** Eric accepted the recommendation. |
 | D11 | **`~/.claude/commands/auto-spec.md`** never asks Eric and skips every review. | Retire it, or never route to it. It breaks the approval rules. | **Decided and done:** renamed to `auto-spec.md.retired`. |
 
@@ -321,7 +333,7 @@ No source defines these. Each has a proposed default that Eric can replace.
 
 | Phase | Scope | Exit |
 | --- | --- | --- |
-| 0 | Review loop matches D1 and D3 (done). Next: the light loop for docs and tests only changes. | A real run on one of Eric's PRs. |
+| 0 | Review loop matches D1 and D3 (done). The light loop, first profiles and static rules (done). | A real run on one of Eric's PRs. |
 | 1 | Profiles in code. Intake, plan, build, freeze, review loop, hygiene, CI, ready PR, on the local platform. Profiles `solidity`, `solidity-support`, `typescript`, `docs`. | A small real feature from ask to ready PR. |
 | 2 | The Auditor as a sub-workflow, PR-delta mode first. | A Solidity change with the review loop and the Auditor. |
 | 3 | The builder on Cloudflare, through a Container per run. | The phase 1 feature, run from `npm run remote`. |

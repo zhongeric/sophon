@@ -55,6 +55,24 @@ export function guard(fs: FileSystem.FileSystem, protect: (path: string) => bool
   }
 }
 
+/** Refuses writes, removals and renames of files that `allow` refuses. Directories stay creatable, so that new files can go in new folders. */
+export function allowFiles(fs: FileSystem.FileSystem, allow: (path: string) => boolean): FileSystem.FileSystem {
+  const check = (path: string) => {
+    if (!allow(FileSystem.normalize(path).replace(/^\/+/, ''))) throw new FileSystem.FsError('EACCES', path)
+  }
+  return {
+    stat: (path) => fs.stat(path),
+    lstat: fs.lstat && ((path) => fs.lstat!(path)),
+    readlink: fs.readlink && ((path) => fs.readlink!(path)),
+    read: (path) => fs.read(path),
+    list: (path) => fs.list(path),
+    mkdir: (path) => fs.mkdir(path),
+    write: async (path, data, append) => (check(path), fs.write(path, data, append)),
+    remove: async (path) => (check(path), fs.remove(path)),
+    rename: async (from, to) => (check(from), check(to), fs.rename(from, to)),
+  }
+}
+
 export type WorkspaceLayout = {
   /** The repository tree, mounted at /repo. */
   repo: FileSystem.FileSystem
