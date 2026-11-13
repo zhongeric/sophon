@@ -9,7 +9,7 @@ import { StopError } from '../core/stop.ts'
 import { codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { ciChecker } from './checker.ts'
 import { githubComments } from './comments.ts'
-import { github, GitHubError, type GitHub } from './github.ts'
+import { github, GitHubError, refusedCredential, type GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubRepo, type PullRequest } from './repo.ts'
 import { createTables, sqlFiles, sqlLedger } from './storage.ts'
@@ -157,7 +157,7 @@ export class PullRequestRuns extends DurableObject<Env> {
         ledger.put('attempts', attempts)
         console.error(`[${row.run}] attempt ${attempts} failed`, error)
         // A refused credential or permission does not fix itself: stop at once instead of retrying.
-        const permanent = error instanceof StopError || (error instanceof GitHubError && (error.status === 401 || error.status === 403))
+        const permanent = error instanceof StopError || refusedCredential(error)
         if (permanent || attempts >= maxAttempts) {
           this.setState(row.run, 'error', message)
           const hint = error instanceof GitHubError ? ' Check the permissions of GITHUB_TOKEN.' : ''
