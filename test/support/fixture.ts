@@ -99,7 +99,7 @@ export const script = scriptFor({ tests: true })
 
 /**
  * The scripted agents. Without `tests`, as on Cloudflare where CI runs the tests, no agent calls run_tests.
- * `holdBug` marks the bug as Eric's decision. `rejectBug` makes the patch agent reject it.
+ * `holdBug` marks the bug as the user's decision. `rejectBug` makes the patch agent reject it.
  */
 export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBug?: boolean }): Script {
   const runTests = (code: string) => (options.tests ? [code] : [])

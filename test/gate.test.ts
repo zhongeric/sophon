@@ -16,7 +16,7 @@ const finding = (id: string, severity: Finding['severity'], extra: Partial<Findi
   ...extra,
 })
 
-test('the gate orders findings by severity, keeps them for the patch agent, and holds the ones that need Eric', () => {
+test('the gate orders findings by severity, keeps them for the patch agent, and holds the ones that need the user', () => {
   const result = gate([
     finding('min-001', 'low'),
     finding('bugs-002', 'high', { decision: 'Should withdraw pause during an upgrade?', needs_decision: true }),
@@ -32,7 +32,7 @@ test('the gate orders findings by severity, keeps them for the patch agent, and 
   assert.match(findingQuestion(result.held[0]!, 'Q1').why, /^Should withdraw pause during an upgrade\? Trigger: reenter withdraw/)
 })
 
-test("Eric's answers settle the held findings", () => {
+test("the user's answers settle the held findings", () => {
   const result = gate([finding('bugs-002', 'high', { decision: 'Pause?', needs_decision: true })])
   const fixed = settle(result, [{ id: 'bugs-002', answer: 'fix it, but keep the event name' }])
   assert.deepEqual(fixed.kept.map((f) => f.id), ['bugs-002'])

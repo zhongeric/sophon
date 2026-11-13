@@ -3,9 +3,13 @@
 A host for workflows of specialized agents, built on [nanocode-ts](https://github.com/nanocodexyz/nanocode-ts).
 It has two workflows:
 
-- the **code review loop** from `~/.claude/skills/code-review-loop`, and
-- the **development workflow** from `~/.claude/skills/ship-quality-code`: from an ask to a PR that is ready for
-  your review, with builder agents for the plan's tasks and the code review loop before the PR is ready.
+- the **code review loop**: context-free reviewers in parallel tracks, a gate, patch agents, and a second pass on
+  another model family, and
+- the **development workflow**: from an ask to a PR that is ready for your review, with builder agents for the
+  plan's tasks and the code review loop before the PR is ready.
+
+The design of the development workflow and of the profiles, with its decisions, is in
+[docs/specs/development-workflow.md](docs/specs/development-workflow.md).
 
 The host owns the flow and the hard rules. Each agent gets one role: its guidelines (`agents/*.md`),
 its workspace, its tools, and a submit tool whose input the host checks. No agent sees another agent's
@@ -56,22 +60,22 @@ resumes the run by itself.
 
 ## Rules in code, not in prompts
 
-| Skill rule | How the host enforces it |
+| Rule | How the host enforces it |
 | --- | --- |
 | Context-free reviewers | Every agent is a new session. Reviewers get only the ask, the diff and the repo. |
 | Read-only tracks | Reviewers' `/repo` is a read-only file system. Writes fail with EROFS, in the file tools and in the shell. |
 | Agents stay in their workspace | The agent shell is nanocode's in-process virtual bash with its own environment. Cell `fetch`, shell network and web search are off. Paths cannot leave the tree, `.git` is hidden, and writes never follow a symlink. |
 | Test scope; one test run at a time | `run_tests` accepts only committed test files, runs the repository's configured command, and runs one command at a time across the host. |
 | Finding schema and evidence rule | `submit_findings` rejects a finding with a missing field, a location that is not a real file and line, or a quote that is not in the file near that line (or in the diff). The agent sees the reasons and can correct the call. |
-| Findings filter (no Jev) | The evidence check is the noise filter. Every finding that passes it goes to the patch agent, which applies it or rejects it with a reason. A rejected critical or high finding becomes a question to you, and the run passes only if you accept the rejection. |
+| Findings filter | The evidence check is the noise filter. Every finding that passes it goes to the patch agent, which applies it or rejects it with a reason. A rejected critical or high finding becomes a question to you, and the run passes only if you accept the rejection. |
 | Patch: log why for each item | `submit_patch_log` must list every finding ID one time, in applied or skipped. |
 | Light or full loop | Profile rules decide, not an agent. The light reviewer cannot write outside docs and tests. |
 | Mechanical style rules | The profiles' static rules run on the added lines before each gate. Their findings skip the evidence check, because the host quotes the line. |
 | Never weaken checks | Patch agents cannot write `.agent-factory.json` or the `protect` paths. Check commands come from the config only. The report lists patch edits outside the change and the findings. |
 | Model swap across passes | The run stops before any work if a step 2 agent uses the same family as its step 1 counterpart. The gate log records the families. |
-| Allowed models | Fable 5.2, Opus 5.5 and Sol only (`allowedModels`). The run stops before any work on another model. |
+| Allowed models | Fable 5.2, Opus 5.5 and Sol by default. `ALLOWED_MODELS` (model IDs, comma-separated) replaces the list. The run stops before any work on another model. |
 | No API keys in prompts or files | Keys stay in the host's dispatch. They go only to their own provider's origin. Check commands get an allowlisted environment, never the host's keys. |
-| Open questions (A2) | A read-only questions agent runs beside the step 1 reviewers and posts its questions at once. A reviewer marks a finding that depends on your decision, and the gate holds it until you answer. Patch agents, later reviewers and the intent check read your answers. |
+| Open questions | A read-only questions agent runs beside the step 1 reviewers and posts its questions at once. A reviewer marks a finding that depends on your decision, and the gate holds it until you answer. Patch agents, later reviewers and the intent check read your answers. |
 | Missing key or input: stop | The run stops before it freezes anything. |
 | Ready PR, never draft | `--ship` pushes the fixes to the PR branch (no force) and marks the PR ready, only on PASS. |
 | A PR cannot change its own rails | On Cloudflare, `.agent-factory.json` comes from the base branch. Locally, it comes from your working copy. |
@@ -106,7 +110,7 @@ Each target repository needs `.agent-factory.json` at its root:
     "format": { "command": "forge fmt --check {files}", "files": "\\.sol$" }
   },
   "tests": { "pattern": "\\.t\\.sol$", "command": "forge test --match-path {test}" },
-  "guides": { "evm-cortex": "~/uniswap/evm-cortex" },
+  "guides": { "evm-cortex": "~/src/evm-cortex" },
   "protect": ["foundry.toml", "remappings.txt"]
 }
 ```
@@ -123,7 +127,10 @@ Each target repository needs `.agent-factory.json` at its root:
 - `{files}` is the changed files that match `files`. A check with no matching files is skipped.
 - `{tests}` runs the targeted tests in one command; `{test}` runs one command per test file.
 - Targeted tests are the changed test files plus the test files that name a changed source file.
-- `guides` are mounted read-only at `/guides/<name>`. The STE dictionary is always at `/guides/ste`.
+- `guides` are mounted read-only at `/guides/<name>`. The `solidity` profile reads `/guides/evm-cortex` when it
+  exists: a clone of [evm-cortex](https://github.com/ccashwell/evm-cortex).
+- The STE dictionary is at `/guides/ste` when `agents/guides/ste` holds it. The specification is not in this
+  repository: [agents/guides/ste/README.md](agents/guides/ste/README.md) tells you how to get it.
 - `env` lists extra environment variables that the checks need, for example `["ETH_RPC_URL", "FOUNDRY_PROFILE"]`.
 - `setup` runs one time in each new worktree before its first check, for example
   `"npm ci --prefer-offline --no-audit --no-fund"` or `"forge install"`. Worktrees start without dependencies.
@@ -154,13 +161,13 @@ The fixes stay on a local branch, `factory/<run>`, in a worktree at `runs/<run>/
 Each run writes:
 
 - `report.md`: PASS or FAIL, the triage line, the criteria, each step, the checks and the intent verdict
-- `gate-log.txt`: the triage line, then one line per finding in the skill's format, with the model family of each step
+- `gate-log.txt`: the triage line, then one line per finding with its gate decision, with the model family of each step
 - `state.json`: the ledger, with every finding, gate decision, patch log and turn report
 - `agents/<step>.events.jsonl` and `agents/<step>.sqlite`: each agent's event log and journal
 
 `--models file.json` overrides models per step and role, for example
 `{ "step1": { "bugs": { "provider": "claude", "model": "claude-opus-5-5", "thinking": "high" } } }`.
-The light loop's model is `light`.
+The light loop's model is `light`. `ALLOWED_MODELS` in the environment replaces the allowed models.
 
 ## Development workflow
 
@@ -226,12 +233,16 @@ journals, and a worktree for each branch under `branches/`. Each review pass is 
 ```bash
 npx wrangler login
 npx wrangler deploy
-for name in GITHUB_TOKEN GITHUB_WEBHOOK_SECRET ANTHROPIC_API_KEY OPENAI_API_KEY ADMIN_TOKEN; do
+for name in GITHUB_TOKEN GITHUB_WEBHOOK_SECRET ANTHROPIC_API_KEY OPENAI_API_KEY ADMIN_TOKEN ALLOWED_USERS; do
   npx wrangler secret put $name
 done
 ```
 
-Set `ALLOWED_USERS` in `wrangler.jsonc` to the GitHub logins that may start runs and answer questions.
+`ALLOWED_USERS` is the GitHub logins, comma-separated, that may start runs and answer questions. Without it, no one
+can. `ALLOWED_MODELS` replaces the allowed models, as on the local platform.
+
+Put the STE dictionary in `agents/guides/ste` before you deploy ([how](agents/guides/ste/README.md)). The Worker
+bundles it when it is there. Without it, the agents apply the STE rules without lookups.
 
 The webhook is optional. Without it, start runs with `npm run remote` (below); the run still picks up your
 `/answer` comments and CI results by polling. With it, `/review` comments start runs and answers take effect at
@@ -297,7 +308,7 @@ npm run remote -- report acme/app#123
 ```
 agents/                    guidelines, one file per role, and shared rules (factory, reviewer, STE)
 agents/profiles/           the guides of each profile (Solidity, TypeScript)
-agents/guides/ste/         the STE dictionary, mounted at /guides/ste
+agents/guides/ste/         where the STE dictionary goes (not in the repository), mounted at /guides/ste
 src/core/                  platform-neutral: it typechecks without Node types (tsconfig.core.json)
   workflows/               the code review loop and the development workflow
   profiles.ts              profiles: triage, guides, forbidden paths, plan sections and static rules for each stack
@@ -319,17 +330,17 @@ containers/build/          the build image of development runs
 scripts/smoke.ts           one live reviewer against the test fixture (npm run smoke, uses --claude-plan auth)
 ```
 
-## Where this differs from the skill
+## Design notes
 
-- The late bugs pass runs when any patch changed code since the freeze, and reviews every fix since then.
-  The skill runs it only after a step 2 patch, so step 1 fixes could skip a bugs review.
+- The late bugs pass runs when any patch changed code since the freeze, and reviews every fix since then. Thus
+  step 1 fixes also get a bugs review, not only step 2 fixes.
 - Step 2 has no diff to review when the step 1 patch changed nothing. The run records that and goes on.
-- Missing credentials stop the run before it starts; the host does not ask for them (A2 item 4).
+- Missing credentials stop the run before it starts. The host does not ask for them.
 - On Cloudflare, review agents cannot run tests during their turns; CI checks the result. Builders of development
   runs can, on the build container.
 - On Cloudflare, in-process git reads a symlink as its target's content, so a PR that only retargets a symlink
   shows no change to the reviewers. The fixes never change a symlink.
-- Triage uses profile rules, not a Jev chore score (D1). The light reviewer also applies the host findings.
+- Triage uses profile rules, not a score from a model (D1). The light reviewer also applies the host findings.
 - Not built yet: the review bot loop after the PR is ready, and the Auditor workflow.
 
 ## Development
@@ -342,3 +353,9 @@ npm test        # unit tests; the review loop and the development workflow on No
 FACTORY_CONTAINERS=1 node --test --test-name-pattern=develop test/cloudflare.test.ts
                 # the development run on the Worker with a real local build container (needs Docker)
 ```
+
+[AGENTS.md](AGENTS.md) has the rules for changes to this repository, for people and for coding agents.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -12,7 +12,7 @@ const secret = 'webhook-secret'
 const repository = { full_name: 'acme/app' }
 const vars = (mock: { url: string }) => ({
   ADMIN_TOKEN: 'admin',
-  ALLOWED_USERS: 'Eric',
+  ALLOWED_USERS: 'Maintainer',
   ANTHROPIC_API_KEY: 'anthropic-key',
   ANTHROPIC_URL: `${mock.url}/v1/messages`,
   GITHUB_API_URL: mock.url,
@@ -30,16 +30,16 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
   const worker = await startWorker(vars(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 120)))}\nrequests: ${mock.state.requests.slice(-15).join(', ')}\nworker:\n${worker.output().slice(-3000)}`
   try {
-    assert.equal((await sendWebhook(worker.url, null, 'issue_comment', comment('eric', '/review'))).status, 401)
+    assert.equal((await sendWebhook(worker.url, null, 'issue_comment', comment('maintainer', '/review'))).status, 401)
     assert.deepEqual(await (await sendWebhook(worker.url, secret, 'issue_comment', comment('mallory', '/review'))).json(), { ignored: 'not an allowed user' })
 
-    const started = (await (await sendWebhook(worker.url, secret, 'issue_comment', comment('eric', '/review'))).json()) as { run: string; started: boolean }
+    const started = (await (await sendWebhook(worker.url, secret, 'issue_comment', comment('maintainer', '/review'))).json()) as { run: string; started: boolean }
     assert.equal(started.started, true)
     const asked = await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
     assert.match(asked.body, /May sub return a negative number\?/)
 
-    mock.comment('eric', '/answer\nQ1: b')
-    await sendWebhook(worker.url, secret, 'issue_comment', comment('eric', '/answer\nQ1: b'))
+    mock.comment('maintainer', '/answer\nQ1: b')
+    await sendWebhook(worker.url, secret, 'issue_comment', comment('maintainer', '/answer\nQ1: b'))
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/, done.body)
     assert.match(done.body, /CI \(push\): pass/)
@@ -65,7 +65,7 @@ test('on Cloudflare, a fork PR stops before any work, because its fixes would ru
   const worker = await startWorker(vars(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}`
   try {
-    await sendWebhook(worker.url, secret, 'issue_comment', comment('eric', '/review --ship'))
+    await sendWebhook(worker.url, secret, 'issue_comment', comment('maintainer', '/review --ship'))
     const stopped = await until(() => mock.state.comments.find((entry) => entry.body.includes('stopped run')), 60_000, describe)
     assert.match(stopped.body, /fork PRs are not supported/)
     assert.equal(mock.state.turns.length, 0)
@@ -90,8 +90,8 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
     assert.deepEqual(again, { run: started.run, started: false })
 
     await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
-    assert.match(mock.state.comments[0]!.body, /for @Eric/)
-    mock.comment('eric', '/answer recommended')
+    assert.match(mock.state.comments[0]!.body, /for @Maintainer/)
+    mock.comment('maintainer', '/answer recommended')
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/)
     assert.match(done.body, /May sub return a negative number\? \*\*Yes, return -2\*\* \(recommended\)/)
@@ -177,13 +177,13 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
   try {
     await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin, method: 'POST' })
     await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
-    mock.comment('eric', '/answer recommended')
+    mock.comment('maintainer', '/answer recommended')
     const stopped = await until(() => mock.state.comments.find((entry) => entry.body.includes('stopped run')), 120_000, describe)
     assert.match(stopped.body, /HTTP 403.* Check the permissions of GITHUB_TOKEN\. .*npm run remote -- resume acme\/app#7/)
     assert.equal(mock.state.requests.filter((route) => route.endsWith('/actions/runs')).length, 1)
 
     // The webhook path does not restart a stopped run. Only the admin route does.
-    assert.deepEqual(await (await sendWebhook(worker.url, secret, 'issue_comment', comment('eric', '/answer recommended'))).json(), { resumed: false })
+    assert.deepEqual(await (await sendWebhook(worker.url, secret, 'issue_comment', comment('maintainer', '/answer recommended'))).json(), { resumed: false })
     const calls = modelCalls()
     mock.state.ciStatus = 200
     const resume = (pr: number) => fetch(`${worker.url}/runs/acme/app/${pr}/resume`, { headers: admin, method: 'POST' })
@@ -218,13 +218,13 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
   const on = (number: number) => mock.state.comments.filter((entry) => entry.issue === number)
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 160)]))}\nworker:\n${worker.output().slice(-4000)}`
   try {
-    const issueComment = { action: 'created', comment: { body: '/develop', user: { login: 'eric' } }, issue: { number: 5 }, repository }
+    const issueComment = { action: 'created', comment: { body: '/develop', user: { login: 'maintainer' } }, issue: { number: 5 }, repository }
     const started = (await (await sendWebhook(worker.url, secret, 'issue_comment', issueComment)).json()) as { run: string; started: boolean }
     assert.equal(started.started, true)
     const asked = await until(() => on(5).find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
     assert.match(asked.body, /Is this the ask\?/)
-    mock.comment('eric', '/answer recommended', 5)
-    await sendWebhook(worker.url, secret, 'issue_comment', { ...issueComment, comment: { body: '/answer recommended', user: { login: 'eric' } } })
+    mock.comment('maintainer', '/answer recommended', 5)
+    await sendWebhook(worker.url, secret, 'issue_comment', { ...issueComment, comment: { body: '/answer recommended', user: { login: 'maintainer' } } })
 
     const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
     assert.match(done.body, /^# Development run: READY/, done.body)

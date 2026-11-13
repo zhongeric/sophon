@@ -135,7 +135,7 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
       const source = { repo: options.repo, base: input.base, head }
       const run = await nodeRun({ config: input.config, runId, runsDir: options.runsDir, source })
       run.ledger.put('git', source)
-      const loopInput = { ask, config: input.config, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}) }
+      const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}) }
       return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr) })
     },
     ci: options.ci,

@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { profiles, staticFindings, triage } from '../src/core/profiles.ts'
 import { PausedError, type Channel } from '../src/core/questions.ts'
-import { defaultModels } from '../src/core/workflows/code-review-loop.ts'
+import { allowedModelsFrom, defaultAllowedModels, defaultModels } from '../src/core/workflows/code-review-loop.ts'
 import { resumeInput } from '../src/node/cli.ts'
 import { changedFiles, diff, touchedFiles } from '../src/node/git.ts'
 import { fileLedger } from '../src/node/ledger.ts'
@@ -206,7 +206,22 @@ test('the loop stops before any work when a model is outside the allowed list', 
   assert.equal(turns.length, 0)
 })
 
-test('a critical finding that the patch agent rejects goes to Eric, and only his acceptance clears it', async () => {
+test('ALLOWED_MODELS replaces the allowed list', async () => {
+  assert.deepEqual(allowedModelsFrom(undefined), defaultAllowedModels)
+  assert.deepEqual(allowedModelsFrom(' , '), defaultAllowedModels)
+  const repo = fixtureRepo()
+  const input = loopInput(repo, 'allowed-setting')
+  input.models = { ...defaultModels, step1: { ...defaultModels.step1, 'anti-slop': { provider: 'claude', model: 'claude-sonnet-5-5' } } }
+  input.allowedModels = allowedModelsFrom('claude-sonnet-5-5, claude-opus-5-5')
+  const turns: Turn[] = []
+  await assert.rejects(
+    runLoop(repo, 'allowed-setting', runsDir(), { dispatch: scriptedDispatch(script, turns), input }),
+    /outside the allowed list \(claude-sonnet-5-5, claude-opus-5-5\): gpt-6\.1-sol, claude-fable-5-2$/,
+  )
+  assert.equal(turns.length, 0)
+})
+
+test("a critical finding that the patch agent rejects goes to the user, and only the user's acceptance clears it", async () => {
   const rejecting = scriptFor({ rejectBug: true, tests: true })
   const criterion = (result: { criteria: { name: string; ok: boolean; detail: string }[] }) =>
     result.criteria.find((entry) => entry.name === 'No critical or high finding left unapplied without your OK')!

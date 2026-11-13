@@ -18,8 +18,17 @@ export type LoopModels = {
   light: ModelChoice
 }
 
-/** Eric's allowed models for review and build: Fable, Opus 5.5 and Sol. */
-export const allowedModels = ['claude-fable-5-2', 'claude-opus-5-5', 'gpt-6.1-sol']
+/** The models that a run accepts when the host sets no ALLOWED_MODELS: Fable, Opus 5.5 and Sol. The default models use only these. */
+export const defaultAllowedModels = ['claude-fable-5-2', 'claude-opus-5-5', 'gpt-6.1-sol']
+
+/** The ALLOWED_MODELS setting: model IDs, comma-separated. When it is empty, the default list applies. */
+export function allowedModelsFrom(setting: string | undefined): string[] {
+  const models = (setting ?? '')
+    .split(',')
+    .map((model) => model.trim())
+    .filter(Boolean)
+  return models.length > 0 ? models : defaultAllowedModels
+}
 
 const fable: ModelChoice = { provider: 'claude', model: 'claude-fable-5-2' }
 const opus: ModelChoice = { provider: 'claude', model: 'claude-opus-5-5' }
@@ -52,10 +61,10 @@ export function mergeModels(overrides: Partial<LoopModels>): LoopModels {
 
 const choices = (models: LoopModels) => [...Object.values(models.step1), ...Object.values(models.step2), models.light]
 
-export function checkAllowedModels(models: LoopModels): void {
+export function checkAllowedModels(models: LoopModels, allowed = defaultAllowedModels): void {
   const used = choices(models).map((choice) => choice.model)
-  const refused = [...new Set(used.filter((model) => !allowedModels.includes(model)))]
-  if (refused.length > 0) throw new StopError(`models outside the allowed list (${allowedModels.join(', ')}): ${refused.join(', ')}`)
+  const refused = [...new Set(used.filter((model) => !allowed.includes(model)))]
+  if (refused.length > 0) throw new StopError(`models outside the allowed list (${allowed.join(', ')}): ${refused.join(', ')}`)
 }
 
 /** The model-swap rule: every step 2 agent uses another model family than its step 1 counterpart. */
@@ -85,6 +94,8 @@ export type LoopInput = {
   runId: string
   config: RepoConfig
   models: LoopModels
+  /** The models that the run accepts. Default: defaultAllowedModels. */
+  allowedModels?: string[]
   /** The PR under review, when there is one. Questions go to it. */
   pr?: number
   /** On PASS, push the fixes to the PR branch (fast-forward only) and mark the PR ready. */
@@ -113,7 +124,7 @@ export type Criterion = { name: string; ok: boolean; detail: string }
 export type LoopResult = { pass: boolean; criteria: Criterion[]; branch: string; final: string; report: string }
 
 /**
- * The code review loop of the code-review-loop skill, with its order and hard rules in code. Triage picks the light
+ * The code review loop, with its order and hard rules in code. Triage picks the light
  * loop for a docs or tests only change: one fresh reviewer that also fixes. Else the full loop runs: four read-only
  * reviewers, the gate, patch, a model-swapped second pass on the new diff, and a late bugs pass. The static rules of
  * the matched profiles add host findings before each gate. Checks, the intent check of the full loop, and the PASS
@@ -121,7 +132,7 @@ export type LoopResult = { pass: boolean; criteria: Criterion[]; branch: string;
  * finished steps.
  */
 export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<LoopResult> {
-  checkAllowedModels(input.models)
+  checkAllowedModels(input.models, input.allowedModels)
   checkFamilySwap(input.models)
   const missing = providersOf(input.models).filter((provider) => !deps.credentials[provider])
   if (missing.length > 0) throw new StopError(`no credential for ${missing.join(', ')}`)
@@ -158,7 +169,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     const judged = await step(ledger, name, async () => gate(findings))
     let result = judged
     if (judged.held.length > 0) {
-      // A held finding depends on a decision that only Eric can make: ask before it reaches a patch agent.
+      // A held finding depends on a decision that only the user can make: ask before it reaches a patch agent.
       await questions.post(name, judged.held.map((finding, index) => findingQuestion(finding, `Q${index + 1}`)))
       const answers = await questions.wait(name)
       result = settle(judged, answers.map((answer, index) => ({ id: judged.held[index]!.id, answer: answer.answer })))
@@ -176,7 +187,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       assignIds(staticFindings(await repo.diff(range.from, range.to), await repo.changedFiles(range.from, range.to), active), 'rules', prefix),
     )
 
-  // A patch agent may reject a finding with a reason. A rejected critical or high finding goes to Eric.
+  // A patch agent may reject a finding with a reason. A rejected critical or high finding goes to the user.
   const rejections: { id: string; accepted: boolean }[] = []
   const runPatch = async <Log extends PatchLog>(name: string, result: GateResult, run: () => Promise<PatchOutcome<Log>>): Promise<PatchOutcome<Log>> => {
     const outcome = await step(ledger, name, run)

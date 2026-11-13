@@ -17,7 +17,6 @@ import shared_factory from '../../agents/shared/factory.md'
 import shared_reviewer from '../../agents/shared/reviewer.md'
 import shared_ste from '../../agents/shared/ste.md'
 import spec from '../../agents/spec.md'
-import steDictionary from '../../agents/guides/ste/asd-ste100-issue-9.txt'
 import type { Guides } from '../core/platform.ts'
 
 /** The guideline files, bundled into the Worker by Wrangler's Text rules. */
@@ -42,11 +41,29 @@ const texts: Record<string, string> = {
   'spec.md': spec,
 }
 
-export const bundledGuides: Guides = {
-  mounts: { ste: MemoryFileSystem.create({ files: { '/asd-ste100-issue-9.txt': steDictionary } }) },
-  read(file) {
-    const text = texts[file]
-    if (text === undefined) throw new Error(`agents/${file} is not bundled; add it to src/cloudflare/guides.ts`)
-    return text
-  },
+const steFile = 'asd-ste100-issue-9.txt'
+
+/**
+ * The STE dictionary is not in the repository. When agents/guides/ste holds it at deploy, Wrangler adds it as a
+ * module of its own (`find_additional_modules`), and the agents get it at /guides/ste.
+ */
+async function steDictionary(): Promise<string | null> {
+  const path = `./ste/${steFile}`
+  try {
+    return ((await import(path)) as { default: string }).default
+  } catch {
+    return null
+  }
+}
+
+export async function bundledGuides(): Promise<Guides> {
+  const ste = await steDictionary()
+  return {
+    mounts: ste === null ? {} : { ste: MemoryFileSystem.create({ files: { [`/${steFile}`]: ste } }) },
+    read(file) {
+      const text = texts[file]
+      if (text === undefined) throw new Error(`agents/${file} is not bundled; add it to src/cloudflare/guides.ts`)
+      return text
+    },
+  }
 }

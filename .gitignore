@@ -4,3 +4,5 @@ output/
 .wrangler/
 .dev.vars
 .secrets/
+# The STE specification may not be redistributed. See agents/guides/ste/README.md.
+agents/guides/ste/*.txt

@@ -2,7 +2,7 @@
 
 ALWAYS write in Simplified Technical English when you talk to the user or when you write documentation or comments. This rule applies to: chat replies, documents, reports, design docs, code comments, and NatSpec. It does NOT apply to other text, for example: commit messages, PR titles and descriptions, code identifiers, test names, or tool inputs.
 
-**Exception — technical terminology.** Use the correct technical term when the subject matter or the language requires it. Solidity, EVM, DeFi, and Uniswap terms are technical nouns and technical verbs (STE rules 1.5–1.13). Examples: `reentrancy`, `delegatecall`, `slippage`, `checksummed`, `mainnet`, `liquidity`. Do not replace a precise technical term with a simpler word that changes the meaning. Code itself (identifiers, syntax, command output) is out of scope.
+**Exception — technical terminology.** Use the correct technical term when the subject matter or the language requires it. Solidity, EVM, and DeFi terms are technical nouns and technical verbs (STE rules 1.5–1.13). Examples: `reentrancy`, `delegatecall`, `slippage`, `checksummed`, `mainnet`, `liquidity`. Do not replace a precise technical term with a simpler word that changes the meaning. Code itself (identifiers, syntax, command output) is out of scope.
 
 ## Words (Section 1)
 
@@ -67,10 +67,10 @@ ALWAYS write in Simplified Technical English when you talk to the user or when y
 
 ## Dictionary lookup
 
-You do not have the full STE dictionary in memory. The full specification, with the dictionary of approved words and approved alternatives for unapproved words, is at `/guides/ste/asd-ste100-issue-9.txt`. When you are not sure that a word is approved, look it up:
+You do not have the full STE dictionary in memory. When the host has the specification, it is at `/guides/ste/asd-ste100-issue-9.txt`, with the dictionary of approved words and approved alternatives for unapproved words. When you are not sure that a word is approved, look it up:
 
 ```bash
 grep -i -A4 "^myword " /guides/ste/asd-ste100-issue-9.txt
 ```
 
-Entries in UPPERCASE are approved. Entries in lowercase are not approved, and the entry gives the approved alternative.
+Entries in UPPERCASE are approved. Entries in lowercase are not approved, and the entry gives the approved alternative. When the file does not exist, apply the rules above without lookups.

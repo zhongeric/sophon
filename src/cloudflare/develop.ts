@@ -5,7 +5,7 @@ import type { Ledger } from '../core/ledger.ts'
 import type { Branch } from '../core/platform.ts'
 import { commentChannel, PausedError, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { mergeModels, providersOf, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
+import { allowedModelsFrom, mergeModels, providersOf, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { defaultDevelopModels, develop, type DevelopInput, type DevelopModels, type ReviewRequest } from '../core/workflows/develop.ts'
 import { boxEnv, boxMachine, containerBox, httpBox, syncTree, type Box } from './box.ts'
 import { sqlBranches } from './branches.ts'
@@ -74,7 +74,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       ci: { pollMs: 0, startMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000, waitMs: 0 },
       credentials: credentialsFor(this.env, new Set([...providersOf(input.models.review), ...Object.values(input.models.develop).map((choice) => choice.provider)])),
       files: sqlFiles(this.ctx.storage.sql, run),
-      guides: bundledGuides,
+      guides: await bundledGuides(),
       ledger,
       log,
       module,
@@ -116,6 +116,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     type Overrides = Partial<LoopModels> & { develop?: Partial<DevelopModels> }
     const overrides = this.env.MODELS ? (JSON.parse(this.env.MODELS) as Overrides) : {}
     return {
+      allowedModels: allowedModelsFrom(this.env.ALLOWED_MODELS),
       ask: `${issue.title}\n\n${issue.body ?? ''}`.trim(),
       base,
       baseRef,

@@ -6,7 +6,7 @@ import { repoConfigFile } from '../core/checks.ts'
 import type { Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { mergeModels, providersOf, type LoopModels } from '../core/workflows/code-review-loop.ts'
+import { allowedModelsFrom, mergeModels, providersOf, type LoopModels } from '../core/workflows/code-review-loop.ts'
 import { defaultDevelopModels, develop, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
 import { credential } from './credentials.ts'
@@ -44,7 +44,7 @@ Questions go to the terminal when it is interactive. Otherwise the intake and sp
 the run directory, and the review questions go to the PR. A paused run exits with status 3; resume it with
 --run <id>.
 
-Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY. The gh CLI must be logged in.`
+Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, ALLOWED_MODELS (model IDs, comma-separated). The gh CLI must be logged in.`
 
 async function main(): Promise<number> {
   const { values } = parseArgs({
@@ -131,6 +131,7 @@ async function newInput(values: Values): Promise<{ input: DevelopInput; repo: st
   const overrides = values.models ? (JSON.parse(readFileSync(String(values.models), 'utf8')) as Overrides) : {}
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
   const input: DevelopInput = {
+    allowedModels: allowedModelsFrom(process.env.ALLOWED_MODELS),
     ask,
     base,
     baseRef,
