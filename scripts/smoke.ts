@@ -7,7 +7,7 @@ import { fixtureRepo, gitSource, loopInput, module } from '../test/support/fixtu
 
 // Runs one live bugs reviewer on Claude Haiku against the test fixture, signed with the nc Claude login.
 const repo = fixtureRepo()
-const input = loopInput(repo, `smoke-${Date.now()}`)
+const input = await loopInput(repo, `smoke-${Date.now()}`)
 const run = await nodeRun({ config: input.config, runId: input.runId, runsDir: resolve('runs'), source: gitSource(repo) })
 const frozen = await run.repo.freeze()
 const context: RunContext = {

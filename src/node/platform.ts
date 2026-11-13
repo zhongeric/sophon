@@ -5,8 +5,9 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
-import { commandChecker, parseRepoConfig, type RepoConfig } from '../core/checks.ts'
+import { commandChecker, parseRepoConfig, readRepoConfig, requireChecks, resolveRepoConfig, type RepoConfig } from '../core/checks.ts'
 import type { AgentStore, Files, Guides, PullRequests } from '../core/platform.ts'
+import { profileDefaults, type RootFiles } from '../core/profiles.ts'
 import type { Credentials } from '../core/providers.ts'
 import type { Channel } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
@@ -19,9 +20,24 @@ import { localMachine } from './machine.ts'
 
 export const agentsDir = fileURLToPath(new URL('../../agents/', import.meta.url))
 
-export function loadRepoConfig(path: string): RepoConfig {
-  if (!existsSync(path)) throw new StopError(`${path} does not exist. Add it with the checks of the repository (see README).`)
-  const config = parseRepoConfig(readFileSync(path, 'utf8'), path)
+/** The files at the root of a working copy. */
+function diskRoot(repo: string): RootFiles {
+  const file = (name: string) => join(repo, name)
+  return {
+    exists: async (name) => existsSync(file(name)),
+    read: async (name) => (existsSync(file(name)) ? readFileSync(file(name), 'utf8') : null),
+  }
+}
+
+/**
+ * The config of a repository on this machine, from its working copy: the profile defaults, and its
+ * .agent-factory.json or the file at `path`. A local run runs the checks, so it needs at least one.
+ */
+export async function loadRepoConfig(repo: string, path?: string): Promise<RepoConfig> {
+  const root = diskRoot(repo)
+  if (path && !existsSync(path)) throw new StopError(`${path} does not exist`)
+  const config = path ? resolveRepoConfig(await profileDefaults(root), parseRepoConfig(readFileSync(path, 'utf8'), path)) : await readRepoConfig(root, `in ${repo}`)
+  requireChecks(config, repo)
   const guides = Object.entries(config.guides ?? {}).map(([name, guide]) => [name, guide.replace(/^~(?=\/)/, homedir())])
   return { ...config, guides: Object.fromEntries(guides) }
 }

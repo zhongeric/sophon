@@ -1,6 +1,6 @@
 import { Sql } from 'nanocode-ts/cloudflare'
 import module from 'nanocode-ts/nanocode_wasm.wasm'
-import { commandChecker } from '../core/checks.ts'
+import { commandChecker, requireChecks } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Branch } from '../core/platform.ts'
 import { commentChannel, commentLimit, PausedError, type Comments } from '../core/questions.ts'
@@ -12,7 +12,7 @@ import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubPulls } from './pulls.ts'
-import { baseConfig } from './run.ts'
+import { baseConfig } from './config.ts'
 import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
 import { sqlFiles } from './storage.ts'
 import { encodePath } from './trees.ts'
@@ -114,7 +114,8 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       ask: `${issue.title}\n\n${issue.body ?? ''}`.trim(),
       base,
       baseRef,
-      config: await baseConfig(gh, request.owner, request.repo, baseRef),
+      // The build container runs the checks, so a development run needs at least one.
+      config: requireChecks(await baseConfig(gh, request.owner, request.repo, baseRef), `${request.owner}/${request.repo}`),
       models: { develop: { ...defaultDevelopModels, ...overrides.develop }, review: mergeModels(overrides) },
       runId: run,
       source: `${request.owner}/${request.repo}#${request.issue}`,

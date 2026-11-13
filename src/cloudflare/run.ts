@@ -1,12 +1,12 @@
 import { Sql } from 'nanocode-ts/cloudflare'
 import module from 'nanocode-ts/nanocode_wasm.wasm'
-import { parseRepoConfig, repoConfigFile, type RepoConfig } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import { commentChannel, commentLimit, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { allowedModelsFrom, codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { ciChecker } from './checker.ts'
-import { GitHubError, type GitHub } from './github.ts'
+import { baseConfig } from './config.ts'
+import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubRepo, type PullRequest } from './repo.ts'
 import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
@@ -19,19 +19,6 @@ export type StartRequest = PullRequest & { ship: boolean; by: string; full?: boo
 
 /** A finished review as the development workflow needs it: the fixes as a commit on GitHub. */
 export type ReviewOutcome = { waiting: string } | (LoopResult & { waiting?: undefined })
-
-/** The rails of a repository from its base branch, so that a PR or a run cannot change its own. */
-export async function baseConfig(gh: GitHub, owner: string, repo: string, ref: string): Promise<RepoConfig> {
-  let text: string
-  try {
-    text = await (await gh.raw(`/repos/${owner}/${repo}/contents/${repoConfigFile}?ref=${encodeURIComponent(ref)}`, 'application/vnd.github.raw')).text()
-  } catch (error) {
-    if (error instanceof GitHubError && error.status === 404)
-      throw new StopError(`add ${repoConfigFile} to ${ref} first. The run reads its rails from the base branch, so a PR cannot change its own.`)
-    throw error
-  }
-  return { ...parseRepoConfig(text, `${repoConfigFile} on ${ref}`), guides: {} }
-}
 
 /** The review runs of one PR. */
 export class PullRequestRuns extends Runs<StartRequest> {

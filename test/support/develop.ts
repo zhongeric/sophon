@@ -168,13 +168,13 @@ export function fakePulls(ci: boolean[] = [false], options: { stale?: boolean } 
   return { pulls, state }
 }
 
-export function developInput(repo: string, runId: string): DevelopInput {
+export async function developInput(repo: string, runId: string): Promise<DevelopInput> {
   const base = execFileSync('git', ['rev-parse', 'main'], { cwd: repo }).toString().trim()
   return {
     ask: 'Add sub and mul next to add, with tests.',
     base,
     baseRef: 'main',
-    config: loadRepoConfig(join(repo, '.agent-factory.json')),
+    config: await loadRepoConfig(repo),
     models: { develop: defaultDevelopModels, review: defaultModels },
     runId,
     source: `${repo} on main`,
@@ -187,7 +187,7 @@ export async function runDevelop(
   runsDir: string,
   options: { runId: string; dispatch: Contracts.RuntimeOptions['dispatch']; pulls: PullRequests; channel?: Channel; input?: DevelopInput },
 ) {
-  const input = options.input ?? developInput(repo, options.runId)
+  const input = options.input ?? (await developInput(repo, options.runId))
   const deps = await nodeDevelop({
     channel: options.channel ?? memoryChannel().channel,
     ci: { pollMs: 10, startMs: 1_000, waitMs: 5_000 },

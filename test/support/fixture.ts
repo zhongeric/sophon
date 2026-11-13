@@ -177,10 +177,10 @@ export function memoryChannel(replies: Record<string, string | null> = {}) {
 
 export const gitSource = (repo: string): GitSource => ({ base: 'main', head: 'feature', repo })
 
-export function loopInput(repo: string, runId: string): LoopInput {
+export async function loopInput(repo: string, runId: string): Promise<LoopInput> {
   return {
     ask: 'Add a sub function that subtracts b from a.',
-    config: loadRepoConfig(join(repo, '.agent-factory.json')),
+    config: await loadRepoConfig(repo),
     models: defaultModels,
     runId,
     source: `${repo} main..feature`,
@@ -194,7 +194,7 @@ export async function runLoop(
   runsDir: string,
   options: { dispatch: Contracts.RuntimeOptions['dispatch']; channel?: Channel; input?: LoopInput },
 ) {
-  const input = options.input ?? loopInput(repo, runId)
+  const input = options.input ?? (await loopInput(repo, runId))
   const run = await nodeRun({ config: input.config, runId, runsDir, source: gitSource(repo) })
   const result = await codeReviewLoop(input, {
     ...run,
