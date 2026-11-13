@@ -16,7 +16,7 @@ export type Env = {
   GITHUB_WEBHOOK_SECRET: string
   ANTHROPIC_API_KEY?: string
   OPENAI_API_KEY?: string
-  /** GitHub logins, comma-separated, that may start runs and answer questions. */
+  /** GitHub logins, comma-separated, that can start runs and answer questions. */
   ALLOWED_USERS: string
   /** Bearer token for the status and report routes. */
   ADMIN_TOKEN?: string
@@ -56,8 +56,8 @@ const maxAttempts = 3
 const maxRestarts = 5
 const retryMs = 60_000
 const defaultPauseSeconds = 60
-/** GitHub refuses comments over 65,536 characters. */
-export const commentLimit = 60_000
+/** How long CI can take, when CI_TIMEOUT_MINUTES does not say. */
+export const defaultCiTimeoutMinutes = 30
 
 export function allowedUsers(env: Env): string[] {
   return env.ALLOWED_USERS.split(',')
@@ -65,7 +65,7 @@ export function allowedUsers(env: Env): string[] {
     .filter(Boolean)
 }
 
-/** The answerers of a run: the config may narrow who answers, never widen it past ALLOWED_USERS. */
+/** The answerers of a run: the config can limit who answers, but cannot permit users outside ALLOWED_USERS. */
 export function answerersOf(env: Env, configured: string[] | undefined): string[] {
   const allowed = allowedUsers(env).map((login) => login.toLowerCase())
   return (configured ?? allowed).filter((login) => allowed.includes(login.toLowerCase()))

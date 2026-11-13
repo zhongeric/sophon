@@ -137,9 +137,10 @@ export function developScript(options: { blockSub?: boolean; reviewFix?: boolean
 /**
  * PRs and CI in memory. `ci` gives the result of each pushed commit in order: the first is red, the next ones green.
  * With `stale`, the first look at each commit finds only an old finished job, as when another branch ran CI on it.
+ * While `state.noCi` is true, no commit has CI.
  */
 export function fakePulls(ci: boolean[] = [false], options: { stale?: boolean } = {}) {
-  const state = { opened: [] as { head: string; title: string; body: string }[], ready: [] as number[], comments: [] as string[], shas: [] as string[], looks: {} as Record<string, number> }
+  const state = { opened: [] as { head: string; title: string; body: string }[], ready: [] as number[], comments: [] as string[], shas: [] as string[], looks: {} as Record<string, number>, noCi: false }
   const pulls: PullRequests = {
     async open(options) {
       state.opened.push(options)
@@ -152,6 +153,7 @@ export function fakePulls(ci: boolean[] = [false], options: { stale?: boolean } 
       state.comments.push(body)
     },
     async ci(sha): Promise<CiJob[]> {
+      if (state.noCi) return []
       if (!state.shas.includes(sha)) state.shas.push(sha)
       state.looks[sha] = (state.looks[sha] ?? 0) + 1
       const job = (created: string, name: string) => ({ created, done: true, name, ok: ci[state.shas.indexOf(sha)] ?? true, run: 1, url: `https://ci.example/${sha}` })

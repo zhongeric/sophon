@@ -1,5 +1,6 @@
 import type { Contracts } from 'nanocode-ts'
 import { checkQuestions, questionsSchema, type Answer, type Question } from './questions.ts'
+import { StopError } from './stop.ts'
 
 /** What the intake agent understood of the ask, and how it routes the ask. */
 export type Intake = {
@@ -63,11 +64,14 @@ export function routeQuestions(intake: Intake): Question[] {
 
 export type Route = { stop: boolean; spec: boolean; passes: 1 | 2 }
 
-/** Reads the route from the answers to the host's questions. Free text that corrects the ask goes on, as a decision for the planner. */
+/**
+ * Reads the route from the answers to the host's questions. Free text that corrects the ask becomes a decision for the planner.
+ * A correction can start with "No,". The stop option, "no", "stop", and "stop the run" stop the run.
+ */
 export function route(intake: Intake, answers: Answer[]): Route {
   const [confirm, spec, passes] = routeQuestions(intake).map((question) => answers.find((answer) => answer.id === question.id)?.answer ?? question.recommendation)
   return {
-    stop: confirm === confirmOptions[1] || /^\s*(no\b|stop\b)/i.test(confirm!),
+    stop: confirm === confirmOptions[1] || /^\s*(no([\s,]+stop(\s+the\s+run)?)?|stop(\s+the\s+run)?)[.!]?\s*$/i.test(confirm!),
     spec: spec === specOptions[0] || /^\s*(yes|spec)\b/i.test(spec!),
     passes: passes === passOptions[1] || /\b(two|2)\b/i.test(passes!) ? 2 : 1,
   }
@@ -194,6 +198,12 @@ export function checkPlan(input: unknown, sections: string[]): Plan {
 const within = (path: string, entry: string) => path === entry.replace(/\/$/, '') || path.startsWith(`${entry.replace(/\/$/, '')}/`)
 
 export const inScope = (path: string, files: string[]) => files.some((entry) => within(path, entry))
+
+/** Reads the most builders at the same time from user input. Only an integer of 1 or more is valid. */
+export function parseParallel(text: string): number {
+  if (!/^\s*\d+\s*$/.test(text) || Number(text) < 1) throw new StopError(`--parallel must be an integer of 1 or more, not ${JSON.stringify(text)}`)
+  return Number(text)
+}
 
 const overlap = (a: string[], b: string[]) => a.some((x) => b.some((y) => within(x, y) || within(y, x)))
 

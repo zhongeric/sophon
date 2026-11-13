@@ -167,6 +167,9 @@ export const decisionsLine = (files: Record<string, string>) => ('/decisions.md'
 /** \`edited\` is true when someone changed the comment after it was posted; anyone with write access can. */
 export type PrComment = { author: string; body: string; createdAt: string; edited?: boolean }
 
+/** GitHub refuses comments over 65,536 characters. A longer text is cut at this length. */
+export const commentLimit = 60_000
+
 /** The comments of one PR, on any platform. `at` is the comment's creation time, from the same clock as the replies. */
 export type Comments = {
   post(body: string): Promise<{ url: string; at: string }>

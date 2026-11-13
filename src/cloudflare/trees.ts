@@ -2,7 +2,7 @@ import { Bash, MemoryFileSystem, Mount, type FileSystem } from 'nanocode-ts/bash
 import type { GitHub } from './github.ts'
 import { gunzip, untar, type TarEntry } from './tar.ts'
 
-/** Repository trees in Durable Object SQL, and in-process git on them, for the review and the development runs. */
+// Repository trees in Durable Object SQL, and in-process git on them, for the review and the development runs.
 
 export type ChangedFile = { filename: string; status: string; previous_filename?: string }
 type Contents = { type: 'file' | 'symlink' | 'dir' | 'submodule'; target?: string }

@@ -3,24 +3,23 @@ import module from 'nanocode-ts/nanocode_wasm.wasm'
 import { commandChecker } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Branch } from '../core/platform.ts'
-import { commentChannel, PausedError, type Comments } from '../core/questions.ts'
+import { commentChannel, commentLimit, PausedError, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { mergeModels, providersOf, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
-import { defaultDevelopModels, develop, type DevelopInput, type DevelopModels, type ReviewRequest } from '../core/workflows/develop.ts'
-import { boxEnv, boxMachine, containerBox, httpBox, syncTree, type Box } from './box.ts'
+import { mergeModels, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
+import { defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels, type ReviewRequest } from '../core/workflows/develop.ts'
+import { boxMachine, containerBox, httpBox, syncWithSetup, type Box } from './box.ts'
 import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubPulls } from './pulls.ts'
 import { baseConfig } from './run.ts'
-import { answerersOf, credentialsFor, Runs } from './runs.ts'
+import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
 import { sqlFiles } from './storage.ts'
 import { encodePath } from './trees.ts'
 
 /** A development run on a GitHub issue: the issue's title and body are the ask, and its comments carry the questions. */
 export type DevelopRequest = { owner: string; repo: string; issue: number; by: string; base?: string; hotfix?: boolean; full?: boolean; parallel?: number }
 
-const defaultCiTimeoutMinutes = 30
 /** The container stops after this long without a command. A stopped container comes back empty, and the next sync copies the trees again. */
 const containerIdleMs = 30 * 60_000
 const setupTimeoutMs = 20 * 60_000
@@ -56,15 +55,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     const checker = (branch: Branch) => {
       const dir = `work/${branch.name.replace(/[^A-Za-z0-9._-]/g, '-')}`
       // The setup runs after each full copy, so a container that came back empty installs its dependencies again.
-      const sync = async () => {
-        const last = this.synced.get(dir) ?? null
-        const next = await syncTree(box, branch.tree, dir, last)
-        if (!last && setup) {
-          const result = await box.exec(['bash', '-c', setup], { cwd: dir, env: boxEnv, timeoutMs: setupTimeoutMs })
-          if (result.exit_code !== 0) throw new Error(`the setup command failed: ${result.output.slice(-2000)}`)
-        }
-        this.synced.set(dir, next)
-      }
+      const sync = () => syncWithSetup(box, this.synced, branch.tree, dir, { command: setup, timeoutMs: setupTimeoutMs })
       return commandChecker(branch, { ...input.config, setup: undefined }, boxMachine(box, dir, sync))
     }
     const result = await develop(input, {
@@ -72,7 +63,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, pollMs: 0, waitMs: 0 }),
       checker,
       ci: { pollMs: 0, startMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000, waitMs: 0 },
-      credentials: credentialsFor(this.env, new Set([...providersOf(input.models.review), ...Object.values(input.models.develop).map((choice) => choice.provider)])),
+      credentials: credentialsFor(this.env, developProviders(input.models)),
       files: sqlFiles(this.ctx.storage.sql, run),
       guides: bundledGuides,
       ledger,
@@ -82,7 +73,10 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       review: (review) => this.review(request, ledger, review),
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
-    return { passed: result.status === 'ready', summary: result.report }
+    // A run that waits for the user, for example for CI, stops on an error, so that the admin resume starts it again from its ledger.
+    if (result.resume) throw new StopError(result.resume)
+    const summary = result.report.length > commentLimit ? `${result.report.slice(0, commentLimit)}\n\n(cut: see the report of run \`${run}\`)` : result.report
+    return { passed: result.status === 'ready', summary }
   }
 
   private box(): Box {

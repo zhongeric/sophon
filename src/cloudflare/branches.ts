@@ -2,10 +2,14 @@ import type { Contracts } from 'nanocode-ts'
 import { SqlFileSystem } from 'nanocode-ts/bash'
 import type { Ledger } from '../core/ledger.ts'
 import type { Branch, Branches } from '../core/platform.ts'
+import { StopError } from '../core/stop.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { base64, copyTree, encodePath, nameStatus, restoreFromGitHub, treeGit, treeWriter, writeTarball, type ChangedFile } from './trees.ts'
 
 type Tree = { scope: string; start: string }
+
+/** The most files that the compare of GitHub lists. */
+const compareFileLimit = 300
 
 /**
  * The branches of a development run in Durable Object SQL: one tree for each branch, with in-process git. A new
@@ -83,14 +87,14 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
       name,
       tree,
       head,
-      diff: (from, to) => git('diff', '--no-color', `${localOf(from)}..${localOf(to)}`),
       changedFiles: async (from, to) => existing(await git('diff', '--name-status', `${localOf(from)}..${localOf(to)}`)),
       committedFiles: async () => (await git('ls-files')).split('\n').filter(Boolean),
       async pending() {
         // Staging shows new files in the diff. The reset after it keeps run_tests to committed files.
         await git('add', '-A')
         try {
-          return { diff: await git('diff', '--cached', '--no-color'), changed: existing(await git('diff', '--cached', '--name-status')) }
+          const names = await git('diff', '--cached', '--name-status')
+          return { diff: await git('diff', '--cached', '--no-color'), changed: existing(names), removed: nameStatus(names).filter(([status]) => status === 'D').map(([, path]) => path) }
         } finally {
           await git('reset', '-q')
         }
@@ -111,6 +115,9 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
         const pushed = remotes()[await head()]
         if (!pushed) throw new Error(`${name}: push the branch before you merge ${ref}`)
         const compare = await gh.json<{ files?: ChangedFile[] }>('GET', `${api}/compare/${pushed}...${ref}`)
+        // The compare lists at most 300 files. A longer list can be incomplete. The tree then differs from the commit.
+        if ((compare.files?.length ?? 0) >= compareFileLimit)
+          throw new StopError(`${name}: the changes from ${pushed.slice(0, 12)} to ${ref.slice(0, 12)} touch ${compareFileLimit} or more files, more than the compare of GitHub can list`)
         for (const file of compare.files ?? []) {
           if (file.status === 'renamed') await writer.remove(file.previous_filename!)
           if (file.status === 'removed') await writer.remove(file.filename)
@@ -147,8 +154,13 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
         remember(await headOf(scope), from)
       } else {
         const local = localOf(from)
+        // The first tree at the commit: the run's dev branch comes before its task branches, and holds no uncommitted builder work.
         let source: Tree | undefined
-        for (const entry of Object.values(trees())) if ((await headOf(entry.scope)) === local) source = entry
+        for (const entry of Object.values(trees()))
+          if ((await headOf(entry.scope)) === local) {
+            source = entry
+            break
+          }
         if (!source) throw new Error(`no branch of the run is at ${from}`)
         await copyTree(open(source.scope).tree, target.tree, { git: true })
       }

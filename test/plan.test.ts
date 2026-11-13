@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { checkIntake, checkPlan, checkSpec, frozenAsk, route, routeQuestions, waves, type Plan, type PlanTask } from '../src/core/plan.ts'
+import { checkIntake, checkPlan, checkSpec, frozenAsk, parseParallel, route, routeQuestions, waves, type Plan, type PlanTask } from '../src/core/plan.ts'
 
 const intake = { title: 'Add sub', summary: 'Adds sub() to src/math.ts.', slug: 'add-sub', larger: false, passes: 1, reason: 'One small function.', questions: [] }
 const answer = (id: string, text: string) => ({ id, question: id, answer: text, recommended: false })
@@ -24,6 +24,16 @@ test('the host asks to confirm the ask and the route in the same batch, and read
   assert.deepEqual(route(asked, []), { stop: false, spec: true, passes: 1 })
   assert.deepEqual(route(asked, [answer('Q2', 'Yes, and also handle zero'), answer('Q3', 'Plan now'), answer('Q4', 'Two passes')]), { stop: false, spec: false, passes: 2 })
   assert.equal(route(asked, [answer('Q2', 'No, stop the run')]).stop, true)
+  for (const text of ['no', 'Stop.', 'No, stop', 'no stop the run!', 'Stop the run', 'Stop the run!', ' STOP THE RUN. '])
+    assert.equal(route(asked, [answer('Q2', text)]).stop, true, text)
+  // A correction that starts with "No" goes on, as a decision for the planner.
+  for (const text of ['No, it must also handle zero', 'No — only the CLI, not the API', 'Nothing to add', 'stop at the first error'])
+    assert.equal(route(asked, [answer('Q2', text)]).stop, false, text)
+})
+
+test('the builder count is an integer of 1 or more', () => {
+  assert.equal(parseParallel('2'), 2)
+  for (const text of ['abc', '3x', '0', '-1', '1.5', '']) assert.throws(() => parseParallel(text), /--parallel must be an integer of 1 or more/, text)
 })
 
 test('the spec needs its sections as headings', () => {

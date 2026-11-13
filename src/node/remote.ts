@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
+import { parseParallel } from '../core/plan.ts'
 import { StopError } from '../core/stop.ts'
 
 const usage = `Usage: npm run remote -- <command> <number> [options]
@@ -87,7 +88,7 @@ async function main(): Promise<number> {
   const factory = setting('FACTORY_URL').replace(/\/$/, '')
   const url = `${factory}/runs/${owner}/${repo}/${pr}`
   const headers = { authorization: `Bearer ${setting('ADMIN_TOKEN')}`, 'content-type': 'application/json' }
-  const develop = { base: values.base, full: values.full === true, hotfix: values.hotfix === true, parallel: values.parallel ? Number(values.parallel) : undefined }
+  const develop = { base: values.base, full: values.full === true, hotfix: values.hotfix === true, parallel: values.parallel !== undefined ? parseParallel(values.parallel) : undefined }
   const requests: Record<string, () => Promise<Response>> = {
     develop: () => fetch(`${factory}/develop/${owner}/${repo}/${pr}`, { body: JSON.stringify(develop), headers, method: 'POST' }),
     report: () => fetch(`${url}/report`, { headers }),

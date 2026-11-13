@@ -92,12 +92,22 @@ async function branchExists(repo: string, name: string): Promise<boolean> {
   }
 }
 
+/** True when origin has the branch. `git ls-remote --exit-code` exits with 2 when no ref matches. */
+async function remoteBranchExists(repo: string, name: string): Promise<boolean> {
+  try {
+    await git(repo, 'ls-remote', '--exit-code', '--heads', 'origin', `refs/heads/${name}`)
+    return true
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 2) return false
+    throw error
+  }
+}
+
 function gitBranch(tree: string, name: string): Branch {
   return {
     name,
     tree: diskFileSystem(tree),
     head: () => currentCommit(tree),
-    diff: (from, to) => diff(tree, from, to),
     changedFiles: (from, to) => changedFiles(tree, from, to),
     committedFiles: () => trackedFiles(tree),
     async pending() {
@@ -105,15 +115,22 @@ function gitBranch(tree: string, name: string): Branch {
       await git(tree, 'add', '-A')
       try {
         const patch = await git(tree, 'diff', '--cached', '--no-color', '--no-ext-diff')
-        const names = await git(tree, 'diff', '--cached', '--name-only', '--diff-filter=ACMR')
-        return { diff: patch, changed: names.split('\n').filter(Boolean) }
+        const names = await git(tree, 'diff', '--cached', '--name-only', '--diff-filter=ACMRT')
+        const removed = await git(tree, 'diff', '--cached', '--name-only', '--no-renames', '--diff-filter=D')
+        return { diff: patch, changed: names.split('\n').filter(Boolean), removed: removed.split('\n').filter(Boolean) }
       } finally {
         await git(tree, 'reset', '-q')
       }
     },
     commit: (message) => commitAll(tree, message),
+    /** A fast-forward when it can, else a merge commit. A failed merge is aborted, so that a resume starts from a clean worktree. */
     async merge(ref, message) {
-      await git(tree, 'merge', '--ff', '--no-edit', '-m', message, ref)
+      try {
+        await git(tree, 'merge', '--ff', '--no-edit', '-m', message, ref)
+      } catch (error) {
+        await git(tree, 'merge', '--abort').catch(() => undefined)
+        throw error
+      }
     },
   }
 }
@@ -134,7 +151,7 @@ export function gitBranches(repo: string, dir: string): Branches {
       }
       return gitBranch(tree, name)
     },
-    exists: (name) => branchExists(repo, name),
+    exists: async (name) => (await branchExists(repo, name)) || (await remoteBranchExists(repo, name)),
     async push(branch) {
       await git(worktreePath(dir, branch.name), 'push', 'origin', `HEAD:refs/heads/${branch.name}`)
       return branch.head()

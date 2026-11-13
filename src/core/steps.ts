@@ -23,10 +23,6 @@ export type RunContext = {
 
 export type Range = { from: string; to: string }
 
-const runTask = <T>(context: RunContext, spec: AgentSpec, prompt: string, tool: string) => runTurn<T>(context.host, spec, prompt, tool)
-const submitTool = (context: RunContext, id: string, definition: Contracts.HostTool, check: (input: unknown) => Promise<unknown>) =>
-  submitOnce(context.host, `output:${id}`, definition, check)
-
 function testTools(context: RunContext, role: Role): HostTools {
   const run = context.tests
   if (!role.tests || !context.config.tests || !run) return {}
@@ -43,12 +39,10 @@ function spec(context: RunContext, id: string, role: Role, model: ModelChoice, w
   }
 }
 
-const decisionFiles = (context: RunContext) => decisionsFile(context.host.ledger)
-
 async function reviewInputs(context: RunContext, range: Range) {
   const patch = await context.repo.diff(range.from, range.to)
   const changed = await context.repo.changedFiles(range.from, range.to)
-  const files = { '/ask.md': context.ask, '/diff.patch': patch, '/changed-files.txt': changed.join('\n'), ...decisionFiles(context) }
+  const files = { '/ask.md': context.ask, '/diff.patch': patch, '/changed-files.txt': changed.join('\n'), ...decisionsFile(context.host.ledger) }
   return { patch, changed, files }
 }
 
@@ -73,7 +67,7 @@ export async function review(context: RunContext, id: string, role: Role, model:
   const inputs = await reviewInputs(context, range)
   const workspace = await createWorkspace({ repo: reviewTree(context), review: inputs.files, guides: context.guides.mounts })
   const read = treeReader(context)
-  const tools = submitTool(context, id, submitFindings, async (input) => {
+  const tools = submitOnce(context.host, `output:${id}`, submitFindings, async (input) => {
     const checked = await checkFindings(input, { read, diff: inputs.patch })
     if (checked.errors.length > 0) throw new Error(`rejected:\n${checked.errors.join('\n')}`)
     return assignIds(checked.findings, track, prefix)
@@ -90,7 +84,7 @@ export async function review(context: RunContext, id: string, role: Role, model:
     '',
     'Call submit_findings one time with every finding, or with an empty list. Then reply "done".',
   ].join('\n')
-  return runTask(context, spec(context, id, role, model, workspace, tools), prompt, 'submit_findings')
+  return runTurn(context.host, spec(context, id, role, model, workspace, tools), prompt, 'submit_findings')
 }
 
 export type PatchLog = { applied: { id: string; change: string }[]; skipped: { id: string; reason: string }[] }
@@ -144,7 +138,7 @@ async function editBase(context: RunContext, id: string): Promise<string> {
 /** Runs one editing agent to its submit tool, commits its changes, and lists the files that it touched outside the change and the findings. */
 async function edit<Log extends PatchLog>(context: RunContext, before: string, agent: AgentSpec, prompt: string, tool: string, kept: Finding[], message: string): Promise<PatchOutcome<Log>> {
   const { repo } = context
-  const log = await runTask<Log>(context, agent, prompt, tool)
+  const log = await runTurn<Log>(context.host, agent, prompt, tool)
   await repo.commit(message)
   const after = await repo.head()
   const touched = after === before ? [] : await repo.changedFiles(before, after)
@@ -165,10 +159,10 @@ export async function patch(context: RunContext, id: string, model: ModelChoice,
     '/kept-findings.json': JSON.stringify(kept, null, 2),
     '/gate-log.txt': gateLog.join('\n'),
     '/diff.patch': await context.repo.diff(context.frozen.base, before),
-    ...decisionFiles(context),
+    ...decisionsFile(context.host.ledger),
   }
   const workspace = await createWorkspace({ repo: guard(context.repo.tree, (path) => isProtected(context.config, path)), review, guides: context.guides.mounts })
-  const tools = submitTool(context, id, submitPatchLog, async (input) => checkPatchLog(input, kept))
+  const tools = submitOnce(context.host, `output:${id}`, submitPatchLog, async (input) => checkPatchLog(input, kept))
   const prompt = [
     'Apply the kept findings.',
     '',
@@ -218,7 +212,7 @@ export async function light(
   const review = { ...inputs.files, '/host-findings.json': JSON.stringify(options.kept, null, 2), '/gate-log.txt': options.gateLog.join('\n') }
   const repo = allowFiles(guard(context.repo.tree, (path) => isProtected(context.config, path)), options.allow)
   const workspace = await createWorkspace({ repo, review, guides: context.guides.mounts })
-  const tools = submitTool(context, id, submitLightLog, async (input) => {
+  const tools = submitOnce(context.host, `output:${id}`, submitLightLog, async (input) => {
     const log = checkPatchLog(input, options.kept) as LightLog
     if (!Array.isArray(log.fixes) || log.fixes.some((fix) => typeof fix?.location !== 'string' || typeof fix.change !== 'string'))
       throw new Error('fixes must be an array of { location, change }')
@@ -264,7 +258,7 @@ const submitVerdict: Contracts.HostTool = {
 export async function intent(context: RunContext, id: string, model: ModelChoice, range: Range): Promise<Verdict> {
   const inputs = await reviewInputs(context, range)
   const workspace = await createWorkspace({ repo: reviewTree(context), review: inputs.files, guides: context.guides.mounts })
-  const tools = submitTool(context, id, submitVerdict, async (input) => {
+  const tools = submitOnce(context.host, `output:${id}`, submitVerdict, async (input) => {
     const verdict = input as Verdict
     if (typeof verdict?.satisfied !== 'boolean' || !Array.isArray(verdict.gaps)) throw new Error('satisfied and gaps are required')
     if (verdict.satisfied === verdict.gaps.length > 0) throw new Error('satisfied must be false exactly when there is a gap')
@@ -279,14 +273,14 @@ export async function intent(context: RunContext, id: string, model: ModelChoice
     '',
     'Call submit_verdict one time.',
   ].join('\n')
-  return runTask(context, spec(context, id, roles.intent, model, workspace, tools), prompt, 'submit_verdict')
+  return runTurn(context.host, spec(context, id, roles.intent, model, workspace, tools), prompt, 'submit_verdict')
 }
 
 /** A read-only agent that finds the decisions that only the user can make. Runs beside the step 1 reviewers. */
 export async function askQuestions(context: RunContext, id: string, model: ModelChoice, range: Range): Promise<Question[]> {
   const inputs = await reviewInputs(context, range)
   const workspace = await createWorkspace({ repo: reviewTree(context), review: inputs.files, guides: context.guides.mounts })
-  const tools = submitTool(context, id, submitQuestions, async (input) => checkQuestions(input))
+  const tools = submitOnce(context.host, `output:${id}`, submitQuestions, async (input) => checkQuestions(input))
   const prompt = [
     'Find the decisions in this change that only the user can make.',
     '',
@@ -296,5 +290,5 @@ export async function askQuestions(context: RunContext, id: string, model: Model
     '',
     'Call submit_questions one time, with an empty list when the ask settles everything.',
   ].join('\n')
-  return runTask(context, spec(context, id, roles.questions, model, workspace, tools), prompt, 'submit_questions')
+  return runTurn(context.host, spec(context, id, roles.questions, model, workspace, tools), prompt, 'submit_questions')
 }

@@ -117,7 +117,20 @@ export async function mockServices(
     const url = new URL(request.url ?? '/', 'http://localhost')
     const body = await read(request)
     const route = `${request.method} ${url.pathname}`
-    const input = () => JSON.parse(body.toString()) as Record<string, any>
+    const object = (value: unknown, name: string): Record<string, unknown> => {
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(`${route}: ${name} must be an object`)
+      return value as Record<string, unknown>
+    }
+    /** The JSON body as an object. A route reads each field with the checks below, so a wrong request shape fails the request. */
+    const input = () => object(JSON.parse(body.toString()), 'the body')
+    const string = (value: unknown, name: string): string => {
+      if (typeof value !== 'string') throw new Error(`${route}: ${name} must be a string`)
+      return value
+    }
+    const strings = (value: unknown, name: string): string[] => {
+      if (!Array.isArray(value)) throw new Error(`${route}: ${name} must be an array`)
+      return value.map((item, index) => string(item, `${name}[${index}]`))
+    }
     state.requests.push(route)
     try {
       if (route === 'POST /v1/messages' || route === 'POST /v1/responses') {
@@ -130,9 +143,15 @@ export async function mockServices(
         response.end(await reply.text())
         return
       }
-      if (route === 'POST /machine') return json(response, 200, await exec(input() as never))
+      if (route === 'POST /machine') {
+        const { argv, cwd, env, stdin, timeoutMs } = input()
+        if (typeof timeoutMs !== 'number') throw new Error(`${route}: timeoutMs must be a number`)
+        const environment = Object.fromEntries(Object.entries(object(env, 'env')).map(([key, value]) => [key, string(value, `env.${key}`)]))
+        return json(response, 200, await exec({ argv: strings(argv, 'argv'), cwd: string(cwd, 'cwd'), env: environment, stdin: stdin === null ? null : string(stdin, 'stdin'), timeoutMs }))
+      }
       if (route === 'POST /graphql') {
-        const id = String(input().variables?.id ?? '')
+        const variables = input().variables
+        const id = variables === undefined ? '' : String(object(variables, 'variables').id ?? '')
         const pull = pulls.get(Number(id.replace('PR_', '')))
         if (pull) pull.draft = false
         return json(response, 200, { data: {} })
@@ -143,10 +162,11 @@ export async function mockServices(
         return json(response, 200, [...pulls].filter(([, pull]) => pull.head === head).map(([number, pull]) => view(number, pull)))
       }
       if (route === `POST ${api}/pulls`) {
-        const { base, body: text, draft, head, title } = input()
-        if (base !== 'main' || !shaOf(head)) return json(response, 422, { message: 'Validation Failed' })
+        const fields = input()
+        const head = string(fields.head, 'head')
+        if (fields.base !== 'main' || !shaOf(head)) return json(response, 422, { message: 'Validation Failed' })
         const number = ++next
-        pulls.set(number, { body: text, draft: draft === true, head, title })
+        pulls.set(number, { body: string(fields.body, 'body'), draft: fields.draft === true, head, title: string(fields.title, 'title') })
         return json(response, 201, view(number, pulls.get(number)!))
       }
       const pullRoute = new RegExp(`^GET ${api}/pulls/(\\d+)(/files)?$`).exec(route)
@@ -190,7 +210,7 @@ export async function mockServices(
       }
       const comments = new RegExp(`^(GET|POST) ${api}/issues/(\\d+)/comments$`).exec(route)
       if (comments?.[1] === 'GET') return json(response, 200, page(url, state.comments.filter((entry) => entry.issue === Number(comments[2]))))
-      if (comments?.[1] === 'POST') return json(response, 201, comment(options.botLogin, input().body, Number(comments[2])))
+      if (comments?.[1] === 'POST') return json(response, 201, comment(options.botLogin, string(input().body, 'body'), Number(comments[2])))
       if (route.startsWith(`GET ${api}/git/commits/`)) {
         const sha = url.pathname.split('/').at(-1)!
         return json(response, 200, { sha, tree: { sha: text(['rev-parse', `${sha}^{tree}`]) } })
@@ -200,9 +220,15 @@ export async function mockServices(
         const sha = shaOf(`refs/heads/${name}`)
         return sha ? json(response, 200, { object: { sha }, ref: `refs/heads/${name}` }) : json(response, 404, { message: 'Not Found' })
       }
-      if (route === `POST ${api}/git/blobs`) return json(response, 201, { sha: text(['hash-object', '-w', '--stdin'], Buffer.from(input().content, 'base64')) })
+      if (route === `POST ${api}/git/blobs`) return json(response, 201, { sha: text(['hash-object', '-w', '--stdin'], Buffer.from(string(input().content, 'content'), 'base64')) })
       if (route === `POST ${api}/git/trees`) {
-        const { base_tree, tree } = input() as { base_tree: string; tree: TreeEntry[] }
+        const fields = input()
+        const base_tree = string(fields.base_tree, 'base_tree')
+        if (!Array.isArray(fields.tree)) throw new Error(`${route}: tree must be an array`)
+        const tree = fields.tree.map((value: unknown, position): TreeEntry => {
+          const entry = object(value, `tree[${position}]`)
+          return { mode: string(entry.mode, 'mode'), path: string(entry.path, 'path'), sha: entry.sha === null ? null : string(entry.sha, 'sha'), type: string(entry.type, 'type') }
+        })
         const index = join(mkdtempSync(join(tmpdir(), 'factory-index-')), 'index')
         const env = { GIT_INDEX_FILE: index }
         git(['read-tree', base_tree], undefined, env)
@@ -213,12 +239,14 @@ export async function mockServices(
         return json(response, 201, { sha })
       }
       if (route === `POST ${api}/git/commits`) {
-        const { message, parents, tree } = input() as { message: string; parents: string[]; tree: string }
+        const fields = input()
+        const [message, parents, tree] = [string(fields.message, 'message'), strings(fields.parents, 'parents'), string(fields.tree, 'tree')]
         const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
         return json(response, 201, { sha: text(['commit-tree', tree, ...parents.flatMap((parent) => ['-p', parent]), '-m', message], undefined, identity) })
       }
       if (route === `POST ${api}/git/refs`) {
-        const { ref, sha } = input() as { ref: string; sha: string }
+        const fields = input()
+        const [ref, sha] = [string(fields.ref, 'ref'), string(fields.sha, 'sha')]
         if (shaOf(ref)) return json(response, 422, { message: 'Reference already exists' })
         git(['update-ref', ref, sha])
         state.refs.set(ref, sha)
@@ -226,7 +254,8 @@ export async function mockServices(
       }
       if (request.method === 'PATCH' && url.pathname.startsWith(`${api}/git/refs/`)) {
         const ref = `refs/${decodeURIComponent(url.pathname.slice(`${api}/git/refs/`.length))}`
-        const { force, sha } = input() as { force: boolean; sha: string }
+        const fields = input()
+        const [force, sha] = [fields.force === true, string(fields.sha, 'sha')]
         const current = shaOf(ref)
         if (!force && current && text(['merge-base', current, sha]) !== current) return json(response, 422, { message: 'Update is not a fast forward' })
         git(['update-ref', ref, sha])

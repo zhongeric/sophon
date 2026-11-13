@@ -2,14 +2,14 @@ import { Sql } from 'nanocode-ts/cloudflare'
 import module from 'nanocode-ts/nanocode_wasm.wasm'
 import { parseRepoConfig, repoConfigFile, type RepoConfig } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
-import { commentChannel, type Comments } from '../core/questions.ts'
+import { commentChannel, commentLimit, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { ciChecker } from './checker.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubRepo, type PullRequest } from './repo.ts'
-import { answerersOf, commentLimit, credentialsFor, Runs } from './runs.ts'
+import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
 import { sqlFiles, sqlLedger } from './storage.ts'
 
 export { allowedUsers, type Env } from './runs.ts'
@@ -19,8 +19,6 @@ export type StartRequest = PullRequest & { ship: boolean; by: string; full?: boo
 
 /** A finished review as the development workflow needs it: the fixes as a commit on GitHub. */
 export type ReviewOutcome = { waiting: string } | (LoopResult & { waiting?: undefined })
-
-const defaultCiTimeoutMinutes = 30
 
 /** The rails of a repository from its base branch, so that a PR or a run cannot change its own. */
 export async function baseConfig(gh: GitHub, owner: string, repo: string, ref: string): Promise<RepoConfig> {
@@ -55,7 +53,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     if (!row) return { waiting: `no review run ${run}` }
     if (row.state === 'error') return { waiting: `review run ${run} stopped: ${row.note}. Resume it with npm run remote -- resume.` }
     if (row.state !== 'passed' && row.state !== 'failed') return { waiting: `review run ${run} is ${row.state}${row.note ? `: ${row.note}` : ''}` }
-    const ledger = this.ledger(run)
+    const ledger = sqlLedger(this.ctx.storage.sql, run)
     const result = ledger.get<{ pass: boolean; criteria: LoopResult['criteria']; final: string }>('result')!
     const published = ledger.get<{ local: string; sha: string }>('published')
     const headSha = ledger.get<{ headSha: string }>('snapshot')!.headSha
@@ -90,10 +88,6 @@ export class PullRequestRuns extends Runs<StartRequest> {
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
     return { passed: result.pass, summary: summary(run, result) }
-  }
-
-  private ledger(run: string) {
-    return sqlLedger(this.ctx.storage.sql, run)
   }
 
   /** The run's input. The checks and rails come from the base branch, so a PR cannot change its own. */
