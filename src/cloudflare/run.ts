@@ -4,7 +4,7 @@ import { parseRepoConfig, repoConfigFile, type RepoConfig } from '../core/checks
 import type { Ledger } from '../core/ledger.ts'
 import { commentChannel, commentLimit, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
+import { allowedModelsFrom, codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { ciChecker } from './checker.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
@@ -80,7 +80,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
       checker: ciChecker({ branch, gh, ledger, pull, repo, timeoutMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000 }),
       credentials: credentialsFor(this.env, providersOf(input.models)),
       files: sqlFiles(this.ctx.storage.sql, run),
-      guides: bundledGuides,
+      guides: await bundledGuides(),
       ledger,
       log,
       module,
@@ -102,6 +102,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     const config = await baseConfig(gh, request.owner, request.repo, view.base.ref)
     const overrides = this.env.MODELS ? (JSON.parse(this.env.MODELS) as Partial<LoopModels>) : {}
     return {
+      allowedModels: allowedModelsFrom(this.env.ALLOWED_MODELS),
       ask: request.ask ?? `${view.title}\n\n${view.body ?? ''}`.trim(),
       config,
       models: mergeModels(overrides),

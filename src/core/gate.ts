@@ -1,8 +1,8 @@
 import type { Finding, Severity } from './findings.ts'
 
 /**
- * What happens to a finding after the evidence check: the patch agents get it (`keep`), Eric decides it
- * first (`ask`), or Eric decided against it (`drop`).
+ * What happens to a finding after the evidence check: the patch agents get it (`keep`), the user decides
+ * it first (`ask`), or the user decided against it (`drop`).
  */
 export type Decision = {
   finding: Finding
@@ -13,7 +13,7 @@ export type Decision = {
 
 export type GateResult = { kept: Finding[]; held: Finding[]; decisions: Decision[]; log: string[] }
 
-/** What Eric answered about one held finding. */
+/** What the user answered about one held finding. */
 export type UserDecision = { id: string; answer: string }
 
 export const fixOption = 'Fix it'
@@ -22,7 +22,7 @@ export const skipOption = 'Do not fix it'
 const severityRank: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
 
 /**
- * Orders the findings by severity and holds the ones that a reviewer marked as Eric's decision. Every finding
+ * Orders the findings by severity and holds the ones that a reviewer marked as the user's decision. Every finding
  * here already passed the evidence check, so the patch agents get the rest, and they apply or reject each one.
  */
 export function gate(findings: Finding[]): GateResult {
@@ -37,7 +37,7 @@ function summarize(decisions: Decision[]): GateResult {
   return { kept: pick('keep'), held: pick('ask'), decisions, log: decisions.map(formatDecision) }
 }
 
-/** The question that asks Eric to decide one held finding. */
+/** The question that asks the user to decide one held finding. */
 export function findingQuestion(finding: Finding, id: string) {
   return {
     id,
@@ -48,7 +48,7 @@ export function findingQuestion(finding: Finding, id: string) {
   }
 }
 
-/** Applies Eric's answers to the held findings. Any answer other than "Do not fix it" keeps the finding, with the answer as a note. */
+/** Applies the user's answers to the held findings. Any answer other than "Do not fix it" keeps the finding, with the answer as a note. */
 export function settle(result: GateResult, answers: UserDecision[]): GateResult {
   const decisions = result.decisions.map((decision): Decision => {
     if (decision.action !== 'ask') return decision
@@ -63,7 +63,7 @@ export function settle(result: GateResult, answers: UserDecision[]): GateResult 
 export const acceptRejection = 'Accept the rejection'
 export const refuseRejection = 'Do not accept'
 
-/** Asks Eric about a critical or high finding that a patch agent did not apply. */
+/** Asks the user about a critical or high finding that a patch agent did not apply. */
 export function rejectionQuestion(finding: Finding, reason: string, id: string) {
   return {
     id,

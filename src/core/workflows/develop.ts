@@ -10,18 +10,18 @@ import type { Credentials, Provider } from '../providers.ts'
 import { asker, commentLimit, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
-import { allowedModels, checkAllowedModels, checkFamilySwap, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
+import { checkAllowedModels, checkFamilySwap, defaultAllowedModels, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
 
 export type DevelopModels = Record<'intake' | 'spec' | 'planner' | 'builder', ModelChoice>
 
 const opus: ModelChoice = { provider: 'claude', model: 'claude-opus-5-5' }
 
-/** Intake, spec, planner and builders run on Opus 5.5, the strongest writer of the allowed models (ALL-011). */
+/** Intake, spec, planner and builders run on Opus 5.5, the strongest writer of the allowed models. */
 export const defaultDevelopModels: DevelopModels = { intake: opus, spec: opus, planner: { ...opus, thinking: 'high' }, builder: { ...opus, thinking: 'high' } }
 
 export type DevelopInput = {
   runId: string
-  /** The ask, verbatim (ALL-001). */
+  /** The ask, verbatim. */
   ask: string
   /** The base commit, and the branch that the PR targets. */
   base: string
@@ -30,7 +30,9 @@ export type DevelopInput = {
   source: string
   config: RepoConfig
   models: { develop: DevelopModels; review: LoopModels }
-  /** A small hotfix: the host takes every recommendation without asking (ALL-004). */
+  /** The models that the run accepts. Default: defaultAllowedModels. */
+  allowedModels?: string[]
+  /** A small hotfix: the host takes every recommendation without asking. */
   hotfix?: boolean
   /** The full review loop, also for a docs or tests only change. */
   full?: boolean
@@ -82,22 +84,22 @@ export function developProviders(models: DevelopInput['models']): Set<Provider> 
   return new Set([...providersOf(models.review), ...Object.values(models.develop).map((choice) => choice.provider)])
 }
 
-export function checkDevelopModels(models: DevelopModels): void {
-  const refused = [...new Set(Object.values(models).map((choice) => choice.model))].filter((model) => !allowedModels.includes(model))
-  if (refused.length > 0) throw new StopError(`models outside the allowed list (${allowedModels.join(', ')}): ${refused.join(', ')}`)
+export function checkDevelopModels(models: DevelopModels, allowed = defaultAllowedModels): void {
+  const refused = [...new Set(Object.values(models).map((choice) => choice.model))].filter((model) => !allowed.includes(model))
+  if (refused.length > 0) throw new StopError(`models outside the allowed list (${allowed.join(', ')}): ${refused.join(', ')}`)
 }
 
 /**
- * The development workflow of the ship-quality-code skill, steps 0 to 9, with its order and hard rules in code:
+ * The development workflow, steps 0 to 9, with its order and hard rules in code:
  * intake and the user's confirmation, a spec for a larger change, one plan, builders for the plan's tasks (in
  * parallel when their files do not overlap, each on its own branch), a draft PR, CI with a fix budget, the code
  * review loop once or twice, CI again, and a ready PR only when every criterion holds. Every step is in the
  * ledger, so the same run ID resumes after a pause or a crash without repeating finished steps.
  */
 export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<DevelopResult> {
-  checkAllowedModels(input.models.review)
+  checkAllowedModels(input.models.review, input.allowedModels)
   checkFamilySwap(input.models.review)
-  checkDevelopModels(input.models.develop)
+  checkDevelopModels(input.models.develop, input.allowedModels)
   const missing = [...developProviders(input.models)].filter((provider) => !deps.credentials[provider])
   if (missing.length > 0) throw new StopError(`no credential for ${missing.join(', ')}`)
 
@@ -134,7 +136,7 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
     return { status, pr: state.pr, branch: state.branch, report, resume: resumable ? note : null }
   }
 
-  // 0. Intake: no plan and no code until the user confirms the ask (ALL-010).
+  // 0. Intake: no plan and no code until the user confirms the ask.
   const intook = await step(ledger, 'intake', () => intake(context, 'intake', models.intake, view))
   state.intake = intook
   const routed = route(intook, await ask('intake', [...intook.questions, ...routeQuestions(intook)]))
@@ -275,7 +277,7 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
   const solidity = active.find((profile) => profile.id === 'solidity')
   const audit = solidity !== undefined && changed.some((path) => solidity.files.test(path))
   const criteria: Criterion[] = [
-    { name: 'Ask confirmed', ok: true, detail: input.hotfix ? 'hotfix: the host took every recommendation (ALL-004)' : 'you answered the intake questions' },
+    { name: 'Ask confirmed', ok: true, detail: input.hotfix ? 'hotfix: the host took every recommendation' : 'you answered the intake questions' },
     { name: 'Plan with its four parts', ok: true, detail: `${planned.tasks.length} tasks in ${scheduled.length} waves` },
     { name: 'Every task built', ok: true, detail: state.built.map((entry) => entry.task.id).join(', ') },
     {
@@ -289,7 +291,7 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
       detail: finalCi ? `${final.slice(0, 12)}: ${finalCi.jobs.map((job) => `${job.name}=${job.ok ? 'pass' : 'fail'}`).join(', ')}` : 'not checked: the review loop did not pass',
     },
     { name: 'No build output, logs or environment files', ok: forbidden.length === 0, detail: forbidden.join(', ') || 'none in the change' },
-    ...(audit ? [{ name: 'Auditor for Solidity src/', ok: false, detail: 'required (SOL-052), not built yet. Audit the change before you merge. The PR stays draft.' }] : []),
+    ...(audit ? [{ name: 'Auditor for Solidity src/', ok: false, detail: 'required, not built yet. Audit the change before you merge. The PR stays draft.' }] : []),
   ]
   const pass = criteria.every((criterion) => criterion.ok)
   if (pass) await step(ledger, 'ready', async () => (await pulls.ready(state.pr!.number), true))

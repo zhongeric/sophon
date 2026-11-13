@@ -17,10 +17,13 @@
   ],
   // One build container for each development run. Builders' setup, checks and tests run there, never beside a secret.
   "containers": [{ "class_name": "DevelopmentRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-1", "max_instances": 5 }],
-  "rules": [{ "type": "Text", "globs": ["**/*.md", "**/*.txt"], "fallthrough": true }],
+  "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
+  // The STE dictionary is optional: when agents/guides/ste holds it, it is a module of its own (src/cloudflare/guides.ts).
+  "base_dir": "agents/guides",
+  "find_additional_modules": true,
   "limits": { "cpu_ms": 300000 },
-  "observability": { "enabled": true },
+  "observability": { "enabled": true }
   // Set with: npx wrangler secret put <NAME>
-  // GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, ANTHROPIC_API_KEY, OPENAI_API_KEY, ADMIN_TOKEN
-  "vars": { "ALLOWED_USERS": "zhongeric" }
+  // GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, ANTHROPIC_API_KEY, OPENAI_API_KEY, ADMIN_TOKEN, and ALLOWED_USERS: the GitHub
+  // logins, comma-separated, that can start runs and answer questions.
 }

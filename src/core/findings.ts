@@ -14,7 +14,7 @@ export type Finding = {
   severity: Severity
   evidence: string
   recommendation: string
-  /** The right fix depends on a product or design choice that only Eric can make. */
+  /** The right fix depends on a product or design choice that only the user can make. */
   needs_decision?: boolean
   /** That choice, in one sentence. Required with needs_decision. */
   decision?: string
@@ -54,7 +54,7 @@ export const submitFindings: Contracts.HostTool = {
               type: 'boolean',
               description: 'True only when the right fix depends on a product or design choice that the ask and the decisions leave open',
             },
-            decision: { type: 'string', description: 'With needs_decision: the choice that Eric must make, in one sentence' },
+            decision: { type: 'string', description: 'With needs_decision: the choice that the user must make, in one sentence' },
           },
           required: [...fields],
           additionalProperties: false,

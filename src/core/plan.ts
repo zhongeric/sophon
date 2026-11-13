@@ -266,7 +266,7 @@ export function renderPlan(plan: Plan, options: { tasks: boolean }): string {
   ].join('\n')
 }
 
-/** The frozen package for the review loop: the verbatim ask, the user's decisions, and the plan without its tasks (ALL-040). */
+/** The frozen package for the review loop: the verbatim ask, the user's decisions, and the plan without its tasks. */
 export function frozenAsk(ask: string, decisions: Answer[], plan: Plan): string {
   return [
     ask.trim(),

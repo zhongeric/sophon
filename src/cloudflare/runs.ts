@@ -16,8 +16,10 @@ export type Env = {
   GITHUB_WEBHOOK_SECRET: string
   ANTHROPIC_API_KEY?: string
   OPENAI_API_KEY?: string
-  /** GitHub logins, comma-separated, that can start runs and answer questions. */
-  ALLOWED_USERS: string
+  /** GitHub logins, comma-separated, that can start runs and answer questions. Without it, no one can. */
+  ALLOWED_USERS?: string
+  /** Model IDs, comma-separated, that runs accept. Default: defaultAllowedModels. */
+  ALLOWED_MODELS?: string
   /** Bearer token for the status and report routes. */
   ADMIN_TOKEN?: string
   /** JSON that overrides the default models per step and role, and per development role under "develop". */
@@ -60,7 +62,8 @@ const defaultPauseSeconds = 60
 export const defaultCiTimeoutMinutes = 30
 
 export function allowedUsers(env: Env): string[] {
-  return env.ALLOWED_USERS.split(',')
+  return (env.ALLOWED_USERS ?? '')
+    .split(',')
     .map((login) => login.trim())
     .filter(Boolean)
 }

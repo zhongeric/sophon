@@ -7,7 +7,7 @@ import { repoConfigFile } from '../core/checks.ts'
 import type { Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError, type Channel } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { codeReviewLoop, defaultModels, mergeModels, providersOf, type LoopInput, type LoopModels } from '../core/workflows/code-review-loop.ts'
+import { allowedModelsFrom, codeReviewLoop, defaultModels, mergeModels, providersOf, type LoopInput, type LoopModels } from '../core/workflows/code-review-loop.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
 import { credential } from './credentials.ts'
 import { git, type GitSource } from './git.ts'
@@ -45,7 +45,7 @@ Questions for you go to the PR as a comment with --pr, to the terminal when it i
 and to a file in the run directory otherwise. A run that waits for answers exits with status 3;
 resume it with --run <id> after you answer.
 
-Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY`
+Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, ALLOWED_MODELS (model IDs, comma-separated)`
 
 async function main(): Promise<number> {
   const { values } = parseArgs({
@@ -142,6 +142,7 @@ async function newInput(values: Values): Promise<{ input: LoopInput; source: Git
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
   const input: LoopInput = {
     ask,
+    allowedModels: allowedModelsFrom(process.env.ALLOWED_MODELS),
     config,
     models,
     runId: `${stamp}-${headSha}`,
