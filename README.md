@@ -107,10 +107,12 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 
 ## Cloudflare
 
-You need Workers Paid, Containers for development runs, and Docker on the machine that deploys. The GitHub token is
-fine-grained, with read and write access to Contents, Pull requests and Issues, and read access to Actions and Commit
-statuses. Each target repository needs CI on pull requests and on pushes to `factory/**`. Fork PRs are refused,
-because that CI would run fork code with the repository secrets.
+You need Workers Paid, Containers for development runs, and Docker on the machine that deploys. When you set
+`GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`, the Worker calls GitHub as that GitHub App. The key must be PKCS#8
+(`openssl pkcs8 -topk8 -nocrypt`). Without them, the Worker uses `GITHUB_TOKEN`, a fine-grained token with read and
+write access to Contents, Pull requests and Issues, and read access to Actions and Commit statuses. Each target
+repository needs CI on pull requests and on pushes to `factory/**`. Fork PRs are refused, because that CI would run
+fork code with the repository secrets.
 
 ```bash
 npx wrangler deploy

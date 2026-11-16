@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { generateKeyPairSync } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -73,6 +74,31 @@ test('on Cloudflare, a fork PR stops before any work, because its fixes would ru
     assert.match(stopped.body, /fork PRs are not supported/)
     assert.equal(mock.state.turns.length, 0)
     assert.equal(mock.state.refs.size, 0)
+  } finally {
+    worker.stop()
+    mock.close()
+  }
+})
+
+test('on Cloudflare, with the GitHub App secrets, a repository without the App stops the run before any work, with the install link in the note', { timeout: 120_000 }, async () => {
+  const repo = fixtureRepo()
+  const mock = await mockServices(repo, { app: { installed: false, slug: 'sophon-factory' }, botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } })
+  const worker = await startWorker({ ...vars(mock), GITHUB_APP_ID: '12345', GITHUB_APP_PRIVATE_KEY: privateKey })
+  const admin = { authorization: 'Bearer admin' }
+  const describe = () => `requests: ${mock.state.requests.join(', ')}\nworker:\n${worker.output().slice(-3000)}`
+  try {
+    await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin, method: 'POST' })
+    const stopped = await until(async () => {
+      const status = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin })).json()) as { runs: { state: string; note: string }[] }
+      return status.runs[0]?.state === 'error' ? status.runs[0] : undefined
+    }, 60_000, describe)
+    assert.match(stopped.note, /https:\/\/github\.com\/apps\/sophon-factory\/installations\/new/)
+    assert.equal(mock.state.comments.length, 0)
+    assert.equal(mock.state.requests.filter((route) => route.startsWith('POST /v1/')).length, 0)
+    const lookup = mock.state.authorizations.find((entry) => entry.route === 'GET /repos/acme/app/installation')
+    assert.match(lookup?.authorization ?? '', /^Bearer [\w-]+\.[\w-]+\.[\w-]+$/)
+    assert.ok(!mock.state.authorizations.some((entry) => entry.authorization.includes('github-token')), describe())
   } finally {
     worker.stop()
     mock.close()
