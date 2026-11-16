@@ -67,8 +67,10 @@ export type DevelopDeps = {
 }
 
 export type DevelopStatus = 'ready' | 'failed' | 'blocked' | 'stopped'
-/** `resume` says what the user does before the same run can go on, for example add CI. It is null when a new run is necessary. */
-/** `merge` is null unless the host merged the PR. */
+/**
+ * `resume` says what the user does before the same run can go on, for example add CI. It is null when a new run is
+ * necessary. `merge` is null unless the host merged the PR.
+ */
 export type DevelopResult = {
   status: DevelopStatus
   pr: { number: number; url: string } | null

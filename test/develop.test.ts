@@ -355,27 +355,35 @@ test('Node GitHub: failureLog returns a link when gh fails', async () => {
   }
 })
 
-test('Node GitHub: merge runs gh pr merge at the head, and only a merged PR with a merge commit is a merge', async () => {
+test('Node GitHub: merge calls the merge API at the head in one call, and a refusal of gh goes to the core step', async () => {
   const dir = runsDir()
   const calls = join(dir, 'calls')
-  const gh = (view: string) =>
-    writeFileSync(join(dir, 'gh'), `#!/bin/sh\necho "$*" >> "${calls}"\nif [ "$2" = view ]; then printf '%s' '${view}'; fi\n`, { mode: 0o755 })
+  const gh = (script: string) => writeFileSync(join(dir, 'gh'), `#!/bin/sh\necho "$*" >> "${calls}"\n${script}\n`, { mode: 0o755 })
+  const logged = () => readFileSync(calls, 'utf8').split('\n').filter(Boolean)
   const path = process.env.PATH
   process.env.PATH = `${dir}:${path ?? ''}`
   try {
     const pulls = ghPullRequests(dir, 'main')
-    gh('{"state":"MERGED","mergeCommit":{"oid":"abc123"}}')
+    gh(`printf '%s' '{"sha":"abc123","merged":true,"message":"Pull Request successfully merged"}'`)
     assert.deepEqual(await pulls.merge(9, { method: 'squash', sha: 'f00d' }), { merged: true, sha: 'abc123' })
-    assert.deepEqual(readFileSync(calls, 'utf8').split('\n').filter(Boolean), ['pr merge 9 --squash --match-head-commit f00d', 'pr view 9 --json state,mergeCommit'])
+    // The answer gives the merge commit, so no later call can turn a merged PR into a refusal.
+    assert.deepEqual(logged(), ['api repos/{owner}/{repo}/pulls/9/merge --method PUT -f merge_method=squash -f sha=f00d'])
 
-    gh('{"state":"OPEN","mergeCommit":null}')
-    assert.deepEqual(await pulls.merge(9, { method: 'rebase', sha: 'f00d' }), { merged: false, reason: 'the PR is OPEN after gh pr merge' })
+    gh(`printf '%s' '{"merged":false,"message":"Pull Request is not mergeable"}'`)
+    assert.deepEqual(await pulls.merge(9, { method: 'merge', sha: 'f00d' }), { merged: false, reason: 'Pull Request is not mergeable' })
 
-    writeFileSync(join(dir, 'gh'), '#!/bin/sh\nprintf "Pull request is not mergeable:\\nthe merge commit cannot be cleanly created" >&2\nexit 1\n', { mode: 0o755 })
-    assert.deepEqual(await pulls.merge(9, { method: 'merge', sha: 'f00d' }), {
-      merged: false,
-      reason: 'gh pr merge: Pull request is not mergeable: the merge commit cannot be cleanly created',
+    // A base branch that requires a merge queue: the API refuses, and the host never calls gh pr merge, which can queue the PR.
+    gh(`printf 'gh: Changes must be made through the merge queue (HTTP 405)' >&2\nexit 1`)
+    await assert.rejects(pulls.merge(9, { method: 'rebase', sha: 'f00d' }), {
+      message: 'gh api repos/{owner}/{repo}/pulls/9/merge: gh: Changes must be made through the merge queue (HTTP 405)',
     })
+    assert.deepEqual(logged().filter((line) => !line.startsWith('api ')), [])
+
+    // A resumed run: GitHub refuses the merge of a PR that it already merged at the head, and the host reads the merge.
+    gh(`case "$*" in *merge*) printf 'gh: Pull Request is not mergeable (HTTP 405)' >&2; exit 1;; esac
+printf '%s' '{"merged":true,"merge_commit_sha":"abc123","head":{"sha":"f00d"}}'`)
+    assert.deepEqual(await pulls.merge(9, { method: 'squash', sha: 'f00d' }), { merged: true, sha: 'abc123' })
+    assert.deepEqual(logged().slice(-2), ['api repos/{owner}/{repo}/pulls/9/merge --method PUT -f merge_method=squash -f sha=f00d', 'api repos/{owner}/{repo}/pulls/9'])
   } finally {
     if (path === undefined) delete process.env.PATH
     else process.env.PATH = path

@@ -1,14 +1,16 @@
 import { readCi } from '../core/ci.ts'
+import { mergePull } from '../core/merge.ts'
 import type { PullRequests } from '../core/platform.ts'
 import { gh } from './channels.ts'
 
 const logTailChars = 6_000
-const reasonChars = 300
 
 /** The PRs and CI of the repository at `repo`, through the gh CLI and its login. */
 export function ghPullRequests(repo: string, baseRef: string): PullRequests {
   const run = gh(repo)
   const get = async <T>(path: string) => JSON.parse(await run(['api', path])) as T
+  const put = async <T>(path: string, body: Record<string, unknown>) =>
+    JSON.parse(await run(['api', path, '--method', 'PUT', ...Object.entries(body).flatMap(([key, value]) => ['-f', `${key}=${value}`])])) as T
   return {
     async open({ head, title, body }) {
       const open = JSON.parse(await run(['pr', 'list', '--head', head, '--state', 'open', '--json', 'number,url'])) as { number: number; url: string }[]
@@ -19,19 +21,9 @@ export function ghPullRequests(repo: string, baseRef: string): PullRequests {
     async ready(pr) {
       if ((JSON.parse(await run(['pr', 'view', String(pr), '--json', 'isDraft'])) as { isDraft: boolean }).isDraft) await run(['pr', 'ready', String(pr)])
     },
-    async merge(pr, { method, sha }) {
-      try {
-        await run(['pr', 'merge', String(pr), `--${method}`, '--match-head-commit', sha])
-        type View = { state: string; mergeCommit: { oid: string } | null }
-        const view = JSON.parse(await run(['pr', 'view', String(pr), '--json', 'state,mergeCommit'])) as View
-        if (view.state === 'MERGED' && view.mergeCommit?.oid) return { merged: true, sha: view.mergeCommit.oid }
-        // For example, a merge queue keeps the PR open.
-        return { merged: false, reason: `the PR is ${view.state} after gh pr merge` }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        return { merged: false, reason: message.replace(/\s+/g, ' ').trim().slice(0, reasonChars) }
-      }
-    },
+    // The merge API merges immediately or refuses. gh pr merge can add the PR to a merge queue.
+    // The answer gives the merge commit, so the host does not make a second call after the merge.
+    merge: (pr, { method, sha }) => mergePull(put, get, `repos/{owner}/{repo}/pulls/${pr}`, method, sha),
     async comment(pr, body) {
       await run(['pr', 'comment', String(pr), '--body-file', '-'], body)
     },

@@ -8,7 +8,8 @@ import { scriptedDispatch, type Script, type Turn } from './scripted-model.ts'
 
 export type MockComment = { id: number; issue: number; user: { login: string }; body: string; created_at: string; updated_at: string; html_url: string }
 type TreeEntry = { path: string; mode: string; type: string; sha: string | null }
-type Pull = { head: string; title: string; body: string; draft: boolean; headRepo?: string; merged?: boolean }
+/** `merged` is the merge commit, after the host merged the PR. */
+type Pull = { head: string; title: string; body: string; draft: boolean; headRepo?: string; merged?: string }
 
 /**
  * GitHub, Anthropic, OpenAI and a build machine on one local port, for the Cloudflare host under wrangler dev.
@@ -77,6 +78,8 @@ export async function mockServices(
     draft: pull.draft,
     head: { ref: pull.head, repo: { full_name: pull.headRepo ?? `${options.owner}/${options.name}` }, sha: shaOf(pull.head) },
     html_url: `https://github.com/${options.owner}/${options.name}/pull/${number}`,
+    merge_commit_sha: pull.merged ?? null,
+    merged: pull.merged !== undefined,
     node_id: `PR_${number}`,
     number,
     title: pull.title,
@@ -188,13 +191,14 @@ export async function mockServices(
         const method = string(fields.merge_method, 'merge_method')
         if (!['squash', 'merge', 'rebase'].includes(method)) throw new Error(`${route}: merge_method must be squash, merge or rebase`)
         const sha = string(fields.sha, 'sha')
+        if (pull.merged) return json(response, 405, { message: 'Pull Request is not mergeable' })
         if (sha !== shaOf(pull.head)) return json(response, 409, { message: 'Head branch was modified. Review and try the merge again.' })
         if (pull.draft) return json(response, 405, { message: 'Pull Request is still a draft' })
         // Every method merges as a squash: the tests read only the tree on main.
         const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
         const commit = text(['commit-tree', `${sha}^{tree}`, '-p', shaOf('main')!, '-m', `${pull.title} (#${number})`], undefined, identity)
         git(['update-ref', 'refs/heads/main', commit])
-        pull.merged = true
+        pull.merged = commit
         state.merges.push({ commit, method, pr: number, sha })
         return json(response, 200, { merged: true, message: 'Pull Request successfully merged', sha: commit })
       }

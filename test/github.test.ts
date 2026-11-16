@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { github, GitHubError, refusedCredential, type GitHub } from '../src/cloudflare/github.ts'
+import { deleteRemoteBranch } from '../src/cloudflare/branches.ts'
 import { githubPulls } from '../src/cloudflare/pulls.ts'
 
 const answer = (status: number, body: unknown = {}, headers: Record<string, string> = {}) => new Response(JSON.stringify(body), { headers, status })
@@ -201,12 +202,9 @@ test('json gives undefined for a 204 answer without a body', async () => {
   assert.deepEqual(calls, ['DELETE https://api.test/repos/acme/app/git/refs/heads/x'])
 })
 
-test('a PR merge sends the method and the head, and a refusal of GitHub is a result', async () => {
+/** A GitHub client that gives the scripted JSON answers in sequence, throws the scripted errors, and records each call. */
+function stubbed(...answers: (unknown | Error)[]) {
   const calls: { method: string; path: string; body: unknown }[] = []
-  const answers: (unknown | Error)[] = [
-    { merged: true, sha: 'abc123', message: 'Pull Request successfully merged' },
-    new GitHubError(409, 'GitHub PUT /repos/acme/app/pulls/7/merge answered HTTP 409: Head branch was modified'),
-  ]
   const stub: GitHub = {
     async json<T>(method: string, path: string, body?: unknown) {
       calls.push({ method, path, body })
@@ -219,11 +217,41 @@ test('a PR merge sends the method and the head, and a refusal of GitHub is a res
       throw new Error('no GraphQL')
     },
   }
+  return { calls, stub }
+}
+
+test('a PR merge sends the method and the head, and a refusal of GitHub throws', async () => {
+  const refusal = new GitHubError(409, 'GitHub PUT /repos/acme/app/pulls/7/merge answered HTTP 409: Head branch was modified')
+  const { calls, stub } = stubbed({ merged: true, sha: 'abc123', message: 'Pull Request successfully merged' }, refusal)
   const pulls = githubPulls(stub, 'acme', 'app', 'main')
   assert.deepEqual(await pulls.merge(7, { method: 'squash', sha: 'f00d' }), { merged: true, sha: 'abc123' })
   assert.deepEqual(calls, [{ method: 'PUT', path: '/repos/acme/app/pulls/7/merge', body: { merge_method: 'squash', sha: 'f00d' } }])
-  assert.deepEqual(await pulls.merge(7, { method: 'rebase', sha: 'f00d' }), {
-    merged: false,
-    reason: 'GitHub PUT /repos/acme/app/pulls/7/merge answered HTTP 409: Head branch was modified',
-  })
+  await assert.rejects(pulls.merge(7, { method: 'rebase', sha: 'f00d' }), refusal)
+})
+
+test('a refused PR merge of a resumed run returns the merge when GitHub already merged the PR at the head', async () => {
+  const refusal = new GitHubError(405, 'GitHub PUT /repos/acme/app/pulls/7/merge answered HTTP 405: Pull Request is not mergeable')
+  const pull = (sha: string) => ({ merged: true, merge_commit_sha: 'abc123', head: { sha } })
+  const { calls, stub } = stubbed(refusal, pull('f00d'), refusal, pull('beef'))
+  const pulls = githubPulls(stub, 'acme', 'app', 'main')
+  assert.deepEqual(await pulls.merge(7, { method: 'squash', sha: 'f00d' }), { merged: true, sha: 'abc123' })
+  assert.deepEqual(calls.map((call) => `${call.method} ${call.path}`), ['PUT /repos/acme/app/pulls/7/merge', 'GET /repos/acme/app/pulls/7'])
+  // A PR that merged at another head is not the merge of this run: the refusal stays.
+  await assert.rejects(pulls.merge(7, { method: 'squash', sha: 'f00d' }), refusal)
+})
+
+test('a branch delete accepts a ref that is not there, but not a refused delete', async () => {
+  const ref = '/repos/acme/app/git/refs/heads/factory/dev-x'
+  const missing = stubbed(new GitHubError(422, 'Reference does not exist'), new GitHubError(404, 'Not Found'))
+  await deleteRemoteBranch(missing.stub, '/repos/acme/app', 'factory/dev-x')
+  assert.deepEqual(
+    missing.calls.map((call) => `${call.method} ${call.path}`),
+    [`DELETE ${ref}`, 'GET /repos/acme/app/git/ref/heads/factory/dev-x'],
+  )
+  const refusal = new GitHubError(422, 'Cannot delete this protected branch')
+  const protectedRef = stubbed(refusal, { ref: 'refs/heads/factory/dev-x' })
+  await assert.rejects(deleteRemoteBranch(protectedRef.stub, '/repos/acme/app', 'factory/dev-x'), refusal)
+  const gone = stubbed(new GitHubError(404, 'Not Found'))
+  await deleteRemoteBranch(gone.stub, '/repos/acme/app', 'factory/dev-x')
+  assert.deepEqual(gone.calls.map((call) => call.method), ['DELETE'])
 })
