@@ -199,7 +199,10 @@ async function commitEdits<Log extends PatchLog>(context: RunContext, before: st
   const touched = after === before ? [] : await repo.changedFiles(before, after)
   const allowed = new Set([
     ...(await repo.changedFiles(context.frozen.base, context.frozen.head)),
-    ...kept.map((finding) => parseLocation(finding.location)!.path),
+    ...kept.flatMap((finding) => {
+      const location = parseLocation(finding.location)
+      return location && 'path' in location ? [location.path] : []
+    }),
   ])
   return { before, after, changed: after !== before, log, outOfScope: touched.filter((path) => !allowed.has(path)) }
 }

@@ -61,7 +61,10 @@ export function bugsShards(diff: string): string[][] {
 /** The findings of one patch agent, and the files that only this agent may write. */
 export type PatchGroup = { findings: Finding[]; files: string[] }
 
-const fileOf = (finding: Finding) => parseLocation(finding.location)?.path ?? finding.location
+const fileOf = (finding: Finding) => {
+  const location = parseLocation(finding.location)
+  return location && 'path' in location ? location.path : finding.location
+}
 
 /**
  * Splits the kept findings across patch agents that work at the same time. The findings in one file go to one agent,
