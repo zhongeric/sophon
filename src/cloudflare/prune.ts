@@ -1,4 +1,4 @@
-import { pruneBranches, type BranchFacts, type PruneResult, type PullState } from '../core/prune.ts'
+import { pruneBranches, reasonOf, type BranchFacts, type PruneResult, type PullState } from '../core/prune.ts'
 import { deleteRemoteBranch } from './branches.ts'
 import type { GitHub } from './github.ts'
 import { encodePath } from './trees.ts'
@@ -14,12 +14,10 @@ type Ref = { ref: string; object: { sha: string } }
 type Pull = { state: string; merged?: boolean; merged_at?: string | null; body?: string | null; head: { sha: string } }
 
 const pageSize = 100
-const reasonChars = 300
 
-const stateOf = (pull: Pull): PullState => (pull.merged || pull.merged_at ? 'merged' : pull.state === 'closed' ? 'closed' : 'open')
+export const stateOf = (pull: Pull): PullState => (pull.merged || pull.merged_at ? 'merged' : pull.state === 'closed' ? 'closed' : 'open')
 /** Queued, running, paused and error runs can go on, so only passed and failed runs are finished. */
 const finished = (state: State) => state === 'passed' || state === 'failed'
-const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().slice(0, reasonChars)
 
 /**
  * Prunes the factory/* branches on GitHub with the rules of src/core/prune.ts. `only` limits the sweep, for example to
@@ -28,11 +26,13 @@ const reasonOf = (error: unknown) => (error instanceof Error ? error.message : S
 export async function sweepBranches(options: { gh: GitHub; owner: string; repo: string; lookup: RunLookup; only?: (name: string) => boolean }): Promise<PruneResult> {
   const { gh, owner, lookup } = options
   const api = `/repos/${owner}/${options.repo}`
-  const refs: Ref[] = []
+  // GitHub can ignore per_page and page on this endpoint and give the full list on each page. A page without new refs stops the loop.
+  const refs = new Map<string, Ref>()
   for (let page = 1; ; page++) {
     const batch = await gh.json<Ref[]>('GET', `${api}/git/matching-refs/heads/factory/?per_page=${pageSize}&page=${page}`)
-    refs.push(...batch)
-    if (batch.length < pageSize) break
+    const before = refs.size
+    for (const ref of batch) if (!refs.has(ref.ref)) refs.set(ref.ref, ref)
+    if (batch.length < pageSize || refs.size === before) break
   }
   /** True when `sha` is in `base`: the merge base of the two is `sha`. */
   const contains = async (base: string, sha: string) =>
@@ -44,9 +44,8 @@ export async function sweepBranches(options: { gh: GitHub; owner: string; repo: 
   }
 
   const factsOf = async (name: string, sha: string): Promise<BranchFacts> => {
-    const unknown = async (pr: PullState | null): Promise<BranchFacts> => ({ applied: false, inDefault: pr !== 'open' && (await inDefault(sha)), name, pr, run: null })
-    // The listing gives only factory/ names. A name outside factory/ is kept without a GitHub call.
     if (!name.startsWith('factory/')) return { applied: false, inDefault: false, name, pr: null, run: null }
+    const unknown = async (pr: PullState | null): Promise<BranchFacts> => ({ applied: false, inDefault: pr !== 'open' && (await inDefault(sha)), name, pr, run: null })
     const review = /^factory\/(pr-(\d+)-.+)$/.exec(name)
     if (review) {
       const number = Number(review[2])
@@ -67,7 +66,7 @@ export async function sweepBranches(options: { gh: GitHub; owner: string; repo: 
 
   const facts: BranchFacts[] = []
   const unread: PruneResult['kept'] = []
-  for (const ref of refs) {
+  for (const ref of refs.values()) {
     const name = ref.ref.replace(/^refs\/heads\//, '')
     if (options.only && !options.only(name)) continue
     try {

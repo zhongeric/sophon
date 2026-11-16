@@ -57,6 +57,15 @@ test('prune prints each deleted, kept and failed branch, and exits 0 also with f
 
 test('prune exits 1 and prints the raw text when the route fails or the body is not the prune result', () => {
   assert.deepEqual(pruneOutcome({ ok: false, text: 'unauthorized' }), { code: 1, text: 'unauthorized' })
-  for (const text of ['not json', 'null', '{"deleted":[],"kept":[]}', '{"deleted":[1],"kept":[],"failed":[]}'])
+  for (const text of [
+    'not json',
+    'null',
+    '{"deleted":[],"kept":[]}',
+    '{"deleted":[1],"kept":[],"failed":[]}',
+    '{"deleted":[{}],"kept":[],"failed":[]}',
+    '{"deleted":[{"name":"factory/a","rule":"kept"}],"kept":[],"failed":[]}',
+    '{"deleted":[],"kept":[{"name":7,"reason":"open PR"}],"failed":[]}',
+    '{"deleted":[],"kept":[],"failed":[{"name":"factory/a"}]}',
+  ])
     assert.deepEqual(pruneOutcome({ ok: true, text }), { code: 1, text })
 })

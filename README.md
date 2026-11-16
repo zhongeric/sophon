@@ -105,7 +105,7 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 - **Questions** that need you (D11) go to the PR, the terminal, or `runs/<run>/questions-<batch>.md`. Answer with `/answer` and one
   line for each question (`Q1: b`, or your own words), or with `/answer recommended`.
 - **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
-  fixes are on the local branch `factory/<run>` until you apply them or the PR closes or merges.
+  fixes stay on `factory/<run>`. The run deletes it at its end after `--ship` or a closed PR.
 - **Models:** `--models file.json` sets the model of each role.
 - **Budget:** `--budget <usd>` caps the spend of a run. At the cap, the run asks you to raise it or stop. Prices come
   from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`, `cached_input`, `cache_write`,

@@ -75,4 +75,5 @@ export function branchesSection(result: PruneResult): string[] {
   ]
 }
 
-const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().slice(0, reasonChars)
+/** The message of an error on one line and cut to a length that a report or a sweep output can show. */
+export const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().slice(0, reasonChars)

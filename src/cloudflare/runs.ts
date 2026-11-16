@@ -43,7 +43,6 @@ export type Env = {
   MACHINE_URL?: string
 }
 
-export type { State }
 export type RunRow = { run: string; state: State; note: string; created: number; request: string }
 /** The result of `resume`: `state` is the state of the latest run before the call, or null when there is no run. */
 export type ResumeResult = { resumed: boolean; state: State | null; reason: string }

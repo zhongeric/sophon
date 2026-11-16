@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { PausedError, type Channel } from '../src/core/questions.ts'
 import { StopError } from '../src/core/stop.ts'
-import { recordUsage, zeroTokens, type Prices } from '../src/core/usage.ts'
+import { BudgetStop, recordUsage, zeroTokens, type Prices } from '../src/core/usage.ts'
 import { develop, type ReviewRequest } from '../src/core/workflows/develop.ts'
 import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
@@ -479,6 +479,70 @@ test('develop: at the budget, the run asks with the run totals and a stop ends i
   assert.match(result.report, /^Budget: \$0\.0010\. Spent: \$0\.\d{4}\.$/m)
   assert.equal(result.github.state.opened.length, 0)
   assert.equal(requests.length, 0)
+})
+
+test('develop: a stop in a build wave waits for a delayed task branch before pruning', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const input = await developInput(repo, 'wave-stop')
+  const github = fakePulls()
+  const deps = await nodeDevelop({
+    channel: memoryChannel().channel,
+    ci: { pollMs: 10, startMs: 1_000, waitMs: 5_000 },
+    credentials,
+    dispatch: scriptedDispatch(developScript(), []),
+    input,
+    log: () => {},
+    module,
+    pulls: github.pulls,
+    repo,
+    reviewChannel: async () => memoryChannel().channel,
+    runsDir: runsDir(),
+  })
+  const created: string[] = []
+  const probed: string[] = []
+  let release = () => {}
+  const createSibling = new Promise<void>((resolve) => { release = resolve })
+  let stopped = () => {}
+  const firstStopped = new Promise<void>((resolve) => { stopped = resolve })
+  const running = develop(input, {
+    ...deps,
+    branches: {
+      ...deps.branches,
+      async branch(name, from) {
+        if (name === 'factory/task-wave-stop-mul') await createSibling
+        const branch = await deps.branches.branch(name, from)
+        if (!name.startsWith('factory/task-wave-stop-')) return branch
+        created.push(name)
+        if (name === 'factory/task-wave-stop-sub') {
+          stopped()
+          throw new BudgetStop('stopped in a build wave')
+        }
+        throw new Error('sibling failed after the budget stop')
+      },
+      async exists(name) {
+        if (name.startsWith('factory/task-wave-stop-')) probed.push(name)
+        return deps.branches.exists(name)
+      },
+    },
+  })
+  await firstStopped
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  const prematureProbes = [...probed]
+  release()
+  const result = await running
+
+  assert.deepEqual(prematureProbes, [])
+  assert.equal(result.status, 'stopped', result.report)
+  assert.equal(result.pr, null)
+  assert.deepEqual(created.sort(), ['factory/task-wave-stop-mul', 'factory/task-wave-stop-sub'])
+  for (const task of ['sub', 'mul']) {
+    const name = `factory/task-wave-stop-${task}`
+    assert.equal(deps.ledger.get(`step:build.${task}`), undefined)
+    await assert.rejects(git(repo, 'show-ref', '--verify', '--quiet', `refs/heads/${name}`), name)
+    assert.ok(result.report.includes(`- deleted ${name} (stranded)`), result.report)
+  }
+  assert.doesNotMatch(result.report, /deleted factory\/task-wave-stop-tests/)
+  assert.equal(github.state.opened.length, 0)
 })
 
 test('develop: a review pass that stops at its budget is not recorded, and a resume with a higher budget runs it again', { timeout: 120_000 }, async () => {

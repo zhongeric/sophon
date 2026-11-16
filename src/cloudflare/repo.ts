@@ -6,6 +6,7 @@ import type { PullState } from '../core/prune.ts'
 import { StopError } from '../core/stop.ts'
 import { deleteRemoteBranch } from './branches.ts'
 import { GitHubError, type GitHub } from './github.ts'
+import { stateOf } from './prune.ts'
 import { base64, encodePath, nameStatus, restoreFromGitHub, treeGit, treeWriter, writeTarball, type ChangedFile } from './trees.ts'
 
 export type PullRequest = { owner: string; repo: string; pr: number }
@@ -173,8 +174,7 @@ export function githubRepo(options: {
     },
 
     async pullState(pr): Promise<PullState> {
-      const view = await gh.json<PullView>('GET', `${api}/pulls/${pr}`)
-      return view.merged_at ? 'merged' : view.state === 'closed' ? 'closed' : 'open'
+      return stateOf(await gh.json<PullView>('GET', `${api}/pulls/${pr}`))
     },
     deleteBranch: () => deleteRemoteBranch(gh, api, options.branch),
     // The SQL tree is Durable Object data of the run, and it stays.

@@ -114,6 +114,20 @@ test('a failed run whose PR closed deletes its fix branch as stranded', async ()
   assert.equal(branchLine(result, repo), 'Deleted factory/closed: the PR closed without a merge.')
 })
 
+test('a resumed run whose fix branch the prune deleted returns its result without a git call', async () => {
+  const repo = fixtureRepo()
+  const dir = runsDir()
+  const input = { ...(await loopInput(repo, 'ended')), pr: 7 }
+  const closed = (real: Repo): Repo => ({ ...real, pullState: async () => 'closed' })
+  const first = await runLoop(repo, 'ended', dir, { dispatch: scriptedDispatch(scriptFor({ rejectBug: true, tests: true }), []), input, repo: closed })
+  assert.equal(hasBranch(repo, 'factory/ended'), false)
+
+  const turns: Turn[] = []
+  const second = await runLoop(repo, 'ended', dir, { dispatch: scriptedDispatch(script, turns), input, repo: closed })
+  assert.deepEqual(second, first)
+  assert.deepEqual(turns, [])
+})
+
 test('a failed delete is a note in the report, and the run still passes', async () => {
   const repo = fixtureRepo()
   const input = { ...(await loopInput(repo, 'refused-delete')), pr: 7 }

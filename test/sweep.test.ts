@@ -17,6 +17,8 @@ type Setup = {
   refuse?: string[]
   /** The paths that fail with HTTP 500. */
   broken?: string[]
+  /** True when the branch list ignores per_page and page and gives all refs on each page. */
+  unpaged?: boolean
 }
 
 const api = '/repos/acme/app'
@@ -44,6 +46,7 @@ function sweep(setup: Setup, only?: (name: string) => boolean) {
         const refs = Object.entries(setup.refs).map(([name, sha]) => ({ object: { sha }, ref: `refs/heads/${name}` }))
         const page = Number(url.searchParams.get('page'))
         const size = Number(url.searchParams.get('per_page'))
+        if (setup.unpaged) return refs as T
         return refs.slice((page - 1) * size, page * size) as T
       }
       if (method === 'GET' && url.pathname === api) return { default_branch: 'main' } as T
@@ -199,6 +202,17 @@ test('a refused delete goes to failed, a GitHub error keeps its branch, and the 
 test('the sweep reads every page of the branch list, and only limits the branches', async () => {
   const refs = Object.fromEntries(Array.from({ length: 101 }, (_, index) => [`factory/x-${index}`, `s${index}`]))
   const run = sweep({ refs }, (name) => name === 'factory/x-100')
+  const result = await run.result
+  assert.deepEqual(result.kept, [{ name: 'factory/x-100', reason: 'unknown run' }])
+  assert.deepEqual(
+    run.calls.filter((call) => call.includes('matching-refs')),
+    [1, 2].map((page) => `GET ${api}/git/matching-refs/heads/factory/?per_page=100&page=${page}`),
+  )
+})
+
+test('the sweep stops when a page of the branch list gives no new refs, and reads each branch one time', async () => {
+  const refs = Object.fromEntries(Array.from({ length: 101 }, (_, index) => [`factory/x-${index}`, `s${index}`]))
+  const run = sweep({ refs, unpaged: true }, (name) => name === 'factory/x-100')
   const result = await run.result
   assert.deepEqual(result.kept, [{ name: 'factory/x-100', reason: 'unknown run' }])
   assert.deepEqual(

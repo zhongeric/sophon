@@ -6,7 +6,7 @@ import { step, type Ledger } from '../ledger.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
 import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeResult, PullRequests } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
-import { branchesSection, pruneBranches, type BranchFacts, type BranchRun, type PruneResult } from '../prune.ts'
+import { branchesSection, pruneBranches, reasonOf, type BranchFacts, type BranchRun, type PruneResult } from '../prune.ts'
 import type { Credentials, Provider } from '../providers.ts'
 import { asker, commentLimit, decisionLists, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
 import type { ModelChoice } from '../roles.ts'
@@ -96,8 +96,6 @@ const ciGraceMs = 3 * 60_000
 /** The most that GitHub's clock and the host's clock can differ. */
 const clockSkewMs = 30_000
 const defaultParallel = 3
-/** The longest reason of a refused merge or a failed branch delete in the report. */
-const reasonChars = 300
 
 type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failures: string }
 /** A review pass. Records of older runs have no usage: it counts as zero. */
@@ -162,7 +160,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   // A resume without --budget must not apply the override again, so the recorded input does not keep it.
   const { budgetOverride, ...recorded } = input
   ledger.put('input', recorded)
-  // A run that deleted its development branch cannot go on: a resume would start the branch again from the base.
+  // A run that deleted its development branch cannot go on: a resume starts the branch again from the base.
   const ended = ledger.get<DevelopResult>('ended')
   if (ended) return ended
   const view = await branches.view(input.base)
@@ -188,10 +186,15 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const prune = async (merged: boolean): Promise<PruneResult> => {
     const pr = merged ? 'merged' : state.pr ? 'open' : null
     const own = (name: string, kind: BranchRun['kind'], applied: boolean, of: BranchFacts['pr']): BranchFacts => ({ name, run: { kind, finished: true, ship: false }, pr: of, applied, inDefault: false })
+    // A stop in a wave leaves the task branches of that wave out of state.built, but they can exist.
+    const built = new Set(state.built.map((entry) => entry.task.id))
+    const unbuilt = (state.plan?.tasks ?? []).filter((task) => !built.has(task.id))
+    const present = await Promise.all(unbuilt.map((task) => branches.exists(taskBranch(task)).catch(() => false)))
+    const tasks = [...state.built.map((entry) => entry.task), ...unbuilt.filter((_, index) => present[index])]
     // A failed delete-branch step is already in the note, so the prune leaves that branch alone.
     const facts = [
       ...(state.branch && remoteDeleted !== false ? [own(state.branch, 'develop', false, pr)] : []),
-      ...state.built.map((entry) => own(taskBranch(entry.task), 'task', mergedTasks.has(entry.task.id), null)),
+      ...tasks.map((task) => own(taskBranch(task), 'task', mergedTasks.has(task.id), null)),
       // The run merged the fixes of each finished pass, or the pass had none.
       ...[...new Set(state.reviews.map((review) => review.branch))].map((name) => own(name, 'review', true, pr)),
     ]
@@ -272,26 +275,29 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const scheduled = waves(planned.tasks, input.parallel ?? defaultParallel)
   for (const [index, wave] of scheduled.entries()) {
     const from = await step(ledger, `wave.${index}`, () => dev.head())
-    const logs = await Promise.all(
-      wave.map((task) =>
-        step(ledger, `build.${task.id}`, async () => {
-          const branch = await branches.branch(taskBranch(task), from)
-          return build(context, {
-            id: `build.${task.id}`,
-            turn: { request: 'task', key: `output:build.${task.id}` },
-            model: models.builder,
-            branch,
-            scope: task.files,
-            active,
-            checker: deps.checker(branch),
-            base: input.base,
-            review: { '/ask.md': input.ask, '/plan.md': planText, '/task.md': renderTask(task, state.built) },
-            prompt: buildPrompt(task),
-            label: `agent-factory: ${task.id}`,
-          })
-        }),
-      ),
+    const builds = wave.map((task) =>
+      step(ledger, `build.${task.id}`, async () => {
+        const branch = await branches.branch(taskBranch(task), from)
+        return build(context, {
+          id: `build.${task.id}`,
+          turn: { request: 'task', key: `output:build.${task.id}` },
+          model: models.builder,
+          branch,
+          scope: task.files,
+          active,
+          checker: deps.checker(branch),
+          base: input.base,
+          review: { '/ask.md': input.ask, '/plan.md': planText, '/task.md': renderTask(task, state.built) },
+          prompt: buildPrompt(task),
+          label: `agent-factory: ${task.id}`,
+        })
+      }),
     )
+    const logs = await Promise.all(builds).catch(async (error: unknown) => {
+      // All tasks must end before finish checks or deletes their branches.
+      await Promise.allSettled(builds)
+      throw error
+    })
     state.built.push(...wave.map((task, position) => ({ task, log: logs[position]! })))
     const blocked = state.built.filter((entry) => entry.log.blocked.trim())
     if (blocked.length > 0) return finish('blocked', [], blocked.map((entry) => `Task ${entry.task.id} is blocked: ${entry.log.blocked}`).join('\n'))
@@ -488,9 +494,6 @@ async function watchCi(ledger: Ledger, pulls: PullRequests, timing: DevelopDeps[
     await new Promise((resolve) => setTimeout(resolve, timing.pollMs))
   }
 }
-
-/** An error as one line for the finish note of the report. */
-const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().slice(0, reasonChars)
 
 const noCi = (sha: string) => `No CI ran on ${sha.slice(0, 12)}. Add CI that runs on pull requests, push again, and resume the run.`
 

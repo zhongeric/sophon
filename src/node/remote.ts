@@ -44,7 +44,7 @@ export function parseRepo(text: string): { owner: string; repo: string } {
 
 /**
  * Gives the lines and the exit code for a prune response: one line for each deleted, kept and failed branch. A failed
- * delete does not change the exit code. A failed route, or a body without the three lists, gives the raw text and exit code 1.
+ * delete does not change the exit code. A failed route, or a body without the three valid lists, gives the raw text and exit code 1.
  */
 export function pruneOutcome({ ok, text }: { ok: boolean; text: string }): { code: number; text: string } {
   if (!ok) return { code: 1, text }
@@ -54,16 +54,26 @@ export function pruneOutcome({ ok, text }: { ok: boolean; text: string }): { cod
   } catch {
     return { code: 1, text }
   }
-  const list = (key: string): Record<string, unknown>[] | null => {
+  // The detail is the rule of a deleted branch, else the reason.
+  type Entry = { name: string; detail: string }
+  const list = (key: string, detail: string, valid = (_value: string) => true): Entry[] | null => {
     const value = typeof body === 'object' && body !== null && key in body ? (body as Record<string, unknown>)[key] : undefined
-    return Array.isArray(value) && value.every((item) => typeof item === 'object' && item !== null) ? value : null
+    if (!Array.isArray(value)) return null
+    const entries = value.map((item: unknown) => {
+      if (typeof item !== 'object' || item === null) return null
+      const fields = item as Record<string, unknown>
+      const [name, info] = [fields.name, fields[detail]]
+      return typeof name === 'string' && typeof info === 'string' && valid(info) ? { name, detail: info } : null
+    })
+    return entries.every((entry): entry is Entry => entry !== null) ? entries : null
   }
-  const [deleted, kept, failed] = [list('deleted'), list('kept'), list('failed')]
+  const deleted = list('deleted', 'rule', (rule) => ['merged', 'applied', 'stranded'].includes(rule))
+  const [kept, failed] = [list('kept', 'reason'), list('failed', 'reason')]
   if (!deleted || !kept || !failed) return { code: 1, text }
   const lines = [
-    ...deleted.map((branch) => `deleted ${String(branch.name)} (${String(branch.rule)})`),
-    ...kept.map((branch) => `kept ${String(branch.name)}: ${String(branch.reason)}`),
-    ...failed.map((branch) => `failed ${String(branch.name)}: ${String(branch.reason)}`),
+    ...deleted.map((branch) => `deleted ${branch.name} (${branch.detail})`),
+    ...kept.map((branch) => `kept ${branch.name}: ${branch.detail}`),
+    ...failed.map((branch) => `failed ${branch.name}: ${branch.detail}`),
   ]
   return { code: 0, text: lines.length > 0 ? lines.join('\n') : 'no factory/* branches' }
 }

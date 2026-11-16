@@ -76,7 +76,7 @@ export default {
       if (request.method !== 'POST') return new Response('method not allowed', { status: 405 })
       return Response.json(await prune(env, pruneRoute[1]!, pruneRoute[2]!))
     }
-    if (!route) return new Response('not found', { status: 404 })
+    if (!route) return new Response('agent-factory', { status: 404 })
     const [, kind, owner = '', repo = '', number, action] = route
     const by = allowedUsers(env)[0] ?? owner
     if (kind === 'develop') {
