@@ -84,15 +84,16 @@ export async function checkFindings(input: unknown, sources: Sources): Promise<C
   if (!Array.isArray(list)) return { findings: [], errors: ['findings must be an array'] }
   const errors: string[] = []
   const findings: Submitted[] = []
+  const artifacts = sources.artifact && artifactReader(sources.artifact.bind(sources))
   for (const [index, item] of list.entries()) {
-    const problems = await checkFinding(item as Record<string, unknown>, sources)
+    const problems = await checkFinding(item as Record<string, unknown>, sources, artifacts)
     if (problems.length > 0) errors.push(...problems.map((problem) => `findings[${index}]: ${problem}`))
     else findings.push(normalizeLocation(item as Submitted))
   }
   return errors.length > 0 ? { findings: [], errors } : { findings, errors: [] }
 }
 
-async function checkFinding(item: Record<string, unknown>, sources: Sources): Promise<string[]> {
+async function checkFinding(item: Record<string, unknown>, sources: Sources, artifacts: ArtifactReader | undefined): Promise<string[]> {
   const missing = fields.filter((field) => typeof item[field] !== 'string' || (item[field] as string).trim() === '')
   if (missing.length > 0) return [`missing ${missing.join(', ')}`]
   const finding = item as Submitted
@@ -101,54 +102,73 @@ async function checkFinding(item: Record<string, unknown>, sources: Sources): Pr
 
   const location = parseLocation(finding.location)
   if (!location) {
-    return [`location "${finding.location}" is not path:line, path:start-end, artifact:<id>, artifact:<id>:line or artifact:<id>:start-end`]
+    // List the artifact forms only when this review can read artifacts, so that a code reviewer uses file locations.
+    const forms = artifacts ? artifactLocationForms : 'path:line or path:start-end'
+    return [`location "${finding.location}" is not ${forms}`]
   }
-  return 'path' in location ? checkFileEvidence(finding, location, sources) : checkArtifactEvidence(finding, location, sources)
+  return 'path' in location ? checkFileEvidence(finding, location, sources) : checkArtifactEvidence(finding, location, artifacts)
 }
 
 async function checkFileEvidence(finding: Submitted, location: FileLocation, sources: Sources): Promise<string[]> {
   const file = await sources.read(location.path)
-  if (file === null) return [`location "${finding.location}": ${location.path} does not exist in the reviewed tree`]
+  if (file === null) {
+    if (sources.artifact && location.path.startsWith('artifact:')) {
+      return [`location "${finding.location}" is not ${artifactLocationForms}`]
+    }
+    return [`location "${finding.location}": ${location.path} does not exist in the reviewed tree`]
+  }
   const lines = file.split('\n')
   if (location.start > lines.length) return [`location "${finding.location}": the file has ${lines.length} lines`]
   const diff = squash(stripDiffMarkers(fileDiff(sources.diff, location.path)))
   return checkEvidence(
     finding.evidence,
     [evidenceWindow(lines, location), diff],
+    'code',
     (fragment) => `evidence "${fragment}" is not in ${location.path} near line ${location.start}, or in its diff. Quote code that you read.`,
   )
 }
 
 /** The diff is not a source for an artifact quote, because an artifact is not in the reviewed tree. */
-async function checkArtifactEvidence(finding: Submitted, location: ArtifactLocation, sources: Sources): Promise<string[]> {
+async function checkArtifactEvidence(finding: Submitted, location: ArtifactLocation, artifacts: ArtifactReader | undefined): Promise<string[]> {
   const { artifact: id, lines: range } = location
-  if (!sources.artifact) return [`location "${finding.location}": this review has no artifact store`]
-  const bytes = await sources.artifact(id)
-  if (bytes === null) return [`location "${finding.location}": artifact ${id} does not exist in the run store`]
-  const text = utf8Text(bytes)
-  if (text === null) return [`location "${finding.location}": artifact ${id} is binary, and the evidence check reads only UTF-8 text`]
+  if (!artifacts) return [`location "${finding.location}": this review has no artifact store`]
+  const text = await artifacts(id)
+  if (text === 'unknown') return [`location "${finding.location}": artifact ${id} does not exist in the run store`]
+  if (text === 'binary') return [`location "${finding.location}": artifact ${id} is binary, and the evidence check reads only UTF-8 text`]
   if (!range) {
-    return checkEvidence(finding.evidence, [squash(text)], (fragment) => `evidence "${fragment}" is not in artifact ${id}. Quote text that you read.`)
+    const unmatched = (fragment: string) => `evidence "${fragment}" is not in artifact ${id}. Quote text that you read.`
+    return checkEvidence(finding.evidence, [text.squashed()], 'text', unmatched)
   }
-  const lines = text.split('\n')
+  const lines = text.lines()
   if (range.start > lines.length) return [`location "${finding.location}": the artifact has ${lines.length} lines`]
   return checkEvidence(
     finding.evidence,
     [evidenceWindow(lines, range)],
+    'text',
     (fragment) => `evidence "${fragment}" is not in artifact ${id} near line ${range.start}. Quote text that you read.`,
   )
 }
 
-/** Checks each fragment of an evidence quote: it must be long enough and appear in one of the squashed texts. */
-function checkEvidence(evidence: string, texts: string[], unmatched: (fragment: string) => string): string[] {
+/**
+ * Checks each fragment of an evidence quote: it must be long enough and appear in one of the squashed texts.
+ * A fragment matches with its line-number gutters removed, or as it is.
+ * The rows of a table can start with a number and a pipe.
+ * The noun is the thing that the reviewer quotes: code or text.
+ */
+function checkEvidence(evidence: string, texts: string[], noun: string, unmatched: (fragment: string) => string): string[] {
   const fragments = evidence
     .split(/\.\.\.|…/)
-    .map((fragment) => squash(stripLineNumbers(fragment)))
-    .filter((fragment) => fragment.length > 0)
-  if (fragments.length === 0) return ['evidence has no quoted code']
-  const short = fragments.filter((fragment) => fragment.replace(/\s/g, '').length < minEvidenceChars)
-  if (short.length > 0) return short.map((fragment) => `evidence "${fragment}" is too short: quote at least ${minEvidenceChars} non-space characters of code`)
-  return fragments.filter((fragment) => !texts.some((text) => text.includes(fragment))).map(unmatched)
+    .map((fragment) => ({ stripped: squash(stripLineNumbers(fragment)), raw: squash(fragment) }))
+    .filter(({ raw }) => raw.length > 0)
+  if (fragments.length === 0) return [`evidence has no quoted ${noun}`]
+  const long = (form: string) => form.replace(/\s/g, '').length >= minEvidenceChars
+  const found = (form: string) => long(form) && texts.some((text) => text.includes(form))
+  const failed = fragments.filter(({ stripped, raw }) => !found(stripped) && !found(raw))
+  const short = failed.filter(({ stripped, raw }) => !long(stripped) && !long(raw))
+  if (short.length > 0) {
+    return short.map(({ raw }) => `evidence "${raw}" is too short: quote at least ${minEvidenceChars} non-space characters of ${noun}`)
+  }
+  return failed.map(({ stripped, raw }) => unmatched(long(stripped) ? stripped : raw))
 }
 
 /** The squashed lines around a line range, where its evidence quote may appear. */
@@ -156,10 +176,34 @@ function evidenceWindow(lines: string[], range: LineRange): string {
   return squash(lines.slice(Math.max(0, range.start - 1 - evidenceWindowLines), range.end + evidenceWindowLines).join('\n'))
 }
 
+/** The text of an artifact, with its lines and its squashed form calculated only when a location needs them. */
+type ArtifactText = { lines(): string[]; squashed(): string }
+type ArtifactEntry = ArtifactText | 'unknown' | 'binary'
+type ArtifactReader = (id: string) => Promise<ArtifactEntry>
+
+/** Reads and decodes each artifact one time for each submit_findings call, because many findings can cite the same large artifact. */
+function artifactReader(read: (id: string) => Promise<Uint8Array | null>): ArtifactReader {
+  const cache = new Map<string, Promise<ArtifactEntry>>()
+  const load = async (id: string): Promise<ArtifactEntry> => {
+    const bytes = await read(id)
+    if (bytes === null) return 'unknown'
+    const text = utf8Text(bytes)
+    if (text === null) return 'binary'
+    let lines: string[] | undefined
+    let squashed: string | undefined
+    return { lines: () => (lines ??= text.split('\n')), squashed: () => (squashed ??= squash(text)) }
+  }
+  return (id) => {
+    const entry = cache.get(id) ?? load(id)
+    cache.set(id, entry)
+    return entry
+  }
+}
+
 /** The text of artifact bytes, or null when the bytes are not strict UTF-8 or contain a NUL character. The check does not use the media_type. */
 function utf8Text(bytes: Uint8Array): string | null {
   try {
-    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
     return text.includes('\0') ? null : text
   } catch {
     return null
@@ -167,18 +211,19 @@ function utf8Text(bytes: Uint8Array): string | null {
 }
 
 /** Lines from start to end, both included. */
-export type LineRange = { start: number; end: number }
-export type FileLocation = { path: string } & LineRange
+type LineRange = { start: number; end: number }
+type FileLocation = { path: string } & LineRange
 /** An artifact of the run store, by its ID. Without lines, the evidence quote can be anywhere in the artifact. */
-export type ArtifactLocation = { artifact: string; lines: LineRange | null }
+type ArtifactLocation = { artifact: string; lines: LineRange | null }
 
-const artifactLocation = /^artifact:([^:]*)(?::(\d+)(?:-(\d+))?)?$/
+const artifactLocation = /^artifact:([^:]+)(?::(\d+)(?:-(\d+))?)?$/
+const artifactLocationForms = 'path:line, path:start-end, artifact:<id>, artifact:<id>:line or artifact:<id>:start-end'
 
+/** A location with the "artifact:" prefix and no valid artifact ID is a file location, so that a file such as "artifact:notes.md" stays a source. */
 export function parseLocation(location: string): FileLocation | ArtifactLocation | null {
   const text = location.trim()
-  if (text.startsWith('artifact:')) {
-    const [, id = '', start, end] = artifactLocation.exec(text) ?? []
-    if (!isArtifactId(id)) return null
+  const [, id = '', start, end] = artifactLocation.exec(text) ?? []
+  if (isArtifactId(id)) {
     if (start === undefined) return { artifact: id, lines: null }
     const lines = lineRange(start, end)
     return lines && { artifact: id, lines }
