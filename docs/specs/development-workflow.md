@@ -367,7 +367,7 @@ No rule covers these yet. Each default applies until the user replaces it.
 | G3 | Backend conventions: API shape, errors, logging, config, migrations | Follow the repo. Validate external input at the boundary. Additive migrations first. |
 | G4 | A security path for code that is not Solidity | Dependency and secret scans as host checks in the `typescript` profile. A focused security track in the review loop for auth and data paths. |
 | G5 | Frontend and backend deploys | Out of scope until the deploy workflow. The PR is the end of this workflow. |
-| G6 | Budgets: CI-fix rounds, review rounds, cost | Two CI-fix rounds, then a blocker. The pass count from triage, then FAIL. A cost budget per run, recorded in the report. |
+| G6 | Budgets: CI-fix rounds, review rounds, cost | Two CI-fix rounds, then a blocker. The pass count from triage, then FAIL. Built: the ledger records the tokens of each agent and of the run, and each report has a Usage section with the estimated USD from `MODEL_PRICES`. An optional cost budget per run (`--budget`, or `budget` of the admin routes) pauses the run before an agent turn at the budget with one question: raise it or stop. A stop ends a review run with FAIL and a development run as stopped, with the reason "cost budget". |
 | G7 | Where the frozen package and notes live | The PR description, written by the host, plus the run ledger. |
 | G8 | Mixed-stack monorepos | Profiles match per package. Each package's strictest policy applies to its files. |
 | G9 | Docs, config and CI changes | `docs` and `ci-infra` profiles (section 4.4). |

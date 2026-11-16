@@ -5,6 +5,7 @@ import type { Ledger } from '../core/ledger.ts'
 import type { Branch } from '../core/platform.ts'
 import { commentChannel, commentLimit, PausedError, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
+import { parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels, type ReviewRequest } from '../core/workflows/develop.ts'
 import { boxMachine, containerBox, httpBox, syncWithSetup, type Box } from './box.ts'
@@ -17,8 +18,11 @@ import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './ru
 import { sqlFiles } from './storage.ts'
 import { encodePath } from './trees.ts'
 
-/** A development run on a GitHub issue: the issue's title and body are the ask, and its comments carry the questions. */
-export type DevelopRequest = { owner: string; repo: string; issue: number; by: string; base?: string; hotfix?: boolean; full?: boolean; parallel?: number }
+/**
+ * A development run on a GitHub issue: the issue's title and body are the ask, and its comments carry the questions.
+ * `budget` is the cost budget in USD.
+ */
+export type DevelopRequest = { owner: string; repo: string; issue: number; by: string; base?: string; hotfix?: boolean; full?: boolean; parallel?: number; budget?: number }
 
 /** The container stops after this long without a command. A stopped container comes back empty, and the next sync copies the trees again. */
 const containerIdleMs = 30 * 60_000
@@ -47,6 +51,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
 
   protected async execute(run: string, request: DevelopRequest, ledger: Ledger, gh: GitHub, comments: Comments) {
     const input = ledger.get<DevelopInput>('input') ?? (await this.input(run, request, gh))
+    const prices = parsePrices(this.env.MODEL_PRICES)
     const { owner, repo } = request
     const log = (line: string) => console.log(`[${owner}/${repo}#${request.issue} ${run}] ${line}`)
     const sql = Sql.create(this.ctx.storage)
@@ -69,6 +74,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       ledger,
       log,
       module,
+      prices,
       pulls: githubPulls(gh, owner, repo, input.baseRef),
       review: (review) => this.review(request, ledger, review),
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
@@ -92,7 +98,8 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     const key = `review-run:${review.runId}`
     let run = ledger.get<string>(key)
     if (!run) {
-      run = (await runs.start({ ask: review.ask, by: request.by, full: review.full, owner, pr: review.pr, repo, ship: false })).run
+      const budget = review.budget !== undefined ? { budget: review.budget } : {}
+      run = (await runs.start({ ask: review.ask, by: request.by, full: review.full, owner, pr: review.pr, repo, ship: false, ...budget })).run
       ledger.put(key, run)
     }
     const outcome = await runs.outcome(run)
@@ -122,6 +129,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       ...(request.hotfix ? { hotfix: true } : {}),
       ...(request.full ? { full: true } : {}),
       ...(request.parallel ? { parallel: request.parallel } : {}),
+      ...(request.budget !== undefined ? { budget: request.budget } : {}),
     }
   }
 }

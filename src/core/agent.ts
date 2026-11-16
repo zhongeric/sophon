@@ -2,6 +2,7 @@ import { AgentRuntime, Contracts } from 'nanocode-ts'
 import type { Ledger } from './ledger.ts'
 import type { AgentStore } from './platform.ts'
 import { dispatcher, type Credentials, type Provider } from './providers.ts'
+import { recordUsage } from './usage.ts'
 import { repoMount } from './workspace.ts'
 
 export type HostToolHandler = (input: unknown, context: Contracts.ToolCallContext) => Promise<unknown>
@@ -26,6 +27,8 @@ export type AgentHost = {
   credentials: Credentials
   /** Replaces the credentialed dispatch, for scripted models in tests. */
   dispatch?: Contracts.RuntimeOptions['dispatch']
+  /** Runs before the host opens an agent turn, for example to compare the spend with the budget. A rejection stops the turn. */
+  beforeTurn?: () => Promise<void>
   log(line: string): void
 }
 
@@ -54,6 +57,7 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
     const runtime = await AgentRuntime.instantiate(host.module, host.store.sql, {
       published(events) {
         host.store.record(spec.id, events)
+        recordUsage(host.ledger, spec.id, spec.model, events)
         for (const event of events) {
           const line = describe(event)
           if (line) host.log(`${spec.id}: ${line}`)
@@ -141,6 +145,7 @@ export async function runTurn<T>(
 ): Promise<T> {
   const recorded = host.ledger.get<T>(turn.key)
   if (recorded !== undefined) return recorded
+  await host.beforeTurn?.()
   const retriesKey = `retries:${spec.id}:${turn.request}`
   const retries = host.ledger.get<number>(retriesKey) ?? 0
   const request = retries === 0 ? turn.request : `${turn.request}-retry-${retries}`

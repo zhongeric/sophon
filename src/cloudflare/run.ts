@@ -3,6 +3,7 @@ import module from 'nanocode-ts/nanocode_wasm.wasm'
 import type { Ledger } from '../core/ledger.ts'
 import { commentChannel, commentLimit, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
+import { parsePrices, zeroTokens, type RunUsage } from '../core/usage.ts'
 import { allowedModelsFrom, codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { ciChecker } from './checker.ts'
 import { baseConfig } from './config.ts'
@@ -14,8 +15,11 @@ import { sqlFiles, sqlLedger } from './storage.ts'
 
 export { allowedUsers, type Env } from './runs.ts'
 
-/** `ask` replaces the PR title and body as the original ask, for a review that the development workflow starts. */
-export type StartRequest = PullRequest & { ship: boolean; by: string; full?: boolean; ask?: string }
+/**
+ * `ask` replaces the PR title and body as the original ask, for a review that the development workflow starts.
+ * `budget` is the cost budget in USD.
+ */
+export type StartRequest = PullRequest & { ship: boolean; by: string; full?: boolean; ask?: string; budget?: number }
 
 /** A finished review as the development workflow needs it: the fixes as a commit on GitHub. */
 export type ReviewOutcome = { waiting: string } | (LoopResult & { waiting?: undefined })
@@ -41,7 +45,8 @@ export class PullRequestRuns extends Runs<StartRequest> {
     if (row.state === 'error') return { waiting: `review run ${run} stopped: ${row.note}. Resume it with npm run remote -- resume.` }
     if (row.state !== 'passed' && row.state !== 'failed') return { waiting: `review run ${run} is ${row.state}${row.note ? `: ${row.note}` : ''}` }
     const ledger = sqlLedger(this.ctx.storage.sql, run)
-    const result = ledger.get<{ pass: boolean; criteria: LoopResult['criteria']; final: string }>('result')!
+    // A run that finished before the usage records has no usage and no stop at the budget.
+    const result = ledger.get<{ pass: boolean; criteria: LoopResult['criteria']; final: string; usage?: RunUsage; stopped?: boolean }>('result')!
     const published = ledger.get<{ local: string; sha: string }>('published')
     const headSha = ledger.get<{ headSha: string }>('snapshot')!.headSha
     return {
@@ -50,6 +55,8 @@ export class PullRequestRuns extends Runs<StartRequest> {
       final: published?.local === result.final ? published.sha : headSha,
       pass: result.pass,
       report: sqlFiles(this.ctx.storage.sql, run).read('report.md') ?? '',
+      stopped: result.stopped ?? false,
+      usage: result.usage ?? { tokens: zeroTokens(), unpriced: [], usd: 0 },
     }
   }
 
@@ -57,6 +64,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     const recorded = ledger.get<LoopInput>('input')
     // A run that started before a model role existed has no choice for it: use the default.
     const input = recorded ? { ...recorded, models: mergeModels(recorded.models) } : await this.input(run, request, gh)
+    const prices = parsePrices(this.env.MODEL_PRICES)
     const pull = { owner: request.owner, pr: request.pr, repo: request.repo }
     const branch = `factory/${run}`
     const log = (line: string) => console.log(`[${request.owner}/${request.repo}#${request.pr} ${run}] ${line}`)
@@ -71,6 +79,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
       ledger,
       log,
       module,
+      prices,
       repo,
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
@@ -98,6 +107,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
       source: `${request.owner}/${request.repo}#${request.pr}`,
       ...(request.ship ? { ship: { headRef: view.head.ref, pr: request.pr } } : {}),
       ...(request.full ? { full: true } : {}),
+      ...(request.budget !== undefined ? { budget: request.budget } : {}),
     }
   }
 }

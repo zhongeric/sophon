@@ -1,4 +1,6 @@
 import { DevelopmentRuns, type DevelopRequest } from './develop.ts'
+import { StopError } from '../core/stop.ts'
+import { parseBudget } from '../core/usage.ts'
 import { sameSecret, verifySignature } from './github.ts'
 import { allowedUsers, PullRequestRuns, type Env } from './run.ts'
 
@@ -35,6 +37,17 @@ const commandOptions = (text: string): DevelopOptions =>
     parallel: /--parallel\s+(\d+)/.exec(text)?.[1],
   })
 
+/** The cost budget of an admin start route. The comment commands and the labels do not take a budget (decision 4 of the ask). */
+function budgetOf(body: Record<string, unknown>): { budget?: number } | Response {
+  if (body.budget === undefined) return {}
+  try {
+    return { budget: parseBudget(body.budget) }
+  } catch (error) {
+    if (error instanceof StopError) return new Response(error.message, { status: 400 })
+    throw error
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
@@ -47,12 +60,16 @@ export default {
     if (kind === 'develop') {
       if (request.method !== 'POST' || action) return new Response('method not allowed', { status: 405 })
       const options = (await request.json().catch(() => ({}))) as Record<string, unknown>
-      return accepted(await issue(env, owner, repo, Number(number)).start({ by, issue: Number(number), owner, repo, ...developOptions(options) }))
+      const budget = budgetOf(options)
+      if (budget instanceof Response) return budget
+      return accepted(await issue(env, owner, repo, Number(number)).start({ by, issue: Number(number), owner, repo, ...developOptions(options), ...budget }))
     }
     const pr = Number(number)
     if (request.method === 'POST' && !action) {
-      const options = (await request.json().catch(() => ({}))) as { ship?: boolean; full?: boolean }
-      return accepted(await pullRequest(env, owner, repo, pr).start({ by, full: options.full === true, owner, pr, repo, ship: options.ship === true }))
+      const options = (await request.json().catch(() => ({}))) as Record<string, unknown>
+      const budget = budgetOf(options)
+      if (budget instanceof Response) return budget
+      return accepted(await pullRequest(env, owner, repo, pr).start({ by, full: options.full === true, owner, pr, repo, ship: options.ship === true, ...budget }))
     }
     const runs = await runsOf(env, owner, repo, pr)
     if (request.method === 'GET' && action === 'report')

@@ -170,6 +170,7 @@ npm run review -- --repo ~/src/app --base main --ask-file ask.md
 npm run review -- --run 20261113-101500-1a2b3c4d             # resume
 npm run review -- --repo ~/src/app --pr 123 --ship          # on PASS, push the fixes and mark the PR ready
 npm run review -- --repo ~/src/app --pr 123 --full          # the full loop, also for a docs or tests only change
+npm run review -- --repo ~/src/app --pr 123 --budget 5      # a cost budget of 5 USD, see Model usage and cost budget
 ```
 
 ### Your answers
@@ -187,7 +188,8 @@ The fixes stay on a local branch, `factory/<run>`, in a worktree at `runs/<run>/
 
 Each run writes:
 
-- `report.md`: PASS or FAIL, the triage line, the criteria, each step, the checks and the intent verdict
+- `report.md`: PASS or FAIL, the triage line, the criteria, each step, the checks, the intent verdict and the
+  Usage section
 - `gate-log.txt`: the triage line, then one line per finding with its gate decision, with the model family of each step
 - `state.json`: the ledger, with every finding, gate decision, patch log and turn report
 - `agents/<step>.events.jsonl` and `agents/<step>.sqlite`: each agent's event log and journal
@@ -200,6 +202,47 @@ the labels. The same bytes give the same ID, and the first meta stays. A step ca
 `--models file.json` overrides models per step and role, for example
 `{ "step1": { "bugs": { "provider": "claude", "model": "claude-opus-5-5", "thinking": "high" } } }`.
 The light loop's model is `light`. `ALLOWED_MODELS` in the environment replaces the allowed models.
+
+### Model usage and cost budget
+
+The host records the tokens of each agent from the events of its model calls: input, cached input, cache write and
+output. A resumed run does not count a model call two times. The tokens of a subagent count for its parent agent.
+
+`MODEL_PRICES` gives the price of each model in USD per million tokens. On the local platform, it is an environment
+variable with JSON of this shape:
+
+```json
+{ "<model ID>": { "input": 5, "cached_input": 0.5, "cache_write": 6.25, "output": 25 } }
+```
+
+- Each entry must have all four numbers, and no number can be less than zero.
+- The input tokens include the cached and the cache-write tokens. The host uses the `input` price only for the
+  remaining input tokens.
+- Prices change, so the code has no default prices. Without `MODEL_PRICES`, no model has a price.
+- An invalid `MODEL_PRICES` stops the run before any work, also without a budget.
+
+The `report.md` of each review run and development run has a Usage section. It has one row for each step, with the
+model, the four token counts and the estimated USD. A model without a price shows its tokens and "no price". The
+total row gives the token sums, the USD of the priced models and the number of models without a price. A development
+run also has one row for each review pass.
+
+`--budget <usd>` sets a cost budget for the run, for `npm run review` and `npm run develop`. The budget must be a
+number of USD above zero. Otherwise, the run stops before it starts. Without a budget, the flow does not change.
+
+- A budget needs a price for each model of the run configuration, also for the roles that do not run. When a model
+  has no price, the run stops before any work.
+- Before each agent turn, the host compares the estimated spend with the budget. At the budget or over it, the run
+  pauses with one question: raise the budget, or stop the run. Parallel agents share this one question.
+- To raise the budget, answer with a new USD number above the spend, for example `Q1: 12`. The host asks again
+  when the answer is not a number above the spend.
+- The recommendation is to stop, so `/answer recommended` stops the run. A `--hotfix` development run stops at the
+  budget without a question.
+- A stopped review run ends with FAIL and does not ship. A stopped development run ends as stopped, and its PR stays
+  draft. Both reports give the reason "cost budget" and the Usage section.
+- With `--run`, a new `--budget` replaces the recorded budget. Without `--budget`, the recorded budget or your
+  last raise stays.
+- In a development run, the budget is for the development agents and the review loop together. Each review pass
+  gets the remaining budget.
 
 ## Development workflow
 
@@ -231,6 +274,7 @@ Intake, spec, planner and builders run on Opus 5.5. The review loop uses its own
 npm run develop -- --repo ~/src/app --ask "Add a fee switch to the vault, off by default"
 npm run develop -- --repo ~/src/app --ask-file ask.md --base develop --parallel 2
 npm run develop -- --run dev-20261113-201500                # resume after a pause
+npm run develop -- --repo ~/src/app --ask-file ask.md --budget 20   # a cost budget of 20 USD
 ```
 
 The repository needs a config (the profile defaults or `.agent-factory.json`, as for the review loop), an origin on
@@ -273,6 +317,11 @@ done
 `ALLOWED_USERS` is the GitHub logins, comma-separated, that can start runs and answer questions. Without it, no one
 can. `ALLOWED_MODELS` replaces the allowed models, as on the local platform.
 
+`MODEL_PRICES` is optional. It has the same JSON as on the local platform ([Model usage and cost
+budget](#model-usage-and-cost-budget)). Set it as a Worker variable or as a secret, for example with
+`npx wrangler secret put MODEL_PRICES`. `wrangler.jsonc` does not set it, so this README is the only place that
+documents it. An invalid value stops each run before any work.
+
 Put the STE dictionary in `agents/guides/ste` before you deploy ([how](agents/guides/ste/README.md)). The Worker
 bundles it when it is there. Without it, the agents apply the STE rules without lookups.
 
@@ -289,6 +338,7 @@ npm run remote -- start acme/app#123            # or a PR URL; --ship pushes the
 npm run remote -- start acme/app#123 --full     # the full loop, also for a docs or tests only change
 npm run remote -- develop acme/app#45           # a development run: the issue's title and body are the ask
 npm run remote -- develop acme/app#45 --base develop --parallel 2
+npm run remote -- start acme/app#123 --budget 5 # a cost budget of 5 USD; develop also takes --budget
 npm run remote -- resume acme/app#123           # a PR or an issue: after you answer, instead of waiting for the next poll
 npm run remote -- status acme/app#123
 npm run remote -- report acme/app#123
@@ -311,6 +361,10 @@ npm run remote -- report acme/app#123
   issue and returns `resumed`, the `state` of the latest run and a `reason`, and `GET /runs/<owner>/<repo>/<number>`
   and `.../report` return the status and the report. `npm run remote -- resume` prints the state and the reason,
   and exits 1 when the run did not wake. `npx wrangler tail` shows each agent's tool calls.
+- The two start routes also take `budget` in the body, for example `{"budget": 5}`: the cost budget of the run in USD,
+  as `--budget` on the local platform. A budget that is not a number above zero gets a 400 response, and no run
+  starts. The budget question goes to the PR or the issue. The `/review` and `/develop` comments and the labels do
+  not take a budget, and the resume route does not change it.
 
 ### How it works
 

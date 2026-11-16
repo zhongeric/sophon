@@ -10,7 +10,8 @@ import type { Credentials, Provider } from '../providers.ts'
 import { asker, commentLimit, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
-import { checkAllowedModels, checkFamilySwap, defaultAllowedModels, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
+import { agentRows, BudgetStop, budgetGate, checkPriced, resolveBudget, usageSection, zeroTokens, type Prices, type RunUsage, type UsageRow } from '../usage.ts'
+import { checkAllowedModels, checkFamilySwap, defaultAllowedModels, loopModelIds, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
 
 export type DevelopModels = Record<'intake' | 'spec' | 'planner' | 'builder', ModelChoice>
 
@@ -38,9 +39,12 @@ export type DevelopInput = {
   full?: boolean
   /** At most this many builders at the same time. */
   parallel?: number
+  /** The cost budget in USD, for the development agents and the review loop together. */
+  budget?: number
 }
 
-export type ReviewRequest = { runId: string; ask: string; head: string; full: boolean; pr: number }
+/** `budget` is what remains of the development budget, so that the review loop stays inside it. */
+export type ReviewRequest = { runId: string; ask: string; head: string; full: boolean; pr: number; budget?: number }
 
 /** What the platform supplies. */
 export type DevelopDeps = {
@@ -51,6 +55,8 @@ export type DevelopDeps = {
   guides: Guides
   credentials: Credentials
   dispatch?: Contracts.RuntimeOptions['dispatch']
+  /** USD per million tokens of each model, from MODEL_PRICES. Default: no prices. */
+  prices?: Prices
   /** Where the user answers the intake and spec questions. */
   channel: Channel
   branches: Branches
@@ -77,7 +83,8 @@ const clockSkewMs = 30_000
 const defaultParallel = 3
 
 type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failures: string }
-type Review = { pass: boolean; head: string; final: string; branch: string; report: string }
+/** A review pass. Records of older runs have no usage: it counts as zero. */
+type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage; stopped?: boolean }
 
 /** The providers of every model that a development run uses: the development roles and the review loop. */
 export function developProviders(models: DevelopInput['models']): Set<Provider> {
@@ -94,22 +101,51 @@ export function checkDevelopModels(models: DevelopModels, allowed = defaultAllow
  * intake and the user's confirmation, a spec for a larger change, one plan, builders for the plan's tasks (in
  * parallel when their files do not overlap, each on its own branch), a draft PR, CI with a fix budget, the code
  * review loop once or twice, CI again, and a ready PR only when every criterion holds. Every step is in the
- * ledger, so the same run ID resumes after a pause or a crash without repeating finished steps.
+ * ledger, so the same run ID resumes after a pause or a crash without repeating finished steps. When the user stops
+ * the run at the cost budget, the run ends as stopped with its report.
  */
 export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<DevelopResult> {
+  const stop: { finish?: Finish } = {}
+  try {
+    return await developSteps(input, deps, stop)
+  } catch (error) {
+    if (error instanceof BudgetStop && stop.finish) return stop.finish('stopped', [], `The run ${error.message}. Reason: cost budget. The PR stays draft.`)
+    throw error
+  }
+}
+
+type Finish = (status: DevelopStatus, criteria: Criterion[], note: string, resumable?: boolean) => Promise<DevelopResult>
+
+/** The steps of develop(). It sets `stop.finish`, so that develop() can write the report of a run that stops at the budget. */
+async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { finish?: Finish }): Promise<DevelopResult> {
   checkAllowedModels(input.models.review, input.allowedModels)
   checkFamilySwap(input.models.review)
   checkDevelopModels(input.models.develop, input.allowedModels)
   const missing = [...developProviders(input.models)].filter((provider) => !deps.credentials[provider])
   if (missing.length > 0) throw new StopError(`no credential for ${missing.join(', ')}`)
+  const prices = deps.prices ?? {}
+  if (resolveBudget(deps.ledger, input.budget) !== undefined)
+    checkPriced([...Object.values(input.models.develop).map((choice) => choice.model), ...loopModelIds(input.models.review)], prices)
 
   const { ledger, branches, pulls } = deps
   const models = input.models.develop
+  // What the report shows. Each stage fills its part.
+  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [] }
+  // The review passes keep their usage in their own ledgers, so their spend counts here as extra spend.
+  const budget = budgetGate({
+    channel: deps.channel,
+    extraSpend: () => state.reviews.reduce((sum, review) => sum + (review.usage?.usd ?? 0), 0),
+    ledger,
+    log: deps.log,
+    prices,
+    recommend: input.hotfix === true,
+    runId: input.runId,
+  })
   ledger.put('input', input)
   const view = await branches.view(input.base)
   const active = profilesById(await step(ledger, 'profiles', async () => (await presentProfiles(async (path) => (await view.stat(`/${path}`)) !== null)).map((profile) => profile.id)))
   const context: DevelopContext = {
-    host: { module: deps.module, store: deps.store, ledger, credentials: deps.credentials, dispatch: deps.dispatch, log: deps.log },
+    host: { module: deps.module, store: deps.store, ledger, credentials: deps.credentials, dispatch: deps.dispatch, log: deps.log, beforeTurn: budget.check },
     config: input.config,
     guides: deps.guides,
     stackGuides: [...new Set(active.flatMap((profile) => profile.guides))],
@@ -122,10 +158,10 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
     return questions.wait(batch)
   }
 
-  // What the report shows. Each stage fills its part.
-  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [] }
-  const finish = async (status: DevelopStatus, criteria: Criterion[], note: string, resumable = false): Promise<DevelopResult> => {
-    const report = renderReport(state, status, criteria, note, decisions(ledger))
+  const finish: Finish = async (status, criteria, note, resumable = false) => {
+    const limit = budget.limit()
+    const usage = usageSection([...agentRows(ledger), ...state.reviews.map(reviewRow)], prices, limit === undefined ? undefined : { limit, spent: budget.spent() })
+    const report = renderReport(state, status, criteria, note, decisions(ledger), usage)
     deps.files.write('report.md', report)
     // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
     if (state.pr && ledger.get('commented') !== report) {
@@ -135,6 +171,7 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
     ledger.put('result', { status, pr: state.pr, branch: state.branch })
     return { status, pr: state.pr, branch: state.branch, report, resume: resumable ? note : null }
   }
+  stop.finish = finish
 
   // 0. Intake: no plan and no code until the user confirms the ask.
   const intook = await step(ledger, 'intake', () => intake(context, 'intake', models.intake, view))
@@ -252,10 +289,15 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
   for (let pass = 1; pass <= routed.passes; pass++) {
     const at = head
     const review = await step(ledger, `review.${pass}`, async (): Promise<Review> => {
-      const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, full: input.full === true, pr: state.pr!.number })
-      return { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report }
+      await budget.check()
+      // After the check, the spend is below the limit, so the remaining budget is positive.
+      const limit = budget.limit()
+      const remaining = limit === undefined ? {} : { budget: limit - budget.spent() }
+      const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, full: input.full === true, pr: state.pr!.number, ...remaining })
+      return { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage, stopped: loop.stopped }
     })
     state.reviews.push(review)
+    if (review.stopped) return finish('stopped', [], `You stopped review loop pass ${pass} at its budget. Reason: cost budget. The PR stays draft.`)
     if (review.final !== at) {
       await step(ledger, `merge.review.${pass}`, async () => {
         await dev.merge(review.final, `agent-factory: review loop fixes, pass ${pass} (${input.runId})`)
@@ -401,7 +443,13 @@ type ReportState = {
   reviews: Review[]
 }
 
-function renderReport(state: ReportState, status: DevelopStatus, criteria: Criterion[], note: string, answers: Answer[]): string {
+/** One row of the Usage section for a review pass, with the tokens and USD of all its agents. */
+function reviewRow(review: Review, index: number): UsageRow {
+  const usage = review.usage ?? { tokens: zeroTokens(), usd: 0, unpriced: [] }
+  return { step: `review.${index + 1}`, model: 'review loop', tokens: usage.tokens, usd: usage.usd, unpriced: usage.unpriced }
+}
+
+function renderReport(state: ReportState, status: DevelopStatus, criteria: Criterion[], note: string, answers: Answer[], usage: string[]): string {
   const triage = (report: string) => /^- Triage: (.*)$/m.exec(report)?.[1] ?? ''
   return [
     `# Development run: ${status.toUpperCase()}`,
@@ -440,6 +488,8 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
           '',
         ]
       : []),
+    ...usage,
+    '',
     '## Your decisions',
     '',
     ...(answers.length > 0 ? answers.map((answer) => `- ${answer.question} **${answer.answer}**${answer.recommended ? ' (recommended)' : ''}`) : ['- none asked']),

@@ -118,9 +118,10 @@ export function checkQuestions(input: unknown): Question[] {
 
 /**
  * Posts each batch one time and records its answers in the ledger. A batch without answers
- * pauses the run; the resumed run reads the answers from where the batch went.
+ * pauses the run; the resumed run reads the answers from where the batch went. With `decisions` false, the answers
+ * do not go into the decisions of the run, which the agents read, for example the answers about the cost budget.
  */
-export function asker(ledger: Ledger, channel: Channel, runId: string, log: (line: string) => void) {
+export function asker(ledger: Ledger, channel: Channel, runId: string, log: (line: string) => void, options: { decisions?: boolean } = {}) {
   const post = async (batch: string, questions: Question[]) => {
     ledger.put(`questions:${batch}`, questions)
     if (questions.length === 0 || ledger.get(`posted:${batch}`)) return
@@ -140,7 +141,7 @@ export function asker(ledger: Ledger, channel: Channel, runId: string, log: (lin
   }
   const record = (batch: string, answers: Answer[]) => {
     ledger.put(`answers:${batch}`, answers)
-    ledger.put('decisions', [...decisions(ledger), ...answers])
+    if (options.decisions !== false) ledger.put('decisions', [...decisions(ledger), ...answers])
     return answers
   }
   /** Takes every recommendation without asking, when the user said so for this run. */

@@ -7,6 +7,7 @@ import { parseParallel } from '../core/plan.ts'
 import type { Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
+import { parseBudget, parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
 import { defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
@@ -41,12 +42,15 @@ Options:
   --models <path>        JSON that overrides models: { "develop": { "builder": ... }, "review": { "step1": ... } }
   --claude-plan          Sign Claude requests with the nc Claude login instead of ANTHROPIC_API_KEY
   --wait <minutes>       How long to wait for answers or CI before the run pauses (default 60)
+  --budget <usd>         Cost budget in USD for the run and its review loop. At the budget, the run asks you to
+                         raise it or to stop. With --run, it replaces the recorded budget.
 
 Questions go to the terminal when it is interactive. Otherwise the intake and spec questions go to a file in
 the run directory, and the review questions go to the PR. A paused run exits with status 3; resume it with
 --run <id>.
 
-Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, ALLOWED_MODELS (model IDs, comma-separated). The gh CLI must be logged in.`
+Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, ALLOWED_MODELS (model IDs, comma-separated), MODEL_PRICES (JSON: USD
+per million tokens of each model ID, see README.md). The gh CLI must be logged in.`
 
 async function main(): Promise<number> {
   const { values } = parseArgs({
@@ -54,6 +58,7 @@ async function main(): Promise<number> {
       ask: { type: 'string' },
       'ask-file': { type: 'string' },
       base: { type: 'string' },
+      budget: { type: 'string' },
       'claude-plan': { type: 'boolean' },
       full: { type: 'boolean' },
       help: { short: 'h', type: 'boolean' },
@@ -70,8 +75,13 @@ async function main(): Promise<number> {
     console.log(usage)
     return 0
   }
+  const budget = values.budget !== undefined ? parseBudget(values.budget) : undefined
+  const prices = parsePrices(process.env.MODEL_PRICES)
   const runsDir = resolve(values['runs-dir'] ?? fileURLToPath(new URL('../../runs/', import.meta.url)))
-  const { input, repo } = values.run ? resumeInput(runsDir, values.run) : await newInput(values)
+  const started = values.run ? resumeInput(runsDir, values.run) : await newInput(values)
+  const { repo } = started
+  // A new budget replaces the recorded one. Without it, the recorded budget or the last raise stays.
+  const input: DevelopInput = budget !== undefined ? { ...started.input, budget } : started.input
 
   const credentials: Credentials = {}
   for (const provider of developProviders(input.models)) credentials[provider] = credential(provider, { claudePlan: values['claude-plan'] })
@@ -86,6 +96,7 @@ async function main(): Promise<number> {
     input,
     log: (line) => console.error(`[${new Date().toTimeString().slice(0, 8)}] ${line}`),
     module: await WebAssembly.compile(readFileSync(fileURLToPath(import.meta.resolve('nanocode-ts/nanocode_wasm.wasm')))),
+    prices,
     pulls: ghPullRequests(repo, input.baseRef),
     repo,
     async reviewChannel(pr) {

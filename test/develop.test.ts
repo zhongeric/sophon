@@ -19,7 +19,8 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   const turns: Turn[] = []
   const { channel, posted } = memoryChannel()
   const github = fakePulls([false, true])
-  const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(developScript(), turns), pulls: github.pulls, runId: 'dev' })
+  const prices = { 'claude-opus-5-5': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 }, 'gpt-6.1-sol': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 } }
+  const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(developScript(), turns), prices, pulls: github.pulls, runId: 'dev' })
 
   assert.equal(result.status, 'ready', result.report)
   assert.equal(result.branch, 'factory/dev-add-sub-mul')
@@ -59,6 +60,13 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.doesNotMatch(result.report, /- \[ \]/)
   assert.match(result.report, /- Pass 1: PASS, `TRIAGE path=full reason=not-docs-or-tests/)
   assert.equal(github.state.comments.length, 1)
+
+  // The Usage section: the development agents, the review pass with the USD of all its agents, and the total.
+  assert.match(result.report, /^## Usage$/m)
+  assert.match(result.report, /^\| intake \| claude-opus-5-5 \| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$0\.\d{4} \|$/m)
+  assert.match(result.report, /^\| review\.1 \| review loop \| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$0\.\d{4} \|$/m)
+  assert.match(result.report, /^\| \*\*Total\*\* \| {2}\| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$\d+\.\d+ \|$/m)
+  assert.doesNotMatch(result.report, /^Budget:/m)
 })
 
 test('develop: a run without intake answers pauses, and resumes without asking again or repeating the intake', { timeout: 120_000 }, async () => {

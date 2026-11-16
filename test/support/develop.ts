@@ -6,6 +6,7 @@ import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../../src/core/ci.ts'
 import type { PullRequests } from '../../src/core/platform.ts'
 import type { Channel } from '../../src/core/questions.ts'
+import type { Prices } from '../../src/core/usage.ts'
 import { defaultModels } from '../../src/core/workflows/code-review-loop.ts'
 import { defaultDevelopModels, develop, type DevelopInput } from '../../src/core/workflows/develop.ts'
 import { loadRepoConfig, nodeDevelop } from '../../src/node/platform.ts'
@@ -185,7 +186,7 @@ export async function developInput(repo: string, runId: string): Promise<Develop
 export async function runDevelop(
   repo: string,
   runsDir: string,
-  options: { runId: string; dispatch: Contracts.RuntimeOptions['dispatch']; pulls: PullRequests; channel?: Channel; input?: DevelopInput },
+  options: { runId: string; dispatch: Contracts.RuntimeOptions['dispatch']; pulls: PullRequests; channel?: Channel; input?: DevelopInput; prices?: Prices },
 ) {
   const input = options.input ?? (await developInput(repo, options.runId))
   const deps = await nodeDevelop({
@@ -196,6 +197,7 @@ export async function runDevelop(
     input,
     log: () => {},
     module,
+    prices: options.prices,
     pulls: options.pulls,
     repo,
     reviewChannel: async () => memoryChannel().channel,

@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { parseParallel } from '../core/plan.ts'
 import { StopError } from '../core/stop.ts'
+import { parseBudget } from '../core/usage.ts'
 
 const usage = `Usage: npm run remote -- <command> <number> [options]
 
@@ -19,6 +20,9 @@ Commands:
   report <number>   Print the report of the latest run
 
 <pr>, <issue> and <number> are owner/repo#123, or a GitHub PR or issue URL.
+
+start and develop also take --budget <usd>, the cost budget of the run in USD. At the budget, the run asks
+on the PR or issue to raise the budget or to stop.
 
 Environment: FACTORY_URL and ADMIN_TOKEN, or the same keys in .secrets/cloudflare.env.`
 
@@ -72,6 +76,7 @@ async function main(): Promise<number> {
     allowPositionals: true,
     options: {
       base: { type: 'string' },
+      budget: { type: 'string' },
       full: { type: 'boolean' },
       help: { short: 'h', type: 'boolean' },
       hotfix: { type: 'boolean' },
@@ -85,15 +90,17 @@ async function main(): Promise<number> {
     return values.help ? 0 : 2
   }
   const { owner, repo, pr } = parseTarget(target)
+  if (values.budget !== undefined && command !== 'start' && command !== 'develop') throw new StopError('only start and develop take --budget')
+  const budget = values.budget !== undefined ? { budget: parseBudget(values.budget) } : {}
   const factory = setting('FACTORY_URL').replace(/\/$/, '')
   const url = `${factory}/runs/${owner}/${repo}/${pr}`
   const headers = { authorization: `Bearer ${setting('ADMIN_TOKEN')}`, 'content-type': 'application/json' }
-  const develop = { base: values.base, full: values.full === true, hotfix: values.hotfix === true, parallel: values.parallel !== undefined ? parseParallel(values.parallel) : undefined }
+  const develop = { base: values.base, full: values.full === true, hotfix: values.hotfix === true, parallel: values.parallel !== undefined ? parseParallel(values.parallel) : undefined, ...budget }
   const requests: Record<string, () => Promise<Response>> = {
     develop: () => fetch(`${factory}/develop/${owner}/${repo}/${pr}`, { body: JSON.stringify(develop), headers, method: 'POST' }),
     report: () => fetch(`${url}/report`, { headers }),
     resume: () => fetch(`${url}/resume`, { headers, method: 'POST' }),
-    start: () => fetch(url, { body: JSON.stringify({ full: values.full === true, ship: values.ship === true }), headers, method: 'POST' }),
+    start: () => fetch(url, { body: JSON.stringify({ full: values.full === true, ship: values.ship === true, ...budget }), headers, method: 'POST' }),
     status: () => fetch(url, { headers }),
   }
   const send = requests[command]

@@ -87,6 +87,16 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
   const admin = { authorization: 'Bearer admin', 'content-type': 'application/json' }
   try {
     assert.equal((await fetch(`${worker.url}/runs/acme/app/7`, { method: 'POST' })).status, 401)
+    // A budget that is not a positive number of USD gets 400, and no run starts.
+    const refused = await fetch(`${worker.url}/runs/acme/app/7`, { body: JSON.stringify({ budget: 0 }), headers: admin, method: 'POST' })
+    assert.equal(refused.status, 400)
+    assert.match(await refused.text(), /budget must be a positive number/)
+    const refusedDevelop = await fetch(`${worker.url}/develop/acme/app/5`, { body: JSON.stringify({ budget: 'abc' }), headers: admin, method: 'POST' })
+    assert.equal(refusedDevelop.status, 400)
+    for (const number of [5, 7]) {
+      const status = (await (await fetch(`${worker.url}/runs/acme/app/${number}`, { headers: admin })).json()) as { runs: unknown[] }
+      assert.deepEqual(status.runs, [])
+    }
     const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: admin, method: 'POST' })).json()) as { run: string; started: boolean }
     assert.equal(started.started, true)
     const again = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin, method: 'POST' })).json()) as { run: string; started: boolean }
