@@ -60,7 +60,7 @@ The principles of the development workflow hold. These follow from them.
 | 1 Survey | spec | surveyors at the same time, one for each lens of the domain (for example literature, known objects, data coverage) | Each claim cites an artifact with a quote. The host finds the quote in the artifact. |
 | 2 Hypotheses | step 1 reviewers | generators on different model families and lenses | Schema: statement, why past work missed it, data, test, kill criterion, cost. The host merges duplicates by their data and test. |
 | 3 Pick | gate, held findings | the user | No spend on a hypothesis that the user did not pick. |
-| 4 Prereg | plan (one planner, D7) | one preregistrar | The core sections and the domain's sections. The host commits `prereg/<id>.md`, records its hash, and protects the path. A change is a new version with a reason. |
+| 4 Prereg | plan (one planner, D7) | one preregistrar | The core sections and the domain's sections. The host commits `prereg/<hypothesis>-v<n>.md`, records its hash, and protects the path. A change is a new version with a reason. |
 | 5 Build | build | builder, on a branch of the notebook | Writes only `analysis/<id>/`. Checkpoints and static rules as today. |
 | 6 Calibrate | done-looks-like | host | Runs the domain's `known` and `inject` commands on the search partition. Recall under the prereg threshold goes back to the builder, in two rounds at most. After the second round, the host stops with a blocker and asks the user. |
 | 7 Sweep | none | host, on the box | Runs the domain's `sweep` command at the frozen commit in a bounded pool. Each partition is a ledger step. Results go to artifacts. |
