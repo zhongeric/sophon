@@ -15,6 +15,7 @@ import { nodeDevelop } from '../src/node/platform.ts'
 import { developInput, developScript, developRepo, fakePulls, mergeCommit, plan, runDevelop, scopeQuestion, sources } from './support/develop.ts'
 import { credentials, memoryChannel, module } from './support/fixture.ts'
 import { probeNetwork, scriptedDispatch, webSearch, type Turn } from './support/scripted-model.ts'
+import { visible, visibleLines, visibleWords } from './support/visible.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
 
@@ -58,7 +59,9 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.throws(() => execFileSync('git', ['--git-dir', origin, 'cat-file', '-e', 'factory/dev-add-sub-mul:test/run.log'], { stdio: 'pipe' }))
   assert.equal(github.state.opened.length, 1)
   assert.equal(github.state.opened[0]!.title, 'Add sub and mul')
-  assert.match(github.state.opened[0]!.body, /# Ask\n\n> Add sub and mul next to add, with tests\.[\s\S]*## Done looks like/)
+  assert.match(github.state.opened[0]!.body, /<details><summary>.*<\/summary>\n\nagent-factory run `dev` .* opened this draft PR\.[\s\S]*# Ask\n\n> Add sub and mul next to add, with tests\.[\s\S]*## Done looks like[\s\S]*<\/details>$/)
+  assert.equal(visible(github.state.opened[0]!.body).trim(), plan.smallest_change)
+  assert.ok(visibleWords(github.state.opened[0]!.body) <= 150)
   assert.equal(github.state.shas.length, 2)
   assert.deepEqual(github.state.ready, [9])
 
@@ -70,6 +73,9 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.doesNotMatch(github.state.opened[0]!.body, /# Decisions of the user/)
 
   assert.match(result.report, /^# Development run: READY/)
+  assert.ok(visibleLines(result.report).length <= 10, result.report)
+  assert.match(visible(result.report), /^PR: \S+$/m)
+  assert.doesNotMatch(visible(result.report), /^- \[/m)
   assert.match(result.report, /^- \[x\] Every task built: sub, mul, tests$/m)
   assert.doesNotMatch(result.report, /- \[ \]/)
   assert.match(result.report, /- Pass 1: PASS, `TRIAGE path=full reason=not-docs-or-tests/)
@@ -104,7 +110,8 @@ test('develop: with the merge permission, the host merges the ready PR at the ch
   const head = (await git(repo, 'rev-parse', 'refs/heads/factory/dev-add-sub-mul')).trim()
   assert.equal(github.state.shas.at(-1), head)
   assert.deepEqual(github.state.merges, [{ pr: 9, method: 'squash', sha: head }])
-  assert.match(github.state.opened[0]!.body, /opened this draft PR\. .*\n\nCloses #12\n\n# Ask\n/)
+  assert.match(github.state.opened[0]!.body, /^Closes #12\n\n/)
+  assert.match(github.state.opened[0]!.body, /<details><summary>.*<\/summary>\n\nagent-factory run `merged` .* opened this draft PR\. .*\n\n# Ask\n/)
   assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
   assert.match(result.report, new RegExp(`^Merged by the host \\(squash\\): ${mergeCommit}\\.$`, 'm'))
   assert.equal(github.state.comments.length, 1)
@@ -174,6 +181,9 @@ test('develop: a run that fails a criterion with the merge permission does not m
   const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript({ reviewFix: true }), []), pulls: github.pulls, runId: 'failed' })
   assert.equal(result.status, 'failed', result.report)
   assert.match(result.report, /^- \[ \] CI green on the head/m)
+  assert.ok(visibleLines(result.report).length <= 10, result.report)
+  assert.match(visible(result.report), /^- \[ \] CI green on the head/m)
+  assert.doesNotMatch(visible(result.report), /^- \[x\]/m)
   assert.deepEqual(github.state.merges, [])
   assert.deepEqual(github.state.ready, [])
   assert.equal(result.merge, null)
