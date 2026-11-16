@@ -31,7 +31,7 @@ export type Role<Id extends string = string> = {
   findings?: { track: Track; prefix: string }
   /** Gets the run_tests tool. */
   tests: boolean
-  /** The role may get the domain's egress later. Today the host gives no role network access. */
+  /** When true, the role may get the egress of the domain. When false, the role stays offline. */
   egress: boolean
 }
 

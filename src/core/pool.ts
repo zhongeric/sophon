@@ -1,6 +1,5 @@
 /**
  * Runs `run` on each item, with at most `limit` calls in progress at the same time, and gives the results in the order of the items.
- * The research stages run one role on many items with a limit. `waves` in plan.ts stays for the plan tasks.
  * When one call fails, the pool starts no new items, waits until the calls in progress settle, and then rejects with the first error.
  */
 export async function pool<T, R>(items: readonly T[], limit: number, run: (item: T, index: number) => Promise<R>): Promise<R[]> {

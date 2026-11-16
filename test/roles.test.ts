@@ -15,7 +15,6 @@ test('in each table, each key is the id of its role', () => {
 
 test('the review and development roles keep their guides and rails, and get no egress', () => {
   const reviewer = ['shared/factory.md', 'shared/reviewer.md']
-  const none = undefined
   assert.deepEqual(Object.fromEntries(Object.entries(reviewRoles).map(([id, role]) => [id, shape(role)])), {
     minimize: { guides: [...reviewer, 'minimize.md'], stackGuides: false, findings: { track: 'minimize', prefix: 'min' }, tests: false, egress: false },
     rules: { guides: [...reviewer, 'rules.md', 'shared/ste.md'], stackGuides: true, findings: { track: 'rules', prefix: 'rules' }, tests: false, egress: false },
@@ -30,16 +29,16 @@ test('the review and development roles keep their guides and rails, and get no e
       egress: false,
     },
     'late-bugs': { guides: [...reviewer, 'bugs.md', 'late-pass.md'], stackGuides: true, findings: { track: 'bugs', prefix: 'late-bugs' }, tests: true, egress: false },
-    patch: { guides: ['shared/factory.md', 'patch.md', 'shared/ste.md'], stackGuides: true, findings: none, tests: true, egress: false },
-    intent: { guides: ['shared/factory.md', 'intent.md'], stackGuides: false, findings: none, tests: false, egress: false },
-    questions: { guides: ['shared/factory.md', 'questions.md'], stackGuides: false, findings: none, tests: false, egress: false },
-    light: { guides: ['shared/factory.md', 'light.md', 'anti-slop.md', 'shared/ste.md'], stackGuides: true, findings: none, tests: true, egress: false },
+    patch: { guides: ['shared/factory.md', 'patch.md', 'shared/ste.md'], stackGuides: true, findings: undefined, tests: true, egress: false },
+    intent: { guides: ['shared/factory.md', 'intent.md'], stackGuides: false, findings: undefined, tests: false, egress: false },
+    questions: { guides: ['shared/factory.md', 'questions.md'], stackGuides: false, findings: undefined, tests: false, egress: false },
+    light: { guides: ['shared/factory.md', 'light.md', 'anti-slop.md', 'shared/ste.md'], stackGuides: true, findings: undefined, tests: true, egress: false },
   })
   assert.deepEqual(Object.fromEntries(Object.entries(developRoles).map(([id, role]) => [id, shape(role)])), {
-    intake: { guides: ['shared/factory.md', 'intake.md'], stackGuides: false, findings: none, tests: false, egress: false },
-    spec: { guides: ['shared/factory.md', 'spec.md', 'shared/ste.md'], stackGuides: false, findings: none, tests: false, egress: false },
-    planner: { guides: ['shared/factory.md', 'planner.md', 'shared/ste.md'], stackGuides: true, findings: none, tests: false, egress: false },
-    builder: { guides: ['shared/factory.md', 'builder.md', 'shared/ste.md'], stackGuides: true, findings: none, tests: true, egress: false },
+    intake: { guides: ['shared/factory.md', 'intake.md'], stackGuides: false, findings: undefined, tests: false, egress: false },
+    spec: { guides: ['shared/factory.md', 'spec.md', 'shared/ste.md'], stackGuides: false, findings: undefined, tests: false, egress: false },
+    planner: { guides: ['shared/factory.md', 'planner.md', 'shared/ste.md'], stackGuides: true, findings: undefined, tests: false, egress: false },
+    builder: { guides: ['shared/factory.md', 'builder.md', 'shared/ste.md'], stackGuides: true, findings: undefined, tests: true, egress: false },
   })
 })
 
@@ -54,13 +53,10 @@ test('the research table has its nine roles, and only four of them may get the e
   assert.deepEqual(researchRoles['late-skeptic'].guides, ['shared/factory.md', 'research/skeptic.md', 'research/late-skeptic.md'])
   assert.equal(researchRoles.builder, developRoles.builder)
   assert.deepEqual(researchRoles.intake.guides, ['shared/factory.md', 'research/intake.md'])
-  assert.notDeepEqual(researchRoles.intake.guides, developRoles.intake.guides)
 })
 
 test('guideFiles holds each guide of each table and profile one time', () => {
   assert.equal(new Set(guideFiles).size, guideFiles.length)
   const all = [...Object.values(tables).flatMap((table) => Object.values(table).flatMap((role) => role.guides)), ...profiles.flatMap((profile) => profile.guides)]
   for (const file of all) assert.ok(guideFiles.includes(file), file)
-  assert.ok(guideFiles.includes('intake.md'))
-  assert.ok(guideFiles.includes('research/intake.md'))
 })
