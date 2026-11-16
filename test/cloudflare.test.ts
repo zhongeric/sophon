@@ -430,7 +430,6 @@ test('on Cloudflare, /develop asks a user question of the intake agent on the is
     const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
     assert.match(done.body, /^# Development run: READY/, done.body)
     assert.equal(on(5).filter((entry) => entry.body.includes('agent-factory:questions')).length, 1, describe())
-    // answerersOf gives the ALLOWED_USERS fallback in lower case, and GitHub mentions ignore case.
     assert.match(asked.body.split('\n')[0]!, /^@maintainer$/i)
     assert.doesNotMatch(done.body, /@Maintainer/i)
     assert.match(done.body, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
