@@ -11,7 +11,6 @@ const key = (owner: string, repo: string, number: number) => `${owner}/${repo}#$
 const pullRequest = (env: Env, owner: string, repo: string, pr: number) => env.PULL_REQUESTS.get(env.PULL_REQUESTS.idFromName(key(owner, repo, pr)))
 const issue = (env: Env, owner: string, repo: string, number: number) => env.DEVELOPMENT_RUNS.get(env.DEVELOPMENT_RUNS.idFromName(key(owner, repo, number)))
 const accepted = (body: unknown) => Response.json(body, { status: 202 })
-/** The login of the App bot in this isolate. */
 const botLogins: BotLogins = new Map()
 
 /** The review runs of a PR, or the development runs of an issue. GitHub numbers both in one sequence, so a number is one or the other. */

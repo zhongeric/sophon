@@ -43,20 +43,24 @@ export async function appJwt(appId: string, pem: string, nowMs: number): Promise
   return `${unsigned}.${base64url(new Uint8Array(signature))}`
 }
 
+/** The slug of the App from GET /app. The client must use the App JWT. */
+async function appSlug(app: GitHub): Promise<string> {
+  const { slug } = await app.json<{ slug?: unknown }>('GET', '/app')
+  if (typeof slug !== 'string') throw new Error('GitHub gave no slug for the App')
+  return slug
+}
+
 /**
  * The login of the App bot, `<slug>[bot]`, from GET /app. Without GITHUB_APP_ID or GITHUB_APP_PRIVATE_KEY, it gives
  * undefined and sends no request. The cache keeps only a login that GitHub gave.
  */
-export async function appBotLogin(secrets: GitHubSecrets, cache: BotLogins, options: AccessOptions = {}): Promise<string | undefined> {
+export async function appBotLogin(secrets: GitHubSecrets, cache: BotLogins): Promise<string | undefined> {
   const { GITHUB_APP_ID: appId, GITHUB_APP_PRIVATE_KEY: pem } = secrets
   if (!appId || !pem) return undefined
   const cached = cache.get(appId)
   if (cached) return cached
-  const now = options.now ?? Date.now
-  const app = github(() => appJwt(appId, pem, now()), secrets.GITHUB_API_URL ?? 'https://api.github.com')
-  const { slug } = await app.json<{ slug?: unknown }>('GET', '/app')
-  if (typeof slug !== 'string') throw new Error('GitHub gave no slug for the App')
-  const login = `${slug}[bot]`
+  const app = github(() => appJwt(appId, pem, Date.now()), secrets.GITHUB_API_URL ?? 'https://api.github.com')
+  const login = `${await appSlug(app)}[bot]`
   cache.set(appId, login)
   return login
 }
@@ -92,9 +96,7 @@ export async function githubAccess(
     installation = found.id
   } catch (error) {
     if (!(error instanceof GitHubError && error.status === 404)) throw error
-    const { slug } = await app.json<{ slug?: unknown }>('GET', '/app')
-    if (typeof slug !== 'string') throw new Error('GitHub gave no slug for the App')
-    throw new StopError(`the GitHub App is not installed on ${owner}/${repo}. Install it: https://github.com/apps/${slug}/installations/new`)
+    throw new StopError(`the GitHub App is not installed on ${owner}/${repo}. Install it: https://github.com/apps/${await appSlug(app)}/installations/new`)
   }
   const create = async () => {
     const created = await app.json<{ token?: unknown; expires_at?: unknown }>('POST', `/app/installations/${installation}/access_tokens`)
