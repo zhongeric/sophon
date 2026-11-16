@@ -137,7 +137,11 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
       limits?.begin(requestId)
       const submitted = await runtime.submit(scope, { metadata: { agent: spec.id }, prompt, request_id: requestId })
       if (submitted.submitted === 'too_large') throw new Error(`${spec.id}: prompt of ${submitted.bytes} bytes is too large`)
-      if (submitted.submitted === 'conflict') throw new Error(`${spec.id}: turn ${requestId} exists with another prompt`)
+      if (submitted.submitted === 'conflict') {
+        // The turn keeps the prompt of its journal, because the agent already worked from it. A deploy can change the prompt text.
+        if (!(await runtime.turn(scope, requestId))) throw new Error(`${spec.id}: turn ${requestId} exists with another prompt`)
+        host.log(`${spec.id}: the prompt of turn ${requestId} changed, so the turn continues with the prompt of its journal`)
+      }
       for (let reconnects = 0; ; ) {
         const view = await runtime.turn(scope, requestId)
         if (view && finished.has(view.report.status)) {
