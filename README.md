@@ -153,7 +153,11 @@ of that field. `"tests": null` or `"setup": ""` turns a default off. For example
   directory prefix: `deploy*` protects `deploy-prod/run.sh`. An entry that ends with `/` matches only a directory
   prefix.
 - `{tests}` runs the targeted tests in one command; `{test}` runs one command per test file.
-- Targeted tests are the changed test files plus the test files that name a changed source file.
+- Targeted tests are the changed test files, plus the test files with a direct import line that names a changed
+  file. The name of an import line is the last segment of its path or module name, without the extension. For
+  example, `from '../src/core/agent.ts'` names `agent`, and Python `from search import known` names `search`
+  and `known`. For a changed file that no test file imports, the targeted tests are the test files that have its
+  base name as a word. This rule is the same for all profiles.
 - `guides` are mounted read-only at `/guides/<name>`. The `solidity` profile reads `/guides/evm-cortex` when it
   exists: a clone of [evm-cortex](https://github.com/ccashwell/evm-cortex).
 - The STE dictionary is at `/guides/ste` when `agents/guides/ste` holds it. The specification is not in this
@@ -223,6 +227,7 @@ Intake, spec, planner and builders run on Opus 5.5. The review loop uses its own
 | A builder stays in its task | A builder can write only the files and directories of its task, never protected paths. Parallel builders work in separate worktrees, so one builder's half-done work never breaks another's checks. |
 | Static rules and forbidden paths gate every commit | `checkpoint` checks the added lines and the paths before it commits, and returns each problem to the builder. Build output, logs and `.env` files never enter the history. |
 | Nothing uncommitted, every file explained | `submit_build_log` refuses uncommitted work, and needs each changed file with a reason. A builder that cannot finish says why, and the run stops with that blocker. |
+| Tests run one time, at submit | `run_checks` runs only the configured checks. `submit_build_log` runs the targeted tests of all changes of the task, and refuses the log when a test or the setup fails, with the end of its output. A blocked log runs no tests. |
 | CI budget | Two CI-fix rounds after the build, then a blocker. A single task's fixes go to the same builder session. |
 | Review before ready | The code review loop runs on the result, once or twice. A red CI after the review fails the run, because a fix there would skip the review. |
 | Ready only on PASS | The PR stays draft unless the review loop passed, CI is green, and no forbidden path is in the change. A change to Solidity `src/` stays draft, because the Auditor workflow is not built yet. |
@@ -335,6 +340,13 @@ npm run remote -- report acme/app#123
   directory of the container: all of it the first time, then only the files that changed. After a full copy it
   runs `setup`. The container gets no secret and no git remote, so code under development never runs beside a
   token. It stops after 30 minutes without a command, and the next copy starts again from the full tree.
+- The object keeps the manifest of each container directory in its SQL, for each run, with one row for each file.
+  Thus, after a restart of the object, the next sync sends only the changes. A marker file `<dir>.sync` beside each
+  directory holds the sync ID of the last sync that passed. When the marker is missing or different, the object copies
+  all of the tree and runs `setup` again. A container start removes the manifests. A sync or a setup that fails
+  part of the way always gives a full copy and `setup` on the next sync.
+- Each sync writes one log line with the directory, the type of copy (full or changes), the number of files sent
+  and the time in milliseconds. Each setup writes one log line with the directory, the result and the time.
 - Pushes go through the Git Data API. The review loop runs as a review run of the new PR, in that PR's object,
   as a `/review` would. The development run waits for it, then takes its fixes from GitHub.
 

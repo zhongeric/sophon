@@ -99,22 +99,60 @@ async function exists(repo: Tree, path: string): Promise<boolean> {
   return (await repo.tree.stat(`/${path}`)) !== null
 }
 
-/** The test files that the change touches, and the test files that mention a changed source file. */
+/** The last path segment without its extension: src/core/agent.ts gives agent. */
+const baseName = (path: string) => path.split('/').at(-1)!.replace(/\.[^.]*$/, '')
+
+/** The last segment of a Python module. The leading dots of a relative import do not count. */
+const moduleName = (module: string) => module.replace(/^\.+/, '').split('.').at(-1)!
+
+// A `from '...'` part on any line covers import and export lines over more lines, and the Solidity import {X} from.
+const fromPath = /\bfrom\s+(['"])([^'"\n]+)\1/g
+const importPath = /\bimport\s+(['"])([^'"\n]+)\1/g
+const callPath = /\b(?:require|import)\s*\(\s*(['"])([^'"\n]+)\1\s*\)/g
+// The full line must match, so that a TypeScript `import x from '...'` does not give x.
+const pythonImport = /^[ \t]*import[ \t]+([\w.]+(?:[ \t]+as[ \t]+\w+)?(?:[ \t]*,[ \t]*[\w.]+(?:[ \t]+as[ \t]+\w+)?)*)[ \t]*(?:#.*)?$/gm
+const pythonFrom = /^[ \t]*from[ \t]+(\.*[\w.]*)[ \t]+import[ \t]+(\([^)]*\)|[^\n#]+)/gm
+
+/** The names of the direct import lines of a file: the base name of each import path, and the Python module and imported names. */
+function importNames(content: string): Set<string> {
+  const names = new Set<string>()
+  for (const regex of [fromPath, importPath, callPath]) for (const match of content.matchAll(regex)) names.add(baseName(match[2]!))
+  for (const match of content.matchAll(pythonImport))
+    for (const part of match[1]!.split(',')) names.add(moduleName(part.trim().split(/\s+/)[0]!))
+  for (const match of content.matchAll(pythonFrom)) {
+    names.add(moduleName(match[1]!))
+    for (const part of match[2]!.replace(/[()\\]/g, ' ').split(',')) {
+      const name = part.trim().split(/\s+/)[0]!
+      if (/^\w+$/.test(name)) names.add(name)
+    }
+  }
+  names.delete('')
+  return names
+}
+
+/**
+ * The targeted tests: the changed test files, and the test files whose direct import lines name the base name of a
+ * changed source file. For a changed file that no test file imports, the test files that have its base name as a
+ * word, so that files that the tests reach through a process, or files that are not code, keep their tests.
+ * Only committed test files that exist, in the order of committedFiles.
+ */
 export async function targetedTests(repo: Tree, config: RepoConfig, changed: string[]): Promise<string[]> {
   if (!config.tests) return []
   const pattern = new RegExp(config.tests.pattern)
-  const tests = (await repo.committedFiles()).filter((path) => pattern.test(path))
-  const sources = changed.filter((path) => !pattern.test(path)).map((path) => path.split('/').at(-1)!.replace(/\.[^.]*$/, ''))
-  const words = sources.map((name) => new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`))
-  const targeted: string[] = []
-  for (const path of tests) {
-    if (changed.includes(path)) targeted.push(path)
-    else if (await exists(repo, path)) {
-      const content = text(await repo.tree.read(`/${path}`))
-      if (words.some((word) => word.test(content))) targeted.push(path)
-    }
+  const files: { path: string; content: string; imports: Set<string> }[] = []
+  for (const path of new Set((await repo.committedFiles()).filter((path) => pattern.test(path)))) {
+    if (!(await exists(repo, path))) continue
+    const content = text(await repo.tree.read(`/${path}`))
+    files.push({ path, content, imports: importNames(content) })
   }
-  return targeted
+  const sources = [...new Set(changed.filter((path) => !pattern.test(path)).map(baseName))]
+  const imported = sources.filter((name) => files.some((file) => file.imports.has(name)))
+  const words = sources
+    .filter((name) => !imported.includes(name))
+    .map((name) => new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`))
+  return files
+    .filter((file) => changed.includes(file.path) || imported.some((name) => file.imports.has(name)) || words.some((word) => word.test(file.content)))
+    .map((file) => file.path)
 }
 
 /** Checks that run the configured commands on a machine. Commands come from the config only. */
@@ -144,7 +182,7 @@ export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine)
     return results
   }
   return {
-    async checks(changed) {
+    async checks(changed, options = {}) {
       const failed = await setup()
       if (failed) return [failed]
       const results: CheckResult[] = []
@@ -159,6 +197,7 @@ export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine)
         if (matching.length === 0) results.push({ name, command, status: 'skipped', exit_code: null, output: 'no changed files match' })
         else results.push(await run(name, command.replace('{files}', matching.map(quote).join(' '))))
       }
+      if (options.tests === false) return results
       const tests = await targetedTests(repo, config, changed)
       if (tests.length === 0) results.push({ name: 'tests', command: config.tests?.command ?? '', status: 'skipped', exit_code: null, output: 'no targeted tests' })
       else results.push(...(await runTests(tests)))

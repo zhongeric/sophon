@@ -65,7 +65,11 @@ export type PullRequests = {
 
 /** Runs the repository's checks. `tests` runs test files during agent turns, or is null where the platform cannot. */
 export type Checker = {
-  checks(changed: string[]): Promise<CheckResult[]>
+  /**
+   * Runs the configured checks on the changed files, then their targeted tests. The tests run by default. With
+   * `tests: false`, only the setup and the configured checks run.
+   */
+  checks(changed: string[], options?: { tests?: boolean }): Promise<CheckResult[]>
   tests: ((tests: string[]) => Promise<CheckResult[]>) | null
 }
 

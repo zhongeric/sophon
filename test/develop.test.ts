@@ -38,6 +38,9 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.match(outputs, /scope refused: .*EACCES/)
   assert.match(outputs, /checkpoint refused:.*test\/run.log:1: Remove test\/run.log from the change/)
   assert.doesNotMatch(outputs, /SCOPE WRITE ALLOWED|LOG COMMITTED/)
+  // The host ran the targeted tests at submit and refused the log with the wrong expectation, with the end of the failed output.
+  assert.match(outputs, /submit refused: the targeted tests failed \(test\/ops\.test\.ts\).*--- tests \(exit code 1\) ---.*sub and mul/)
+  assert.doesNotMatch(outputs, /FAILING LOG ACCEPTED/)
 
   // The PR is the run's branch, pushed without force. The first CI was red, the fix made it green.
   const show = (path: string) => execFileSync('git', ['--git-dir', origin, 'show', `factory/dev-add-sub-mul:${path}`]).toString()
