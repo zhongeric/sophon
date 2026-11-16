@@ -200,6 +200,7 @@ each run that reads the config stops before it starts. An unknown key is an erro
   a secret of agent-factory, for example `GITHUB_TOKEN`.
 - The `checklist` file is Markdown. Each top-level list item is one checklist item, with its indented lines.
 - The `guides` directory holds the domain guides. The host reads each `.md` file directly in the directory.
+- The host does not read a symlink as a file or a directory, on Cloudflare and locally.
 
 The `holdout` file is JSON with two lists. Each list must have one or more strings. Other keys are errors.
 
@@ -211,7 +212,8 @@ The `holdout` file is JSON with two lists. Each list must have one or more strin
 ```
 
 - `refuse` holds the URL prefixes that the egress refuses to agents. Each prefix is an `https` URL. Its host must be a
-  host of `egress`, not a subdomain of it.
+  host of `egress`, not a subdomain of it. A prefix cannot have a user, a password or a fragment. The host gives each
+  prefix in the normalized URL form, with a lowercase host and without the default port.
 - `targets` holds the IDs of the holdout targets.
 
 A missing or bad holdout file, checklist or guides directory stops the run with the path of the file.

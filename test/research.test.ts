@@ -168,10 +168,10 @@ async function loadRejects(patch: Record<string, string | undefined>, file: stri
   })
 }
 
-test('the loader returns the config, the holdout as written, the checklist items and the top-level .md guides', async () => {
+test('the loader returns the config, the holdout with normalized prefixes, the checklist items and the top-level .md guides', async () => {
   const domain = await load({})
   assert.equal(domain.config, config)
-  assert.deepEqual(domain.holdout, holdout)
+  assert.deepEqual(domain.holdout, { ...holdout, refuse: ['https://archive.example.org/api/target?id=42', 'https://export.arxiv.org/abs/'] })
   assert.deepEqual(domain.checklist, ['Instrument artifacts', 'Known objects'])
   assert.deepEqual(Object.keys(domain.guides).sort(), ['archive.md', 'statistics.md'])
   assert.equal(domain.guides['statistics.md'], '# Statistics\n')
@@ -199,7 +199,10 @@ test('each holdout prefix is an https URL on an egress host, not on a subdomain'
   await loadRejects(refuse('archive.example.org/api'), file, /refuse\[1\] must be an https URL prefix/)
   await loadRejects(refuse('https://data.archive.example.org/api'), file, /refuse\[1\] must be on a host of research.egress, not data\.archive\.example\.org/)
   await loadRejects(refuse('https://example.org/'), file, /refuse\[1\] must be on a host of research.egress/)
-  assert.deepEqual((await load(refuse('https://Archive.Example.org:443/x'))).holdout.refuse[1], 'https://Archive.Example.org:443/x')
+  await loadRejects(refuse('https://user@archive.example.org/x'), file, /refuse\[1\] must not have a user or a password/)
+  await loadRejects(refuse('https://archive.example.org/x#frag'), file, /refuse\[1\] must not have a fragment/)
+  // The egress compares normalized request URLs, so the loader gives each prefix in normalized form.
+  assert.deepEqual((await load(refuse('https://Archive.Example.org:443/x'))).holdout.refuse[1], 'https://archive.example.org/x')
 })
 
 test('each top-level list item of the checklist is one item, with its nested and continuation lines', async () => {
@@ -218,7 +221,7 @@ test('each top-level list item of the checklist is one item, with its nested and
     '   with a second paragraph',
     '2) Statistics',
     '## Notes',
-    '  - not part of an item',
+    '  - an indented top-level item',
     '+ Last',
     '-not an item',
   ].join('\n')
@@ -228,14 +231,64 @@ test('each top-level list item of the checklist is one item, with its nested and
     'Known objects\nthat continue here',
     'Contamination\nwith a second paragraph',
     'Statistics',
+    'an indented top-level item',
     'Last\n-not an item',
   ])
+})
+
+test('a top-level list marker can have up to 3 spaces before it and a tab after it', async () => {
+  const items = async (text: string) => (await load({ 'research/checklist.md': text })).checklist
+  assert.deepEqual(await items(' - a\n - b\n'), ['a', 'b'])
+  assert.deepEqual(await items('-\ttab item\n'), ['tab item'])
+  assert.deepEqual(await items('1. a\n  2. b\n'), ['a', 'b'])
+})
+
+test('a list marker in a code fence does not start a checklist item', async () => {
+  const file = 'research/checklist.md'
+  const items = async (text: string) => (await load({ [file]: text })).checklist
+  await loadRejects({ [file]: '```\n- Example\n```\n' }, file, /no top-level list item/)
+  assert.deepEqual(await items('- Real\n```\n- Example\n```\n'), ['Real'])
+  assert.deepEqual(await items('~~~\n- Example\n~~~\n- Real\n'), ['Real'])
+  // A fence indented under an item stays in that item.
+  assert.deepEqual(await items('- Real\n  ```\n  - code\n  ```\n'), ['Real\n```\n- code\n```'])
+})
+
+test('fences permit at most three spaces of indent relative to the current list item', async () => {
+  const items = async (text: string) => (await load({ 'research/checklist.md': text })).checklist
+  for (const fence of ['```', '~~~']) {
+    assert.deepEqual(await items(`    ${fence}\n\n- Real\n`), ['Real'])
+    assert.deepEqual(await items(`- First\n      ${fence}\n\n- Real\n`), [`First\n${fence}`, 'Real'])
+    assert.deepEqual(await items(`   ${fence}\n- Example\n   ${fence}\n- Real\n`), ['Real'])
+    assert.deepEqual(await items(`- Real\n     ${fence}\n  - code\n     ${fence}\n- Next\n`), [`Real\n${fence}\n- code\n${fence}`, 'Next'])
+    assert.deepEqual(await items(`${fence}\n    ${fence}\n- Example\n${fence}\n- Real\n`), ['Real'])
+    assert.deepEqual(await items(`- Real\n  ${fence}\n      ${fence}\n  - code\n  ${fence}\n- Next\n`), [`Real\n${fence}\n${fence}\n- code\n${fence}`, 'Next'])
+  }
+})
+
+test('a fence on the list marker line stays in its checklist item', async () => {
+  const items = async (text: string) => (await load({ 'research/checklist.md': text })).checklist
+  for (const fence of ['```', '~~~']) {
+    assert.deepEqual(await items(`- ${fence}\n  sample\n  ${fence}\n- Real\n`), [`${fence}\nsample\n${fence}`, 'Real'])
+    assert.deepEqual(await items(`1. ${fence}\n   - code\n   ${fence}\n2. Real\n`), [`${fence}\n- code\n${fence}`, 'Real'])
+    assert.deepEqual(await items(`-     ${fence}\n- Real\n`), [fence, 'Real'])
+  }
+})
+
+test('an item-local fence ends when its list container ends', async () => {
+  const items = async (text: string) => (await load({ 'research/checklist.md': text })).checklist
+  for (const fence of ['```', '~~~']) {
+    assert.deepEqual(await items(`- First\n  ${fence}\n  sample\n- Second\n- Third\n`), [`First\n${fence}\nsample`, 'Second', 'Third'])
+    assert.deepEqual(await items(`- ${fence}\n  sample\n\n- Second\n`), [`${fence}\nsample`, 'Second'])
+    assert.deepEqual(await items(`- First\n  ${fence}\n\n  - code\n- Second\n`), [`First\n${fence}\n- code`, 'Second'])
+    assert.deepEqual(await items(`- First\n  ${fence}\n  sample\nOutside the item.\n- Second\n`), [`First\n${fence}\nsample`, 'Second'])
+    assert.deepEqual(await items(`1. First\n   ${fence}\n   sample\n  2. Second\n`), [`First\n${fence}\nsample`, 'Second'])
+  }
 })
 
 test('a missing checklist, or a checklist without items, stops with its path', async () => {
   const file = 'research/checklist.md'
   await loadRejects({ [file]: undefined }, file, /does not exist/)
-  await loadRejects({ [file]: '# Checklist\n\nNo items here.\n  - indented only\n' }, file, /no top-level list item/)
+  await loadRejects({ [file]: '# Checklist\n\nNo items here.\n    - four spaces of indent\n' }, file, /no top-level list item/)
 })
 
 test('a missing guides directory, or one without .md files, stops with its path', async () => {

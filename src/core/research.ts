@@ -19,7 +19,10 @@ export type ResearchConfig = {
   credentials?: Record<string, ResearchCredential>
 }
 
-/** The holdout file. `refuse` is the list of URL prefixes that the egress refuses to agents. */
+/**
+ * The holdout file. `refuse` is the list of URL prefixes that the egress refuses to agents. Each prefix has the
+ * normalized form of the URL parser (lowercase host, no default port), because the egress compares normalized request URLs.
+ */
 export type Holdout = { refuse: string[]; targets: string[] }
 
 /** The domain of a notebook: its config and the files that the config names. `guides` maps a file name with .md to its text. */
@@ -112,7 +115,7 @@ function credentials(value: unknown, key: string, egress: string[], fail: Fail):
     const at = `${key}[${JSON.stringify(name)}]`
     const host = name.toLowerCase()
     if (!egress.includes(host)) fail(at, `names a host that is not in research.egress`)
-    if (host in parsed) fail(at, `repeats the host ${host}`)
+    if (Object.hasOwn(parsed, host)) fail(at, `repeats the host ${host}`)
     const credential = object(entry, at, ['header', 'secret'], fail)
     const header = nonEmptyString(credential.header, `${at}.header`, fail)
     if (!headerToken.test(header)) fail(`${at}.header`, `must be an HTTP header name: ${JSON.stringify(header)}`)
@@ -161,30 +164,66 @@ function parseHoldout(text: string, egress: string[], fail: Fail): Holdout {
     return fail('the file', `is not valid JSON: ${error instanceof Error ? error.message : String(error)}`)
   }
   const holdout = object(value, 'the file', ['refuse', 'targets'], fail, (name) => name)
-  const refuse = stringList(holdout.refuse, 'refuse', fail)
-  refuse.forEach((prefix, index) => {
+  const refuse = stringList(holdout.refuse, 'refuse', fail).map((prefix, index) => {
     const url = URL.canParse(prefix) ? new URL(prefix) : null
-    if (url?.protocol !== 'https:') fail(`refuse[${index}]`, `must be an https URL prefix: ${prefix}`)
+    if (url?.protocol !== 'https:') return fail(`refuse[${index}]`, `must be an https URL prefix: ${prefix}`)
     if (!egress.includes(url.hostname)) fail(`refuse[${index}]`, `must be on a host of research.egress, not ${url.hostname}`)
+    if (url.username !== '' || url.password !== '') fail(`refuse[${index}]`, `must not have a user or a password: ${prefix}`)
+    // A request URL has no fragment, so a prefix with a fragment does not match a request.
+    if (url.href.includes('#')) fail(`refuse[${index}]`, `must not have a fragment: ${prefix}`)
+    return url.href
   })
   return { refuse, targets: stringList(holdout.targets, 'targets', fail) }
 }
 
-const listMarker = /^(?:[-*+]|\d+[.)]) /
+const listMarker = /^( {0,3})([-*+]|\d{1,9}[.)])([ \t]+)/
 const heading = /^ {0,3}#{1,6}(?:\s|$)/
+const fenceOpen = /^ {0,3}(`{3,}(?!.*`)|~{3,})/
+const fenceClose = /^ {0,3}(`+|~+)[ \t]*$/
 
 /**
  * The top-level list items of a Markdown file. An item holds its first line and the indented lines after it. A heading,
- * or a line without indent after a blank line, ends the item.
+ * a line without indent after a blank line, or a code fence with less indent than the item text ends the item. A list
+ * marker in a code fence does not start an item.
  */
-export function checklistItems(text: string): string[] {
+function checklistItems(text: string): string[] {
   const items: string[][] = []
   let current: string[] | null = null
+  // The column of the text of the current item. A list marker with less indent starts the next top-level item.
+  let content = 0
   let blank = false
+  // The backticks or tildes that opened the current code fence.
+  let fence: string | null = null
+  let fenceOffset = 0
   for (const line of text.split(/\r?\n/)) {
+    const indent = line.search(/[^ ]|$/)
+    if (fence !== null && fenceOffset > 0 && line.trim() !== '' && indent < fenceOffset) {
+      fence = null
+      current = null
+    }
+    if (fence !== null) {
+      const close = indent >= fenceOffset ? fenceClose.exec(line.slice(fenceOffset))?.[1] : undefined
+      if (close !== undefined && close.charAt(0) === fence.charAt(0) && close.length >= fence.length) fence = null
+      current?.push(line)
+      continue
+    }
+    const offset = current !== null && indent >= content ? content : 0
+    const open = fenceOpen.exec(line.slice(offset))?.[1]
+    if (open !== undefined) {
+      fence = open
+      fenceOffset = offset
+      if (current !== null && indent < content) current = null
+      current?.push(line)
+      blank = false
+      continue
+    }
     const marker = listMarker.exec(line)
-    if (marker) {
-      current = [line.slice(marker[0].length)]
+    if (marker && (current === null || indent < content)) {
+      const [whole, before = '', bullet = '', after = ''] = marker
+      content = before.length + bullet.length + (/^ {1,4}$/.test(after) ? after.length : 1)
+      current = [line.slice(whole.length)]
+      fence = fenceOpen.exec(line.slice(content))?.[1] ?? null
+      fenceOffset = content
       items.push(current)
       blank = false
     } else if (current === null) continue

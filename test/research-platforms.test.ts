@@ -31,7 +31,7 @@ function write(root: string, files: Record<string, string>) {
   }
 }
 
-/** The research files of main, plus files that the domain must not include: a note, a nested guide and a symlink. */
+/** The research files of main, plus files that the domain must not include: a note and a nested guide. */
 const mainFiles = {
   'research/holdout.json': holdout('main-target'),
   'research/checklist.md': '# Checklist\n\n- Check the known set\n- Check the holdout\n',
@@ -49,6 +49,7 @@ function researchRepo(): string {
   git('config', 'user.name', 'Test')
   git('config', 'commit.gpgsign', 'false')
   write(repo, mainFiles)
+  // The domain does not include a symlink as a guide.
   symlinkSync('method.md', join(repo, 'research/guides/link.md'))
   git('add', '-A')
   git('commit', '-q', '-m', 'research on main')
@@ -116,6 +117,12 @@ test('locally, the research paths resolve against the repository root, also with
   write(repo, mainFiles)
   symlinkSync('method.md', join(repo, 'research/guides/link.md'))
   symlinkSync('missing.md', join(repo, 'research/guides/gone.md'))
+  // Symlinks to a file or a directory outside the repository.
+  const outside = mkdtempSync(join(tmpdir(), 'factory-outside-'))
+  write(outside, { 'holdout.json': holdout('outside-target'), 'checklist.md': '- Outside item\n', 'guide.md': 'outside\n' })
+  symlinkSync(join(outside, 'guide.md'), join(repo, 'research/guides/out.md'))
+  symlinkSync(join(outside, 'holdout.json'), join(repo, 'research/outside-holdout.json'))
+  symlinkSync(outside, join(repo, 'research/ext'))
   const elsewhere = mkdtempSync(join(tmpdir(), 'factory-config-'))
   write(elsewhere, { 'research/holdout.json': holdout('elsewhere-target'), 'research/guides/method.md': 'elsewhere\n' })
   const path = join(elsewhere, 'config.json')
@@ -128,8 +135,8 @@ test('locally, the research paths resolve against the repository root, also with
       config: research,
       holdout: { refuse: ['https://archive.example.org/objects/'], targets: ['main-target'] },
       checklist: ['Check the known set', 'Check the holdout'],
-      // A symlink counts by its target. A symlink without a target is not a file.
-      guides: { 'link.md': 'method on main\n', 'method.md': 'method on main\n', 'sources.md': 'sources\n' },
+      // As on Cloudflare, the domain does not include a symlink as a guide, also when it points outside the repository.
+      guides: { 'method.md': 'method on main\n', 'sources.md': 'sources\n' },
     })
 
     const source = `in ${repo}`
@@ -138,8 +145,20 @@ test('locally, the research paths resolve against the repository root, also with
     await stops(loadResearch(repo, { ...research, checklist: 'nowhere/checklist.md' }), `nowhere/checklist.md ${source}: the file does not exist`)
     await stops(loadResearch(repo, { ...research, guides: 'research/missing' }), `research/missing ${source}: the directory does not exist`)
     await stops(loadResearch(repo, { ...research, guides: 'research/checklist.md' }), `research/checklist.md ${source}: the directory does not exist`)
+
+    await stops(loadResearch(repo, { ...research, holdout: 'research/holdout.json/x' }), `research/holdout.json/x ${source}: the file does not exist`)
+    await stops(loadResearch(repo, { ...research, checklist: 'research/checklist.md/x' }), `research/checklist.md/x ${source}: the file does not exist`)
+    await stops(loadResearch(repo, { ...research, guides: 'research/checklist.md/x' }), `research/checklist.md/x ${source}: the directory does not exist`)
+    const invalidPath = 'research/\0/checklist.md'
+    await stops(loadResearch(repo, { ...research, checklist: invalidPath }), `${invalidPath} ${source}: the file does not exist`)
+
+    // A symlink to a path outside the repository, or a path under such a symlink, is missing, as on Cloudflare.
+    await stops(loadResearch(repo, { ...research, holdout: 'research/outside-holdout.json' }), `research/outside-holdout.json ${source}: the file does not exist`)
+    await stops(loadResearch(repo, { ...research, checklist: 'research/ext/checklist.md' }), `research/ext/checklist.md ${source}: the file does not exist`)
+    await stops(loadResearch(repo, { ...research, guides: 'research/ext' }), `research/ext ${source}: the directory does not exist`)
   } finally {
     rmSync(repo, { force: true, recursive: true })
+    rmSync(outside, { force: true, recursive: true })
     rmSync(elsewhere, { force: true, recursive: true })
   }
 })

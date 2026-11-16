@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
@@ -52,23 +52,34 @@ export async function loadRepoConfig(repo: string, path?: string): Promise<RepoC
   return { ...config, guides: Object.fromEntries(guides) }
 }
 
-/** The status of a path after symlinks, or null when the path or the target of a symlink is missing. */
-function statOf(path: string) {
+/**
+ * The status of a path relative to `repo`, or null when the path is missing or a part of it is a symlink. The
+ * contents API on Cloudflare does not give symlinks as files or directories, and a symlink can point out of the
+ * repository, so the two readers both ignore symlinks.
+ */
+function plainStat(repo: string, path: string) {
   try {
-    return statSync(path)
+    let current = repo
+    let info = statSync(repo, { throwIfNoEntry: false }) ?? null
+    for (const part of path.split('/').filter((part) => part !== '' && part !== '.')) {
+      if (!info?.isDirectory()) return null
+      current = join(current, part)
+      info = lstatSync(current, { throwIfNoEntry: false }) ?? null
+      if (!info || info.isSymbolicLink()) return null
+    }
+    return info
   } catch {
     return null
   }
 }
 
-/** The files of a working copy at paths relative to its root. Reads and listings follow symlinks, as diskRoot does. */
+/** The files of a working copy at paths relative to its root, without symlinks, as the reader on Cloudflare. */
 function diskFiles(repo: string): ResearchFiles {
   return {
-    read: async (path) => (statOf(join(repo, path))?.isFile() ? readFileSync(join(repo, path), 'utf8') : null),
+    read: async (path) => (plainStat(repo, path)?.isFile() ? readFileSync(join(repo, path), 'utf8') : null),
     async list(dir) {
-      const path = join(repo, dir)
-      if (!statOf(path)?.isDirectory()) return null
-      return readdirSync(path).filter((name) => statOf(join(path, name))?.isFile() ?? false)
+      if (!plainStat(repo, dir)?.isDirectory()) return null
+      return readdirSync(join(repo, dir)).filter((name) => plainStat(repo, `${dir}/${name}`)?.isFile() ?? false)
     },
   }
 }
