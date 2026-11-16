@@ -13,6 +13,8 @@ export function gh(cwd: string): Gh {
       const child = execFile('gh', args, { cwd, maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) =>
         error ? reject(new Error(`gh ${args.slice(0, 2).join(' ')}: ${stderr || error.message}`)) : resolve(stdout),
       )
+      // gh can exit before it reads stdin. Its exit status reports the failure, so a broken pipe here is not an error.
+      child.stdin?.on('error', () => {})
       child.stdin?.end(input ?? '')
     })
 }

@@ -17,6 +17,8 @@ own PRs, and its rules reviewer reads this file first.
   `src/cloudflare/guides.ts`. A test checks this.
 - `docs/specs/development-workflow.md` is the design. Code comments refer to its decisions (D1, D7) and its gaps
   (G6). Do not change these IDs.
+- `docs/specs/research-workflow.md` is the design of the research workflow, with its decisions (RD1) and gaps (RG1).
+  The same rule applies to its IDs.
 
 ## Design rules
 

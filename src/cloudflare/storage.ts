@@ -1,5 +1,6 @@
 import type { Ledger } from '../core/ledger.ts'
 import type { Files } from '../core/platform.ts'
+import { createArtifactTables } from './artifacts.ts'
 
 /** The tables of the host's own state in a Durable Object, beside the SDK's journal. */
 export function createTables(sql: SqlStorage): void {
@@ -8,6 +9,7 @@ export function createTables(sql: SqlStorage): void {
   sql.exec(
     'create table if not exists factory_runs (run text primary key, state text not null, note text not null, created integer not null, request text not null)',
   )
+  createArtifactTables(sql)
 }
 
 /** One run's ledger in Durable Object SQL. Writes are synchronous, so each step is stored before the next one starts. */
