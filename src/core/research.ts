@@ -17,7 +17,7 @@ export type ResearchConfig = {
   prereg_sections: string[]
   commands: { known: string; inject: string; evaluate: string; reproduce: string; sweep?: string }
   credentials?: Record<string, ResearchCredential>
-  /** Normalized https URLs for scout (R4). Their hosts need not be in egress: the host reads them, not the agent egress. */
+  /** Normalized https URLs for scout (R4). The host reads them, thus egress does not limit their hosts. */
   feeds?: string[]
 }
 

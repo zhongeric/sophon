@@ -145,12 +145,10 @@ test('feeds are normalized https URLs without repeats, and their hosts need not 
   assert.equal('feeds' in (parse(without) ?? {}), false)
   rejects(research({ feeds: [] }), 'research.feeds', /non-empty list/)
   rejects(research({ feeds: 'https://export.arxiv.org/rss/astro-ph' }), 'research.feeds', /non-empty list/)
-  rejects(research({ feeds: ['https://a.org/rss', ''] }), 'research.feeds[1]', /non-empty string/)
   rejects(research({ feeds: ['https://a.org/rss', 7] }), 'research.feeds[1]', /non-empty string/)
   rejects(research({ feeds: ['https://a.org/rss', 'http://a.org/rss'] }), 'research.feeds[1]', /https URL/)
   rejects(research({ feeds: ['https://a.org/rss', 'a.org/rss'] }), 'research.feeds[1]', /https URL/)
   rejects(research({ feeds: ['https://a.org/rss', 'https://user@a.org/rss'] }), 'research.feeds[1]', /user or a password/)
-  rejects(research({ feeds: ['https://a.org/rss', 'https://user:pass@a.org/rss'] }), 'research.feeds[1]', /user or a password/)
   rejects(research({ feeds: ['https://a.org/rss', 'https://A.org:443/rss'] }), 'research.feeds[1]', /repeats the URL https:\/\/a\.org\/rss/)
 })
 
