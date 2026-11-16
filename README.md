@@ -296,6 +296,15 @@ npm run remote -- report acme/app#123
 
 `npm run remote` reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from `.secrets/cloudflare.env`.
 
+```bash
+npm run metrics                                     # each build container of the last hour: CPU, memory, disk, network
+npm run metrics -- acme/app#45 --since 3h --detail  # one issue's container, with a line for each 5 minutes
+```
+
+`npm run metrics` gets the numbers from the Cloudflare GraphQL Analytics API, and shows the latest run of each
+container's issue. It reads `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` in the same way. The token needs
+the account permissions Account Analytics Read and Containers Read. Cloudflare reports the metrics some minutes late.
+
 - With the webhook: comment `/review` on a PR, or add the `agent-review` label. `/review --ship` also pushes the
   fixes to the PR branch and marks it ready on PASS. `/review --full` forces the full loop.
 - With the webhook: comment `/develop` on an issue, or add the `agent-develop` label. `/develop` takes the options
