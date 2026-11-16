@@ -1,5 +1,5 @@
 import type { Contracts } from 'nanocode-ts'
-import { checkQuestions, questionsSchema, type Answer, type Question } from './questions.ts'
+import { checkQuestions, decisionLists, questionsSchema, type Answer, type Question } from './questions.ts'
 import { StopError } from './stop.ts'
 
 /** What the intake agent understood of the ask, and how it routes the ask. */
@@ -17,7 +17,7 @@ export type Intake = {
 export const submitIntake: Contracts.HostTool = {
   name: 'submit_intake',
   description:
-    'Submit the intake one time: your summary of the ask, a PR title, a branch slug, the route (larger change, review passes) with the reason, and the questions that only the user can decide.',
+    'Submit the intake one time: your summary of the ask, a PR title, a branch slug, the route (larger change, review passes) with the reason, and your open questions, each with a level by D11.',
   parameters: {
     type: 'object',
     properties: {
@@ -52,13 +52,19 @@ export const confirmOptions = ['Yes, go on', 'No, stop the run']
 export const specOptions = ['Write a spec first', 'Plan now']
 export const passOptions = ['One pass', 'Two passes']
 
-/** The host's questions after the intake agent's: confirm the ask, then the route. One batch, so one round trip. */
+/**
+ * The host's questions after the intake agent's: confirm the ask, then the route. They are run questions (D11), so the host
+ * takes the intake agent's recommendation. When the intake agent raises a user question, the batch goes to the user anyway,
+ * so the confirmation goes too, with rule scope: the user sees the summary and can correct it or stop the run.
+ * One batch, so a user question of the intake agent needs one round trip.
+ */
 export function routeQuestions(intake: Intake): Question[] {
   const next = (offset: number) => `Q${intake.questions.length + offset}`
+  const confirm: Pick<Question, 'level' | 'rule'> = intake.questions.some((question) => question.level === 'user') ? { level: 'user', rule: 'scope' } : { level: 'run' }
   return [
-    { id: next(1), question: 'Is this the ask? Correct it in your own words if it is not.', why: intake.summary, options: confirmOptions, recommendation: confirmOptions[0]! },
-    { id: next(2), question: 'Write a spec before the plan?', why: intake.reason, options: specOptions, recommendation: specOptions[intake.larger ? 0 : 1]! },
-    { id: next(3), question: 'How many review loop passes?', why: intake.reason, options: passOptions, recommendation: passOptions[intake.passes - 1]! },
+    { id: next(1), question: 'Is this the ask? Correct it in your own words if it is not.', why: intake.summary, options: confirmOptions, recommendation: confirmOptions[0]!, ...confirm },
+    { id: next(2), question: 'Write a spec before the plan?', why: intake.reason, options: specOptions, recommendation: specOptions[intake.larger ? 0 : 1]!, level: 'run' },
+    { id: next(3), question: 'How many review loop passes?', why: intake.reason, options: passOptions, recommendation: passOptions[intake.passes - 1]!, level: 'run' },
   ]
 }
 
@@ -83,7 +89,7 @@ export const specSections = ['Summary', 'Surfaces', 'Edge cases', 'Out of scope'
 
 export const submitSpec: Contracts.HostTool = {
   name: 'submit_spec',
-  description: `Submit the spec one time, in Markdown with the sections ${specSections.join(', ')}. Also submit each decision that the user can overrule as a question with options and your recommendation.`,
+  description: `Submit the spec one time, in Markdown with the sections ${specSections.join(', ')}. Also submit each decision as a question with options, your recommendation and a level by D11. Only a user question goes to the user.`,
   parameters: {
     type: 'object',
     properties: { spec: { type: 'string', description: 'The spec in Markdown' }, decisions: questionsSchema },
@@ -279,12 +285,12 @@ export function renderPlan(plan: Plan, options: { tasks: boolean }): string {
   ].join('\n')
 }
 
-/** The frozen package for the review loop: the verbatim ask, the user's decisions, and the plan without its tasks. */
+/** The frozen package for the review loop: the verbatim ask, the decisions of the user and of the run, and the plan without its tasks. */
 export function frozenAsk(ask: string, decisions: Answer[], plan: Plan): string {
   return [
     ask.trim(),
     '',
-    ...(decisions.length > 0 ? ['## Decisions of the user', '', ...decisions.map((answer) => `- ${answer.question} **${answer.answer}**`), ''] : []),
+    ...decisionLists(decisions, { user: '## Decisions of the user', run: '## Decisions the run made' }),
     '# Plan',
     '',
     renderPlan(plan, { tasks: false }),

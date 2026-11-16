@@ -1,16 +1,56 @@
 import type { Contracts } from 'nanocode-ts'
 import type { Ledger } from './ledger.ts'
 
-/** A decision that only the user can make, with the options and the host's recommendation. */
+/** The kinds of choice that only the user can make (D11). */
+export const rules = ['scope', 'capability', 'spend', 'decision'] as const
+export type Rule = (typeof rules)[number]
+export const isRule = (value: unknown): value is Rule => rules.some((rule) => rule === value)
+
+/**
+ * A decision with the options and the host's recommendation. A `user` question goes to the user and names its rule.
+ * The host takes the recommendation of a `run` question at once (D11).
+ */
 export type Question = {
   id: string
   question: string
   why: string
   options: string[]
   recommendation: string
+  level: 'user' | 'run'
+  rule?: Rule
 }
 
-export type Answer = { id: string; question: string; answer: string; recommended: boolean }
+/** `decidedBy` is absent when the user decided, also in a ledger from before D11. */
+export type Answer = { id: string; question: string; answer: string; recommended: boolean; decidedBy?: 'run' }
+
+/** A question from a ledger before D11 has no level, so it counts as a user question. */
+const isUser = (question: Question) => question.level !== 'run'
+
+/** Keep the decisions of the user separate from the decisions that the run made. */
+function splitDecisions(answers: Answer[]): { user: Answer[]; run: Answer[] } {
+  return { user: answers.filter((answer) => answer.decidedBy !== 'run'), run: answers.filter((answer) => answer.decidedBy === 'run') }
+}
+
+/**
+ * The decisions of the user, then the decisions that the run made, as two Markdown lists under their titles. One renderer for
+ * the frozen ask, the PR body and the reports, so that their lines do not drift. A list without decisions shows its `empty`
+ * line, or no section when the caller gives no `empty` line.
+ */
+export function decisionLists(
+  answers: Answer[],
+  titles: { user: string; run: string },
+  options: { empty?: { user: string; run: string }; recommended?: boolean } = {},
+): string[] {
+  const { user, run } = splitDecisions(answers)
+  const line = (answer: Answer) => `- ${answer.question} **${answer.answer}**${options.recommended && answer.recommended ? ' (recommended)' : ''}`
+  const section = (title: string, list: Answer[], empty?: string) => {
+    const lines = list.length > 0 ? list.map(line) : empty ? [empty] : []
+    return lines.length > 0 ? [title, '', ...lines, ''] : []
+  }
+  return [...section(titles.user, user, options.empty?.user), ...section(titles.run, run, options.empty?.run)]
+}
+
+const runAnswer = (question: Question): Answer => ({ id: question.id, question: question.question, answer: question.recommendation, recommended: true, decidedBy: 'run' })
 
 /** Where a batch of questions went, so that a resumed run reads its answers from the same place. */
 export type Posted = { batch: string; ref: string; at: string }
@@ -78,7 +118,7 @@ export function parseAnswers(body: string, questions: Question[]): Answer[] | nu
   })
 }
 
-/** The JSON schema of a list of questions, for every submit tool that asks the user. */
+/** The JSON schema of a list of questions, for every submit tool that raises questions. */
 export const questionsSchema = {
   type: 'array',
   items: {
@@ -88,8 +128,17 @@ export const questionsSchema = {
       why: { type: 'string', description: 'Why the answer changes the work, with the file or the part of the ask' },
       options: { type: 'array', items: { type: 'string' } },
       recommendation: { type: 'string', description: 'The option that you recommend, word for word' },
+      level: {
+        type: 'string',
+        enum: ['user', 'run'],
+        description:
+          'D11: user only when the choice (1) removes or adds scope compared with the ask, (2) changes capabilities across workflows ' +
+          '(network and web search, protected paths, secrets, allowed models, blinding), (3) commits spend over the budget or an irreversible or public action, ' +
+          'or (4) departs from a recorded D or RD row. Every other question is run: the host takes your recommendation at once and does not ask the user.',
+      },
+      rule: { type: 'string', enum: [...rules], description: 'With level user: the D11 rule that makes it a question for the user' },
     },
-    required: ['question', 'why', 'options', 'recommendation'],
+    required: ['question', 'why', 'options', 'recommendation', 'level'],
     additionalProperties: false,
   },
 }
@@ -97,7 +146,8 @@ export const questionsSchema = {
 export const submitQuestions: Contracts.HostTool = {
   name: 'submit_questions',
   description:
-    'Submit the questions that only the user can decide, one time. Submit an empty list when the ask settles everything. ' +
+    'Submit your open questions, one time. Submit an empty list when the ask settles everything. ' +
+    'Give each question a level by D11: only a user question goes to the user, and it needs its rule. The host takes the recommendation of a run question at once. ' +
     'Each question needs at least two options, and the recommendation must be one of the options, word for word.',
   parameters: { type: 'object', properties: { questions: questionsSchema }, required: ['questions'], additionalProperties: false },
 }
@@ -110,43 +160,74 @@ export function checkQuestions(input: unknown): Question[] {
     if (!item.question?.trim() || !item.why?.trim()) problems.push(`questions[${index}]: question and why are required`)
     if (!Array.isArray(item.options) || item.options.length < 2) problems.push(`questions[${index}]: give at least two options`)
     else if (!item.options.includes(item.recommendation ?? '')) problems.push(`questions[${index}]: the recommendation must be one of the options`)
-    return { id: `Q${index + 1}`, question: item.question ?? '', why: item.why ?? '', options: item.options ?? [], recommendation: item.recommendation ?? '' }
+    if (item.level !== 'user' && item.level !== 'run') problems.push(`questions[${index}]: level must be user or run`)
+    else if (item.level === 'user' && !isRule(item.rule)) problems.push(`questions[${index}]: a user question needs a rule: ${rules.join(', ')}`)
+    const question = { id: `Q${index + 1}`, question: item.question ?? '', why: item.why ?? '', options: item.options ?? [], recommendation: item.recommendation ?? '' }
+    // A run question takes its recommendation, so a rule on it has no use.
+    return item.level === 'user' && isRule(item.rule) ? { ...question, level: 'user', rule: item.rule } : { ...question, level: 'run' }
   })
   if (problems.length > 0) throw new Error(problems.join('\n'))
   return questions
 }
 
 /**
- * Posts each batch one time and records its answers in the ledger. A batch without answers
- * pauses the run; the resumed run reads the answers from where the batch went.
+ * Posts the user questions of each batch one time, and records the answers of all its questions in the ledger.
+ * A batch with only run questions takes its recommendations at once, with no post (D11). A posted batch without answers pauses the run. The resumed run reads the answers from where the batch went.
  */
 export function asker(ledger: Ledger, channel: Channel, runId: string, log: (line: string) => void) {
   const post = async (batch: string, questions: Question[]) => {
+    if (ledger.get(`answers:${batch}`)) return
+    // A batch keeps its questions, also when it is from before D11.
+    questions = ledger.get<Question[]>(`questions:${batch}`) ?? questions
     ledger.put(`questions:${batch}`, questions)
-    if (questions.length === 0 || ledger.get(`posted:${batch}`)) return
-    const posted = await channel.post(runId, batch, questions)
+    if (!ledger.get(`run-answers:${batch}`)) {
+      const run = questions.filter((question) => !isUser(question)).map(runAnswer)
+      ledger.put('decisions', [...decisions(ledger), ...run])
+      ledger.put(`run-answers:${batch}`, run)
+    }
+    if (ledger.get(`posted:${batch}`)) return
+    const user = questions.filter(isUser)
+    if (user.length === 0) {
+      if (questions.length > 0) record(batch, questions.map(runAnswer))
+      return
+    }
+    const posted = await channel.post(runId, batch, user)
     ledger.put(`posted:${batch}`, posted)
-    log(`asked ${questions.length} questions (${batch}) at ${channel.where(posted)}`)
+    log(`asked ${user.length} questions (${batch}) at ${channel.where(posted)}`)
   }
+  /** The answers of every question of the batch, in the order of the questions. */
   const wait = async (batch: string): Promise<Answer[]> => {
     const recorded = ledger.get<Answer[]>(`answers:${batch}`)
     if (recorded) return recorded
     const questions = ledger.get<Question[]>(`questions:${batch}`) ?? []
     const posted = ledger.get<Posted>(`posted:${batch}`)
     if (questions.length === 0 || !posted) return []
-    const answers = await channel.answers(posted, questions)
+    const user = questions.filter(isUser)
+    const answers = await channel.answers(posted, user)
     if (!answers) throw new PausedError(`waiting for your answers at ${channel.where(posted)}`)
-    return record(batch, answers)
+    const all = questions.map((question) => {
+      if (!isUser(question)) return runAnswer(question)
+      const answer = answers.find((entry) => entry.id === question.id)
+      if (!answer) throw new Error(`the channel gave no answer for ${question.id} of ${batch}`)
+      return answer
+    })
+    return record(batch, all)
   }
   const record = (batch: string, answers: Answer[]) => {
+    const run = ledger.get<Answer[]>(`run-answers:${batch}`) ?? []
     ledger.put(`answers:${batch}`, answers)
-    ledger.put('decisions', [...decisions(ledger), ...answers])
+    ledger.put('decisions', [...decisions(ledger), ...answers.filter((answer) => !run.some((entry) => entry.id === answer.id))])
     return answers
   }
   /** Takes every recommendation without asking, when the user said so for this run. */
   const recommend = (batch: string, questions: Question[]): Answer[] =>
     ledger.get<Answer[]>(`answers:${batch}`) ??
-    record(batch, questions.map((question) => ({ id: question.id, question: question.question, answer: question.recommendation, recommended: true })))
+    record(
+      batch,
+      questions.map((question) =>
+        isUser(question) ? { id: question.id, question: question.question, answer: question.recommendation, recommended: true } : runAnswer(question),
+      ),
+    )
   return { post, wait, recommend }
 }
 
@@ -154,15 +235,21 @@ export function decisions(ledger: Ledger): Answer[] {
   return ledger.get<Answer[]>('decisions') ?? []
 }
 
-/** The user's answers so far, as /review/decisions.md, for every agent that runs after them. */
+/** The decisions so far, as /review/decisions.md, for every agent that runs after them: the user's first, then the run's. */
 export function decisionsFile(ledger: Ledger): Record<string, string> {
-  const answers = decisions(ledger)
-  if (answers.length === 0) return {}
-  const lines = answers.map((answer) => `- ${answer.question}\n  Answer: ${answer.answer}`)
-  return { '/decisions.md': `# Decisions of the user\n\nThese answers settle open points of the ask. Follow them.\n\n${lines.join('\n')}\n` }
+  const { user, run } = splitDecisions(decisions(ledger))
+  if (user.length === 0 && run.length === 0) return {}
+  const section = (title: string, note: string, answers: Answer[]) =>
+    answers.length > 0 ? ['', `## ${title}`, '', note, '', ...answers.map((answer) => `- ${answer.question}\n  Answer: ${answer.answer}`)] : []
+  const text = [
+    '# Decisions',
+    ...section('Decisions of the user', 'These answers settle open points of the ask. Follow them.', user),
+    ...section('Decisions the run made', 'The run took the recommendation for these questions, because they did not need the user (D11). Follow them.', run),
+  ]
+  return { '/decisions.md': `${text.join('\n')}\n` }
 }
 
-export const decisionsLine = (files: Record<string, string>) => ('/decisions.md' in files ? ['- Decisions of the user: /review/decisions.md'] : [])
+export const decisionsLine = (files: Record<string, string>) => ('/decisions.md' in files ? ['- Decisions: /review/decisions.md'] : [])
 
 /** \`edited\` is true when someone changed the comment after it was posted; anyone with write access can. */
 export type PrComment = { author: string; body: string; createdAt: string; edited?: boolean }

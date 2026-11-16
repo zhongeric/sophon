@@ -56,6 +56,16 @@ export const sources = {
 
 const intake = { title: 'Add sub and mul', summary: 'Adds sub() and mul() next to add(), with tests.', slug: 'add-sub-mul', larger: false, passes: 1, reason: 'Two small functions.', questions: [] }
 
+/** A question about the scope of the ask, which only the user can decide (D11). */
+export const scopeQuestion = {
+  question: 'Add div too?',
+  why: 'The ask names sub and mul, and div is the other operation of the four.',
+  options: ['No, only sub and mul', 'Yes, add div'],
+  recommendation: 'No, only sub and mul',
+  level: 'user',
+  rule: 'scope',
+}
+
 const task = (id: string, files: string[], depends_on: string[] = []) => ({ id, title: `Add ${id}`, work: `Build ${id}.`, files, depends_on })
 /** The plan that the scripted planner submits. */
 export const plan = {
@@ -84,8 +94,9 @@ const wrongProduct = {
  * commit a log file and then commits a test with a wrong expectation. The host refuses that log because the test
  * fails, so the builder submits a test of sub only, and the CI fixer adds mul to it. Reviewers find nothing, unless
  * `reviewFix`: then the bugs reviewer finds the missing mul test and the patch agent adds it.
+ * With `askScope`, the intake agent raises one user question about the scope.
  */
-export function developScript(options: { blockSub?: boolean; reviewFix?: boolean } = {}): Script {
+export function developScript(options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean } = {}): Script {
   return ({ role, output, request }) => {
     if (output !== null) return { text: 'done' }
     switch (role) {
@@ -99,7 +110,7 @@ export function developScript(options: { blockSub?: boolean; reviewFix?: boolean
           ].join('\n'),
         }
       case 'intake':
-        return { cell: `await tools.submit_intake(${JSON.stringify(intake)})` }
+        return { cell: `await tools.submit_intake(${JSON.stringify(options.askScope ? { ...intake, questions: [scopeQuestion] } : intake)})` }
       case 'planner':
         return { cell: `await tools.submit_plan(${JSON.stringify(plan)})` }
       case 'builder': {

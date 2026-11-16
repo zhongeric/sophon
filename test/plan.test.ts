@@ -10,15 +10,25 @@ test('the intake needs a title, a branch slug, and the route with its reason', (
   assert.deepEqual(checkIntake(intake).questions, [])
 })
 
-test('the host asks to confirm the ask and the route in the same batch, and reads the route from the answers', () => {
-  const question = { question: 'May sub return a negative number?', why: 'sub(3, 5)', options: ['Yes', 'No, throw'], recommendation: 'Yes' }
-  const asked = checkIntake({ ...intake, larger: true, questions: [question] })
+test('the route questions are run questions after the intake questions, and the host reads the route from the answers', () => {
   assert.deepEqual(
-    routeQuestions(asked).map((entry) => [entry.id, entry.recommendation]),
+    routeQuestions(checkIntake(intake)).map((entry) => [entry.id, entry.recommendation, entry.level]),
     [
-      ['Q2', 'Yes, go on'],
-      ['Q3', 'Write a spec first'],
-      ['Q4', 'One pass'],
+      ['Q1', 'Yes, go on', 'run'],
+      ['Q2', 'Plan now', 'run'],
+      ['Q3', 'One pass', 'run'],
+    ],
+  )
+  // A user question of the intake agent posts the batch, so the confirmation goes to the user with the summary.
+  const question = { question: 'May sub return a negative number?', why: 'sub(3, 5)', options: ['Yes', 'No, throw'], recommendation: 'Yes', level: 'user', rule: 'scope' }
+  const asked = checkIntake({ ...intake, larger: true, questions: [question] })
+  assert.equal(routeQuestions(asked)[0]!.rule, 'scope')
+  assert.deepEqual(
+    routeQuestions(asked).map((entry) => [entry.id, entry.recommendation, entry.level]),
+    [
+      ['Q2', 'Yes, go on', 'user'],
+      ['Q3', 'Write a spec first', 'run'],
+      ['Q4', 'One pass', 'run'],
     ],
   )
   assert.deepEqual(route(asked, []), { stop: false, spec: true, passes: 1 })
@@ -101,4 +111,19 @@ test('the frozen package holds the verbatim ask, the decisions and the plan, but
   assert.match(frozen, /^Add sub\.\n\n## Decisions of the user\n\n- Negative results\? \*\*Allow them\*\*\n\n# Plan\n\n## Smallest change/)
   assert.match(frozen, /- \[ \] The tests pass \(`npm test`\)/)
   assert.doesNotMatch(frozen, /## Tasks/)
+  assert.doesNotMatch(frozen, /## Decisions the run made/)
+})
+
+test('the frozen package lists the decisions of the user and the decisions that the run made, each with its label', () => {
+  const frozen = frozenAsk(
+    'Add sub.',
+    [
+      { id: 'Q1', question: 'Negative results?', answer: 'Allow them', recommended: true },
+      { id: 'Q2', question: 'How many review loop passes?', answer: 'One pass', recommended: true, decidedBy: 'run' },
+    ],
+    plan,
+  )
+  assert.match(frozen, /## Decisions of the user\n\n- Negative results\? \*\*Allow them\*\*\n\n## Decisions the run made\n\n- How many review loop passes\? \*\*One pass\*\*\n\n# Plan/)
+  const runOnly = frozenAsk('Add sub.', [{ id: 'Q1', question: 'Spec?', answer: 'Plan now', recommended: true, decidedBy: 'run' }], plan)
+  assert.match(runOnly, /^Add sub\.\n\n## Decisions the run made\n\n- Spec\? \*\*Plan now\*\*/)
 })

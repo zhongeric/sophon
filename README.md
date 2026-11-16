@@ -41,7 +41,8 @@ light: one reviewer that also fixes ─▶ commit ─▶ checks ─▶ PASS or F
 | --- | --- |
 | Reviewers are context-free and read-only | Each agent is a new session. Writes to the reviewed tree fail. |
 | Findings need evidence | `submit_findings` refuses a finding whose quote is not at its file and line. |
-| Every finding gets an answer | The patch log lists each finding as applied or skipped, with a reason. A skipped critical or high finding fails the run, unless you accept it. |
+| Every finding gets an answer | The patch log lists each finding as applied or skipped, with a reason. A skipped critical or high finding fails the run. |
+| Questions only when they need you | A run asks only when a choice changes the scope of the ask, what agents can reach or do, spend or a public action, or a recorded decision (D11). It takes the recommendation for every other question, posts nothing, and lists it in the report. |
 | Agents stay in their workspace | An in-process shell, with no network, a hidden `.git`, and no writes through a symlink. |
 | Checks stay strong | Agents cannot write `.agent-factory.json`, protected paths or `.github/`. Check commands come from the config. |
 | A PR cannot change its own rules | On Cloudflare, the config comes from the base branch. |
@@ -101,7 +102,7 @@ npm run develop -- --repo ~/src/app --ask "Add a fee switch, off by default"
 npm run review -- --run <id>                     # resume a run, also with npm run develop
 ```
 
-- **Questions** go to the PR, the terminal, or `runs/<run>/questions-<batch>.md`. Answer with `/answer` and one
+- **Questions** that need you (D11) go to the PR, the terminal, or `runs/<run>/questions-<batch>.md`. Answer with `/answer` and one
   line for each question (`Q1: b`, or your own words), or with `/answer recommended`.
 - **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
   fixes are on the local branch `factory/<run>`.

@@ -7,10 +7,10 @@ import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type 
 import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeResult, PullRequests } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
-import { asker, commentLimit, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
+import { asker, commentLimit, decisionLists, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
-import { checkAllowedModels, checkFamilySwap, defaultAllowedModels, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
+import { checkAllowedModels, checkFamilySwap, decisionSections, defaultAllowedModels, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
 
 export type DevelopModels = Record<'intake' | 'spec' | 'planner' | 'builder', ModelChoice>
 
@@ -105,7 +105,7 @@ export function checkDevelopModels(models: DevelopModels, allowed = defaultAllow
 
 /**
  * The development workflow, steps 0 to 9, with its order and hard rules in code:
- * intake and the user's confirmation, a spec for a larger change, one plan, builders for the plan's tasks (in
+ * intake and the confirmation of the ask, a spec for a larger change, one plan, builders for the plan's tasks (in
  * parallel when their files do not overlap, each on its own branch), a draft PR, CI with a fix budget, the code
  * review loop once or twice, CI again, and a ready PR only when every criterion holds. Every step is in the
  * ledger, so the same run ID resumes after a pause or a crash without repeating finished steps.
@@ -150,14 +150,16 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
     return { status, pr: state.pr, branch: state.branch, report, resume: resumable ? note : null, merge }
   }
 
-  // 0. Intake: no plan and no code until the user confirms the ask.
+  // 0. Intake: no plan and no code before the ask is confirmed. The route questions are run questions (D11), so the run
+  // takes the recommendations of the intake agent. The run asks the user only when the intake agent raises a user question.
   const intook = await step(ledger, 'intake', () => intake(context, 'intake', models.intake, view))
   state.intake = intook
-  const routed = route(intook, await ask('intake', [...intook.questions, ...routeQuestions(intook)]))
+  const intakeAnswers = await ask('intake', [...intook.questions, ...routeQuestions(intook)])
+  const routed = route(intook, intakeAnswers)
   state.route = routed
   if (routed.stop) return finish('stopped', [], 'You stopped the run at intake.')
 
-  // 1. Spec, for a larger change. Its decisions are one batch of questions, so the user can overrule them.
+  // 1. Spec, for a larger change. Its decisions are one batch of questions. Only its user questions go to the user (D11).
   let spec: string | null = null
   if (routed.spec) {
     const written = await step(ledger, 'spec', () => writeSpec(context, 'spec', models.spec, view))
@@ -291,7 +293,16 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
   const solidity = active.find((profile) => profile.id === 'solidity')
   const audit = solidity !== undefined && changed.some((path) => solidity.files.test(path))
   const criteria: Criterion[] = [
-    { name: 'Ask confirmed', ok: true, detail: input.hotfix ? 'hotfix: the host took every recommendation' : 'you answered the intake questions' },
+    // The marks of the answers tell who confirmed the ask. A ledger from before D11 posted every question, also the route questions.
+    {
+      name: 'Ask confirmed',
+      ok: true,
+      detail: input.hotfix
+        ? 'hotfix: the host took every recommendation'
+        : intakeAnswers.some((answer) => answer.decidedBy !== 'run')
+          ? 'you answered the intake questions'
+          : 'the run took the recommendations of the intake agent (D11)',
+    },
     { name: 'Plan with its four parts', ok: true, detail: `${planned.tasks.length} tasks in ${scheduled.length} waves` },
     { name: 'Every task built', ok: true, detail: state.built.map((entry) => entry.task.id).join(', ') },
     {
@@ -427,7 +438,7 @@ function prBody(input: DevelopInput, answers: Answer[], planText: string): strin
     '',
     ...input.ask.trim().split('\n').map((line) => `> ${line}`),
     '',
-    ...(answers.length > 0 ? ['# Decisions of the user', '', ...answers.map((answer) => `- ${answer.question} **${answer.answer}**`), ''] : []),
+    ...decisionLists(answers, { user: '# Decisions of the user', run: '# Decisions the run made' }),
     planText,
   ].join('\n')
 }
@@ -485,9 +496,6 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
           '',
         ]
       : []),
-    '## Your decisions',
-    '',
-    ...(answers.length > 0 ? answers.map((answer) => `- ${answer.question} **${answer.answer}**${answer.recommended ? ' (recommended)' : ''}`) : ['- none asked']),
-    '',
+    ...decisionSections(answers),
   ].join('\n')
 }

@@ -179,7 +179,8 @@ test('on Cloudflare, deleted source files and the old paths of renamed source fi
 
 test('on Cloudflare, a missing permission stops the run at once, and resume continues it from the ledger', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo()
-  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  // The open question is a run question, so the run asks nothing on the PR (D11).
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ runQuestion: true, tests: false }) })
   mock.state.ciStatus = 403
   const worker = await startWorker(vars(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}`
@@ -187,8 +188,6 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
   const modelCalls = () => mock.state.requests.filter((route) => route.startsWith('POST /v1/')).length
   try {
     await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin, method: 'POST' })
-    await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
-    mock.comment('maintainer', '/answer recommended')
     const stopped = await until(() => mock.state.comments.find((entry) => entry.body.includes('stopped run')), 120_000, describe)
     assert.match(stopped.body, /HTTP 403.* Check the permissions of GITHUB_TOKEN\. .*npm run remote -- resume acme\/app#7/)
     assert.equal(mock.state.requests.filter((route) => route.endsWith('/actions/runs')).length, 1)
@@ -201,6 +200,8 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
     assert.deepEqual(await (await resume(7)).json(), { reason: 'started the run again from its ledger after the error', resumed: true, state: 'error' })
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/)
+    assert.ok(!mock.state.comments.some((entry) => entry.body.includes('agent-factory:questions')), describe())
+    assert.match(done.body, /## Decisions the run made\n\n- May sub return a negative number\? \*\*Yes, return -2\*\*/)
     // Only the intent check was left: the reviewers and patch agents did not run again.
     assert.ok(modelCalls() - calls <= 2, `${modelCalls() - calls} model calls after resume`)
 
@@ -233,13 +234,11 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     const issueComment = { action: 'created', comment: { body: '/develop', user: { login: 'maintainer' } }, issue: { number: 5 }, repository }
     const started = (await (await sendWebhook(worker.url, secret, 'issue_comment', issueComment)).json()) as { run: string; started: boolean }
     assert.equal(started.started, true)
-    const asked = await until(() => on(5).find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
-    assert.match(asked.body, /Is this the ask\?/)
-    mock.comment('maintainer', '/answer recommended', 5)
-    await sendWebhook(worker.url, secret, 'issue_comment', { ...issueComment, comment: { body: '/answer recommended', user: { login: 'maintainer' } } })
-
+    // The intake agent raised no user question, so the run takes its recommendations and does not ask on the issue (D11).
     const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
     assert.match(done.body, /^# Development run: READY/, done.body)
+    assert.ok(!on(5).some((entry) => entry.body.includes('agent-factory:questions')), describe())
+    assert.match(done.body, /## Decisions the run made\n\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\*/)
     const [number, pull] = [...mock.state.pulls].find(([, entry]) => entry.head === 'factory/dev-add-sub-mul')!
     assert.equal(pull.draft, false)
     assert.match(pull.body, /# Ask\n\n> Add sub and mul/)
@@ -270,6 +269,41 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     assert.deepEqual([mock.fileAt('refs/heads/main', 'src/sub.ts'), mock.fileAt('refs/heads/main', 'src/mul.ts')], [sources.sub, sources.mul])
     const status = (await (await fetch(`${worker.url}/runs/acme/app/5`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: { run: string; state: string }[] }
     assert.deepEqual(status.runs.map((run) => run.state), ['passed'])
+  } finally {
+    worker.stop()
+    mock.close()
+  }
+})
+
+test('on Cloudflare, /develop asks a user question of the intake agent on the issue, and the /answer webhook resumes the run', { timeout: 300_000 }, async () => {
+  const { repo } = developRepo({
+    checks: { machine: 'test -f .setup-done' },
+    setup: 'touch .setup-done',
+    stack: 'TypeScript',
+    tests: { command: 'env -u NODE_TEST_CONTEXT node --test {tests}', pattern: '\\.test\\.ts$' },
+  })
+  const issues = { 5: { body: 'Add sub and mul next to add, with tests.', title: 'Add sub and mul' } }
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', issues, name: 'app', owner: 'acme', script: developScript({ askScope: true }) })
+  const worker = await startWorker({ ...vars(mock), MACHINE_URL: `${mock.url}/machine` })
+  const on = (number: number) => mock.state.comments.filter((entry) => entry.issue === number)
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 160)]))}\nworker:\n${worker.output().slice(-4000)}`
+  try {
+    const issueComment = { action: 'created', comment: { body: '/develop', user: { login: 'maintainer' } }, issue: { number: 5 }, repository }
+    const started = (await (await sendWebhook(worker.url, secret, 'issue_comment', issueComment)).json()) as { run: string; started: boolean }
+    assert.equal(started.started, true)
+    // The scope question is a user question (D11), so the issue gets it with the confirmation of the ask, but not the route questions.
+    const asked = await until(() => on(5).find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
+    assert.match(asked.body, /\*\*Q1\.\*\* Add div too\?/)
+    assert.match(asked.body, /\*\*Q2\.\*\* Is this the ask\?/)
+    assert.doesNotMatch(asked.body, /Write a spec before the plan\?|How many review loop passes\?/)
+    mock.comment('maintainer', '/answer recommended', 5)
+    await sendWebhook(worker.url, secret, 'issue_comment', { ...issueComment, comment: { body: '/answer recommended', user: { login: 'maintainer' } } })
+
+    const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
+    assert.match(done.body, /^# Development run: READY/, done.body)
+    assert.equal(on(5).filter((entry) => entry.body.includes('agent-factory:questions')).length, 1, describe())
+    assert.match(done.body, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
+    assert.match(done.body, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\*.*\n- Is this the ask\? .*\*\*Yes, go on\*\*.*\n\n## Decisions the run made\n\n- Write a spec before the plan\? \*\*Plan now\*\*/)
   } finally {
     worker.stop()
     mock.close()
