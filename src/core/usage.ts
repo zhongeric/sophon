@@ -86,28 +86,40 @@ export function recordUsage(ledger: Ledger, agentId: string, model: string, even
   let total = record.total
   let changed = false
   for (const logged of events) {
-    const inner = (logged.event as { event?: InnerEvent } | null)?.event
-    if (inner?.type !== 'model.call.completed') continue
-    const run = typeof inner.request_id === 'string' ? inner.request_id : (logged.request_id ?? '')
-    const seq = typeof inner.seq === 'number' ? inner.seq : logged.seq
-    const seen = agent.seen[run]
-    if (seen !== undefined && seq <= seen) continue
-    agent.seen = { ...agent.seen, [run]: seq }
+    const call = modelCall((logged.event as { event?: unknown } | null)?.event, logged)
+    if (!call) continue
+    const seen = agent.seen[call.run]
+    if (seen !== undefined && call.seq <= seen) continue
+    agent.seen = { ...agent.seen, [call.run]: call.seq }
     changed = true
+    if (call.replayed) continue
+    agent.tokens = addTokens(agent.tokens, call.tokens)
+    total = addTokens(total, call.tokens)
+  }
+  if (!changed) return
+  ledger.put(usageKey, { agents: { ...record.agents, [agentId]: agent }, total } satisfies UsageRecord)
+}
+
+/** One completed model call. `run` and `seq` identify it, so that a republished event counts one time. */
+export type ModelCall = { run: string; seq: number; replayed: boolean; tokens: Tokens }
+
+/** Reads a `model.call.completed` event of the SDK. `logged` gives the run and the sequence when the event has none. */
+export function modelCall(event: unknown, logged: Contracts.LoggedEvent): ModelCall | undefined {
+  const inner = event as InnerEvent | null | undefined
+  if (inner?.type !== 'model.call.completed') return undefined
+  const usage = inner.payload?.usage
+  return {
+    run: typeof inner.request_id === 'string' ? inner.request_id : (logged.request_id ?? ''),
+    seq: typeof inner.seq === 'number' ? inner.seq : logged.seq,
     // A replayed call comes from the journal: the provider did not bill it again.
-    if (inner.payload?.timing?.replayed === true) continue
-    const usage = inner.payload?.usage
-    const tokens = {
+    replayed: inner.payload?.timing?.replayed === true,
+    tokens: {
       input: count(usage?.input_tokens),
       cached: count(usage?.input_tokens_details?.cached_tokens),
       cache_write: count(usage?.input_tokens_details?.cache_write_tokens),
       output: count(usage?.output_tokens),
-    }
-    agent.tokens = addTokens(agent.tokens, tokens)
-    total = addTokens(total, tokens)
+    },
   }
-  if (!changed) return
-  ledger.put(usageKey, { agents: { ...record.agents, [agentId]: agent }, total } satisfies UsageRecord)
 }
 
 type InnerEvent = {

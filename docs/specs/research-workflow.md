@@ -93,8 +93,8 @@ user labels it. Scout is read-only and periodic: a cron trigger and a Durable Ob
 - **Breadth:** the host maps one role over many items (lenses, candidate batches, partitions) in a bounded pool. Each
   item is a ledger step, so a resumed run does not run it again.
 - **Depth:** inside one turn, a surveyor or the analyst can start nanocode subagents, as builders can.
-  Only the root agent submits. Today the host sets no limit on the count or the budget of subagents. Section 6.2 adds
-  these limits for each role.
+  Only the root agent submits. In each root turn, `openAgent` limits the subagents that run at the same time, the
+  subagents that start, and their tokens. `roles.ts` sets these limits for each role.
 - **Diversity:** generators and skeptics get different model families and different lenses, because agents of one
   family can share a mistake. The family-swap check applies to the skeptic passes.
 - **Model tiers:** screeners on a cheap tier. Judgment roles on the strong tier. A research run has its own
@@ -128,7 +128,7 @@ Each is a separate PR. Each is also useful to the other workflows, or is off for
 | `python` profile | `profiles.ts`, the build image | Notebooks are Python. The repository's setup installs the domain's packages. |
 | Roles by workflow | `roles.ts` | The research roles in a table of their own. |
 | A bounded pool | `plan.ts` (`waves`) | Sweeps, screens and generators. |
-| Subagent limits | `agent.ts` (`openAgent`) | RD1. The host sets the count and the budget of subagents for each role. |
+| Subagent limits | `agent.ts` (`openAgent`), `subagents.ts`, `roles.ts` | RD1. Each role has a limit, no subagents, or no limit. A limit sets the most subagents at the same time, and the most subagents and subagent tokens in one root turn. A spawn over a limit fails with an error that the agent sees. |
 
 ### 6.3 The domain, in the notebook
 
