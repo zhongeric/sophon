@@ -6,8 +6,9 @@ import { test } from 'node:test'
 import type { Contracts } from 'nanocode-ts'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import { openAgent, type AgentHost, type HostTools } from '../src/core/agent.ts'
+import type { Ledger } from '../src/core/ledger.ts'
 import type { SubagentLimit } from '../src/core/roles.ts'
-import { subagentKey, subagentLimits, type SubagentCounts } from '../src/core/subagents.ts'
+import { subagentKey, subagentLimits, type SubagentRecord } from '../src/core/subagents.ts'
 import { createWorkspace } from '../src/core/workspace.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { sqliteStore } from '../src/node/platform.ts'
@@ -76,7 +77,7 @@ async function lead(limit: SubagentLimit, replies: Reply[], options: { hold?: bo
       .filter((turn) => !turn.subagent && turn.output !== null)
       .flatMap((turn) => (JSON.parse(turn.output ?? '[]') as { text?: string }[]).map((block) => block.text ?? ''))
       .join('')
-  const counts = (request = 'task') => host.ledger.get<SubagentCounts>(subagentKey('lead', request))
+  const counts = (request = 'task') => host.ledger.get<SubagentRecord>(subagentKey('lead'))?.turns[request]
   return { agent, output, counts }
 }
 
@@ -157,7 +158,7 @@ test('a new root request ID starts its counts at zero', async () => {
   }
 })
 
-const call = (run: string, seq: number, replayed = false): Contracts.LoggedEvent => ({
+const call = (run: string, seq: number, replayed = false, usage: object = { input_tokens: 8, output_tokens: 4 }): Contracts.LoggedEvent => ({
   seq: 0,
   request_id: 'other',
   created_at: 0,
@@ -166,7 +167,7 @@ const call = (run: string, seq: number, replayed = false): Contracts.LoggedEvent
     update: {
       type: 'event',
       id: 1,
-      event: { type: 'model.call.completed', request_id: run, seq, payload: { usage: { input_tokens: 8, output_tokens: 4 }, timing: { replayed } } },
+      event: { type: 'model.call.completed', request_id: run, seq, payload: { usage, timing: { replayed } } },
     },
   },
 })
@@ -214,9 +215,59 @@ test('the counts persist in the ledger, and a replayed spawn or event adds nothi
   // The known subagent continues, and the same events and a replayed call add nothing.
   await again(request(1), signal, timing)
   resumed.observe([call('s1', 1), call('s1', 2), call('s1', 3, true), completion(1)])
-  assert.deepEqual(ledger.get(subagentKey('lead', 'task')), { started: [1], running: [], tokens: 24, seen: { s1: 3 } })
+  assert.deepEqual(ledger.get<SubagentRecord>(subagentKey('lead'))?.turns.task, { started: [1], running: [], tokens: 24 })
+  assert.deepEqual(ledger.get<SubagentRecord>(subagentKey('lead'))?.seen, { s1: 3 })
   await again(request(2), signal, timing)
   resumed.observe([completion(2)])
   await assert.rejects(again(request(3), signal, timing), /this turn started 2 of 2 subagents/)
   assert.deepEqual(sent, [undefined, 1, 1, 2])
+})
+
+test('an interruption after a ledger write preserves both token counts and call sequences on resume', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'factory-subagents-')), 'state.json')
+  const ledger = fileLedger(path)
+  const interrupted: Ledger = {
+    get: ledger.get,
+    put(key, value) {
+      ledger.put(key, value)
+      throw new Error('host interrupted')
+    },
+  }
+  const first = subagentLimits(interrupted, 'lead', roomy)
+  first.begin('task')
+  assert.throws(() => first.observe([call('s1', 1)]), /host interrupted/)
+
+  // Resume from the durable state after the first write, before any subsequent write.
+  const durable = fileLedger(path)
+  const resumed = subagentLimits(durable, 'lead', roomy)
+  resumed.begin('task')
+  resumed.observe([call('s1', 1)])
+  assert.deepEqual(durable.get(subagentKey('lead')), {
+    turns: { task: { started: [], running: [], tokens: 12 } },
+    seen: { s1: 1 },
+  })
+})
+
+test('a republished model call of an earlier root turn adds nothing to the later turn', () => {
+  const ledger = fileLedger(join(mkdtempSync(join(tmpdir(), 'factory-subagents-')), 'state.json'))
+  const limits = subagentLimits(ledger, 'lead', roomy)
+  limits.begin('task')
+  limits.observe([call('s1', 1), call('s1', 2)])
+  limits.begin('nudge')
+  limits.observe([call('s1', 1), call('s1', 2)])
+  assert.equal(ledger.get<SubagentRecord>(subagentKey('lead'))?.turns.task?.tokens, 24)
+  assert.equal(ledger.get<SubagentRecord>(subagentKey('lead'))?.turns.nudge?.tokens ?? 0, 0)
+})
+
+test('the token limit counts inclusive input without adding cached tokens twice', () => {
+  const ledger = fileLedger(join(mkdtempSync(join(tmpdir(), 'factory-subagents-')), 'state.json'))
+  const limits = subagentLimits(ledger, 'lead', roomy)
+  limits.begin('task')
+  limits.observe([
+    // input_tokens includes 10 plain, 90 cached, and 5 cache-write tokens.
+    call('s1', 1, false, { input_tokens: 105, output_tokens: 4, input_tokens_details: { cached_tokens: 90, cache_write_tokens: 5 } }),
+    // input_tokens with the cached tokens: 100 + 4.
+    call('s1', 2, false, { input_tokens: 100, output_tokens: 4, input_tokens_details: { cached_tokens: 90, cache_write_tokens: 5 } }),
+  ])
+  assert.equal(ledger.get<SubagentRecord>(subagentKey('lead'))?.turns.task?.tokens, 213)
 })
