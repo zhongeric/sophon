@@ -3,7 +3,7 @@ import { writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { callRunTests, commandChecker, isProtected } from '../src/core/checks.ts'
+import { callRunTests, commandChecker, isProtected, protectedEntries } from '../src/core/checks.ts'
 import { gitRepo } from '../src/node/git.ts'
 import { localMachine, runCommand } from '../src/node/machine.ts'
 import { loadRepoConfig } from '../src/node/platform.ts'
@@ -70,6 +70,12 @@ test('the config file and its protect entries are protected', () => {
   assert.equal(isProtected(config, '/ci/check.sh'), true)
   assert.equal(isProtected(config, '/package.json'), true)
   assert.equal(isProtected(config, '/src/package.json'), false)
+})
+
+test('the protected entries are the config file, then the protect entries', () => {
+  assert.deepEqual(protectedEntries({ stack: 'TypeScript', checks: {}, protect: ['ci/', 'package.json'] }), ['.agent-factory.json', 'ci/', 'package.json'])
+  assert.deepEqual(protectedEntries({ stack: 'TypeScript', checks: {}, protect: [] }), ['.agent-factory.json'])
+  assert.deepEqual(protectedEntries({ stack: 'TypeScript', checks: {} }), ['.agent-factory.json'])
 })
 
 test('a star in a protect entry matches characters in one path segment', () => {

@@ -80,6 +80,8 @@ Each stage below lists who does the work, what the host enforces, and where the 
   Done-looks-like is a list of acceptance checks. Each check is a command (a test, a typecheck, a CI job) or a
   statement that the intent reviewer verifies later.
 - **Rails:** the host refuses a plan without all four parts, or with a done-looks-like that has no checkable item.
+  The host also refuses a plan with a task whose files include a protected path, because the host refuses each write
+  to it.
   Profiles add plan sections. For example, a Solidity plan must list interfaces before implementations and the
   deployment sequence.
 - **One planner, not four in parallel (D7).** Each part sets limits on the other parts.
