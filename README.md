@@ -162,6 +162,62 @@ of that field. `"tests": null` or `"setup": ""` turns a default off. For example
 - `setup` runs one time in each new worktree before its first check, for example
   `"npm ci --prefer-offline --no-audit --no-fund"` or `"forge install"`. Worktrees start without dependencies.
 
+A research notebook adds a `research` field (section 6.3 of
+[docs/specs/research-workflow.md](docs/specs/research-workflow.md)). No workflow uses it yet. When the field is bad,
+each run that reads the config stops before it starts. An unknown key is an error at each level.
+
+```json
+{
+  "research": {
+    "egress": ["archive.example.org", "export.arxiv.org"],
+    "holdout": "research/holdout.json",
+    "lenses": { "survey": ["literature", "known objects"], "skeptic": ["systematics", "statistics"] },
+    "guides": "research/guides",
+    "checklist": "research/checklist.md",
+    "prereg_sections": ["Known set", "Injection grid", "Holdout"],
+    "commands": {
+      "known": "python -m search.known {prereg}",
+      "inject": "python -m search.inject {prereg}",
+      "sweep": "python -m search.sweep {prereg} {partition}",
+      "evaluate": "python -m search.evaluate {prereg}",
+      "reproduce": "python -m search.reproduce {prereg}"
+    },
+    "credentials": { "archive.example.org": { "header": "X-API-Key", "secret": "ARCHIVE_API_KEY" } }
+  }
+}
+```
+
+- `egress` is a list of host names, for example `archive.example.org`. Do not write a scheme, path, port, user or
+  query. The host changes each name to lowercase. Each name can occur only one time.
+- `lenses.survey`, `lenses.skeptic` and `prereg_sections` are lists of names. Each list must have one or more names.
+- `holdout`, `checklist` and `guides` are paths relative to the repository root. An absolute path, a backslash, and
+  a `..` above the root are errors. The host removes `.`, `..` and extra `/`.
+- `commands` must have `known`, `inject`, `evaluate` and `reproduce`. `sweep` is optional. A placeholder is
+  `{name}` without a `$` before it, thus a shell `${VAR}` is not a placeholder. Commands can use `{prereg}`, the path of
+  the frozen prereg. Only `sweep` can also use `{partition}`. A command can have no placeholder.
+- `credentials` is optional. Each key is a host of `egress`. `header` is the name of an HTTP header. `secret` is the
+  name of a host environment variable that holds the value. Do not write the value in the file. `secret` cannot name
+  a secret of agent-factory, for example `GITHUB_TOKEN`.
+- The `checklist` file is Markdown. Each top-level list item is one checklist item, with its indented lines.
+- The `guides` directory holds the domain guides. The host reads each `.md` file directly in the directory.
+- The host does not read a symlink as a file or a directory, on Cloudflare and locally.
+
+The `holdout` file is JSON with two lists. Each list must have one or more strings. Other keys are errors.
+
+```json
+{
+  "refuse": ["https://archive.example.org/api/target?id=42"],
+  "targets": ["T-42"]
+}
+```
+
+- `refuse` holds the URL prefixes that the egress refuses to agents. Each prefix is an `https` URL. Its host must be a
+  host of `egress`, not a subdomain of it. A prefix cannot have a user, a password or a fragment. The host gives each
+  prefix in the normalized URL form, with a lowercase host and without the default port.
+- `targets` holds the IDs of the holdout targets.
+
+A missing or bad holdout file, checklist or guides directory stops the run with the path of the file.
+
 ## Local usage
 
 ```bash
@@ -356,6 +412,7 @@ src/core/                  platform-neutral: it typechecks without Node types (t
   workspace.ts             the agent shell and the rails: read-only, protected paths, no symlink writes, .git hidden
   findings.ts gate.ts      the evidence check; the gate that holds findings for your decision
   questions.ts checks.ts   questions and /answer parsing; repository config and command checks
+  research.ts              the research field of the config, and the loader of its holdout, checklist and guides
 src/node/                  the CLIs: git worktrees and branches, local machine, terminal/file/gh channels, PRs and
                            CI through gh, nc plan login. develop.ts runs the development workflow, remote.ts
                            drives the deployed Worker

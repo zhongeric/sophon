@@ -1,6 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { Checker, Repo } from './platform.ts'
 import { profileDefaults, type RootFiles } from './profiles.ts'
+import { parseResearchConfig, type ResearchConfig } from './research.ts'
 import { hostSecrets } from './secrets.ts'
 import { StopError } from './stop.ts'
 
@@ -22,6 +23,8 @@ export type RepoConfig = {
   /** GitHub logins whose PR replies answer questions. */
   answerers?: string[]
   timeout_ms?: number
+  /** The domain of a research notebook: section 6.3 of docs/specs/research-workflow.md. */
+  research?: ResearchConfig
 }
 
 export const repoConfigFile = '.agent-factory.json'
@@ -32,6 +35,7 @@ export function parseRepoConfig(text: string, source: string): Partial<RepoConfi
   if (config.checks !== undefined && (typeof config.checks !== 'object' || config.checks === null))
     throw new StopError(`${source}: checks must be an object of named commands`)
   if (config.tests && !/\{tests?\}/.test(config.tests.command)) throw new StopError(`${source}: tests.command needs {test} or {tests}`)
+  if (config.research !== undefined) config.research = parseResearchConfig(config.research, source)
   return config
 }
 
