@@ -158,6 +158,8 @@ export async function runTurn<T>(
       if (report.status !== 'completed') throw new Error(`${spec.id}: turn ${report.status}: ${JSON.stringify(report.error ?? null)}`)
       // The first turn keeps the nudge request ID of earlier runs, so that their journals resume.
       const nudge = request === 'task' ? 'nudge' : `${request}-nudge`
+      // The nudge is a new agent turn, so the budget check applies to it too.
+      await host.beforeTurn?.()
       failed = (await agent.ask(nudge, `You ended the turn without calling ${tool}. Call tools.${tool} now.`)).status === 'failed'
     }
   } finally {

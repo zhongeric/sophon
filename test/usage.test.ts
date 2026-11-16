@@ -16,7 +16,6 @@ import {
   parsePrices,
   recordUsage,
   resolveBudget,
-  runUsage,
   spendOf,
   usageOf,
   usageSection,
@@ -98,8 +97,8 @@ test('recordUsage sums each agent and the run, counts missing fields as zero, an
   const other = [call('r3', 1, { input_tokens: 7, output_tokens: 3 })]
   const expected = {
     agents: [
-      { id: 'a', model: 'm1', tokens: { input: 105, cached: 40, cache_write: 10, output: 20 } },
-      { id: 'b', model: 'm2', tokens: { input: 7, cached: 0, cache_write: 0, output: 3 } },
+      { step: 'a', model: 'm1', tokens: { input: 105, cached: 40, cache_write: 10, output: 20 } },
+      { step: 'b', model: 'm2', tokens: { input: 7, cached: 0, cache_write: 0, output: 3 } },
     ],
     total: { input: 112, cached: 40, cache_write: 10, output: 23 },
   }
@@ -131,10 +130,10 @@ test('the Usage section shows each step, no price, a precomputed row, the total 
   const spend = spendOf(ledger, prices)
   assert.deepEqual(spend.unpriced, ['m2'])
   assert.ok(Math.abs(spend.usd - 0.0045) < 1e-12)
-  assert.deepEqual(runUsage(ledger, prices), { tokens: { input: 1010, cached: 0, cache_write: 0, output: 101 }, ...spend })
+  assert.deepEqual(usageOf(ledger).total, { input: 1010, cached: 0, cache_write: 0, output: 101 })
 
   const rows = [
-    ...usageOf(ledger).agents.map((agent) => ({ step: agent.id, model: agent.model, tokens: agent.tokens })),
+    ...usageOf(ledger).agents,
     { step: 'review.1', model: 'several', tokens: { input: 1, cached: 0, cache_write: 0, output: 1 }, usd: 2, unpriced: ['m3'] },
   ]
   const section = usageSection(rows, prices, { limit: 5, spent: 2.0045 }).join('\n')
@@ -209,6 +208,34 @@ test('an answer that is not a number above the spend asks again in a new batch',
   assert.deepEqual(decisions(ledger), [])
 })
 
+test('round-off at the budget asks a question and requires a higher budget', async () => {
+  const ledger = memoryLedger()
+  const prices = { m1: { input: 100_000, cached_input: 0, cache_write: 0, output: 0 } }
+  recordUsage(ledger, 'a', 'm1', [call('r1', 1, { input_tokens: 2 })])
+  const { channel, posted, replies } = scriptedChannel()
+  const gate = budgetGate({ ledger, prices, channel, runId: 'round-off', extraSpend: () => 0.7, log: () => {} })
+  assert.equal(gate.spent(), 0.2 + 0.7)
+  resolveBudget(ledger, 0.900001)
+  await gate.check()
+  assert.equal(posted.length, 0)
+
+  resolveBudget(ledger, 0.9)
+  await assert.rejects(gate.check(), PausedError)
+  assert.equal(posted.length, 1)
+  const first = posted[0]
+  assert.ok(first)
+  replies[first.batch] = '/answer\nQ1: 0.9'
+  await assert.rejects(gate.check(), PausedError)
+  assert.equal(posted.length, 2)
+  const second = posted[1]
+  assert.ok(second)
+  replies[second.batch] = '/answer\nQ1: 1.2'
+  await gate.check()
+  await gate.check()
+  assert.equal(gate.limit(), 1.2)
+  assert.equal(posted.length, 2)
+})
+
 test('stop, the stop option and /answer recommended stop the run at the budget', async () => {
   for (const reply of ['/answer\nQ1: stop', '/answer\nQ1: b', '/answer recommended']) {
     const { ledger, posted, replies, gate } = spentTen()
@@ -256,6 +283,20 @@ test('a new given budget replaces the recorded one; the same value keeps a raise
   resolveBudget(paused.ledger, 11)
   await paused.gate().check()
   assert.equal(paused.posted.length, 1)
+})
+
+test('a budget of the current invocation applies also when it is the same as the first given value', async () => {
+  const { ledger, posted, replies, gate } = spentTen()
+  assert.equal(resolveBudget(ledger, 5), 5)
+  await assert.rejects(gate().check(), PausedError)
+  replies[posted[0]!.batch] = '/answer\nQ1: 12'
+  await gate().check()
+  assert.equal(resolveBudget(ledger, 5), 12)
+  // A resume with --budget 5 lowers the budget again, and a later resume without --budget keeps it.
+  assert.equal(resolveBudget(ledger, 5, 5), 5)
+  assert.equal(resolveBudget(fileLedgerCopy(ledger), 5), 5)
+  await assert.rejects(gate().check(), PausedError)
+  assert.equal(posted.length, 2)
 })
 
 /** The same state in a new ledger object, as a resumed run reads it. */

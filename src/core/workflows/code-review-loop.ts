@@ -10,7 +10,7 @@ import { asker, decisions, type Answer, type Channel } from '../questions.ts'
 import { roles, type ModelChoice } from '../roles.ts'
 import { askQuestions, intent, light, patch, review, splitReview, type LightLog, type PatchLog, type PatchOutcome, type Range, type RunContext, type Verdict } from '../steps.ts'
 import { StopError } from '../stop.ts'
-import { agentRows, BudgetStop, budgetGate, checkPriced, resolveBudget, runUsage, usageSection, type Prices, type RunUsage } from '../usage.ts'
+import { BudgetStop, budgetGate, checkPriced, resolveBudget, spendOf, usageOf, usageSection, type Prices, type RunUsage } from '../usage.ts'
 
 export type LoopModels = {
   step1: Record<'minimize' | 'rules' | 'bugs' | 'anti-slop' | 'patch' | 'questions', ModelChoice>
@@ -68,7 +68,7 @@ const choices = (models: LoopModels) => [...Object.values(models.step1), ...Obje
 export const loopModelIds = (models: LoopModels) => choices(models).map((choice) => choice.model)
 
 export function checkAllowedModels(models: LoopModels, allowed = defaultAllowedModels): void {
-  const used = choices(models).map((choice) => choice.model)
+  const used = loopModelIds(models)
   const refused = [...new Set(used.filter((model) => !allowed.includes(model)))]
   if (refused.length > 0) throw new StopError(`models outside the allowed list (${allowed.join(', ')}): ${refused.join(', ')}`)
 }
@@ -110,6 +110,10 @@ export type LoopInput = {
   full?: boolean
   /** The cost budget in USD. At the budget, the run asks the user to raise it or to stop. */
   budget?: number
+  /** A budget of the current invocation, for example --budget on a resume. It replaces the budget, and the ledger does not record it. */
+  budgetOverride?: number
+  /** Stop at the budget without a question, because the development run that started this loop asks with the run totals. */
+  stopAtBudget?: boolean
 }
 
 /** What the platform supplies: a Node host on a laptop, or a Durable Object on Cloudflare. */
@@ -149,11 +153,13 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   const missing = providersOf(input.models).filter((provider) => !deps.credentials[provider])
   if (missing.length > 0) throw new StopError(`no credential for ${missing.join(', ')}`)
   const prices = deps.prices ?? {}
-  if (resolveBudget(deps.ledger, input.budget) !== undefined) checkPriced(loopModelIds(input.models), prices)
+  if (resolveBudget(deps.ledger, input.budget, input.budgetOverride) !== undefined) checkPriced(loopModelIds(input.models), prices)
 
   const { ledger, repo } = deps
-  const budget = budgetGate({ channel: deps.channel, ledger, log: deps.log, prices, runId: input.runId })
-  ledger.put('input', input)
+  const budget = budgetGate({ channel: deps.channel, ledger, log: deps.log, prices, recommend: input.stopAtBudget === true, runId: input.runId })
+  // A resume without --budget must not apply the override again, so the recorded input does not keep it.
+  const { budgetOverride, ...recorded } = input
+  ledger.put('input', recorded)
   const frozen = await step(ledger, 'freeze', () => repo.freeze())
   const stack = input.stack ?? input.config.stack
   // Triage also sees deleted files and the old path of each rename, so that a removal of code gets the full loop.
@@ -309,7 +315,8 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
 
   const usage = () => {
     const limit = budget.limit()
-    return { lines: usageSection(agentRows(ledger), prices, limit === undefined ? undefined : { limit, spent: budget.spent() }), run: runUsage(ledger, prices) }
+    const { agents, total } = usageOf(ledger)
+    return { lines: usageSection(agents, prices, limit === undefined ? undefined : { limit, spent: budget.spent() }), run: { tokens: total, ...spendOf(ledger, prices) } }
   }
   const reviewed = async () => {
     const { current, step2Ran, steps } = triaged.path === 'light' ? await lightLoop() : await fullLoop()
@@ -320,23 +327,23 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       triaged.path === 'full' ? await step(ledger, 'intent', () => intent(context, 'intent', input.models.step2.intent, { from: frozen.base, to: current })) : null
     return { current, step2Ran, steps, checks, verdict }
   }
-  let run: Awaited<ReturnType<typeof reviewed>>
+  let outcome: Awaited<ReturnType<typeof reviewed>>
   try {
-    run = await reviewed()
+    outcome = await reviewed()
   } catch (error) {
     if (!(error instanceof BudgetStop)) throw error
     // The user stopped the run at the cost budget: no PASS and no ship. The fixes so far stay on the branch.
     const current = await repo.head()
     const criteria: Criterion[] = [{ name: 'Run inside the cost budget', ok: false, detail: error.message }]
-    const spent = usage()
+    const usageReport = usage()
     const note = `The run ${error.message}. Reason: cost budget.`
     const steps = ['- The run stopped at the cost budget before the steps finished.']
-    const report = renderReport({ input, frozen, current, pass: false, criteria, triage: triaged, steps, checks: null, verdict: null, decisions: decisions(ledger), usage: spent.lines, note })
+    const report = renderReport({ input, frozen, current, pass: false, criteria, triage: triaged, steps, checks: null, verdict: null, decisions: decisions(ledger), usage: usageReport.lines, note })
     deps.files.write('report.md', report)
-    ledger.put('result', { pass: false, criteria, final: current, usage: spent.run, stopped: true })
-    return { pass: false, criteria, branch: frozen.branch, final: current, report, usage: spent.run, stopped: true }
+    ledger.put('result', { pass: false, criteria, final: current, usage: usageReport.run, stopped: true })
+    return { pass: false, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: true }
   }
-  const { current, step2Ran, steps, checks, verdict } = run
+  const { current, step2Ran, steps, checks, verdict } = outcome
 
   const criteria = evaluate({ checks, gateLog: deps.files.exists(gateLog), rejections, step2Ran, verdict })
   const pass = criteria.every((criterion) => criterion.ok)
@@ -346,11 +353,11 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     criteria.push({ name: 'PR is ready, not draft', ok: true, detail: `pushed to ${headRef} and marked #${pr} ready` })
   }
 
-  const spent = usage()
-  const report = renderReport({ input, frozen, current, pass, criteria, triage: triaged, steps, checks, verdict, decisions: decisions(ledger), usage: spent.lines, note: null })
+  const usageReport = usage()
+  const report = renderReport({ input, frozen, current, pass, criteria, triage: triaged, steps, checks, verdict, decisions: decisions(ledger), usage: usageReport.lines, note: null })
   deps.files.write('report.md', report)
-  ledger.put('result', { pass, criteria, final: current, usage: spent.run, stopped: false })
-  return { pass, criteria, branch: frozen.branch, final: current, report, usage: spent.run, stopped: false }
+  ledger.put('result', { pass, criteria, final: current, usage: usageReport.run, stopped: false })
+  return { pass, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: false }
 }
 
 function familyHeader(label: string, models: Record<string, ModelChoice>): string {

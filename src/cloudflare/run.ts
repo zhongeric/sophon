@@ -17,9 +17,10 @@ export { allowedUsers, type Env } from './runs.ts'
 
 /**
  * `ask` replaces the PR title and body as the original ask, for a review that the development workflow starts.
- * `budget` is the cost budget in USD.
+ * `budget` is the cost budget in USD. With `stopAtBudget`, the run stops at the budget without a question, because the
+ * development run that started it asks with the run totals.
  */
-export type StartRequest = PullRequest & { ship: boolean; by: string; full?: boolean; ask?: string; budget?: number }
+export type StartRequest = PullRequest & { ship: boolean; by: string; full?: boolean; ask?: string; budget?: number; stopAtBudget?: boolean }
 
 /** A finished review as the development workflow needs it: the fixes as a commit on GitHub. */
 export type ReviewOutcome = { waiting: string } | (LoopResult & { waiting?: undefined })
@@ -108,6 +109,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
       ...(request.ship ? { ship: { headRef: view.head.ref, pr: request.pr } } : {}),
       ...(request.full ? { full: true } : {}),
       ...(request.budget !== undefined ? { budget: request.budget } : {}),
+      ...(request.stopAtBudget ? { stopAtBudget: true } : {}),
     }
   }
 }

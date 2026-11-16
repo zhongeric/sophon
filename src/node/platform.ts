@@ -163,7 +163,9 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
       const source = { repo: options.repo, base: input.base, head }
       const run = await nodeRun({ config: input.config, runId, runsDir: options.runsDir, source })
       run.ledger.put('git', source)
-      const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}), ...(budget !== undefined ? { budget } : {}) }
+      const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}), ...(budget !== undefined ? { budgetOverride: budget } : {}), stopAtBudget: true }
+      // The pass runs again after a raise with a new remaining budget, so the budget is an override, not the recorded value.
+      // At the budget, the pass stops without a question, and the development run asks with the run totals.
       return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr) })
     },
     ci: options.ci,

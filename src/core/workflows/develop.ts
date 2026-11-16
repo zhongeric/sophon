@@ -10,7 +10,7 @@ import type { Credentials, Provider } from '../providers.ts'
 import { asker, commentLimit, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
-import { agentRows, BudgetStop, budgetGate, checkPriced, resolveBudget, usageSection, zeroTokens, type Prices, type RunUsage, type UsageRow } from '../usage.ts'
+import { BudgetStop, belowBudget, budgetGate, checkPriced, resolveBudget, usageOf, usageSection, zeroTokens, type Prices, type RunUsage, type UsageRow } from '../usage.ts'
 import { checkAllowedModels, checkFamilySwap, defaultAllowedModels, loopModelIds, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
 
 export type DevelopModels = Record<'intake' | 'spec' | 'planner' | 'builder', ModelChoice>
@@ -41,6 +41,8 @@ export type DevelopInput = {
   parallel?: number
   /** The cost budget in USD, for the development agents and the review loop together. */
   budget?: number
+  /** A budget of the current invocation, for example --budget on a resume. It replaces the budget, and the ledger does not record it. */
+  budgetOverride?: number
 }
 
 /** `budget` is what remains of the development budget, so that the review loop stays inside it. */
@@ -84,7 +86,7 @@ const defaultParallel = 3
 
 type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failures: string }
 /** A review pass. Records of older runs have no usage: it counts as zero. */
-type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage; stopped?: boolean }
+type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage }
 
 /** The providers of every model that a development run uses: the development roles and the review loop. */
 export function developProviders(models: DevelopInput['models']): Set<Provider> {
@@ -124,24 +126,27 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const missing = [...developProviders(input.models)].filter((provider) => !deps.credentials[provider])
   if (missing.length > 0) throw new StopError(`no credential for ${missing.join(', ')}`)
   const prices = deps.prices ?? {}
-  if (resolveBudget(deps.ledger, input.budget) !== undefined)
+  if (resolveBudget(deps.ledger, input.budget, input.budgetOverride) !== undefined)
     checkPriced([...Object.values(input.models.develop).map((choice) => choice.model), ...loopModelIds(input.models.review)], prices)
 
   const { ledger, branches, pulls } = deps
   const models = input.models.develop
   // What the report shows. Each stage fills its part.
-  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [] }
+  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [], stoppedReview: null }
+  const spentPasses = () => [...state.reviews, ...(state.stoppedReview ? [state.stoppedReview] : [])]
   // The review passes keep their usage in their own ledgers, so their spend counts here as extra spend.
   const budget = budgetGate({
     channel: deps.channel,
-    extraSpend: () => state.reviews.reduce((sum, review) => sum + (review.usage?.usd ?? 0), 0),
+    extraSpend: () => spentPasses().reduce((sum, review) => sum + (review.usage?.usd ?? 0), 0),
     ledger,
     log: deps.log,
     prices,
     recommend: input.hotfix === true,
     runId: input.runId,
   })
-  ledger.put('input', input)
+  // A resume without --budget must not apply the override again, so the recorded input does not keep it.
+  const { budgetOverride, ...recorded } = input
+  ledger.put('input', recorded)
   const view = await branches.view(input.base)
   const active = profilesById(await step(ledger, 'profiles', async () => (await presentProfiles(async (path) => (await view.stat(`/${path}`)) !== null)).map((profile) => profile.id)))
   const context: DevelopContext = {
@@ -160,7 +165,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
 
   const finish: Finish = async (status, criteria, note, resumable = false) => {
     const limit = budget.limit()
-    const usage = usageSection([...agentRows(ledger), ...state.reviews.map(reviewRow)], prices, limit === undefined ? undefined : { limit, spent: budget.spent() })
+    const usage = usageSection([...usageOf(ledger).agents, ...spentPasses().map(reviewRow)], prices, limit === undefined ? undefined : { limit, spent: budget.spent() })
     const report = renderReport(state, status, criteria, note, decisions(ledger), usage)
     deps.files.write('report.md', report)
     // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
@@ -285,19 +290,31 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   if (ci.state === 'fail') return finish('blocked', [], `CI is still red on ${ci.sha.slice(0, 12)} after ${ciFixRounds} fix rounds.`)
 
   // 4 and 5. Freeze and the review loop, once or twice. The frozen package is the ask, the decisions and the plan.
+  // A pass that stops at its budget is not a finished step: the budget gate of this run asks with the run totals.
+  // After a raise, or on a resume with a higher budget, the same pass runs again with the new remaining budget.
   let head = ci.sha
   for (let pass = 1; pass <= routed.passes; pass++) {
     const at = head
+    const stoppedKey = `review-stopped.${pass}`
     const review = await step(ledger, `review.${pass}`, async (): Promise<Review> => {
-      await budget.check()
-      // After the check, the spend is below the limit, so the remaining budget is positive.
-      const limit = budget.limit()
-      const remaining = limit === undefined ? {} : { budget: limit - budget.spent() }
-      const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, full: input.full === true, pr: state.pr!.number, ...remaining })
-      return { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage, stopped: loop.stopped }
+      state.stoppedReview = ledger.get<Review>(stoppedKey) ?? null
+      for (;;) {
+        await budget.check()
+        // After the check, the spend is below the limit, so the remaining budget is positive. The ledger of the pass
+        // already counts the spend of its stopped attempt, so that spend is not taken from the remaining budget.
+        const limit = budget.limit()
+        const remaining = limit === undefined ? {} : { budget: limit - budget.spent() + (state.stoppedReview?.usage?.usd ?? 0) }
+        const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, full: input.full === true, pr: state.pr!.number, ...remaining })
+        const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage }
+        if (!loop.stopped) return result
+        ledger.put(stoppedKey, result)
+        state.stoppedReview = result
+        // Below the run budget, no raise can let the pass go on, for example when the user stopped the pass itself.
+        if (limit === undefined || belowBudget(budget.spent(), limit)) throw new BudgetStop(`stopped at the cost budget in review loop pass ${pass}`)
+      }
     })
+    state.stoppedReview = null
     state.reviews.push(review)
-    if (review.stopped) return finish('stopped', [], `You stopped review loop pass ${pass} at its budget. Reason: cost budget. The PR stays draft.`)
     if (review.final !== at) {
       await step(ledger, `merge.review.${pass}`, async () => {
         await dev.merge(review.final, `agent-factory: review loop fixes, pass ${pass} (${input.runId})`)
@@ -441,6 +458,8 @@ type ReportState = {
   fixes: BuildLog[]
   cis: Ci[]
   reviews: Review[]
+  /** The review pass that stopped at its budget. Its spend counts until the pass runs again and finishes. */
+  stoppedReview: Review | null
 }
 
 /** One row of the Usage section for a review pass, with the tokens and USD of all its agents. */

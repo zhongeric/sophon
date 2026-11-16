@@ -45,14 +45,13 @@ export function parsePrices(setting: string | undefined): Prices {
   const prices: Prices = {}
   for (const [model, entry] of Object.entries(parsed)) {
     if (!isObject(entry)) throw new StopError(`MODEL_PRICES: ${model} must be an object with ${priceFields.join(', ')}`)
-    const price = zeroPrice()
-    for (const field of priceFields) {
+    const price = (field: (typeof priceFields)[number]): number => {
       const value = entry[field]
       if (typeof value !== 'number' || !Number.isFinite(value) || value < 0)
         throw new StopError(`MODEL_PRICES: ${model}.${field} must be a non-negative number of USD per million tokens`)
-      price[field] = value
+      return value
     }
-    prices[model] = price
+    prices[model] = { input: price('input'), cached_input: price('cached_input'), cache_write: price('cache_write'), output: price('output') }
   }
   return prices
 }
@@ -121,15 +120,10 @@ type InnerEvent = {
   }
 }
 
-/** The token sums of each agent and of the run. */
-export function usageOf(ledger: Ledger): { agents: { id: string; model: string; tokens: Tokens }[]; total: Tokens } {
+/** The token sums of the run, and one row of the Usage section for each agent. */
+export function usageOf(ledger: Ledger): { agents: UsageRow[]; total: Tokens } {
   const record = usageRecord(ledger)
-  return { agents: Object.entries(record.agents).map(([id, agent]) => ({ id, model: agent.model, tokens: agent.tokens })), total: record.total }
-}
-
-/** The rows of the Usage section for the agents of this ledger, one row for each agent. */
-export function agentRows(ledger: Ledger): UsageRow[] {
-  return usageOf(ledger).agents.map((agent) => ({ step: agent.id, model: agent.model, tokens: agent.tokens }))
+  return { agents: Object.entries(record.agents).map(([step, agent]) => ({ step, model: agent.model, tokens: agent.tokens })), total: record.total }
 }
 
 /** The estimated USD of the priced agents, and the models without a price. */
@@ -144,11 +138,7 @@ export function spendOf(ledger: Ledger, prices: Prices): { usd: number; unpriced
   return { usd, unpriced: [...unpriced] }
 }
 
-export function runUsage(ledger: Ledger, prices: Prices): RunUsage {
-  return { tokens: usageOf(ledger).total, ...spendOf(ledger, prices) }
-}
-
-export const formatUsd = (usd: number) => `$${usd.toFixed(usd < 1 ? 4 : 2)}`
+const formatUsd = (usd: number) => `$${usd.toFixed(usd < 1 ? 4 : 2)}`
 
 /** The Markdown lines of the Usage section of a report. */
 export function usageSection(rows: UsageRow[], prices: Prices, budget?: { limit: number; spent: number }): string[] {
@@ -173,7 +163,7 @@ export function usageSection(rows: UsageRow[], prices: Prices, budget?: { limit:
     '| Step | Model | Input | Cached | Cache write | Output | USD |',
     '| --- | --- | ---: | ---: | ---: | ---: | ---: |',
     ...lines,
-    tableRow('**Total**', '', total, `${formatUsd(usd)}${unpriced.size > 0 ? ` (${unpriced.size} models without a price)` : ''}`),
+    tableRow('**Total**', '', total, `${formatUsd(usd)}${unpriced.size > 0 ? ` (${unpriced.size} ${unpriced.size === 1 ? 'model' : 'models'} without a price)` : ''}`),
     ...(budget ? ['', `Budget: ${formatUsd(budget.limit)}. Spent: ${formatUsd(budget.spent)}.`] : []),
   ]
 }
@@ -182,20 +172,29 @@ const tableRow = (step: string, model: string, tokens: Tokens, usd: string) =>
   `| ${step} | ${model} | ${tokens.input} | ${tokens.cached} | ${tokens.cache_write} | ${tokens.output} | ${usd} |`
 
 /**
- * The budget of the run, kept in the ledger. A given value that is not the last given value replaces the budget,
- * so a new value on resume applies. Without a new value, the recorded budget or the last raise stays.
+ * The budget of the run, kept in the ledger. `override` comes from the current invocation, for example --budget on a
+ * resume, and always replaces the budget. `recorded` comes from the recorded input. It replaces the budget only when
+ * it is not the last recorded value, so that a resume without a new value keeps the recorded budget or the last raise.
  */
-export function resolveBudget(ledger: Ledger, given: number | undefined): number | undefined {
+export function resolveBudget(ledger: Ledger, recorded: number | undefined, override?: number): number | undefined {
   const state = budgetState(ledger)
-  if (given === undefined || given === state.given) return state.limit
+  const value = override ?? (recorded === state.given ? undefined : recorded)
+  if (value === undefined) return state.limit
+  if (value === state.limit && recorded === state.given) return value
   // A new round, so that a later question does not read the answers of a question about the old budget.
-  ledger.put(budgetKey, { limit: given, given, round: state.round + 1 } satisfies BudgetState)
-  return given
+  ledger.put(budgetKey, { limit: value, given: recorded, round: state.round + 1 } satisfies BudgetState)
+  return value
 }
 
 /** The user chose to stop the run at the cost budget. */
 export class BudgetStop extends Error {
   override name = 'BudgetStop'
+}
+
+/** Treat round-off near the limit as an exhausted budget. */
+export function belowBudget(spent: number, limit: number): boolean {
+  const tolerance = 8 * Number.EPSILON * Math.max(Math.abs(spent), Math.abs(limit))
+  return limit - spent > tolerance
 }
 
 const raiseOption = 'Raise the budget (write the new USD number)'
@@ -214,7 +213,7 @@ export function budgetGate(options: {
   log(line: string): void
   /** USD that the ledger does not record, for example finished review passes. */
   extraSpend?: () => number
-  /** Take the recommendation without a question, as in a hotfix run. */
+  /** Stop at the budget without a question, as in a hotfix run, because the recommendation is to stop. */
   recommend?: boolean
 }) {
   const { ledger, prices } = options
@@ -227,7 +226,10 @@ export function budgetGate(options: {
     for (;;) {
       const state = budgetState(ledger)
       const now = spent()
-      if (state.limit === undefined || now < state.limit) return
+      if (state.limit === undefined || belowBudget(now, state.limit)) return
+      const stop = new BudgetStop(`stopped at the cost budget: spent ${formatUsd(now)} of ${formatUsd(state.limit)}`)
+      // A hotfix run takes the recommendation, and the recommendation is to stop.
+      if (options.recommend) throw stop
       const batch = `budget.${state.round}`
       const questions: Question[] = [
         {
@@ -238,18 +240,12 @@ export function budgetGate(options: {
           recommendation: stopOption,
         },
       ]
-      let answer: string
-      if (options.recommend) {
-        answer = ask.recommend(batch, questions)[0]?.answer ?? stopOption
-      } else {
-        await ask.post(batch, questions)
-        answer = (await ask.wait(batch))[0]?.answer ?? stopOption
-      }
-      const text = answer.trim()
-      if (text === stopOption || /^stop\b/i.test(text)) throw new BudgetStop(`stopped at the cost budget: spent ${formatUsd(now)} of ${formatUsd(state.limit)}`)
+      await ask.post(batch, questions)
+      const text = ((await ask.wait(batch))[0]?.answer ?? stopOption).trim()
+      if (text === stopOption || /^stop\b/i.test(text)) throw stop
       const raised = /^\$?\s*(\d+(?:\.\d+)?)$/.exec(text)
       const value = raised ? Number(raised[1]) : Number.NaN
-      if (value > now) {
+      if (belowBudget(now, value)) {
         ledger.put(budgetKey, { ...state, limit: value, round: state.round + 1 } satisfies BudgetState)
         options.log(`budget raised to ${formatUsd(value)}`)
         return
@@ -262,7 +258,7 @@ export function budgetGate(options: {
   return {
     check(): Promise<void> {
       const current = limit()
-      if (current === undefined || spent() < current) return Promise.resolve()
+      if (current === undefined || belowBudget(spent(), current)) return Promise.resolve()
       pending ??= settle().finally(() => {
         pending = undefined
       })
@@ -284,5 +280,3 @@ function budgetState(ledger: Ledger): BudgetState {
 const count = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0)
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
-
-const zeroPrice = (): ModelPrice => ({ input: 0, cached_input: 0, cache_write: 0, output: 0 })

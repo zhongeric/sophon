@@ -93,6 +93,39 @@ test('a rejected beforeTurn opens no agent, and a completed turn leaves the usag
   assert.deepEqual(await runTurn(host, spec, 'Write a note.', 'submit_note'), { note: 'done' })
   // Two model calls (the cell and the final text), each with input 8 and output 4.
   const tokens = { input: 16, cached: 0, cache_write: 0, output: 8 }
-  assert.deepEqual(usageOf(host.ledger), { agents: [{ id: 'note', model: 'gpt-5.5', tokens }], total: tokens })
+  assert.deepEqual(usageOf(host.ledger), { agents: [{ step: 'note', model: 'gpt-5.5', tokens }], total: tokens })
   assert.deepEqual(usageOf(fileLedger(join(dir, 'state.json'))).total, tokens)
+})
+
+test('the budget check also runs before the nudge turn, so a first turn that reaches the budget opens no nudge', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'factory-agent-'))
+  const turns: Turn[] = []
+  // The model ends each turn with a text and never calls the submit tool.
+  const dispatch = scriptedDispatch(() => ({ text: 'done' }), turns)
+  let checks = 0
+  const host: AgentHost = {
+    module,
+    store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
+    ledger: fileLedger(join(dir, 'state.json')),
+    credentials,
+    dispatch,
+    beforeTurn: async () => {
+      if (++checks > 1) throw new BudgetStop('over the budget')
+    },
+    log: () => {},
+  }
+  const spec: AgentSpec = {
+    id: 'note',
+    provider: 'codex',
+    model: 'gpt-5.5',
+    instructions: 'Agent role: note',
+    workspace: await createWorkspace({ repo: MemoryFileSystem.create(), review: {} }),
+    tools: submitOnce(host, 'output:note', submitNote, async (input) => input),
+  }
+
+  await assert.rejects(runTurn(host, spec, 'Write a note.', 'submit_note'), BudgetStop)
+  assert.equal(checks, 2)
+  assert.equal(turns.length, 1)
+  assert.ok(!turns.some((turn) => /You ended the turn without calling/.test(turn.request)))
+  assert.equal(host.ledger.get('retries:note:task'), undefined)
 })

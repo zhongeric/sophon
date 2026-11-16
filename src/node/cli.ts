@@ -84,7 +84,7 @@ async function main(): Promise<number> {
   const started = values.run ? resumeInput(runsDir, values.run) : await newInput(values)
   const { source } = started
   // A new budget replaces the recorded one. Without it, the recorded budget or the last raise stays.
-  const input: LoopInput = budget !== undefined ? { ...started.input, budget } : started.input
+  const input: LoopInput = budget !== undefined ? { ...started.input, budgetOverride: budget } : started.input
 
   const credentials: Credentials = {}
   for (const provider of providersOf(input.models)) credentials[provider] = credential(provider, { claudePlan: values['claude-plan'] })

@@ -235,8 +235,9 @@ number of USD above zero. Otherwise, the run stops before it starts. Without a b
   pauses with one question: raise the budget, or stop the run. Parallel agents share this one question.
 - To raise the budget, answer with a new USD number above the spend, for example `Q1: 12`. The host asks again
   when the answer is not a number above the spend.
-- The recommendation is to stop, so `/answer recommended` stops the run. A `--hotfix` development run stops at the
-  budget without a question.
+- The recommendation is to stop, so `/answer recommended` stops the run. A review pass of a development run
+  stops at its budget without a question. The development run asks the budget question with the run totals.
+  In a `--hotfix` development run, the run stops at the budget without a question.
 - A stopped review run ends with FAIL and does not ship. A stopped development run ends as stopped, and its PR stays
   draft. Both reports give the reason "cost budget" and the Usage section.
 - With `--run`, a new `--budget` replaces the recorded budget. Without `--budget`, the recorded budget or your
@@ -319,8 +320,7 @@ can. `ALLOWED_MODELS` replaces the allowed models, as on the local platform.
 
 `MODEL_PRICES` is optional. It has the same JSON as on the local platform ([Model usage and cost
 budget](#model-usage-and-cost-budget)). Set it as a Worker variable or as a secret, for example with
-`npx wrangler secret put MODEL_PRICES`. `wrangler.jsonc` does not set it, so this README is the only place that
-documents it. An invalid value stops each run before any work.
+`npx wrangler secret put MODEL_PRICES`. An invalid value stops each run before any work.
 
 Put the STE dictionary in `agents/guides/ste` before you deploy ([how](agents/guides/ste/README.md)). The Worker
 bundles it when it is there. Without it, the agents apply the STE rules without lookups.

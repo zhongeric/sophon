@@ -37,7 +37,7 @@ const commandOptions = (text: string): DevelopOptions =>
     parallel: /--parallel\s+(\d+)/.exec(text)?.[1],
   })
 
-/** The cost budget of an admin start route. The comment commands and the labels do not take a budget (decision 4 of the ask). */
+/** The cost budget of an admin start route. The comment commands and the labels do not take a budget. */
 function budgetOf(body: Record<string, unknown>): { budget?: number } | Response {
   if (body.budget === undefined) return {}
   try {
