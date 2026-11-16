@@ -7,7 +7,7 @@ import { commentChannel, commentLimit, PausedError, type Comments } from '../cor
 import { StopError } from '../core/stop.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels, type ReviewRequest } from '../core/workflows/develop.ts'
-import { boxMachine, containerBox, httpBox, syncWithSetup, type Box } from './box.ts'
+import { boxMachine, containerBox, httpBox, syncWithSetup, type Box, type SyncStore } from './box.ts'
 import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
@@ -15,24 +15,26 @@ import { githubPulls } from './pulls.ts'
 import { baseConfig } from './config.ts'
 import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
 import { sqlFiles } from './storage.ts'
+import { sqlSyncs } from './syncs.ts'
 import { encodePath } from './trees.ts'
 
 /** A development run on a GitHub issue: the issue's title and body are the ask, and its comments carry the questions. */
 export type DevelopRequest = { owner: string; repo: string; issue: number; by: string; base?: string; hotfix?: boolean; full?: boolean; parallel?: number }
 
-/** The container stops after this long without a command. A stopped container comes back empty, and the next sync copies the trees again. */
+/**
+ * The container stops after this long without a command. A stopped container comes back empty. Its start clears
+ * the sync state in SQL, so the next sync copies the trees again.
+ */
 const containerIdleMs = 30 * 60_000
 const setupTimeoutMs = 20 * 60_000
 
 /**
  * The development runs of one issue. The brain stays here: the ledger, the branches as trees in SQL, every agent
  * session, and the GitHub token. The run's Cloudflare Container only runs the repository's setup and checks on a
- * copy of each branch, so code under development never runs beside a secret.
+ * copy of each branch, so code under development never runs beside a secret. The SQL also keeps what each
+ * container directory got from its last sync, for each run. Thus a restart of this object does not cause a full copy.
  */
 export class DevelopmentRuns extends Runs<DevelopRequest> {
-  /** What each container directory holds, for the next sync. The container and this map both start empty. */
-  private synced = new Map<string, Map<string, string>>()
-
   protected number(request: DevelopRequest) {
     return request.issue
   }
@@ -50,12 +52,14 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     const { owner, repo } = request
     const log = (line: string) => console.log(`[${owner}/${repo}#${request.issue} ${run}] ${line}`)
     const sql = Sql.create(this.ctx.storage)
-    const box = this.box()
+    const syncs = sqlSyncs(this.ctx.storage.sql, run)
+    const box = this.box(syncs)
     const setup = input.config.setup
+    const pending = new Map<string, Promise<void>>()
     const checker = (branch: Branch) => {
       const dir = `work/${branch.name.replace(/[^A-Za-z0-9._-]/g, '-')}`
       // The setup runs after each full copy, so a container that came back empty installs its dependencies again.
-      const sync = () => syncWithSetup(box, this.synced, branch.tree, dir, { command: setup, timeoutMs: setupTimeoutMs })
+      const sync = () => syncWithSetup(box, syncs, pending, branch.tree, dir, { command: setup, timeoutMs: setupTimeoutMs }, log)
       return commandChecker(branch, { ...input.config, setup: undefined }, boxMachine(box, dir, sync))
     }
     const result = await develop(input, {
@@ -79,10 +83,10 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     return { passed: result.status === 'ready', summary }
   }
 
-  private box(): Box {
+  private box(syncs: SyncStore): Box {
     if (this.env.MACHINE_URL) return httpBox(this.env.MACHINE_URL)
     if (!this.ctx.container) throw new StopError('this Worker has no container for builds: add the containers section of wrangler.jsonc and deploy again')
-    return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => this.synced.clear() })
+    return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => syncs.clear() })
   }
 
   /** The review loop runs as a review run of the new PR, in that PR's own object, as a /review would. */
@@ -119,6 +123,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       models: { develop: { ...defaultDevelopModels, ...overrides.develop }, review: mergeModels(overrides) },
       runId: run,
       source: `${request.owner}/${request.repo}#${request.issue}`,
+      issue: request.issue,
       ...(request.hotfix ? { hotfix: true } : {}),
       ...(request.full ? { full: true } : {}),
       ...(request.parallel ? { parallel: request.parallel } : {}),

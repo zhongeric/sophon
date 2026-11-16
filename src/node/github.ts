@@ -1,4 +1,5 @@
 import { readCi } from '../core/ci.ts'
+import { mergePull } from '../core/merge.ts'
 import type { PullRequests } from '../core/platform.ts'
 import { gh } from './channels.ts'
 
@@ -8,6 +9,8 @@ const logTailChars = 6_000
 export function ghPullRequests(repo: string, baseRef: string): PullRequests {
   const run = gh(repo)
   const get = async <T>(path: string) => JSON.parse(await run(['api', path])) as T
+  const put = async <T>(path: string, body: Record<string, unknown>) =>
+    JSON.parse(await run(['api', path, '--method', 'PUT', ...Object.entries(body).flatMap(([key, value]) => ['-f', `${key}=${value}`])])) as T
   return {
     async open({ head, title, body }) {
       const open = JSON.parse(await run(['pr', 'list', '--head', head, '--state', 'open', '--json', 'number,url'])) as { number: number; url: string }[]
@@ -18,6 +21,9 @@ export function ghPullRequests(repo: string, baseRef: string): PullRequests {
     async ready(pr) {
       if ((JSON.parse(await run(['pr', 'view', String(pr), '--json', 'isDraft'])) as { isDraft: boolean }).isDraft) await run(['pr', 'ready', String(pr)])
     },
+    // The merge API merges immediately or refuses. gh pr merge can add the PR to a merge queue.
+    // The answer gives the merge commit, so the host does not make a second call after the merge.
+    merge: (pr, { method, sha }) => mergePull(put, get, `repos/{owner}/{repo}/pulls/${pr}`, method, sha),
     async comment(pr, body) {
       await run(['pr', 'comment', String(pr), '--body-file', '-'], body)
     },

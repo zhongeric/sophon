@@ -156,5 +156,8 @@ export function gitBranches(repo: string, dir: string): Branches {
       await git(worktreePath(dir, branch.name), 'push', 'origin', `HEAD:refs/heads/${branch.name}`)
       return branch.head()
     },
+    async deleteRemote(name) {
+      if (await remoteBranchExists(repo, name)) await git(repo, 'push', 'origin', '--delete', `refs/heads/${name}`)
+    },
   }
 }

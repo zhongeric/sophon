@@ -1,10 +1,10 @@
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../ci.ts'
-import type { RepoConfig } from '../checks.ts'
+import type { MergeMethod, RepoConfig } from '../checks.ts'
 import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
-import type { AgentStore, Branch, Branches, Checker, Files, Guides, PullRequests } from '../platform.ts'
+import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeResult, PullRequests } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
 import { asker, commentLimit, decisionLists, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
@@ -38,6 +38,8 @@ export type DevelopInput = {
   full?: boolean
   /** At most this many builders at the same time. */
   parallel?: number
+  /** The issue that the PR closes. */
+  issue?: number
 }
 
 export type ReviewRequest = { runId: string; ask: string; head: string; full: boolean; pr: number }
@@ -65,8 +67,18 @@ export type DevelopDeps = {
 }
 
 export type DevelopStatus = 'ready' | 'failed' | 'blocked' | 'stopped'
-/** `resume` says what the user does before the same run can go on, for example add CI. It is null when a new run is necessary. */
-export type DevelopResult = { status: DevelopStatus; pr: { number: number; url: string } | null; branch: string | null; report: string; resume: string | null }
+/**
+ * `resume` says what the user does before the same run can go on, for example add CI. It is null when a new run is
+ * necessary. `merge` is null unless the host merged the PR.
+ */
+export type DevelopResult = {
+  status: DevelopStatus
+  pr: { number: number; url: string } | null
+  branch: string | null
+  report: string
+  resume: string | null
+  merge: { method: MergeMethod; sha: string } | null
+}
 
 /** CI-fix rounds after the build, then a blocker (G6). */
 export const ciFixRounds = 2
@@ -75,6 +87,8 @@ const ciGraceMs = 3 * 60_000
 /** The most that GitHub's clock and the host's clock can differ. */
 const clockSkewMs = 30_000
 const defaultParallel = 3
+/** The longest reason of a refused merge or a failed branch delete in the report. */
+const reasonChars = 300
 
 type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failures: string }
 type Review = { pass: boolean; head: string; final: string; branch: string; report: string }
@@ -124,7 +138,7 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
 
   // What the report shows. Each stage fills its part.
   const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [] }
-  const finish = async (status: DevelopStatus, criteria: Criterion[], note: string, resumable = false): Promise<DevelopResult> => {
+  const finish = async (status: DevelopStatus, criteria: Criterion[], note: string, resumable = false, merge: DevelopResult['merge'] = null): Promise<DevelopResult> => {
     const report = renderReport(state, status, criteria, note, decisions(ledger))
     deps.files.write('report.md', report)
     // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
@@ -132,8 +146,8 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
       await pulls.comment(state.pr.number, report.length > commentLimit ? `${report.slice(0, commentLimit)}\n\n(cut: see report.md of run ${input.runId})` : report)
       ledger.put('commented', report)
     }
-    ledger.put('result', { status, pr: state.pr, branch: state.branch })
-    return { status, pr: state.pr, branch: state.branch, report, resume: resumable ? note : null }
+    ledger.put('result', { status, pr: state.pr, branch: state.branch, merge })
+    return { status, pr: state.pr, branch: state.branch, report, resume: resumable ? note : null, merge }
   }
 
   // 0. Intake: no plan and no code before the ask is confirmed. The route questions are run questions (D11), so the run
@@ -305,8 +319,35 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
     ...(audit ? [{ name: 'Auditor for Solidity src/', ok: false, detail: 'required, not built yet. Audit the change before you merge. The PR stays draft.' }] : []),
   ]
   const pass = criteria.every((criterion) => criterion.ok)
-  if (pass) await step(ledger, 'ready', async () => (await pulls.ready(state.pr!.number), true))
-  return finish(pass ? 'ready' : 'failed', criteria, pass ? 'Ready for your review. You merge.' : 'The PR stays draft.')
+  if (!pass) return finish('failed', criteria, 'The PR stays draft.')
+  const pr = state.pr!.number
+  await step(ledger, 'ready', async () => (await pulls.ready(pr), true))
+  const method = input.config.merge
+  if (!method) return finish('ready', criteria, 'Ready for your review. You merge.')
+
+  // 9. The merge, only with the standing permission and only at the head that the final CI checked. The step records a
+  // refusal as a result, so that a resumed run never tries the merge again.
+  const merged = await step(ledger, 'merge', async (): Promise<MergeResult> => {
+    try {
+      return await pulls.merge(pr, { method, sha: final })
+    } catch (error) {
+      return { merged: false, reason: reasonOf(error) }
+    }
+  })
+  if (!merged.merged) return finish('ready', criteria, `Not merged: ${merged.reason}. The PR stays ready for your review. You merge.`)
+  const deleted = await step(ledger, 'delete-branch', async (): Promise<{ deleted: true } | { deleted: false; reason: string }> => {
+    try {
+      await branches.deleteRemote(branchName)
+      return { deleted: true }
+    } catch (error) {
+      return { deleted: false, reason: reasonOf(error) }
+    }
+  })
+  const note = [
+    `Merged by the host (${method}): ${merged.sha}.`,
+    ...(deleted.deleted ? [] : [`The host did not delete the branch ${branchName}: ${deleted.reason}.`]),
+  ].join(' ')
+  return finish('ready', criteria, note, false, { method, sha: merged.sha })
 }
 
 /**
@@ -341,6 +382,9 @@ async function watchCi(ledger: Ledger, pulls: PullRequests, timing: DevelopDeps[
     await new Promise((resolve) => setTimeout(resolve, timing.pollMs))
   }
 }
+
+/** An error as one line for the finish note of the report. */
+const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().slice(0, reasonChars)
 
 const noCi = (sha: string) => `No CI ran on ${sha.slice(0, 12)}. Add CI that runs on pull requests, push again, and resume the run.`
 
@@ -389,6 +433,7 @@ function prBody(input: DevelopInput, answers: Answer[], planText: string): strin
   return [
     `agent-factory run \`${input.runId}\` (${input.source}) opened this draft PR. It stays draft until the review loop passes and CI is green.`,
     '',
+    ...(input.issue ? [`Closes #${input.issue}`, ''] : []),
     '# Ask',
     '',
     ...input.ask.trim().split('\n').map((line) => `> ${line}`),

@@ -37,5 +37,13 @@ own PRs, and its rules reviewer reads this file first.
 
 ## Writing
 
-Docs, comments and agent guidelines use Simplified Technical English. The rules are in `agents/shared/ste.md`. For
-the optional dictionary, see `agents/guides/ste/README.md`.
+- Say less. Each sentence gives the reader a fact that they need, one time. Prefer a list item, a table row or an
+  example to a paragraph.
+- Docs, comments and agent guidelines use Simplified Technical English for their words and grammar
+  (`agents/shared/ste.md`, dictionary: `agents/guides/ste/README.md`). An STE fix never makes text longer.
+- README.md tells a user how to install, configure and run agent-factory. `test/docs.test.ts` keeps it to 200 lines.
+  Design, rationale and internals go to `docs/specs/` or to a code comment. Change the README only when a command, a
+  setting or a behavior that users rely on changes, and replace text instead of appending it.
+- Issues: the problem, the change and the done checks, in about 15 lines. Link the spec instead of copying it.
+- PR descriptions: what changed, why, and how it was tested, in at most five bullets.
+- Comments that the host posts: the result first, and the details in a collapsed block or in the run's report.

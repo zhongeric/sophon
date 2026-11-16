@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { repoConfigFile } from '../core/checks.ts'
-import { parseParallel } from '../core/plan.ts'
+import { parseIssue, parseParallel } from '../core/plan.ts'
 import type { Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
@@ -25,7 +25,7 @@ const usage = `Usage: npm run develop -- --ask <text> [options]
 
 Develops an ask into a ready PR: intake and your confirmation, a spec for a larger change, a plan, builders
 for its tasks, a draft PR, CI with two fix rounds, the code review loop, and CI again. The PR becomes ready
-only when every criterion holds. You merge.
+only when every criterion holds. When ${repoConfigFile} has "merge", the host then merges the PR. Else you merge.
 
 Options:
   --repo <path>          Repository (default: current directory). It needs an origin on GitHub. ${repoConfigFile} is optional:
@@ -38,6 +38,7 @@ Options:
   --hotfix               A small hotfix: take every recommendation without asking
   --full                 The full review loop, also for a docs or tests only change
   --parallel <n>         At most n builders at the same time (default 3)
+  --issue <n>            The issue that the PR closes: the PR body says Closes #<n>. The report stays on the PR.
   --models <path>        JSON that overrides models: { "develop": { "builder": ... }, "review": { "step1": ... } }
   --claude-plan          Sign Claude requests with the nc Claude login instead of ANTHROPIC_API_KEY
   --wait <minutes>       How long to wait for answers or CI before the run pauses (default 60)
@@ -58,6 +59,7 @@ async function main(): Promise<number> {
       full: { type: 'boolean' },
       help: { short: 'h', type: 'boolean' },
       hotfix: { type: 'boolean' },
+      issue: { type: 'string' },
       models: { type: 'string' },
       parallel: { type: 'string' },
       repo: { type: 'string' },
@@ -99,6 +101,7 @@ async function main(): Promise<number> {
   try {
     const result = await develop(input, deps)
     console.log(`${result.status.toUpperCase()}: ${join(deps.dir, 'report.md')}${result.pr ? `\n${result.pr.url}` : ''}`)
+    if (result.merge) console.log(`merged (${result.merge.method}): ${result.merge.sha}`)
     return result.status === 'ready' ? 0 : 1
   } catch (error) {
     if (!(error instanceof PausedError)) throw error
@@ -126,6 +129,7 @@ async function newInput(values: Values): Promise<{ input: DevelopInput; repo: st
   const ask = values['ask-file'] ? readFileSync(String(values['ask-file']), 'utf8') : (values.ask as string | undefined)
   if (!ask?.trim()) throw new StopError('give the ask with --ask or --ask-file')
   const parallel = values.parallel !== undefined ? parseParallel(String(values.parallel)) : undefined
+  const issue = values.issue !== undefined ? parseIssue(String(values.issue)) : undefined
   const baseRef = String(values.base ?? 'main')
   await git(repo, 'fetch', 'origin', baseRef)
   const base = (await git(repo, 'rev-parse', '--verify', `origin/${baseRef}^{commit}`)).trim()
@@ -144,6 +148,7 @@ async function newInput(values: Values): Promise<{ input: DevelopInput; repo: st
     ...(values.hotfix ? { hotfix: true } : {}),
     ...(values.full ? { full: true } : {}),
     ...(parallel !== undefined ? { parallel } : {}),
+    ...(issue !== undefined ? { issue } : {}),
   }
   return { input, repo }
 }

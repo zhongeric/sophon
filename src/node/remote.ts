@@ -53,7 +53,8 @@ export function resumeOutcome(text: string): { code: number; text: string } {
   return { code, text: `${body.resumed ? 'resumed: latest run was' : 'not resumed: latest run is'} ${state ?? 'none'}: ${reason}` }
 }
 
-function setting(name: string): string {
+/** A setting from the environment, else from .secrets/cloudflare.env. */
+export function optionalSetting(name: string): string | undefined {
   const fromFile = existsSync(secretsFile)
     ? Object.fromEntries(
         readFileSync(secretsFile, 'utf8')
@@ -62,7 +63,11 @@ function setting(name: string): string {
           .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]),
       )[name]
     : undefined
-  const value = process.env[name] ?? fromFile
+  return process.env[name] ?? fromFile
+}
+
+export function setting(name: string): string {
+  const value = optionalSetting(name)
   if (!value) throw new StopError(`set ${name}, in the environment or in .secrets/cloudflare.env`)
   return value
 }
