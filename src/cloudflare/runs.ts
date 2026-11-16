@@ -94,7 +94,6 @@ export function credentialsFor(env: Env, providers: Iterable<Provider>): Credent
  */
 export abstract class Runs<Request extends RunRequest> extends DurableObject<Env> {
   busy = false
-  /** In memory only: an installation token never goes to storage. */
   tokens: InstallationTokens = new Map()
 
   constructor(ctx: DurableObjectState, env: Env) {

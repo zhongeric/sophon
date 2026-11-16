@@ -8,10 +8,8 @@ export type GitHubSecrets = { GITHUB_TOKEN?: string; GITHUB_APP_ID?: string; GIT
 export type InstallationTokens = Map<number, { token: string; expiresAt: number }>
 
 type AccessOptions = {
-  fetcher?: typeof fetch
   /** The clock in milliseconds. Tests replace it to make a token expire. */
   now?: () => number
-  sleep?: (ms: number) => Promise<void>
 }
 
 /** The client gets a new installation token when this time or less remains before the token expires. */
@@ -58,14 +56,14 @@ export async function githubAccess(
   const { GITHUB_APP_ID: appId, GITHUB_APP_PRIVATE_KEY: pem } = secrets
   if (!appId && !pem) {
     if (!secrets.GITHUB_TOKEN) throw new StopError('GITHUB_TOKEN is not set: set it, or set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY to use the GitHub App')
-    return { app: false, gh: github(secrets.GITHUB_TOKEN, api, options.fetcher, { sleep: options.sleep }) }
+    return { app: false, gh: github(secrets.GITHUB_TOKEN, api) }
   }
   if (!appId || !pem) {
     const [missing, set] = appId ? ['GITHUB_APP_PRIVATE_KEY', 'GITHUB_APP_ID'] : ['GITHUB_APP_ID', 'GITHUB_APP_PRIVATE_KEY']
     throw new StopError(`${missing} is not set: the GitHub App needs it together with ${set}`)
   }
   const now = options.now ?? Date.now
-  const app = github(() => appJwt(appId, pem, now()), api, options.fetcher, { sleep: options.sleep })
+  const app = github(() => appJwt(appId, pem, now()), api)
   let installation: number
   try {
     const found = await app.json<{ id?: unknown }>('GET', `/repos/${owner}/${repo}/installation`)
@@ -77,14 +75,20 @@ export async function githubAccess(
     if (typeof slug !== 'string') throw new Error('GitHub gave no slug for the App')
     throw new StopError(`the GitHub App is not installed on ${owner}/${repo}. Install it: https://github.com/apps/${slug}/installations/new`)
   }
-  const token = async () => {
-    const cached = cache.get(installation)
-    if (cached && cached.expiresAt - now() > refreshMs) return cached.token
+  const create = async () => {
     const created = await app.json<{ token?: unknown; expires_at?: unknown }>('POST', `/app/installations/${installation}/access_tokens`)
     const expiresAt = typeof created.expires_at === 'string' ? Date.parse(created.expires_at) : NaN
     if (typeof created.token !== 'string' || !Number.isFinite(expiresAt)) throw new Error(`GitHub gave no installation token for ${owner}/${repo}`)
     cache.set(installation, { expiresAt, token: created.token })
     return created.token
   }
-  return { app: true, gh: github(token, api, options.fetcher, { sleep: options.sleep }) }
+  // Requests at the same time get one installation token.
+  let pending: Promise<string> | undefined
+  const token = () => {
+    const cached = cache.get(installation)
+    if (cached && cached.expiresAt - now() > refreshMs) return Promise.resolve(cached.token)
+    pending ??= create().finally(() => { pending = undefined })
+    return pending
+  }
+  return { app: true, gh: github(token, api) }
 }

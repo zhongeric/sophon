@@ -91,6 +91,14 @@ test('the cache that the caller keeps gives the token to a new client', async ()
   })
 })
 
+test('concurrent requests share one installation token request', async () => {
+  await withMock({ installed: true, slug: 'factory' }, async (mock) => {
+    const { gh } = await githubAccess(appSecrets(mock.url), 'acme', 'app', new Map())
+    await Promise.all([1, 2, 3].map(() => gh.json('GET', '/repos/acme/app')))
+    assert.equal(mock.state.requests.filter((route) => route === 'POST /app/installations/42/access_tokens').length, 1)
+  })
+})
+
 test('without the App secrets, requests carry GITHUB_TOKEN and no App route is called', async () => {
   await withMock({ installed: true, slug: 'factory' }, async (mock) => {
     const { app, gh } = await githubAccess({ GITHUB_API_URL: mock.url, GITHUB_TOKEN: 'personal' }, 'acme', 'app', new Map())
