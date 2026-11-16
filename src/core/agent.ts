@@ -3,6 +3,8 @@ import { checkEgress, egressFetch, type Egress, type EgressHost } from './egress
 import type { Ledger } from './ledger.ts'
 import type { AgentStore } from './platform.ts'
 import { dispatcher, type Credentials, type Provider } from './providers.ts'
+import type { Role } from './roles.ts'
+import { subagentLimits } from './subagents.ts'
 import { recordUsage } from './usage.ts'
 import { repoMount } from './workspace.ts'
 
@@ -18,7 +20,8 @@ export type AgentSpec = {
   instructions: string
   workspace: Contracts.WorkspaceHost
   tools: HostTools
-  subagents?: boolean
+  /** Without it, the agent gets no subagents. A limit makes openAgent refuse a spawn over the limit. */
+  subagents?: Role['subagents']
   /** The network access of the agent. Without it, the agent is offline. */
   egress?: Egress
 }
@@ -78,12 +81,15 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
   const sessionKey = `session:${spec.id}`
   const sessionId = host.ledger.get<string>(sessionKey) ?? Contracts.sessionUuid()
   host.ledger.put(sessionKey, sessionId)
+  const limits = typeof spec.subagents === 'object' ? subagentLimits(host.ledger, spec.id, spec.subagents) : undefined
+  const dispatch = host.dispatch ?? dispatcher(host.credentials, spec.provider)
 
   const connect = async () => {
     const runtime = await AgentRuntime.instantiate(host.module, host.store.sql, {
       published(events) {
         host.store.record(spec.id, events)
         recordUsage(host.ledger, spec.id, spec.model, events)
+        limits?.observe(events)
         for (const event of events) {
           const line = describe(event)
           if (line) host.log(`${spec.id}: ${line}`)
@@ -105,12 +111,12 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
         workspace_tools: 'all',
         // Web search runs at the provider, outside the egress and its lock (RD9 of the research spec).
         web_search: spec.egress?.web_search ?? false,
-        subagents: spec.subagents ?? false,
-        ...(spec.subagents ? { subagent_models: [{ harness: spec.provider, model: spec.model }] } : {}),
+        subagents: spec.subagents !== undefined,
+        ...(spec.subagents !== undefined ? { subagent_models: [{ harness: spec.provider, model: spec.model }] } : {}),
         tools: Object.values(spec.tools).map((tool) => tool.definition),
       },
       {
-        dispatch: host.dispatch ?? dispatcher(host.credentials, spec.provider),
+        dispatch: limits ? limits.dispatch(dispatch) : dispatch,
         fetch: agentFetch,
         tools: {
           call(name, input, _signal, context) {
@@ -128,6 +134,7 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
   let runtime = await connect()
   return {
     async ask(requestId, prompt) {
+      limits?.begin(requestId)
       const submitted = await runtime.submit(scope, { metadata: { agent: spec.id }, prompt, request_id: requestId })
       if (submitted.submitted === 'too_large') throw new Error(`${spec.id}: prompt of ${submitted.bytes} bytes is too large`)
       if (submitted.submitted === 'conflict') throw new Error(`${spec.id}: turn ${requestId} exists with another prompt`)
