@@ -10,13 +10,23 @@ test('the intake needs a title, a branch slug, and the route with its reason', (
   assert.deepEqual(checkIntake(intake).questions, [])
 })
 
-test('the host asks to confirm the ask and the route in the same batch, and reads the route from the answers', () => {
+test('the route questions are run questions after the intake questions, and the host reads the route from the answers', () => {
+  assert.deepEqual(
+    routeQuestions(checkIntake(intake)).map((entry) => [entry.id, entry.recommendation, entry.level]),
+    [
+      ['Q1', 'Yes, go on', 'run'],
+      ['Q2', 'Plan now', 'run'],
+      ['Q3', 'One pass', 'run'],
+    ],
+  )
+  // A user question of the intake agent posts the batch, so the confirmation goes to the user with the summary.
   const question = { question: 'May sub return a negative number?', why: 'sub(3, 5)', options: ['Yes', 'No, throw'], recommendation: 'Yes', level: 'user', rule: 'scope' }
   const asked = checkIntake({ ...intake, larger: true, questions: [question] })
+  assert.equal(routeQuestions(asked)[0]!.rule, 'scope')
   assert.deepEqual(
     routeQuestions(asked).map((entry) => [entry.id, entry.recommendation, entry.level]),
     [
-      ['Q2', 'Yes, go on', 'run'],
+      ['Q2', 'Yes, go on', 'user'],
       ['Q3', 'Write a spec first', 'run'],
       ['Q4', 'One pass', 'run'],
     ],

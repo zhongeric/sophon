@@ -264,3 +264,38 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     mock.close()
   }
 })
+
+test('on Cloudflare, /develop asks a user question of the intake agent on the issue, and the /answer webhook resumes the run', { timeout: 300_000 }, async () => {
+  const { repo } = developRepo({
+    checks: { machine: 'test -f .setup-done' },
+    setup: 'touch .setup-done',
+    stack: 'TypeScript',
+    tests: { command: 'env -u NODE_TEST_CONTEXT node --test {tests}', pattern: '\\.test\\.ts$' },
+  })
+  const issues = { 5: { body: 'Add sub and mul next to add, with tests.', title: 'Add sub and mul' } }
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', issues, name: 'app', owner: 'acme', script: developScript({ askScope: true }) })
+  const worker = await startWorker({ ...vars(mock), MACHINE_URL: `${mock.url}/machine` })
+  const on = (number: number) => mock.state.comments.filter((entry) => entry.issue === number)
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 160)]))}\nworker:\n${worker.output().slice(-4000)}`
+  try {
+    const issueComment = { action: 'created', comment: { body: '/develop', user: { login: 'maintainer' } }, issue: { number: 5 }, repository }
+    const started = (await (await sendWebhook(worker.url, secret, 'issue_comment', issueComment)).json()) as { run: string; started: boolean }
+    assert.equal(started.started, true)
+    // The scope question is a user question (D11), so the issue gets it with the confirmation of the ask, but not the route questions.
+    const asked = await until(() => on(5).find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
+    assert.match(asked.body, /\*\*Q1\.\*\* Add div too\?/)
+    assert.match(asked.body, /\*\*Q2\.\*\* Is this the ask\?/)
+    assert.doesNotMatch(asked.body, /Write a spec before the plan\?|How many review loop passes\?/)
+    mock.comment('maintainer', '/answer recommended', 5)
+    await sendWebhook(worker.url, secret, 'issue_comment', { ...issueComment, comment: { body: '/answer recommended', user: { login: 'maintainer' } } })
+
+    const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
+    assert.match(done.body, /^# Development run: READY/, done.body)
+    assert.equal(on(5).filter((entry) => entry.body.includes('agent-factory:questions')).length, 1, describe())
+    assert.match(done.body, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
+    assert.match(done.body, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\*.*\n- Is this the ask\? .*\*\*Yes, go on\*\*.*\n\n## Decisions the run made\n\n- Write a spec before the plan\? \*\*Plan now\*\*/)
+  } finally {
+    worker.stop()
+    mock.close()
+  }
+})

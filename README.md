@@ -280,7 +280,7 @@ Intake, spec, planner and builders run on Opus 5.5. The review loop uses its own
 
 | Rule | How the host enforces it |
 | --- | --- |
-| No plan and no code before the ask is confirmed | The intake questions and the host's route questions are one batch. The route questions are `run` level, so the run uses the recommendations of the intake agent. The run waits for your answer only when the intake agent asks a `user` question, for example about the scope of the ask (D11). `--hotfix` takes every recommendation without asking. |
+| No plan and no code before the ask is confirmed | The intake questions and the host's route questions are one batch. The route questions are `run` level, so the run uses the recommendations of the intake agent. The run waits for your answer only when the intake agent asks a `user` question, for example about the scope of the ask (D11). Then "Is this the ask?" also comes to you, with the summary, so that you can correct the ask or stop the run. `--hotfix` takes every recommendation without asking. |
 | One planner, four parts | `submit_plan` refuses a plan with an empty part, with no done check that has a command, without the sections of its profiles (Solidity: interfaces, deployment sequence), or with tasks that depend on unknown tasks or on each other. |
 | A builder stays in its task | A builder can write only the files and directories of its task, never protected paths. Parallel builders work in separate worktrees, so one builder's half-done work never breaks another's checks. |
 | Static rules and forbidden paths gate every commit | `checkpoint` checks the added lines and the paths before it commits, and returns each problem to the builder. Build output, logs and `.env` files never enter the history. |

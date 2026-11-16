@@ -237,6 +237,33 @@ test('the run does not accept the rejection of a critical finding: no question t
   assert.doesNotMatch(result.report.split('## Decisions the run made')[0]!, /did not apply bugs-001/)
 })
 
+test('a resumed ledger from before D11, where the user accepted the rejection of a critical finding, keeps that OK', async () => {
+  const repo = fixtureRepo()
+  const dir = runsDir()
+  const dispatch = () => scriptedDispatch(scriptFor({ rejectBug: true, tests: true }), [])
+  await runLoop(repo, 'accepted', dir, { dispatch: dispatch() })
+
+  // Rewrite the ledger as a run from before D11: the questions have no level, and the user accepted the rejection.
+  type Entry = { id: string; question: string }
+  const path = join(dir, 'accepted', 'state.json')
+  const state = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+  const key = Object.keys(state).find((name) => /^answers:.*\.rejections$/.test(name))
+  assert.ok(key)
+  const accepted = (state[key] as Entry[]).map(({ id, question }) => ({ id, question, answer: 'Accept the rejection', recommended: false }))
+  const questionsKey = key.replace(/^answers:/, 'questions:')
+  state[key] = accepted
+  state[questionsKey] = (state[questionsKey] as Record<string, unknown>[]).map(({ level: _level, rule: _rule, ...question }) => question)
+  state['decisions'] = [...(state['decisions'] as Entry[]).filter((entry) => !accepted.some((answer) => answer.question === entry.question)), ...accepted]
+  writeFileSync(path, JSON.stringify(state, null, 2))
+
+  const { channel, posted } = memoryChannel()
+  const result = await runLoop(repo, 'accepted', dir, { channel, dispatch: dispatch() })
+  const criterion = result.criteria.find((entry) => entry.name === 'No critical or high finding left unapplied without your OK')!
+  assert.deepEqual(posted, [])
+  assert.deepEqual([criterion.ok, criterion.detail], [true, 'you accepted the rejection of bugs-001'])
+  assert.match(result.report.split('## Decisions the run made')[0]!, /- The patch agent did not apply bugs-001 .*\*\*Accept the rejection\*\*\n/)
+})
+
 test('a run with only run questions asks nothing and lists them as decisions that the run made', async () => {
   const { channel, posted } = memoryChannel()
   const result = await runLoop(fixtureRepo(), 'run-only', runsDir(), { channel, dispatch: scriptedDispatch(scriptFor({ runQuestion: true, tests: true }), []) })

@@ -63,12 +63,14 @@ Each stage below lists who does the work, what the host enforces, and where the 
   the agent's recommendation and reason (P4).
   - The route questions are `run` level (D11), so the host uses the intake agent's recommendations at once.
   - The confirmation of the ask becomes a question to the user only when the intake agent asks a `user` question.
-    For example, the agent asks a question with rule `scope` when the scope of the ask is not clear. The user's
+    For example, the agent asks a question with rule `scope` when the scope of the ask is not clear. Then "Is this
+    the ask?" is also `user` level, with rule `scope`, so the user sees the summary in the same batch. The user's
     `/answer` to that batch is then the confirmation.
   - When the batch has no `user` question, the run continues without a pause. The report lists the recommendations
     as decisions that the run made.
-  - A free-text correction of the summary goes on, as a decision for the planner. The host records which stack
-    profiles apply (section 4).
+  - When the confirmation goes to the user, a free-text correction of the summary goes on, as a decision for the
+    planner, and the stop option stops the run.
+  - The host records which stack profiles apply (section 4).
 - **The user:** answers the `user` questions of the intake, when there are some. A small hotfix skips them when the
   user marks it so (`--hotfix`): the host uses every recommendation, as before D11.
 
@@ -335,7 +337,7 @@ Each decision records a conflict between two rules, and the choice.
 | D8 | **Tests first against a lazy draft.** evm-cortex says tests first. The plan rules say a lazy first draft. | The draft includes its tests, and done-looks-like names them. A bug fix starts with a failing test. |
 | D9 | **Solidity style conflicts.** Test names (three schemes), error names (`ManagerLocked` or `Oracle_StalePrice`), event tense, immutable case, pinned compiler (0.8.24, 0.8.26, 0.8.28), NatSpec on internal functions, coverage (90% or 100%), ReentrancyGuard scope (all external calls or value paths only). | One precedence rule: repo rules > the `solidity` profile > evm-cortex. The D9 picks below are the values of the profile, in `agents/profiles/solidity.md`. |
 | D10 | **Questions at once or one at a time.** | Batch per stage. On an async channel, each round trip costs minutes or hours. |
-| D11 | **Which questions go to the user.** Ask the user about each open choice, or let the run decide most choices. In one afternoon, runs posted 137 questions, and only two of them needed the user. | A question goes to the user only when the choice obeys one of these rules: (1) `scope`: it removes or adds scope compared with the ask. (2) `capability`: it changes what agents can get to or do across workflows (network and web search, protected paths, secrets, allowed models, blinding). (3) `spend`: it commits spend over the budget, or a permanent or public action (a merge without standing permission, a deploy, a publication). (4) `decision`: it does not agree with a recorded D or RD row. Such a question is `user` level and names its rule. Every other question is `run` level: the host uses the recommendation at once, with no post and no pause, and records it as a decision that the run made. The route questions of step 0 and the rejection question of a critical or high finding are `run` level. A held finding is `user` level, with the rule of the finding. The budget question at the cap (#11, see RG2 in `research-workflow.md`) is `user` level, with rule `spend`. A question from an older ledger without a level counts as `user` level. |
+| D11 | **Which questions go to the user.** Ask the user about each open choice, or let the run decide most choices. In one afternoon, runs posted 137 questions, and only two of them needed the user. | A question goes to the user only when the choice obeys one of these rules: (1) `scope`: it removes or adds scope compared with the ask. (2) `capability`: it changes what agents can get to or do across workflows (network and web search, protected paths, secrets, allowed models, blinding). (3) `spend`: it commits spend over the budget, or a permanent or public action (a merge without standing permission, a deploy, a publication). (4) `decision`: it does not agree with a recorded D or RD row. Such a question is `user` level and names its rule. Every other question is `run` level: the host uses the recommendation at once, with no post and no pause, and records it as a decision that the run made. The route questions of step 0 and the rejection question of a critical or high finding are `run` level. When the intake agent asks a `user` question, "Is this the ask?" is `user` level, with rule `scope`, so that the user sees the summary. A held finding is `user` level, with the rule of the finding. The budget question at the cap (#11, see RG2 in `research-workflow.md`) is `user` level, with rule `spend`. A question from an older ledger without a level counts as `user` level. |
 
 ### D9 picks
 

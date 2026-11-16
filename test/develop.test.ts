@@ -81,9 +81,13 @@ test('develop: a user question of the intake agent pauses the run, and the run r
     (error: unknown) => error instanceof PausedError,
   )
   assert.ok(!first.some((turn) => turn.role === 'planner'))
-  // Only the user question goes to the user: the route questions are run questions.
+  // The user question goes to the user with the confirmation of the ask. The other route questions are run questions.
   assert.deepEqual(posted.map((entry) => entry.batch), ['intake'])
-  assert.deepEqual(posted[0]!.questions.map((question) => [question.id, question.question, question.level, question.rule]), [['Q1', scopeQuestion.question, 'user', 'scope']])
+  assert.deepEqual(posted[0]!.questions.map((question) => [question.id, question.question, question.level, question.rule]), [
+    ['Q1', scopeQuestion.question, 'user', 'scope'],
+    ['Q2', 'Is this the ask? Correct it in your own words if it is not.', 'user', 'scope'],
+  ])
+  assert.equal(posted[0]!.questions[1]!.why, 'Adds sub() and mul() next to add(), with tests.')
 
   replies.intake = '/answer recommended'
   const second: Turn[] = []
@@ -92,7 +96,7 @@ test('develop: a user question of the intake agent pauses the run, and the run r
   assert.equal(posted.length, 1)
   assert.ok(!second.some((turn) => turn.role === 'intake'))
   assert.match(result.report, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
-  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n\n## Decisions the run made\n\n- Is this the ask\?/)
+  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\* \(recommended\)\n\n## Decisions the run made\n\n- Write a spec before the plan\?/)
 })
 
 test('develop: a hotfix takes the recommendation of every question, and marks only the run questions as decided by the run', { timeout: 120_000 }, async () => {
@@ -102,7 +106,7 @@ test('develop: a hotfix takes the recommendation of every question, and marks on
   const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(developScript({ askScope: true, blockSub: true }), []), input, pulls: fakePulls().pulls, runId: 'hotfix' })
   assert.equal(result.status, 'blocked', result.report)
   assert.deepEqual(posted, [])
-  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n\n## Decisions the run made\n\n- Is this the ask\?/)
+  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\* \(recommended\)\n\n## Decisions the run made\n\n- Write a spec before the plan\?/)
 })
 
 test('develop: CI that another branch ran on the same commit does not count until the push gets CI of its own', { timeout: 120_000 }, async () => {

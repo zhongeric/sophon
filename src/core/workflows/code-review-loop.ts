@@ -6,7 +6,7 @@ import { step, type Ledger } from '../ledger.ts'
 import type { AgentStore, Checker, Files, Frozen, Guides, Repo } from '../platform.ts'
 import { isLight, profilesById, staticFindings, triage, triageLine, type Triage } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
-import { asker, decisions, splitDecisions, type Answer, type Channel } from '../questions.ts'
+import { asker, decisionLists, decisions, type Answer, type Channel } from '../questions.ts'
 import { reviewRoles, type ModelChoice } from '../roles.ts'
 import { askQuestions, intent, light, patch, review, splitReview, type LightLog, type PatchLog, type PatchOutcome, type Range, type RunContext, type Verdict } from '../steps.ts'
 import { StopError } from '../stop.ts'
@@ -425,7 +425,5 @@ function renderReport(run: ReportInput): string {
 
 /** The decisions of the user, then the decisions that the run made (D11), as report sections. */
 export function decisionSections(answers: Answer[]): string[] {
-  const { user, run } = splitDecisions(answers)
-  const line = (answer: Answer) => `- ${answer.question} **${answer.answer}**${answer.recommended ? ' (recommended)' : ''}`
-  return ['## Your decisions', '', ...(user.length > 0 ? user.map(line) : ['- none asked']), '', '## Decisions the run made', '', ...(run.length > 0 ? run.map(line) : ['- none']), '']
+  return decisionLists(answers, { user: '## Your decisions', run: '## Decisions the run made' }, { empty: { user: '- none asked', run: '- none' }, recommended: true })
 }

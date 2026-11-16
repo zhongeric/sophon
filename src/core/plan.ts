@@ -1,5 +1,5 @@
 import type { Contracts } from 'nanocode-ts'
-import { checkQuestions, questionsSchema, splitDecisions, type Answer, type Question } from './questions.ts'
+import { checkQuestions, decisionLists, questionsSchema, type Answer, type Question } from './questions.ts'
 import { StopError } from './stop.ts'
 
 /** What the intake agent understood of the ask, and how it routes the ask. */
@@ -54,12 +54,15 @@ export const passOptions = ['One pass', 'Two passes']
 
 /**
  * The host's questions after the intake agent's: confirm the ask, then the route. They are run questions (D11), so the host
- * takes the intake agent's recommendation. One batch, so a user question of the intake agent needs one round trip.
+ * takes the intake agent's recommendation. When the intake agent raises a user question, the batch goes to the user anyway,
+ * so the confirmation goes too, with rule scope: the user sees the summary and can correct it or stop the run.
+ * One batch, so a user question of the intake agent needs one round trip.
  */
 export function routeQuestions(intake: Intake): Question[] {
   const next = (offset: number) => `Q${intake.questions.length + offset}`
+  const confirm: Pick<Question, 'level' | 'rule'> = intake.questions.some((question) => question.level === 'user') ? { level: 'user', rule: 'scope' } : { level: 'run' }
   return [
-    { id: next(1), question: 'Is this the ask? Correct it in your own words if it is not.', why: intake.summary, options: confirmOptions, recommendation: confirmOptions[0]!, level: 'run' },
+    { id: next(1), question: 'Is this the ask? Correct it in your own words if it is not.', why: intake.summary, options: confirmOptions, recommendation: confirmOptions[0]!, ...confirm },
     { id: next(2), question: 'Write a spec before the plan?', why: intake.reason, options: specOptions, recommendation: specOptions[intake.larger ? 0 : 1]!, level: 'run' },
     { id: next(3), question: 'How many review loop passes?', why: intake.reason, options: passOptions, recommendation: passOptions[intake.passes - 1]!, level: 'run' },
   ]
@@ -271,14 +274,10 @@ export function renderPlan(plan: Plan, options: { tasks: boolean }): string {
 
 /** The frozen package for the review loop: the verbatim ask, the decisions of the user and of the run, and the plan without its tasks. */
 export function frozenAsk(ask: string, decisions: Answer[], plan: Plan): string {
-  const { user, run } = splitDecisions(decisions)
-  const section = (title: string, answers: Answer[]) =>
-    answers.length > 0 ? [`## ${title}`, '', ...answers.map((answer) => `- ${answer.question} **${answer.answer}**`), ''] : []
   return [
     ask.trim(),
     '',
-    ...section('Decisions of the user', user),
-    ...section('Decisions the run made', run),
+    ...decisionLists(decisions, { user: '## Decisions of the user', run: '## Decisions the run made' }),
     '# Plan',
     '',
     renderPlan(plan, { tasks: false }),

@@ -121,16 +121,28 @@ test('a mixed batch posts only the user questions with their IDs, and wait gives
   const first = asker(ledger, channel, 'run-1', () => {})
   await first.post('spec', batch)
   assert.deepEqual(posted, [{ batch: 'spec', questions: [batch[1], batch[3]] }])
+  const run = [
+    { id: 'Q1', question: 'Q1?', answer: 'a', recommended: true, decidedBy: 'run' },
+    { id: 'Q3', question: 'Q3?', answer: 'a', recommended: true, decidedBy: 'run' },
+  ]
+  assert.deepEqual(decisions(ledger), run)
   await assert.rejects(first.wait('spec'), PausedError)
-  assert.deepEqual(decisions(ledger).map((answer) => [answer.id, answer.decidedBy]), [
-    ['Q1', 'run'],
-    ['Q3', 'run'],
-  ])
+  assert.deepEqual(decisions(ledger), run)
+  const file = decisionsFile(ledger)['/decisions.md'] ?? ''
+  assert.match(file, /## Decisions the run made/)
+  assert.match(file, /- Q1\?\n  Answer: a/)
+  assert.match(file, /- Q3\?\n  Answer: a/)
+  assert.doesNotMatch(file, /Q2\?|Q4\?|Decisions of the user/)
+
+  await first.post('spec', batch)
+  assert.deepEqual(decisions(ledger), run)
+  assert.equal(posted.length, 1)
 
   // The resumed run posts and waits again: no second post, and no decision twice.
   const { channel: answered, posted: reposted, read: reread } = recordingChannel('/answer\nQ4: b')
   const second = asker(ledger, answered, 'run-1', () => {})
   await second.post('spec', batch)
+  assert.deepEqual(decisions(ledger), run)
   const answers = await second.wait('spec')
   assert.deepEqual(reposted, [])
   assert.deepEqual(reread, [[batch[1], batch[3]]])
@@ -142,7 +154,7 @@ test('a mixed batch posts only the user questions with their IDs, and wait gives
   ])
   await second.post('spec', batch)
   assert.deepEqual(await second.wait('spec'), answers)
-  assert.deepEqual(decisions(ledger).map((answer) => answer.id), ['Q1', 'Q3', 'Q2', 'Q4'])
+  assert.deepEqual(decisions(ledger), [...run, answers[1], answers[3]])
   assert.equal(read.length, 1)
 })
 
@@ -196,11 +208,12 @@ test("decisions.md lists the user's decisions, then the decisions that the run m
   const user = { id: 'Q1', question: 'Cut the CLI?', answer: 'No', recommended: false }
   const run = { id: 'Q2', question: 'How many passes?', answer: 'One pass', recommended: true, decidedBy: 'run' as const }
   const file = decisionsFile(memoryLedger({ decisions: [run, user] }))['/decisions.md'] ?? ''
-  assert.match(file, /^# Decisions of the user\n\nThese answers settle open points of the ask\. Follow them\.\n\n- Cut the CLI\?\n  Answer: No\n\n## Decisions the run made\n\n/)
+  assert.match(file, /^# Decisions\n\n## Decisions of the user\n\nThese answers settle open points of the ask\. Follow them\.\n\n- Cut the CLI\?\n  Answer: No\n\n## Decisions the run made\n\n/)
   assert.match(file, /took the recommendation/)
   assert.match(file, /- How many passes\?\n  Answer: One pass\n$/)
   const runOnly = decisionsFile(memoryLedger({ decisions: [run] }))['/decisions.md'] ?? ''
-  assert.match(runOnly, /^# Decisions of the user\n\n.*\n\n- none\n\n## Decisions the run made/)
+  assert.match(runOnly, /^# Decisions\n\n## Decisions the run made\n\n/)
+  assert.doesNotMatch(runOnly, /Decisions of the user/)
 })
 
 test('the PR channel posts one comment and reads only later, unedited /answer replies from the answerers, in any case', async () => {

@@ -26,9 +26,28 @@ export type Answer = { id: string; question: string; answer: string; recommended
 /** A question from a ledger before D11 has no level, so it counts as a user question. */
 const isUser = (question: Question) => question.level !== 'run'
 
-/** The decisions of the user and the decisions that the run made, for the reports, decisions.md, the frozen ask and the PR body. */
-export function splitDecisions(answers: Answer[]): { user: Answer[]; run: Answer[] } {
+/** Keep the decisions of the user separate from the decisions that the run made. */
+function splitDecisions(answers: Answer[]): { user: Answer[]; run: Answer[] } {
   return { user: answers.filter((answer) => answer.decidedBy !== 'run'), run: answers.filter((answer) => answer.decidedBy === 'run') }
+}
+
+/**
+ * The decisions of the user, then the decisions that the run made, as two Markdown lists under their titles. One renderer for
+ * the frozen ask, the PR body and the reports, so that their lines do not drift. A list without decisions shows its `empty`
+ * line, or no section when the caller gives no `empty` line.
+ */
+export function decisionLists(
+  answers: Answer[],
+  titles: { user: string; run: string },
+  options: { empty?: { user: string; run: string }; recommended?: boolean } = {},
+): string[] {
+  const { user, run } = splitDecisions(answers)
+  const line = (answer: Answer) => `- ${answer.question} **${answer.answer}**${options.recommended && answer.recommended ? ' (recommended)' : ''}`
+  const section = (title: string, list: Answer[], empty?: string) => {
+    const lines = list.length > 0 ? list.map(line) : empty ? [empty] : []
+    return lines.length > 0 ? [title, '', ...lines, ''] : []
+  }
+  return [...section(titles.user, user, options.empty?.user), ...section(titles.run, run, options.empty?.run)]
 }
 
 const runAnswer = (question: Question): Answer => ({ id: question.id, question: question.question, answer: question.recommendation, recommended: true, decidedBy: 'run' })
@@ -152,23 +171,25 @@ export function checkQuestions(input: unknown): Question[] {
 }
 
 /**
- * Records the run questions of each batch at once (D11), posts its user questions one time, and records the answers in the ledger.
- * A posted batch without answers pauses the run. The resumed run reads the answers from where the batch went.
- * `decided:<batch>` marks the run answers of a posted batch as recorded, so that a resumed run does not record them again.
+ * Posts the user questions of each batch one time, and records the answers of all its questions in the ledger.
+ * A batch with only run questions takes its recommendations at once, with no post (D11). A posted batch without answers pauses the run. The resumed run reads the answers from where the batch went.
  */
 export function asker(ledger: Ledger, channel: Channel, runId: string, log: (line: string) => void) {
   const post = async (batch: string, questions: Question[]) => {
-    // A posted or answered batch keeps the questions that it had, also when it is from before D11.
-    if (ledger.get(`answers:${batch}`) || ledger.get(`posted:${batch}`)) return
+    if (ledger.get(`answers:${batch}`)) return
+    // A batch keeps its questions, also when it is from before D11.
+    questions = ledger.get<Question[]>(`questions:${batch}`) ?? questions
     ledger.put(`questions:${batch}`, questions)
+    if (!ledger.get(`run-answers:${batch}`)) {
+      const run = questions.filter((question) => !isUser(question)).map(runAnswer)
+      ledger.put('decisions', [...decisions(ledger), ...run])
+      ledger.put(`run-answers:${batch}`, run)
+    }
+    if (ledger.get(`posted:${batch}`)) return
     const user = questions.filter(isUser)
     if (user.length === 0) {
       if (questions.length > 0) record(batch, questions.map(runAnswer))
       return
-    }
-    if (!ledger.get(`decided:${batch}`)) {
-      addDecisions(questions.filter((question) => !isUser(question)).map(runAnswer))
-      ledger.put(`decided:${batch}`, true)
     }
     const posted = await channel.post(runId, batch, user)
     ledger.put(`posted:${batch}`, posted)
@@ -190,14 +211,12 @@ export function asker(ledger: Ledger, channel: Channel, runId: string, log: (lin
       if (!answer) throw new Error(`the channel gave no answer for ${question.id} of ${batch}`)
       return answer
     })
-    ledger.put(`answers:${batch}`, all)
-    addDecisions(answers)
-    return all
+    return record(batch, all)
   }
-  const addDecisions = (answers: Answer[]) => ledger.put('decisions', [...decisions(ledger), ...answers])
   const record = (batch: string, answers: Answer[]) => {
+    const run = ledger.get<Answer[]>(`run-answers:${batch}`) ?? []
     ledger.put(`answers:${batch}`, answers)
-    addDecisions(answers)
+    ledger.put('decisions', [...decisions(ledger), ...answers.filter((answer) => !run.some((entry) => entry.id === answer.id))])
     return answers
   }
   /** Takes every recommendation without asking, when the user said so for this run. */
@@ -220,21 +239,17 @@ export function decisions(ledger: Ledger): Answer[] {
 export function decisionsFile(ledger: Ledger): Record<string, string> {
   const { user, run } = splitDecisions(decisions(ledger))
   if (user.length === 0 && run.length === 0) return {}
-  const lines = (answers: Answer[]) => answers.map((answer) => `- ${answer.question}\n  Answer: ${answer.answer}`)
+  const section = (title: string, note: string, answers: Answer[]) =>
+    answers.length > 0 ? ['', `## ${title}`, '', note, '', ...answers.map((answer) => `- ${answer.question}\n  Answer: ${answer.answer}`)] : []
   const text = [
-    '# Decisions of the user',
-    '',
-    'These answers settle open points of the ask. Follow them.',
-    '',
-    ...(user.length > 0 ? lines(user) : ['- none']),
-    ...(run.length > 0
-      ? ['', '## Decisions the run made', '', 'The run took the recommendation for these questions, because they did not need the user (D11). Follow them.', '', ...lines(run)]
-      : []),
+    '# Decisions',
+    ...section('Decisions of the user', 'These answers settle open points of the ask. Follow them.', user),
+    ...section('Decisions the run made', 'The run took the recommendation for these questions, because they did not need the user (D11). Follow them.', run),
   ]
   return { '/decisions.md': `${text.join('\n')}\n` }
 }
 
-export const decisionsLine = (files: Record<string, string>) => ('/decisions.md' in files ? ['- Decisions of the user: /review/decisions.md'] : [])
+export const decisionsLine = (files: Record<string, string>) => ('/decisions.md' in files ? ['- Decisions: /review/decisions.md'] : [])
 
 /** \`edited\` is true when someone changed the comment after it was posted; anyone with write access can. */
 export type PrComment = { author: string; body: string; createdAt: string; edited?: boolean }

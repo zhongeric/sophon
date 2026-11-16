@@ -27,4 +27,13 @@ Claim the severity that the evidence supports. Every finding that passes the evi
 
 ## Decisions for the user
 
-Set `needs_decision` only when the right fix depends on a choice that the ask and /review/decisions.md leave open, and that choice obeys a D11 rule: it changes the scope of the ask, the capabilities of agents, the spend, or a recorded D or RD row. Write that choice in `decision`, in one sentence, and give the rule in `rule`. The host asks the user before the finding goes to a patch agent. For every other choice, do not set `needs_decision`: the patch agent decides.
+Set `needs_decision` only when the right fix depends on an open choice. The ask and /review/decisions.md do not settle an open choice. The choice must also obey one of these D11 rules:
+
+- `scope`: it changes the scope of the ask.
+- `capability`: it changes the capabilities of agents.
+- `spend`: it changes the spend.
+- `decision`: it changes a recorded D or RD row.
+
+When you set `needs_decision`, write the choice in `decision`, in one sentence. Give the rule in `rule`. The host asks the user before the finding goes to a patch agent.
+
+For every other choice, do not set `needs_decision`. The patch agent decides.
