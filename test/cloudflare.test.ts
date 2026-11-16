@@ -216,11 +216,15 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
     const again = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin, method: 'POST' })).json()) as { run: string; started: boolean }
     assert.deepEqual(again, { run: started.run, started: false })
 
-    await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
-    assert.match(mock.state.comments[0]!.body, /for @Maintainer/)
+    const asked = await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
+    assert.match(mock.state.comments[0]!.body, /for `Maintainer`/)
+    assert.doesNotMatch(mock.state.comments[0]!.body, /@/)
+    // answerersOf gives the ALLOWED_USERS fallback in lower case, and GitHub mentions ignore case.
+    assert.match(asked.body.split('\n')[0]!, /^@maintainer$/i)
     mock.comment('maintainer', '/answer recommended')
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/)
+    assert.doesNotMatch(done.body, /@Maintainer/i)
     assert.match(done.body, /May sub return a negative number\? \*\*Yes, return -2\*\* \(recommended\)/)
   } finally {
     worker.stop()
@@ -426,6 +430,8 @@ test('on Cloudflare, /develop asks a user question of the intake agent on the is
     const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
     assert.match(done.body, /^# Development run: READY/, done.body)
     assert.equal(on(5).filter((entry) => entry.body.includes('agent-factory:questions')).length, 1, describe())
+    assert.match(asked.body.split('\n')[0]!, /^@maintainer$/i)
+    assert.doesNotMatch(done.body, /@Maintainer/i)
     assert.match(done.body, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
     assert.match(done.body, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\*.*\n- Is this the ask\? .*\*\*Yes, go on\*\*.*\n\n## Decisions the run made\n\n- Write a spec before the plan\? \*\*Plan now\*\*/)
   } finally {
