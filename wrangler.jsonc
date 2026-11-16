@@ -16,7 +16,8 @@
     { "new_sqlite_classes": ["DevelopmentRuns"], "tag": "v2" }
   ],
   // One build container for each development run. Builders' setup, checks and tests run there, never beside a secret.
-  "containers": [{ "class_name": "DevelopmentRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-1", "max_instances": 5 }],
+  // standard-4 is 4 vCPU and 12 GiB: the setup and the tests use all cores, and the parallel builders of a run share it.
+  "containers": [{ "class_name": "DevelopmentRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 10 }],
   "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
   // The STE dictionary is optional: when agents/guides/ste holds it, it is a module of its own (src/cloudflare/guides.ts).
   "base_dir": "agents/guides",
