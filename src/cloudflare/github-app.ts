@@ -7,6 +7,9 @@ export type GitHubSecrets = { GITHUB_TOKEN?: string; GITHUB_APP_ID?: string; GIT
 /** The installation tokens of the App, keyed by installation ID. Keep it in memory only, never in storage. */
 export type InstallationTokens = Map<number, { token: string; expiresAt: number }>
 
+/** The login of the App bot, keyed by App ID. Keep it in memory only, never in storage. */
+export type BotLogins = Map<string, string>
+
 type AccessOptions = {
   /** The clock in milliseconds. Tests replace it to make a token expire. */
   now?: () => number
@@ -38,6 +41,24 @@ export async function appJwt(appId: string, pem: string, nowMs: number): Promise
   const unsigned = `${encoded({ alg: 'RS256', typ: 'JWT' })}.${encoded({ exp: iat + 600, iat, iss: appId })}`
   const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', await importKey(pem), new TextEncoder().encode(unsigned))
   return `${unsigned}.${base64url(new Uint8Array(signature))}`
+}
+
+/**
+ * The login of the App bot, `<slug>[bot]`, from GET /app. Without GITHUB_APP_ID or GITHUB_APP_PRIVATE_KEY, it gives
+ * undefined and sends no request. The cache keeps only a login that GitHub gave.
+ */
+export async function appBotLogin(secrets: GitHubSecrets, cache: BotLogins, options: AccessOptions = {}): Promise<string | undefined> {
+  const { GITHUB_APP_ID: appId, GITHUB_APP_PRIVATE_KEY: pem } = secrets
+  if (!appId || !pem) return undefined
+  const cached = cache.get(appId)
+  if (cached) return cached
+  const now = options.now ?? Date.now
+  const app = github(() => appJwt(appId, pem, now()), secrets.GITHUB_API_URL ?? 'https://api.github.com')
+  const { slug } = await app.json<{ slug?: unknown }>('GET', '/app')
+  if (typeof slug !== 'string') throw new Error('GitHub gave no slug for the App')
+  const login = `${slug}[bot]`
+  cache.set(appId, login)
+  return login
 }
 
 /**
