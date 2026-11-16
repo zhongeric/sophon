@@ -203,7 +203,8 @@ function artifactReader(read: (id: string) => Promise<Uint8Array | null>): Artif
 /** The text of artifact bytes, or null when the bytes are not strict UTF-8 or contain a NUL character. The check does not use the media_type. */
 function utf8Text(bytes: Uint8Array): string | null {
   try {
-    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    // ignoreBOM: false is the default, but the Workers types require the field.
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)
     return text.includes('\0') ? null : text
   } catch {
     return null
