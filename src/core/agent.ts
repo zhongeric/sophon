@@ -33,6 +33,8 @@ export type AgentHost = {
   credentials: Credentials
   /** Replaces the credentialed dispatch, for scripted models in tests. */
   dispatch?: Contracts.RuntimeOptions['dispatch']
+  /** Replaces the runtime factory, for tests that change what the runtime answers. */
+  instantiate?: typeof AgentRuntime.instantiate
   /** Runs before the host opens an agent turn, for example to compare the spend with the budget. A rejection stops the turn. */
   beforeTurn?: () => Promise<void>
   /** The artifacts, the lock and the secrets of the egress. Only an agent with an egress uses it. */
@@ -85,7 +87,7 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
   const dispatch = host.dispatch ?? dispatcher(host.credentials, spec.provider)
 
   const connect = async () => {
-    const runtime = await AgentRuntime.instantiate(host.module, host.store.sql, {
+    const runtime = await (host.instantiate ?? AgentRuntime.instantiate)(host.module, host.store.sql, {
       published(events) {
         host.store.record(spec.id, events)
         recordUsage(host.ledger, spec.id, spec.model, events)
@@ -137,7 +139,11 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
       limits?.begin(requestId)
       const submitted = await runtime.submit(scope, { metadata: { agent: spec.id }, prompt, request_id: requestId })
       if (submitted.submitted === 'too_large') throw new Error(`${spec.id}: prompt of ${submitted.bytes} bytes is too large`)
-      if (submitted.submitted === 'conflict') throw new Error(`${spec.id}: turn ${requestId} exists with another prompt`)
+      if (submitted.submitted === 'conflict') {
+        // The turn keeps the prompt of its journal, because the agent already worked from it. A deploy can change the prompt text.
+        if (!(await runtime.turn(scope, requestId))) throw new Error(`${spec.id}: turn ${requestId} exists with another prompt`)
+        host.log(`${spec.id}: the prompt of turn ${requestId} changed, so the turn continues with the prompt of its journal`)
+      }
       for (let reconnects = 0; ; ) {
         const view = await runtime.turn(scope, requestId)
         if (view && finished.has(view.report.status)) {
