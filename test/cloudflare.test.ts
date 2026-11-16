@@ -24,6 +24,59 @@ const vars = (mock: { url: string }) => ({
 })
 const comment = (login: string, body: string) => ({ action: 'created', comment: { body, user: { login } }, issue: { number: 7, pull_request: {} }, repository })
 
+test('on Cloudflare, development collects a stopped review before a budget raise starts its replacement', { timeout: 360_000 }, async () => {
+  const { repo } = developRepo()
+  const issues = { 5: { body: 'Add sub and mul next to add, with tests.', title: 'Add sub and mul' } }
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', issues, name: 'app', owner: 'acme', script: developScript() })
+  const free = { input: 0, cached_input: 0, cache_write: 0, output: 0 }
+  const worker = await startWorker({
+    ...vars(mock),
+    MACHINE_URL: `${mock.url}/machine`,
+    MODEL_PRICES: JSON.stringify({ 'claude-opus-5-5': free, 'gpt-6.1-sol': { ...free, output: 1_000_000 } }),
+  })
+  const headers = { authorization: 'Bearer admin', 'content-type': 'application/json' }
+  const on = (issue: number) => mock.state.comments.filter((entry) => entry.issue === issue)
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 160)]))}\nworker:\n${worker.output().slice(-4000)}`
+  const status = async (issue: number) => (await (await fetch(`${worker.url}/runs/acme/app/${issue}`, { headers })).json()) as { runs: { run: string; state: string }[] }
+  const answer = async (body: string) => {
+    mock.comment('maintainer', body, 5)
+    await sendWebhook(worker.url, secret, 'issue_comment', { action: 'created', comment: { body, user: { login: 'maintainer' } }, issue: { number: 5 }, repository })
+  }
+  try {
+    const started = await fetch(`${worker.url}/develop/acme/app/5`, { body: JSON.stringify({ budget: 1 }), headers, method: 'POST' })
+    assert.equal(started.status, 202)
+    // The intake agent raised no user question, so the first question of the run is the budget question (D11).
+    const asked = await until(() => on(5).find((entry) => /batch=budget\./.test(entry.body)), 300_000, describe)
+    assert.ok(!on(5).some((entry) => entry.body.includes('Is this the ask?')), describe())
+    assert.match(asked.body, /Raise the budget or stop the run\?/)
+    const pull = [...mock.state.pulls.keys()][0]
+    assert.ok(pull !== undefined, describe())
+    const first = await status(pull)
+    assert.equal(first.runs.length, 1, describe())
+    assert.equal(first.runs[0]?.state, 'failed')
+    await until(() => on(pull).find((entry) => entry.body.includes('Reason: cost budget.')), 30_000, describe)
+
+    await fetch(`${worker.url}/runs/acme/app/5/resume`, { headers, method: 'POST' })
+    await until(async () => (await status(5)).runs[0]?.state === 'paused' ? true : undefined, 30_000, describe)
+    assert.equal((await status(pull)).runs.length, 1, describe())
+    await answer('/answer\nQ1: 1000')
+    const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run: READY')), 180_000, describe)
+    assert.equal((await status(pull)).runs.length, 2, describe())
+    const totals = on(pull).filter((entry) => entry.body.startsWith('### agent-factory:')).map((entry) => {
+      const total = /^\| \*\*Total\*\* \|.*\| \$([\d.]+) \|$/m.exec(entry.body)
+      assert.ok(total, entry.body)
+      return Number(total[1])
+    })
+    assert.equal(totals.length, 2, describe())
+    const cumulative = /^\| review\.1 \| review loop \|.*\| \$([\d.]+) \|$/m.exec(done.body)
+    assert.ok(cumulative, done.body)
+    assert.equal(Number(cumulative[1]), totals.reduce((a, b) => a + b, 0))
+  } finally {
+    worker.stop()
+    mock.close()
+  }
+})
+
 test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, and pushes the fixes', { timeout: 240_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
@@ -87,6 +140,16 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
   const admin = { authorization: 'Bearer admin', 'content-type': 'application/json' }
   try {
     assert.equal((await fetch(`${worker.url}/runs/acme/app/7`, { method: 'POST' })).status, 401)
+    // A budget that is not a positive number of USD gets 400, and no run starts.
+    const refused = await fetch(`${worker.url}/runs/acme/app/7`, { body: JSON.stringify({ budget: 0 }), headers: admin, method: 'POST' })
+    assert.equal(refused.status, 400)
+    assert.match(await refused.text(), /budget must be a positive number/)
+    const refusedDevelop = await fetch(`${worker.url}/develop/acme/app/5`, { body: JSON.stringify({ budget: 'abc' }), headers: admin, method: 'POST' })
+    assert.equal(refusedDevelop.status, 400)
+    for (const number of [5, 7]) {
+      const status = (await (await fetch(`${worker.url}/runs/acme/app/${number}`, { headers: admin })).json()) as { runs: unknown[] }
+      assert.deepEqual(status.runs, [])
+    }
     const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: admin, method: 'POST' })).json()) as { run: string; started: boolean }
     assert.equal(started.started, true)
     const again = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin, method: 'POST' })).json()) as { run: string; started: boolean }

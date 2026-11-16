@@ -24,6 +24,8 @@ export type Env = {
   ADMIN_TOKEN?: string
   /** JSON that overrides the default models per step and role, and per development role under "develop". */
   MODELS?: string
+  /** JSON with the USD per million tokens of each model ID, for the Usage section and the cost budget. See README.md. */
+  MODEL_PRICES?: string
   CI_TIMEOUT_MINUTES?: string
   PAUSE_POLL_SECONDS?: string
   /** Endpoint overrides, for gateways and for local tests. */

@@ -4,12 +4,16 @@ import { mkdtempSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { PausedError } from '../src/core/questions.ts'
+import { PausedError, type Channel } from '../src/core/questions.ts'
+import { StopError } from '../src/core/stop.ts'
+import { recordUsage, zeroTokens, type Prices } from '../src/core/usage.ts'
+import { develop, type ReviewRequest } from '../src/core/workflows/develop.ts'
 import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
 import { fileLedger } from '../src/node/ledger.ts'
+import { nodeDevelop } from '../src/node/platform.ts'
 import { developInput, developScript, developRepo, fakePulls, mergeCommit, plan, runDevelop, scopeQuestion, sources } from './support/develop.ts'
-import { memoryChannel } from './support/fixture.ts'
+import { credentials, memoryChannel, module } from './support/fixture.ts'
 import { probeNetwork, scriptedDispatch, webSearch, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
@@ -19,7 +23,8 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   const turns: Turn[] = []
   const { channel, posted } = memoryChannel()
   const github = fakePulls([false, true])
-  const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(probeNetwork(developScript(), 'builder'), turns), pulls: github.pulls, runId: 'dev' })
+  const prices = { 'claude-opus-5-5': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 }, 'gpt-6.1-sol': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 } }
+  const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(probeNetwork(developScript(), 'builder'), turns), prices, pulls: github.pulls, runId: 'dev' })
 
   assert.equal(result.status, 'ready', result.report)
   assert.equal(result.branch, 'factory/dev-add-sub-mul')
@@ -78,6 +83,13 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.equal(result.merge, null)
   assert.doesNotMatch(github.state.opened[0]!.body, /Closes/)
   await git(origin, 'rev-parse', '--verify', 'refs/heads/factory/dev-add-sub-mul')
+
+  // The Usage section: the development agents, the review pass with the USD of all its agents, and the total.
+  assert.match(result.report, /^## Usage$/m)
+  assert.match(result.report, /^\| intake \| claude-opus-5-5 \| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$0\.\d{4} \|$/m)
+  assert.match(result.report, /^\| review\.1 \| review loop \| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$0\.\d{4} \|$/m)
+  assert.match(result.report, /^\| \*\*Total\*\* \| {2}\| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$\d+\.\d+ \|$/m)
+  assert.doesNotMatch(result.report, /^Budget:/m)
 })
 
 test('develop: with the merge permission, the host merges the ready PR at the checked head and deletes only the remote branch', { timeout: 120_000 }, async () => {
@@ -371,6 +383,136 @@ test('develop: a branch that exists only on origin gets a new suffix', { timeout
   assert.equal(github.state.opened[0]?.head, result.branch)
   assert.equal((await git(origin, 'rev-parse', 'refs/heads/factory/dev-add-sub-mul')).trim(), original)
   assert.equal((await git(origin, 'show', 'factory/dev-add-sub-mul-2:src/sub.ts')), sources.sub)
+})
+
+const budgetPrices = {
+  'claude-opus-5-5': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 },
+  'gpt-6.1-sol': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 },
+}
+
+/** A review pass that the test gives: it spends `usd` and stops at its budget when `stopped`. */
+type ScriptedPass = { usd: number; stopped: boolean }
+
+/** Runs the development workflow with a budget, and with review passes that the test gives in place of the review loop. */
+async function runBudget(repo: string, runsDir: string, options: { runId: string; budget: number; channel: Channel; passes: ScriptedPass[]; requests: ReviewRequest[]; prices?: Prices }) {
+  const github = fakePulls([true])
+  const input = { ...(await developInput(repo, options.runId)), budget: options.budget }
+  const deps = await nodeDevelop({
+    channel: options.channel,
+    ci: { pollMs: 10, startMs: 1_000, waitMs: 5_000 },
+    credentials,
+    dispatch: scriptedDispatch(developScript(), []),
+    input,
+    log: () => {},
+    module,
+    prices: options.prices ?? budgetPrices,
+    pulls: github.pulls,
+    repo,
+    reviewChannel: async () => memoryChannel().channel,
+    runsDir,
+  })
+  const review = async (request: ReviewRequest) => {
+    options.requests.push(request)
+    const pass = options.passes.shift()
+    if (!pass) throw new Error('no scripted review pass left')
+    const usage = { tokens: zeroTokens(), usd: pass.usd, unpriced: [] }
+    const report = '- Triage: `TRIAGE path=full`'
+    return { pass: !pass.stopped, criteria: [], branch: 'factory/review', final: request.head, report, usage, stopped: pass.stopped }
+  }
+  return { ...(await develop(input, { ...deps, review })), github }
+}
+
+test('develop: at the budget, the run asks with the run totals and a stop ends it before the PR', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const { channel, posted } = memoryChannel()
+  const requests: ReviewRequest[] = []
+  const result = await runBudget(repo, runsDir(), { runId: 'budget-stop', budget: 0.001, channel, passes: [], requests })
+  assert.equal(result.status, 'stopped', result.report)
+  const asked = posted.find((entry) => entry.batch.startsWith('budget.'))
+  assert.ok(asked, JSON.stringify(posted.map((entry) => entry.batch)))
+  assert.match(asked.questions[0]!.question, /of its budget of \$0\.0010\./)
+  assert.match(result.report, /Reason: cost budget\./)
+  assert.match(result.report, /^Budget: \$0\.0010\. Spent: \$0\.\d{4}\.$/m)
+  assert.equal(result.github.state.opened.length, 0)
+  assert.equal(requests.length, 0)
+})
+
+test('develop: a review pass that stops at its budget is not recorded, and a resume with a higher budget runs it again', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  const { channel, posted } = memoryChannel()
+  const requests: ReviewRequest[] = []
+  // The pass spends $150 of the remaining budget of about $100. The development gate then asks with the run totals.
+  const first = await runBudget(repo, dir, { runId: 'budget-review', budget: 100, channel, passes: [{ usd: 150, stopped: true }], requests })
+  assert.equal(first.status, 'stopped', first.report)
+  assert.match(first.report, /^The run stopped at the cost budget: spent \$15\d\.\d{2} of \$100\.00\. Reason: cost budget\./m)
+  assert.match(first.report, /^\| review\.1 \| review loop \| 0 \| 0 \| 0 \| 0 \| \$150\.00 \|$/m)
+  const asked = posted.filter((entry) => entry.batch.startsWith('budget.'))
+  assert.equal(asked.length, 1)
+  assert.match(asked[0]!.questions[0]!.question, /^The run spent about \$15\d\.\d{2} of its budget of \$100\.00\./)
+  // The review loop got what remains of the run budget after the development agents.
+  const firstBudget = requests[0]!.budget!
+  assert.ok(firstBudget > 99 && firstBudget < 100, String(firstBudget))
+  assert.equal(fileLedger(join(dir, 'budget-review', 'state.json')).get('step:review.1'), undefined)
+
+  // The resumed run gets a higher budget. The same pass runs again, and its stopped attempt does not count two times.
+  const second = await runBudget(repo, dir, { runId: 'budget-review', budget: 1000, channel, passes: [{ usd: 160, stopped: false }], requests })
+  assert.equal(second.status, 'ready', second.report)
+  assert.equal(requests.length, 2)
+  assert.equal(requests[1]!.runId, requests[0]!.runId)
+  assert.ok(Math.abs(requests[1]!.budget! - firstBudget - 900) < 1e-6, String(requests[1]!.budget))
+  assert.match(second.report, /^\| review\.1 \| review loop \| 0 \| 0 \| 0 \| 0 \| \$160\.00 \|$/m)
+  assert.match(second.report, /^Budget: \$1000\.00\. Spent: \$16\d\.\d{2}\.$/m)
+  assert.equal(posted.filter((entry) => entry.batch.startsWith('budget.')).length, 1)
+})
+
+test('develop: a budget with a configured model without a price stops the run before any work', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const requests: ReviewRequest[] = []
+  await assert.rejects(
+    runBudget(repo, runsDir(), { runId: 'budget-unpriced', budget: 5, channel: memoryChannel().channel, passes: [], requests, prices: { 'claude-opus-5-5': budgetPrices['claude-opus-5-5'] } }),
+    (error: unknown) => error instanceof StopError && /no price for: gpt-6\.1-sol$/.test(error.message),
+  )
+  assert.equal(requests.length, 0)
+})
+
+test('develop: $0.20 of development and $0.70 of review pause at a $0.90 budget, then resume after a raise', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  const runId = 'budget-round-off'
+  const path = join(dir, runId, 'state.json')
+  const free = { input: 0, cached_input: 0, cache_write: 0, output: 0 }
+  const prices = { 'claude-opus-5-5': free, 'gpt-6.1-sol': free, prior: { ...free, input: 200_000 } }
+  // Record $0.20 of prior development spend. New scripted calls have zero prices.
+  recordUsage(fileLedger(path), 'prior', 'prior', [{
+    seq: 0,
+    request_id: 'prior',
+    created_at: 0,
+    event: { source: 'agent', event: { request_id: 'prior', seq: 1, type: 'model.call.completed', payload: { usage: { input_tokens: 1 } } } },
+  }])
+  const { channel, posted, replies } = memoryChannel({ 'budget.1': null })
+  const requests: ReviewRequest[] = []
+  const options = { runId, budget: 0.9, channel, requests, prices }
+  await assert.rejects(runBudget(repo, dir, { ...options, passes: [{ usd: 0.7, stopped: true }] }), PausedError)
+  const asked = posted.filter((entry) => entry.batch.startsWith('budget.'))
+  assert.equal(asked.length, 1)
+  const question = asked[0]
+  assert.ok(question)
+  assert.match(question.questions[0]?.question ?? '', /spent about \$0\.9000 of its budget of \$0\.9000\./)
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0]?.budget, 0.7)
+  assert.equal(fileLedger(path).get('step:review.1'), undefined)
+  assert.equal(fileLedger(path).get('result'), undefined)
+
+  replies[question.batch] = '/answer\nQ1: 1.2'
+  const result = await runBudget(repo, dir, { ...options, passes: [{ usd: 0.7, stopped: false }] })
+  assert.equal(result.status, 'ready', result.report)
+  assert.equal(requests.length, 2)
+  const resumed = requests[1]
+  assert.ok(resumed && resumed.budget !== undefined)
+  assert.ok(Math.abs(resumed.budget - 1) < 1e-12)
+  assert.match(result.report, /^Budget: \$1\.20\. Spent: \$0\.9000\.$/m)
+  assert.equal(posted.filter((entry) => entry.batch.startsWith('budget.')).length, 1)
 })
 
 test('Node branches: an origin error is not an absent branch', async () => {

@@ -107,6 +107,9 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 - **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
   fixes are on the local branch `factory/<run>`.
 - **Models:** `--models file.json` sets the model of each role.
+- **Budget:** `--budget <usd>` caps the spend of a run. At the cap, the run asks you to raise it or stop. Prices come
+  from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`, `cached_input`, `cache_write`,
+  `output`). Each report shows the usage of each step.
 - **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
 
 ## Cloudflare
@@ -123,14 +126,15 @@ for name in GITHUB_TOKEN GITHUB_WEBHOOK_SECRET ANTHROPIC_API_KEY OPENAI_API_KEY 
 done
 ```
 
-`ALLOWED_USERS` is the GitHub logins, comma-separated, that can start runs and answer questions.
+`ALLOWED_USERS` is the GitHub logins, comma-separated, that can start runs and answer questions. Set `MODEL_PRICES`
+as a secret to use budgets.
 
 `npm run remote` starts and follows runs. It reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from
 `.secrets/cloudflare.env`.
 
 ```bash
-npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full)
-npm run remote -- develop acme/app#45    # a development run on an issue (--base, --hotfix, --full, --parallel)
+npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full, --budget)
+npm run remote -- develop acme/app#45    # a development run on an issue (--base, --hotfix, --full, --parallel, --budget)
 npm run remote -- resume acme/app#45     # wake a paused run after you answer
 npm run remote -- status acme/app#45     # or report
 npm run metrics                          # CPU, memory and network of each build container

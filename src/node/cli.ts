@@ -7,6 +7,7 @@ import { repoConfigFile } from '../core/checks.ts'
 import type { Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError, type Channel } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
+import { parseBudget, parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, codeReviewLoop, defaultModels, mergeModels, providersOf, type LoopInput, type LoopModels } from '../core/workflows/code-review-loop.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
 import { credential } from './credentials.ts'
@@ -40,12 +41,15 @@ Options:
   --full                 Run the full loop, also when triage allows the light loop for a docs or tests only change
   --ship                 With --pr, on PASS: push the fixes to the PR branch and mark it ready
   --wait <minutes>       With --pr, how long to wait for answers before the run pauses (default 60)
+  --budget <usd>         Cost budget in USD. At the budget, the run asks you to raise it or to stop.
+                         With --run, it replaces the recorded budget.
 
 Questions for you go to the PR as a comment with --pr, to the terminal when it is interactive,
 and to a file in the run directory otherwise. A run that waits for answers exits with status 3;
 resume it with --run <id> after you answer.
 
-Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, ALLOWED_MODELS (model IDs, comma-separated)`
+Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, ALLOWED_MODELS (model IDs, comma-separated),
+MODEL_PRICES (JSON: USD per million tokens of each model ID, see README.md)`
 
 async function main(): Promise<number> {
   const { values } = parseArgs({
@@ -54,6 +58,7 @@ async function main(): Promise<number> {
       ask: { type: 'string' },
       'ask-file': { type: 'string' },
       base: { type: 'string' },
+      budget: { type: 'string' },
       'claude-plan': { type: 'boolean' },
       config: { type: 'string' },
       full: { type: 'boolean' },
@@ -73,8 +78,13 @@ async function main(): Promise<number> {
     console.log(usage)
     return 0
   }
+  const budget = values.budget !== undefined ? parseBudget(values.budget) : undefined
+  const prices = parsePrices(process.env.MODEL_PRICES)
   const runsDir = resolve(values['runs-dir'] ?? fileURLToPath(new URL('../../runs/', import.meta.url)))
-  const { input, source } = values.run ? resumeInput(runsDir, values.run) : await newInput(values)
+  const started = values.run ? resumeInput(runsDir, values.run) : await newInput(values)
+  const { source } = started
+  // A new budget replaces the recorded one. Without it, the recorded budget or the last raise stays.
+  const input: LoopInput = budget !== undefined ? { ...started.input, budgetOverride: budget } : started.input
 
   const credentials: Credentials = {}
   for (const provider of providersOf(input.models)) credentials[provider] = credential(provider, { claudePlan: values['claude-plan'] })
@@ -91,6 +101,7 @@ async function main(): Promise<number> {
       credentials,
       log: (line) => console.error(`[${new Date().toTimeString().slice(0, 8)}] ${line}`),
       module: await WebAssembly.compile(readFileSync(wasm)),
+      prices,
     })
   } catch (error) {
     if (!(error instanceof PausedError)) throw error

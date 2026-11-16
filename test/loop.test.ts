@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { profiles, staticFindings, triage } from '../src/core/profiles.ts'
 import { PausedError, type Channel } from '../src/core/questions.ts'
+import { StopError } from '../src/core/stop.ts'
 import { allowedModelsFrom, defaultAllowedModels, defaultModels, type LoopInput } from '../src/core/workflows/code-review-loop.ts'
 import { resumeInput } from '../src/node/cli.ts'
 import { changedFiles, diff, touchedFiles } from '../src/node/git.ts'
@@ -47,6 +48,52 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   assert.match(gateLog, /FINDING min-001 \| track=minimize \| severity=low \| ACTION=keep/)
   assert.match(result.report, /skipped: min-001 \(inlining adds nothing\)/)
   assert.equal(readFileSync(join(result.dir, 'report.md'), 'utf8'), result.report)
+
+  // Without a budget and prices, the Usage section shows the tokens of each agent and no price.
+  assert.match(result.report, /^## Usage$/m)
+  assert.match(result.report, /^\| step1\.minimize \| claude-opus-5-5 \| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| no price \|$/m)
+  assert.match(result.report, /^\| \*\*Total\*\* \| {2}\| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$0\.0000 \(2 models without a price\) \|$/m)
+  assert.equal(result.stopped, false)
+  assert.ok(result.usage.tokens.input > 0)
+})
+
+/** USD per million tokens: each scripted model call (8 input and 4 output tokens) costs $0.012. */
+const testPrices = {
+  'claude-opus-5-5': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 },
+  'gpt-6.1-sol': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 },
+}
+
+test('at the cost budget, the run asks to raise it or to stop, and a stop ends the run without PASS', async () => {
+  const repo = fixtureRepo()
+  const turns: Turn[] = []
+  const { channel, posted } = memoryChannel()
+  const result = await runLoop(repo, 'budget', runsDir(), { budget: 0.05, channel, dispatch: scriptedDispatch(script, turns), prices: testPrices })
+
+  const asked = posted.find((entry) => entry.batch.startsWith('budget.'))
+  assert.ok(asked, JSON.stringify(posted.map((entry) => entry.batch)))
+  assert.equal(asked.questions[0]!.recommendation, 'Stop the run')
+  // The step 1 reviewers spent more than the budget, so no patch agent opened. The bugs reviewer starts last, after the
+  // diff split, so the budget can stop it before its first turn.
+  assert.ok(turns.some((turn) => ['minimize', 'rules', 'anti-slop', 'bugs'].includes(turn.role)))
+  assert.ok(!turns.some((turn) => turn.role === 'patch'))
+  assert.deepEqual([result.pass, result.stopped], [false, true])
+  assert.ok(result.usage.usd >= 0.05)
+  assert.match(result.report, /^# Code review loop: FAIL/)
+  assert.match(result.report, /cost budget/)
+  assert.match(result.report, /^## Usage$/m)
+  assert.match(result.report, /^Budget: \$0\.0500\. Spent: \$0\.\d{4}\.$/m)
+  assert.equal(readFileSync(join(result.dir, 'report.md'), 'utf8'), result.report)
+  assert.deepEqual(fileLedger(join(result.dir, 'state.json')).get<{ stopped: boolean }>('result')?.stopped, true)
+})
+
+test('a budget with a configured model without a price stops the run before any work', async () => {
+  const repo = fixtureRepo()
+  const turns: Turn[] = []
+  await assert.rejects(
+    runLoop(repo, 'unpriced', runsDir(), { budget: 5, dispatch: scriptedDispatch(script, turns), prices: { 'claude-opus-5-5': testPrices['claude-opus-5-5'] } }),
+    (error: unknown) => error instanceof StopError && /no price for: gpt-6\.1-sol$/.test(error.message),
+  )
+  assert.equal(turns.length, 0)
 })
 
 test('a docs and tests only change takes the light loop: host findings, one reviewer that fixes, checks', async () => {

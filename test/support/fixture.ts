@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import type { Contracts } from 'nanocode-ts'
 import type { Credentials } from '../../src/core/providers.ts'
 import { parseAnswers, type Channel, type Question } from '../../src/core/questions.ts'
+import type { Prices } from '../../src/core/usage.ts'
 import { codeReviewLoop, defaultModels, type LoopInput } from '../../src/core/workflows/code-review-loop.ts'
 import type { GitSource } from '../../src/node/git.ts'
 import { loadRepoConfig, nodeRun } from '../../src/node/platform.ts'
@@ -195,9 +196,10 @@ export async function runLoop(
   repo: string,
   runId: string,
   runsDir: string,
-  options: { dispatch: Contracts.RuntimeOptions['dispatch']; channel?: Channel; input?: LoopInput },
+  options: { dispatch: Contracts.RuntimeOptions['dispatch']; channel?: Channel; input?: LoopInput; prices?: Prices; budget?: number },
 ) {
-  const input = options.input ?? (await loopInput(repo, runId))
+  const given = options.input ?? (await loopInput(repo, runId))
+  const input = options.budget === undefined ? given : { ...given, budget: options.budget }
   const run = await nodeRun({ config: input.config, runId, runsDir, source: gitSource(repo) })
   const result = await codeReviewLoop(input, {
     ...run,
@@ -206,6 +208,7 @@ export async function runLoop(
     dispatch: options.dispatch,
     log: () => {},
     module,
+    prices: options.prices,
   })
   return { ...result, dir: run.dir }
 }

@@ -3,6 +3,7 @@ import { checkEgress, egressFetch, type Egress, type EgressHost } from './egress
 import type { Ledger } from './ledger.ts'
 import type { AgentStore } from './platform.ts'
 import { dispatcher, type Credentials, type Provider } from './providers.ts'
+import { recordUsage } from './usage.ts'
 import { repoMount } from './workspace.ts'
 
 export type HostToolHandler = (input: unknown, context: Contracts.ToolCallContext) => Promise<unknown>
@@ -29,6 +30,8 @@ export type AgentHost = {
   credentials: Credentials
   /** Replaces the credentialed dispatch, for scripted models in tests. */
   dispatch?: Contracts.RuntimeOptions['dispatch']
+  /** Runs before the host opens an agent turn, for example to compare the spend with the budget. A rejection stops the turn. */
+  beforeTurn?: () => Promise<void>
   /** The artifacts, the lock and the secrets of the egress. Only an agent with an egress uses it. */
   egress?: EgressHost
   log(line: string): void
@@ -80,6 +83,7 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
     const runtime = await AgentRuntime.instantiate(host.module, host.store.sql, {
       published(events) {
         host.store.record(spec.id, events)
+        recordUsage(host.ledger, spec.id, spec.model, events)
         for (const event of events) {
           const line = describe(event)
           if (line) host.log(`${spec.id}: ${line}`)
@@ -166,6 +170,7 @@ export async function runTurn<T>(
 ): Promise<T> {
   const recorded = host.ledger.get<T>(turn.key)
   if (recorded !== undefined) return recorded
+  await host.beforeTurn?.()
   const retriesKey = `retries:${spec.id}:${turn.request}`
   const retries = host.ledger.get<number>(retriesKey) ?? 0
   const request = retries === 0 ? turn.request : `${turn.request}-retry-${retries}`
@@ -178,6 +183,8 @@ export async function runTurn<T>(
       if (report.status !== 'completed') throw new Error(`${spec.id}: turn ${report.status}: ${JSON.stringify(report.error ?? null)}`)
       // The first turn keeps the nudge request ID of earlier runs, so that their journals resume.
       const nudge = request === 'task' ? 'nudge' : `${request}-nudge`
+      // The nudge is a new agent turn, so the budget check applies to it too.
+      await host.beforeTurn?.()
       failed = (await agent.ask(nudge, `You ended the turn without calling ${tool}. Call tools.${tool} now.`)).status === 'failed'
     }
   } finally {

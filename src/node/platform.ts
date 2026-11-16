@@ -12,6 +12,7 @@ import type { Credentials } from '../core/providers.ts'
 import type { Channel } from '../core/questions.ts'
 import { loadResearchDomain, type ResearchConfig, type ResearchDomain, type ResearchFiles } from '../core/research.ts'
 import { StopError } from '../core/stop.ts'
+import type { Prices } from '../core/usage.ts'
 import { codeReviewLoop, type LoopDeps } from '../core/workflows/code-review-loop.ts'
 import type { DevelopDeps, DevelopInput } from '../core/workflows/develop.ts'
 import { diskFileSystem, guideFileSystem } from './disk.ts'
@@ -172,6 +173,8 @@ export type NodeDevelopOptions = {
   credentials: Credentials
   module: WebAssembly.Module
   dispatch?: Contracts.RuntimeOptions['dispatch']
+  /** USD per million tokens of each model, for the development run and its review loop passes. */
+  prices?: Prices
   ci: DevelopDeps['ci']
   log(line: string): void
 }
@@ -185,7 +188,7 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
   const dir = resolve(options.runsDir, input.runId)
   const branchesDir = join(dir, 'branches')
   mkdirSync(branchesDir, { recursive: true })
-  const host = { credentials: options.credentials, dispatch: options.dispatch, log: options.log, module: options.module }
+  const host = { credentials: options.credentials, dispatch: options.dispatch, log: options.log, module: options.module, prices: options.prices }
   return {
     ...host,
     dir,
@@ -197,11 +200,13 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
     branches: gitBranches(options.repo, branchesDir),
     pulls: options.pulls,
     checker: (branch) => commandChecker(branch, input.config, localMachine(worktreePath(branchesDir, branch.name))),
-    async review({ runId, ask, head, full, pr }) {
+    async review({ runId, ask, head, full, pr, budget }) {
       const source = { repo: options.repo, base: input.base, head }
       const run = await nodeRun({ config: input.config, runId, runsDir: options.runsDir, source })
       run.ledger.put('git', source)
-      const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}) }
+      const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}), ...(budget !== undefined ? { budgetOverride: budget } : {}), stopAtBudget: true }
+      // The pass runs again after a raise with a new remaining budget, so the budget is an override, not the recorded value.
+      // At the budget, the pass stops without a question, and the development run asks with the run totals.
       return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr) })
     },
     ci: options.ci,

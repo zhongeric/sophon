@@ -8,6 +8,7 @@ import type { Contracts } from 'nanocode-ts'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import { openAgent, runTurn, submitOnce, type AgentHost, type AgentSpec } from '../src/core/agent.ts'
 import { runLock, type Egress } from '../src/core/egress.ts'
+import { BudgetStop, usageOf } from '../src/core/usage.ts'
 import { createWorkspace } from '../src/core/workspace.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { sqliteStore } from '../src/node/platform.ts'
@@ -61,6 +62,75 @@ test('a turn that failed on a model error asks again under a new request ID when
   assert.ok(turns.length > 0)
   assert.match(turns[0]!.request, /Your last turn stopped with an error/)
   assert.equal(second.ledger.get('retries:note:task'), 1)
+})
+
+test('a rejected beforeTurn opens no agent, and a completed turn leaves the usage of the agent in the ledger', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'factory-agent-'))
+  const turns: Turn[] = []
+  const dispatch = scriptedDispatch((turn) => (turn.output === null ? { cell: "await tools.submit_note({ note: 'done' }); text('submitted')" } : { text: 'done' }), turns)
+  const host: AgentHost = {
+    module,
+    store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
+    ledger: fileLedger(join(dir, 'state.json')),
+    credentials,
+    dispatch,
+    beforeTurn: async () => {
+      throw new BudgetStop('over the budget')
+    },
+    log: () => {},
+  }
+  const spec: AgentSpec = {
+    id: 'note',
+    provider: 'codex',
+    model: 'gpt-5.5',
+    instructions: 'Agent role: note',
+    workspace: await createWorkspace({ repo: MemoryFileSystem.create(), review: {} }),
+    tools: submitOnce(host, 'output:note', submitNote, async (input) => input),
+  }
+
+  await assert.rejects(runTurn(host, spec, 'Write a note.', 'submit_note'), BudgetStop)
+  assert.equal(turns.length, 0)
+  assert.equal(host.ledger.get('session:note'), undefined)
+
+  host.beforeTurn = async () => {}
+  assert.deepEqual(await runTurn(host, spec, 'Write a note.', 'submit_note'), { note: 'done' })
+  // Two model calls (the cell and the final text), each with input 8 and output 4.
+  const tokens = { input: 16, cached: 0, cache_write: 0, output: 8 }
+  assert.deepEqual(usageOf(host.ledger), { agents: [{ step: 'note', model: 'gpt-5.5', tokens }], total: tokens })
+  assert.deepEqual(usageOf(fileLedger(join(dir, 'state.json'))).total, tokens)
+})
+
+test('the budget check also runs before the nudge turn, so a first turn that reaches the budget opens no nudge', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'factory-agent-'))
+  const turns: Turn[] = []
+  // The model ends each turn with a text and never calls the submit tool.
+  const dispatch = scriptedDispatch(() => ({ text: 'done' }), turns)
+  let checks = 0
+  const host: AgentHost = {
+    module,
+    store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
+    ledger: fileLedger(join(dir, 'state.json')),
+    credentials,
+    dispatch,
+    beforeTurn: async () => {
+      if (++checks > 1) throw new BudgetStop('over the budget')
+    },
+    log: () => {},
+  }
+  const spec: AgentSpec = {
+    id: 'note',
+    provider: 'codex',
+    model: 'gpt-5.5',
+    instructions: 'Agent role: note',
+    workspace: await createWorkspace({ repo: MemoryFileSystem.create(), review: {} }),
+    tools: submitOnce(host, 'output:note', submitNote, async (input) => input),
+  }
+
+  await assert.rejects(runTurn(host, spec, 'Write a note.', 'submit_note'), BudgetStop)
+  assert.equal(checks, 2)
+  assert.equal(turns.length, 1)
+  assert.ok(!turns.some((turn) => /You ended the turn without calling/.test(turn.request)))
+  assert.equal(host.ledger.get('retries:note:task'), undefined)
 })
 
 const archive: Egress = { hosts: ['archive.example.org'], web_search: true }
