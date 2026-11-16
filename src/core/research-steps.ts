@@ -45,7 +45,7 @@ const submitResearchIntake: Contracts.HostTool = {
   },
 }
 
-export function checkResearchIntake(input: unknown): ResearchIntake {
+function checkResearchIntake(input: unknown): ResearchIntake {
   const intake = input as ResearchIntake
   const problems = [
     ...(!intake?.title?.trim() || intake.title.length > 72 ? ['title must have 1 to 72 characters'] : []),
@@ -121,6 +121,7 @@ const surveyTries = 2
 /**
  * Stage 1: one surveyor on one lens. The ledger counts the rejected submits, so that a resume keeps the count.
  * At the second rejection, or when the turn ends without an accepted survey, the run stops and names the lens.
+ * A check in progress holds a try, so that parallel submits do not get more tries.
  */
 export async function survey(context: ResearchContext, id: string, model: ModelChoice, lens: string): Promise<LensSurvey> {
   const { ledger } = context.host
@@ -129,15 +130,28 @@ export async function survey(context: ResearchContext, id: string, model: ModelC
   const failed = () => new StopError(`the survey of lens "${lens}" failed its claim check ${surveyTries} times`)
   if (rejected() >= surveyTries) throw failed()
   const sources = researchSources(context)
+  let checking = 0
   const tools = submitOnce(context.host, `output:${id}`, submitSurvey, async (input) => {
     if (rejected() >= surveyTries) throw new Error(`the host rejected ${surveyTries} surveys, and the run stops`)
+    if (rejected() + checking >= surveyTries) throw new Error('the host checks your other submit_survey calls. Wait for their result.')
+    checking++
     try {
       return { lens, ...(await checkSurvey(input, sources)) }
     } catch (error) {
       ledger.put(rejectedKey, rejected() + 1)
       throw error
+    } finally {
+      checking--
     }
   })
+  // After the last rejection, the run stops before runTurn opens a nudge turn.
+  const host = {
+    ...context.host,
+    beforeTurn: async () => {
+      if (rejected() >= surveyTries) throw failed()
+      await context.host.beforeTurn?.()
+    },
+  }
   const prompt = [
     `Survey the lens "${lens}" for this program.`,
     '',
@@ -147,7 +161,7 @@ export async function survey(context: ResearchContext, id: string, model: ModelC
     `Call submit_survey one time. After a rejected call, you get one more try. At rejection ${surveyTries}, the run stops.`,
   ].join('\n')
   try {
-    return await runTurn<LensSurvey>(context.host, await agent(context, id, researchRoles.surveyor, model, {}, tools), prompt, 'submit_survey')
+    return await runTurn<LensSurvey>(host, await agent(context, id, researchRoles.surveyor, model, {}, tools), prompt, 'submit_survey')
   } catch (error) {
     if (rejected() >= surveyTries) throw failed()
     if (error instanceof Error && error.message === `${id} did not call submit_survey`) throw new StopError(`the surveyor of lens "${lens}" ended without an accepted survey`)
@@ -156,7 +170,7 @@ export async function survey(context: ResearchContext, id: string, model: ModelC
 }
 
 /** The surveys as one Markdown file, for the generators and the preregistrars. */
-export function renderSurveys(surveys: LensSurvey[]): string {
+function renderSurveys(surveys: LensSurvey[]): string {
   return [
     '# Surveys',
     '',
@@ -187,7 +201,7 @@ export async function generate(context: ResearchContext, id: string, model: Mode
   return runTurn(context.host, spec, prompt, 'submit_hypotheses')
 }
 
-export function renderHypothesis(hypothesis: NumberedHypothesis): string {
+function renderHypothesis(hypothesis: NumberedHypothesis): string {
   return [
     `# ${hypothesis.id}: ${hypothesis.title}`,
     '',

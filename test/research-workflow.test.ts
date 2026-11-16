@@ -5,11 +5,13 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { coreSections, freezePrereg } from '../src/core/prereg.ts'
 import { StopError } from '../src/core/stop.ts'
-import { defaultResearchModels } from '../src/core/workflows/research.ts'
+import { defaultResearchModels, research } from '../src/core/workflows/research.ts'
 import { worktreePath } from '../src/node/git.ts'
-import { memoryChannel } from './support/fixture.ts'
-import { archive, earlierPrereg, holdoutPrefix, notebook, researchConfig, researchInput, researchScript, runResearch } from './support/research.ts'
+import { nodeResearch } from '../src/node/platform.ts'
+import { credentials, memoryChannel, module } from './support/fixture.ts'
+import { archive, earlierPrereg, holdoutPrefix, notebook, prices, researchConfig, researchInput, researchScript, runResearch } from './support/research.ts'
 import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-research-runs-'))
@@ -112,6 +114,93 @@ test('research: intake with a cap, surveys through the egress, two generators, t
   assert.equal(again.length, 0)
 })
 
+test('research: a fresh run creates the next version when the base has an identical prereg', { timeout: 120_000 }, async () => {
+  const { repo } = notebook()
+  const previous = await freezePrereg({
+    hypothesis: 'hyp-001',
+    sections: [...coreSections, 'Holdout'].map((name) => ({ name, text: `${name} of hyp-001.` })),
+    known_recall: 0.9,
+  })
+  writeFileSync(join(repo, previous.path), previous.markdown)
+  gitIn(repo, 'add', previous.path)
+  gitIn(repo, 'commit', '-m', 'freeze earlier prereg')
+  const base = gitIn(repo, 'rev-parse', 'HEAD').trim()
+  const { channel } = memoryChannel({ pick: '/answer\nQ1: a' })
+  const { result, deps } = await runResearch(repo, runsDir(), researchInput(base, 'identical-base'), {
+    channel,
+    dispatch: scriptedDispatch(researchScript(), []),
+  })
+
+  assert.equal(result.status, 'frozen', result.report)
+  assert.equal(result.frozen.length, 1)
+  const frozen = result.frozen[0]
+  assert.ok(frozen)
+  assert.equal(frozen.path, 'prereg/hyp-001-v2.md')
+  assert.equal(frozen.version, 2)
+  assert.notEqual(frozen.commit, base)
+  assert.equal(gitIn(repo, 'rev-parse', `${frozen.commit}^`).trim(), base)
+  assert.equal(gitIn(repo, 'show', `${frozen.commit}:${previous.path}`), previous.markdown)
+  const text = gitIn(repo, 'show', `${frozen.commit}:${frozen.path}`)
+  assert.match(text, /^# Prereg hyp-001 v2\n/)
+  assert.equal(createHash('sha256').update(text).digest('hex'), frozen.sha256)
+  assert.deepEqual(deps.ledger.get('frozen'), result.frozen)
+})
+
+test('research: a resume commits a prereg left in the worktree before it records the freeze', { timeout: 120_000 }, async () => {
+  const { repo, base } = notebook()
+  const runs = runsDir()
+  const input = researchInput(base, 'freeze-interrupted')
+  const { channel } = memoryChannel({ pick: '/answer\nQ1: a' })
+  const deps = await nodeResearch({
+    channel,
+    credentials,
+    dispatch: scriptedDispatch(researchScript(), []),
+    env: { ARCHIVE_TOKEN: 'token-1' },
+    fetch: archive().fetch,
+    input,
+    log: () => {},
+    module,
+    prices,
+    repo,
+    runsDir: runs,
+  })
+  await assert.rejects(
+    research(input, {
+      ...deps,
+      branches: {
+        ...deps.branches,
+        async branch(name, from) {
+          const branch = await deps.branches.branch(name, from)
+          return { ...branch, async commit() { throw new Error('interrupted before freeze commit') } }
+        },
+      },
+    }),
+    /interrupted before freeze commit/,
+  )
+  const branch = 'factory/research-freeze-interrupted'
+  const path = 'prereg/hyp-001-v2.md'
+  const worktree = worktreePath(join(deps.dir, 'branches'), branch)
+  const bytes = readFileSync(join(worktree, path))
+  assert.equal(gitIn(repo, 'rev-parse', branch).trim(), base)
+  assert.equal(deps.ledger.get('step:freeze.hyp-001'), undefined)
+  assert.equal(deps.ledger.get('frozen'), undefined)
+
+  const again: Turn[] = []
+  const { result } = await runResearch(repo, runs, input, { channel, dispatch: scriptedDispatch(researchScript(), again) })
+  assert.equal(result.status, 'frozen', result.report)
+  assert.equal(again.length, 0)
+  assert.equal(result.frozen.length, 1)
+  const frozen = result.frozen[0]
+  assert.ok(frozen)
+  assert.equal(frozen.path, path)
+  assert.equal(frozen.version, 2)
+  assert.notEqual(frozen.commit, base)
+  assert.equal(createHash('sha256').update(bytes).digest('hex'), frozen.sha256)
+  assert.equal(createHash('sha256').update(gitIn(repo, 'show', `${frozen.commit}:${path}`)).digest('hex'), frozen.sha256)
+  assert.equal(gitIn(repo, 'rev-parse', branch).trim(), frozen.commit)
+  assert.equal(gitIn(worktree, 'status', '--porcelain'), '')
+})
+
 test('research: the CLI module runs no command when a test imports it', async () => {
   const exit = process.exitCode
   await import('../src/node/research.ts')
@@ -166,6 +255,48 @@ test('research: a surveyor that fails the claim check two times stops the run an
     stops(/^the survey of lens "catalogs" failed its claim check 2 times$/),
   )
   assert.ok(!turns.some((turn) => turn.role === 'generator'))
+  // The run stops at the second rejection, so no nudge turn asks for a survey that the host refuses.
+  assert.ok(!turns.some((turn) => turn.request.includes('You ended the turn without calling submit_survey')))
+})
+
+test('research: parallel submits of a surveyor get no more than two tries', async () => {
+  const { repo, base } = notebook()
+  const turns: Turn[] = []
+  const { channel } = memoryChannel()
+  await assert.rejects(
+    runResearch(repo, runsDir(), researchInput(base, 'r7p'), { channel, dispatch: scriptedDispatch(researchScript({ parallelLens: 'catalogs' }), turns) }),
+    stops(/^the survey of lens "catalogs" failed its claim check 2 times$/),
+  )
+  assert.ok(!turns.some((turn) => turn.role === 'generator'))
+})
+
+test('research: the intake cap replaces --budget, and an unreadable cap or pick answer gets its question again', { timeout: 120_000 }, async () => {
+  const { repo, base } = notebook()
+  const { channel, posted } = memoryChannel({
+    intake: '/answer\nQ1: a\nQ2: lots',
+    'cap.2': '/answer\nQ1: 40',
+    pick: '/answer\nQ1: I pick a and c',
+    'pick.2': '/answer\nQ1: a',
+  })
+  const { result, deps } = await runResearch(repo, runsDir(), researchInput(base, 'r10', { budgetOverride: 100 }), { channel, dispatch: scriptedDispatch(researchScript(), []) })
+  assert.equal(result.status, 'frozen', result.report)
+  assert.deepEqual(
+    posted.map((batch) => batch.batch),
+    ['intake', 'cap.2', 'pick', 'pick.2', 'approve.1'],
+  )
+  assert.equal(posted[0]!.questions[1]!.recommendation, '100 USD')
+  assert.match(posted[1]!.questions[0]!.why, /budget must be a positive number of USD, not "lots"/)
+  assert.match(posted[3]!.questions[0]!.why, /names no hypothesis of this run: option i/)
+  assert.equal(deps.ledger.get<{ limit: number }>('budget')?.limit, 40)
+  assert.deepEqual(
+    result.frozen.map((entry) => entry.hypothesis),
+    ['hyp-001'],
+  )
+
+  const uncapped = memoryChannel({ intake: '/answer\nQ2: No cap', pick: '/answer\nQ1: None' })
+  const second = await runResearch(repo, runsDir(), researchInput(base, 'r11', { budgetOverride: 100 }), { channel: uncapped.channel, dispatch: scriptedDispatch(researchScript(), []) })
+  assert.equal(second.result.status, 'stopped')
+  assert.equal(second.deps.ledger.get<{ limit?: number }>('budget')?.limit, undefined)
 })
 
 test('research: with no pick, or with no hypothesis, the run stops before any preregistrar', async () => {

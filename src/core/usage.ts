@@ -186,6 +186,12 @@ export function resolveBudget(ledger: Ledger, recorded: number | undefined, over
   return value
 }
 
+/** A new budget round makes sure that later questions do not read answers for the removed limit. */
+export function clearBudget(ledger: Ledger): void {
+  const state = budgetState(ledger)
+  if (state.limit !== undefined) ledger.put(budgetKey, { round: state.round + 1 } satisfies BudgetState)
+}
+
 /** The user chose to stop the run at the cost budget. */
 export class BudgetStop extends Error {
   override name = 'BudgetStop'

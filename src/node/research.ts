@@ -5,8 +5,9 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { repoConfigFile } from '../core/checks.ts'
 import { parseParallel } from '../core/plan.ts'
-import type { Credentials } from '../core/providers.ts'
+import { defaultEndpoints, type Credentials } from '../core/providers.ts'
 import { PausedError, type Channel } from '../core/questions.ts'
+import type { ModelChoice } from '../core/roles.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget, parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom } from '../core/workflows/code-review-loop.ts'
@@ -71,16 +72,16 @@ async function main(): Promise<number> {
     return 0
   }
   const budget = values.budget !== undefined ? parseBudget(values.budget) : undefined
+  const waitMs = parseWait(values.wait ?? String(defaultWaitMinutes))
   const prices = parsePrices(process.env.MODEL_PRICES)
   const runsDir = resolve(values['runs-dir'] ?? fileURLToPath(new URL('../../runs/', import.meta.url)))
-  const started = values.run ? resumeInput(runsDir, values.run) : await newInput(values)
+  const started = values.run ? resumeInput(runsDir, values.run) : await newInput(values, budget)
   const { repo } = started
-  // A new budget replaces the recorded one. Without it, the recorded budget or the cap from the intake stays.
-  const input: ResearchInput = budget !== undefined ? { ...started.input, budgetOverride: budget } : started.input
+  // On a resume, a new budget replaces the recorded one. Without it, the recorded budget or the cap from the intake stays.
+  const input: ResearchInput = values.run && budget !== undefined ? { ...started.input, budgetOverride: budget } : started.input
 
   const credentials: Credentials = {}
   for (const provider of researchProviders(input.models)) credentials[provider] = credential(provider, { claudePlan: values['claude-plan'] })
-  const waitMs = Number(values.wait ?? defaultWaitMinutes) * 60_000
   const dir = resolve(runsDir, input.runId)
   const deps = await nodeResearch({
     channel: process.stdin.isTTY === true ? terminalChannel(process.stdin, process.stderr) : waiting(fileChannel(dir), waitMs),
@@ -103,6 +104,13 @@ async function main(): Promise<number> {
     console.log(`Resume with: ${command} --run ${input.runId}`)
     return pausedExitCode
   }
+}
+
+/** The --wait option in milliseconds. A value that is not a number of 0 or more minutes stops the run. */
+export function parseWait(text: string): number {
+  const minutes = text.trim() === '' ? Number.NaN : Number(text)
+  if (!Number.isFinite(minutes) || minutes < 0) throw new StopError(`--wait must be a number of minutes of 0 or more, not ${JSON.stringify(text)}`)
+  return minutes * 60_000
 }
 
 /** Reads the answers file again until `waitMs` ends, so that the user can reply while the run waits. */
@@ -132,7 +140,41 @@ function resumeInput(runsDir: string, runId: string): { input: ResearchInput; re
 
 type Values = Record<string, string | boolean | undefined>
 
-async function newInput(values: Values): Promise<{ input: ResearchInput; repo: string }> {
+const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+
+function modelChoice(value: unknown, where: string): ModelChoice {
+  const shape = `${where} must be { "provider": ${Object.keys(defaultEndpoints).map((name) => JSON.stringify(name)).join(' or ')}, "model": <ID>, "thinking"?: "low" or "medium" or "high" }`
+  if (!isObject(value)) throw new StopError(shape)
+  const { provider, model, thinking, ...rest } = value
+  if (typeof provider !== 'string' || !Object.hasOwn(defaultEndpoints, provider) || typeof model !== 'string' || model === '') throw new StopError(shape)
+  if (thinking !== undefined && thinking !== 'low' && thinking !== 'medium' && thinking !== 'high') throw new StopError(shape)
+  if (Object.keys(rest).length > 0) throw new StopError(shape)
+  // The keys of defaultEndpoints are the providers.
+  return { provider: provider as ModelChoice['provider'], model, ...(thinking !== undefined ? { thinking } : {}) }
+}
+
+/** The models of a --models file over the defaults. A file with another shape stops the run before any work. */
+export function researchModels(text: string, source: string): ResearchModels {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    throw new StopError(`--models ${source} is not valid JSON: ${(error as Error).message}`)
+  }
+  if (!isObject(parsed)) throw new StopError(`--models ${source} must be a JSON object of roles`)
+  const models = { ...defaultResearchModels }
+  for (const [role, value] of Object.entries(parsed)) {
+    if (role === 'generators') {
+      if (!Array.isArray(value) || value.length !== 2) throw new StopError(`--models ${source}: generators must be a list of two models`)
+      models.generators = [modelChoice(value[0], `--models ${source}: generators[0]`), modelChoice(value[1], `--models ${source}: generators[1]`)]
+    } else if (role === 'intake' || role === 'surveyor' || role === 'preregistrar') models[role] = modelChoice(value, `--models ${source}: ${role}`)
+    else throw new StopError(`--models ${source}: ${role} is not a research role (intake, surveyor, generators, preregistrar)`)
+  }
+  return models
+}
+
+/** The input of a new run. A --budget value is the budget before the intake, so the cap of the intake replaces it. */
+export async function newInput(values: Values, budget?: number): Promise<{ input: ResearchInput; repo: string }> {
   const repo = resolve(String(values.repo ?? process.cwd()))
   const program = values['program-file'] ? readFileSync(String(values['program-file']), 'utf8') : (values.program as string | undefined)
   if (!program?.trim()) throw new StopError('give the program with --program or --program-file')
@@ -140,17 +182,18 @@ async function newInput(values: Values): Promise<{ input: ResearchInput; repo: s
   const baseRef = String(values.base ?? 'main')
   // The local branch, not origin: the run commits on a branch of this working copy and never pushes.
   const base = (await git(repo, 'rev-parse', '--verify', `${baseRef}^{commit}`)).trim()
-  const overrides = values.models ? (JSON.parse(readFileSync(String(values.models), 'utf8')) as Partial<ResearchModels>) : {}
+  const models = values.models ? researchModels(readFileSync(String(values.models), 'utf8'), String(values.models)) : defaultResearchModels
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
   const input: ResearchInput = {
     allowedModels: allowedModelsFrom(process.env.ALLOWED_MODELS),
     base,
     baseRef,
-    models: { ...defaultResearchModels, ...overrides },
+    models,
     program,
     runId: `research-${stamp}`,
     source: `${repo} on ${baseRef}`,
     ...(parallel !== undefined ? { parallel } : {}),
+    ...(budget !== undefined ? { budget } : {}),
   }
   return { input, repo }
 }

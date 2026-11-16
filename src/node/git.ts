@@ -164,7 +164,6 @@ export function gitBranches(repo: string, dir: string): Branches {
   }
 }
 
-
 type TreeEntry = { mode: string; type: string; object: string; name: string }
 
 /** The entries that `git ls-tree` gives for a path, or for the root without a path. Names are relative to the root. */

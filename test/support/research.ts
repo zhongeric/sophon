@@ -103,15 +103,20 @@ const submit = (tool: string, input: unknown) => `await tools.${tool}(${JSON.str
 
 /**
  * The cell of a surveyor: it fetches the page of its lens through the egress, tries the holdout, and submits a survey
- * for each quote, in order. A rejected submit shows in the output.
+ * for each quote, in order or with `parallel` all at once. A rejected submit shows in the output.
  */
-function surveyCell(lens: string, quotes: string[]): string {
+function surveyCell(lens: string, quotes: string[], parallel = false): string {
   return [
     `const response = await fetch('https://archive.example.org/papers/${lens}')`,
     `const id = response.headers.get('x-artifact-id')`,
     `try { await fetch('${holdoutPrefix}targets.csv'); text('HOLDOUT FETCHED') } catch (error) { text('holdout refused: ' + error) }`,
     `const survey = (evidence) => ({ summary: 'The archive of ${lens} says that dwarf galaxies stay quiet.', claims: [{ statement: 'Dwarf galaxies stay quiet.', location: 'artifact:' + id, evidence }] })`,
-    ...quotes.map((quote) => `try { await tools.submit_survey(survey(${JSON.stringify(quote)})); text('survey accepted') } catch (error) { text('survey refused: ' + error) }`),
+    ...(parallel
+      ? [
+          `const results = await Promise.allSettled(${JSON.stringify(quotes)}.map((quote) => tools.submit_survey(survey(quote))))`,
+          `for (const result of results) text(result.status === 'fulfilled' ? 'survey accepted' : 'survey refused: ' + result.reason)`,
+        ]
+      : quotes.map((quote) => `try { await tools.submit_survey(survey(${JSON.stringify(quote)})); text('survey accepted') } catch (error) { text('survey refused: ' + error) }`)),
   ].join('\n')
 }
 
@@ -120,14 +125,16 @@ const goodQuote = 'dwarf galaxies stay quiet'
 
 /**
  * The research roles. The literature surveyor fixes a rejected survey on its second try. The surveyor of `failLens`
- * submits a bad quote two times. With `noHypotheses`, both generators submit an empty list.
+ * submits a bad quote two times. The surveyor of `parallelLens` submits two bad quotes and a good quote at once.
+ * With `noHypotheses`, both generators submit an empty list.
  */
-export function researchScript(options: { failLens?: string; noHypotheses?: boolean } = {}): Script {
+export function researchScript(options: { failLens?: string; parallelLens?: string; noHypotheses?: boolean } = {}): Script {
   return (turn: Turn) => {
     if (turn.output !== null) return { text: 'done' }
     if (turn.role === 'intake') return { cell: submit('submit_research_intake', intake) }
     if (turn.role === 'surveyor') {
       const lens = /Survey the lens \\"([a-z-]+)\\"/.exec(turn.request)?.[1] ?? 'unknown'
+      if (lens === options.parallelLens) return { cell: surveyCell(lens, [badQuote, badQuote, goodQuote], true) }
       const quotes = lens === options.failLens ? [badQuote, badQuote] : lens === 'literature' ? [badQuote, goodQuote] : [goodQuote]
       return { cell: surveyCell(lens, quotes) }
     }

@@ -13,7 +13,7 @@ import { generate, preregister, researchEgress, researchIntake, survey, type Len
 import type { ResearchDomain } from '../research.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
-import { BudgetStop, budgetGate, checkPriced, parseBudget, resolveBudget, usageOf, usageSection, type Prices } from '../usage.ts'
+import { BudgetStop, budgetGate, checkPriced, clearBudget, parseBudget, resolveBudget, usageOf, usageSection, type Prices } from '../usage.ts'
 import { decisionSections, defaultAllowedModels } from './code-review-loop.ts'
 
 /** The two generators run on two model families. */
@@ -44,7 +44,7 @@ export type ResearchInput = {
   parallel?: number
   /** The cost budget in USD before the intake. The cap that the user gives at intake replaces it. */
   budget?: number
-  /** A budget of the current invocation, for example --budget on a resume. It replaces the budget, and the ledger does not record it. */
+  /** A budget of the current invocation, for example --budget on a resume. It replaces the budget, and the ledger does not record it. The intake cap replaces it. */
   budgetOverride?: number
 }
 
@@ -80,14 +80,18 @@ const noCap = 'No cap'
 const noneOption = 'None'
 const approveOptions = ['Approve and freeze', 'Reject (write the reason)']
 const frozenKey = 'frozen'
+/** The cap of the intake answer, after the host applied it. Null is no cap. */
+const capKey = 'cap'
+type Cap = { usd: number | null }
+type Parsed<T> = { value: T } | { error: string }
 
 const choices = (models: ResearchModels) => [models.intake, models.surveyor, ...models.generators, models.preregistrar]
 
-export const researchModelIds = (models: ResearchModels): string[] => choices(models).map((choice) => choice.model)
+const researchModelIds = (models: ResearchModels): string[] => choices(models).map((choice) => choice.model)
 
 export const researchProviders = (models: ResearchModels): Set<Provider> => new Set(choices(models).map((choice) => choice.provider))
 
-export function checkResearchModels(models: ResearchModels, allowed = defaultAllowedModels): void {
+function checkResearchModels(models: ResearchModels, allowed = defaultAllowedModels): void {
   const refused = [...new Set(researchModelIds(models))].filter((model) => !allowed.includes(model))
   if (refused.length > 0) throw new StopError(`models outside the allowed list (${allowed.join(', ')}): ${refused.join(', ')}`)
   // A models file can give another count, so the host also checks the count at run time.
@@ -97,10 +101,8 @@ export function checkResearchModels(models: ResearchModels, allowed = defaultAll
 }
 
 /**
- * The research workflow, stages 0 to 4: the intake with the confirmation of the program and the cost cap, one
- * surveyor for each lens, two generators on two model families and the merge, the pick of the user, and one
- * preregistrar for each pick. The host freezes and commits a prereg only after the user approves it. The run stops
- * before stage 5. Every step is in the ledger, so the same run ID resumes without repeating finished steps.
+ * The host freezes and commits a prereg only after the user approves it. The run stops before stage 5. Every step is
+ * in the ledger, so the same run ID resumes without repeating finished steps.
  */
 export async function research(input: ResearchInput, deps: ResearchDeps): Promise<ResearchResult> {
   const stop: { finish?: Finish } = {}
@@ -138,7 +140,10 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     throw new StopError(error instanceof Error ? error.message : String(error))
   }
   const prices = deps.prices ?? {}
-  if (resolveBudget(ledger, input.budget, input.budgetOverride) !== undefined) checkPriced(researchModelIds(models), prices)
+  // After the intake, the recorded budget is the cap, so that a resume keeps the cap or a later raise.
+  const capped = ledger.get<Cap>(capKey)
+  const recordedBudget = capped ? (capped.usd ?? undefined) : input.budget
+  if (resolveBudget(ledger, recordedBudget, input.budgetOverride) !== undefined) checkPriced(researchModelIds(models), prices)
   const budget = budgetGate({ channel: deps.channel, ledger, log: deps.log, prices, runId: input.runId })
   // A resume without --budget must not apply the override again, so the recorded input does not keep it.
   const { budgetOverride, ...recorded } = input
@@ -166,6 +171,16 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     await questions.post(batch, list)
     return questions.wait(batch)
   }
+  // The ledger keeps an answer that does not parse, so the question goes again in a new batch.
+  const askUntil = async <T>(batch: string, question: Question, answer: string, parse: (text: string) => Parsed<T>): Promise<T> => {
+    for (let round = 2; ; round++) {
+      const parsed = parse(answer)
+      if ('value' in parsed) return parsed.value
+      deps.log(`the answer ${JSON.stringify(answer)} (${batch}): ${parsed.error}, asking again`)
+      const [again] = await ask(`${batch}.${round}`, [{ ...question, id: 'Q1', why: `${parsed.error}.\n${question.why}` }])
+      answer = again?.answer ?? ''
+    }
+  }
   const finish: Finish = async (status, note) => {
     const limit = budget.limit()
     const usage = usageSection(usageOf(ledger).agents, prices, limit === undefined ? undefined : { limit, spent: budget.spent() })
@@ -188,10 +203,17 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   // 0. Intake: no survey before the user confirms the program and sets the cost cap.
   const intook = await step(ledger, 'intake', () => researchIntake(context, 'intake', models.intake))
   state.intake = intook
-  const answers = await ask('intake', [...intook.questions, ...hostQuestions(intook, input.budget ?? defaultCap)])
+  // Without a price for each model, a cap cannot work, so the question recommends no cap.
+  const priced = researchModelIds(models).every((model) => model in prices)
+  const [confirm, capAsk] = hostQuestions(intook, priced ? (budget.limit() ?? defaultCap) : undefined)
+  const answers = await ask('intake', [...intook.questions, confirm, capAsk])
   if (route(asDevelopIntake(intook), answers).stop) return finish('stopped', 'You stopped the run at intake.')
-  const cap = parseCap(answers.find((answer) => answer.id === capId(intook))?.answer ?? noCap)
-  if (resolveBudget(ledger, cap ?? input.budget, input.budgetOverride) !== undefined) checkPriced(researchModelIds(models), prices)
+  if (!capped) {
+    const first = answers.find((answer) => answer.id === capAsk.id)?.answer ?? noCap
+    const cap = await askUntil('cap', capAsk, first, (text) => parseCap(text, researchModelIds(models), prices))
+    applyCap(ledger, cap)
+    ledger.put(capKey, { usd: cap ?? null } satisfies Cap)
+  }
 
   // 1. Survey: one surveyor for each lens.
   const parallel = input.parallel ?? defaultParallel
@@ -211,8 +233,11 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   if (state.hypotheses.length === 0) return finish('stopped', 'The generators made no hypothesis, so the run asked no pick question.')
 
   // 3. Pick: no later agent reads a hypothesis that the user did not pick.
-  const [pick] = await ask('pick', [pickQuestion(state.hypotheses)])
-  const picked = await step(ledger, 'picked', async () => parsePicks(pick?.answer ?? noneOption, state.hypotheses))
+  const picked = await step(ledger, 'picked', async () => {
+    const question = pickQuestion(state.hypotheses)
+    const [pick] = await ask('pick', [question])
+    return askUntil('pick', question, pick?.answer ?? noneOption, (text) => parsePicks(text, state.hypotheses))
+  })
   state.picked = picked
   if (picked.length === 0) return finish('stopped', 'You picked no hypothesis, so the run stopped after stage 3.')
 
@@ -231,7 +256,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
         rejected.push({ hypothesis: pending[index]!.hypothesis, revision: { round, reason: answer === approveOptions[1] ? 'The user gave no reason.' : answer } })
         continue
       }
-      const frozen = await step(ledger, `freeze.${draft.hypothesis}`, () => freeze(branch, draft, input.runId))
+      const frozen = await step(ledger, `freeze.${draft.hypothesis}`, () => freeze(branch, draft, input.runId, context.tree))
       const list = ledger.get<Freeze[]>(frozenKey) ?? []
       if (!list.some((entry) => entry.path === frozen.path)) ledger.put(frozenKey, [...list, frozen])
       if (!state.frozen.some((entry) => entry.path === frozen.path)) state.frozen.push(frozen)
@@ -250,10 +275,21 @@ async function checkFrozen(branch: Branch, frozen: Freeze[]): Promise<void> {
   }
 }
 
-/** Writes the prereg at the next free version on the run branch, and commits it. A file that exists stays as it is. */
-async function freeze(branch: Branch, prereg: Prereg, runId: string): Promise<Freeze> {
+/**
+ * Writes the prereg at the next free version on the run branch, and commits it. A file that exists stays as it is.
+ * The run reuses a matching version only when that path did not exist at the base commit.
+ */
+async function freeze(branch: Branch, prereg: Prereg, runId: string, baseTree: Branch['tree']): Promise<Freeze> {
   let version = 1
   while ((await branch.tree.stat(`/prereg/${prereg.hypothesis}-v${version}.md`)) !== null) version++
+  if (version > 1) {
+    const newest = await freezePrereg(prereg, {}, { version: version - 1 })
+    const bytes = await branch.tree.read(`/${newest.path}`).catch(() => null)
+    if ((await baseTree.stat(`/${newest.path}`)) === null && bytes !== null && (await artifactId(bytes)) === newest.sha256) {
+      await branch.commit(`agent-factory: freeze ${newest.path} (${runId})`)
+      return { hypothesis: newest.hypothesis, version: newest.version, path: newest.path, sha256: newest.sha256, commit: await branch.head() }
+    }
+  }
   const frozen = await freezePrereg(prereg, {}, { version })
   await branch.tree.mkdir('/prereg')
   await branch.tree.write(`/${frozen.path}`, new TextEncoder().encode(frozen.markdown))
@@ -266,17 +302,23 @@ const asDevelopIntake = (intake: ResearchIntake) => ({ ...intake, larger: false,
 
 const capId = (intake: ResearchIntake) => `Q${intake.questions.length + 2}`
 
-/** The questions of the host after the questions of the agent: confirm the program (rule scope), and the cost cap (rule spend). */
-function hostQuestions(intake: ResearchIntake, cap: number): Question[] {
+/**
+ * The questions of the host after the questions of the agent: confirm the program (rule scope), and the cost cap (rule
+ * spend). An undefined cap recommends no cap.
+ */
+function hostQuestions(intake: ResearchIntake, cap: number | undefined): [Question, Question] {
   const [confirm] = routeQuestions(asDevelopIntake(intake))
-  const recommended = `${cap} USD`
+  const recommended = cap === undefined ? noCap : `${cap} USD`
   return [
     { ...confirm!, question: 'Is this the program? Correct it in your own words if it is not.', level: 'user', rule: 'scope' },
     {
       id: capId(intake),
       question: 'What is the cost cap of this run?',
-      why: 'At the cap, the host asks you to raise it or to stop the run before it opens the next agent turn. Write a USD number for another cap.',
-      options: [recommended, noCap],
+      why: [
+        'At the cap, the host asks you to raise it or to stop the run before it opens the next agent turn. Write a USD number for another cap.',
+        ...(cap === undefined ? ['MODEL_PRICES has no price for some models of this run, and a cap needs a price for each model.'] : []),
+      ].join(' '),
+      options: cap === undefined ? [noCap] : [recommended, noCap],
       recommendation: recommended,
       level: 'user',
       rule: 'spend',
@@ -284,11 +326,27 @@ function hostQuestions(intake: ResearchIntake, cap: number): Question[] {
   ]
 }
 
-/** The cap in USD, or undefined for no cap. A text that is not a positive USD number stops the run. */
-function parseCap(answer: string): number | undefined {
+/** The cap in USD, or undefined for no cap. A cap needs a positive USD number and a price for each model. */
+function parseCap(answer: string, models: string[], prices: Prices): Parsed<number | undefined> {
   const text = answer.trim()
-  if (text === noCap || /^no\b/i.test(text)) return undefined
-  return parseBudget(text.replace(/^\$\s*/, '').replace(/\s*usd$/i, ''))
+  if (/^no\b/i.test(text)) return { value: undefined }
+  try {
+    const cap = parseBudget(text.replace(/^\$\s*/, '').replace(/\s*usd$/i, ''))
+    checkPriced(models, prices)
+    return { value: cap }
+  } catch (error) {
+    if (error instanceof StopError) return { error: error.message }
+    throw error
+  }
+}
+
+/** Sets the intake cap as the budget, also over the budget of this invocation. "No cap" removes the limit. */
+function applyCap(ledger: Ledger, cap: number | undefined): void {
+  if (cap !== undefined) {
+    resolveBudget(ledger, cap, cap)
+    return
+  }
+  clearBudget(ledger)
 }
 
 const pickOption = (hypothesis: NumberedHypothesis) => `${hypothesis.id}: ${hypothesis.title}`
@@ -308,11 +366,11 @@ function pickQuestion(hypotheses: NumberedHypothesis[]): Question {
 
 /**
  * The picked IDs, in the order of the merge. An answer gives option letters or hypothesis IDs. The channel already
- * changed a single letter to the text of its option. An answer that names no hypothesis, or an unknown ID, stops the run.
+ * changed a single letter to the text of its option. An answer that names no hypothesis, or an unknown ID, is an error.
  */
-function parsePicks(answer: string, hypotheses: NumberedHypothesis[]): string[] {
+function parsePicks(answer: string, hypotheses: NumberedHypothesis[]): Parsed<string[]> {
   const text = answer.trim()
-  if (text === noneOption || /^none\b/i.test(text)) return []
+  if (/^none\b/i.test(text)) return { value: [] }
   const known = hypotheses.map((hypothesis) => hypothesis.id)
   const option = hypotheses.find((hypothesis) => pickOption(hypothesis) === text)
   const named = option
@@ -322,9 +380,9 @@ function parsePicks(answer: string, hypotheses: NumberedHypothesis[]): string[] 
         .map((token) => token.replace(/[).:]+$/, '').toLowerCase())
         .flatMap((token) => (/^hyp-\d+$/.test(token) ? [token] : /^[a-z]$/.test(token) ? [known[token.charCodeAt(0) - 97] ?? `option ${token}`] : []))
   const unknown = named.filter((id) => !known.includes(id))
-  if (unknown.length > 0) throw new StopError(`the pick answer "${text}" names no hypothesis of this run: ${unknown.join(', ')}`)
-  if (named.length === 0) throw new StopError(`the pick answer "${text}" names no hypothesis: give option letters, hypothesis IDs, or None`)
-  return known.filter((id) => named.includes(id))
+  if (unknown.length > 0) return { error: `the pick answer "${text}" names no hypothesis of this run: ${unknown.join(', ')}` }
+  if (named.length === 0) return { error: `the pick answer "${text}" names no hypothesis: give option letters, hypothesis IDs, or None` }
+  return { value: known.filter((id) => named.includes(id)) }
 }
 
 function approveQuestion(draft: Prereg, index: number): Question {

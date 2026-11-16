@@ -400,6 +400,14 @@ test('a credential header that the host adds does not count toward the request s
   assert.equal(run.calls[0]?.headers.get('x-api-key'), secret)
 })
 
+test('a redirect hop over max_request_bytes is refused, and nothing is stored', async () => {
+  // The URL https://files.example.com/ has 26 bytes.
+  const run = setup({ egress: { max_request_bytes: 100 }, answer: () => redirect(302, `https://files.example.com/${'x'.repeat(75)}`) })
+  await refuses(run.egress('https://api.example.com/a'), /size: the request of 101 bytes is over the cap of 100 bytes/)
+  assert.equal(run.calls.length, 1)
+  assert.deepEqual(await run.artifacts.list(), [])
+})
+
 test('the run lock refuses a matching first URL', async () => {
   const lock = runLock(fileLedger(ledgerPath()), ['https://api.example.com/holdout'])
   const run = setup({ lock })

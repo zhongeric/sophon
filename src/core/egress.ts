@@ -273,8 +273,6 @@ export function egressFetch(agent: string, egress: Egress, host: EgressHost, log
         if (!postTypes.has(type)) throw refused(`method POST with the body type ${JSON.stringify(type)}`)
         body = new Uint8Array(await request.arrayBuffer())
       }
-      const size = requestSize(first, headers, body)
-      if (size > requestCap) throw refused(`size: the request of ${size} bytes is over the cap of ${requestCap} bytes`)
 
       const hopHeaders = (url: URL) => {
         const sent = new Headers(headers)
@@ -290,7 +288,12 @@ export function egressFetch(agent: string, egress: Egress, host: EgressHost, log
         sent.set(credential.header, secret)
         return sent
       }
-      const hop = (url: URL) => send(url.href, { method, headers: hopHeaders(url), body, redirect: 'manual', signal: request.signal })
+      // Each hop has a different URL, so each hop gets the size check.
+      const hop = (url: URL) => {
+        const size = requestSize(url, headers, body)
+        if (size > requestCap) throw refused(`size: the request of ${size} bytes is over the cap of ${requestCap} bytes`)
+        return send(url.href, { method, headers: hopHeaders(url), body, redirect: 'manual', signal: request.signal })
+      }
 
       let url = first
       let response = await hop(url)
