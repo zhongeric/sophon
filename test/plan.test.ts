@@ -48,6 +48,7 @@ test('the spec needs its sections as headings', () => {
 })
 
 const task = (id: string, files: string[], depends_on: string[] = []): PlanTask => ({ id, title: id, work: `Build ${id}.`, files, depends_on })
+const unprotected = () => false
 const plan: Plan = {
   smallest_change: 'Add sub.',
   goals: ['sub subtracts'],
@@ -59,18 +60,30 @@ const plan: Plan = {
 
 test('the host refuses a plan without its four parts, a check with a command, or the sections of its profiles', () => {
   assert.throws(
-    () => checkPlan({ ...plan, non_goals: [], done: [{ check: 'It looks right', command: '' }] }, ['Interfaces']),
+    () => checkPlan({ ...plan, non_goals: [], done: [{ check: 'It looks right', command: '' }] }, ['Interfaces'], unprotected),
     (error: Error) => ['non_goals is empty', 'done needs at least one check with a command', 'the section "Interfaces"'].every((part) => error.message.includes(part)),
   )
-  assert.equal(checkPlan({ ...plan, sections: [{ name: 'interfaces', text: 'No interface changes.' }] }, ['Interfaces']).tasks.length, 1)
+  assert.equal(checkPlan({ ...plan, sections: [{ name: 'interfaces', text: 'No interface changes.' }] }, ['Interfaces'], unprotected).tasks.length, 1)
 })
 
 test('the host refuses tasks that it cannot schedule', () => {
-  assert.throws(() => checkPlan({ ...plan, tasks: [task('sub', ['src/sub.ts'], ['mul']), task('Mul', ['../x'])] }, []), (error: Error) =>
+  assert.throws(() => checkPlan({ ...plan, tasks: [task('sub', ['src/sub.ts'], ['mul']), task('Mul', ['../x'])] }, [], unprotected), (error: Error) =>
     ['depends on the unknown task "mul"', 'task "Mul": the ID must be', '"../x" must be relative'].every((part) => error.message.includes(part)),
   )
-  assert.throws(() => checkPlan({ ...plan, tasks: [task('a', ['a'], ['b']), task('b', ['b'], ['a'])] }, []), /cycle/)
-  assert.throws(() => checkPlan({ ...plan, tasks: [] }, []), /give 1 to 8 tasks/)
+  assert.throws(() => checkPlan({ ...plan, tasks: [task('a', ['a'], ['b']), task('b', ['b'], ['a'])] }, [], unprotected), /cycle/)
+  assert.throws(() => checkPlan({ ...plan, tasks: [] }, [], unprotected), /give 1 to 8 tasks/)
+})
+
+test('the host refuses a task whose files include a protected path, with one error for each such file', () => {
+  const isProtected = (path: string) => ['wrangler.jsonc', '.github/'].includes(path)
+  const deploy = task('deploy', ['src/deploy.ts', 'wrangler.jsonc', '.github/'])
+  assert.throws(
+    () => checkPlan({ ...plan, tasks: [deploy] }, [], isProtected),
+    (error: Error) =>
+      error.message ===
+      ['task "deploy": "wrangler.jsonc" is a protected path, and the host refuses each write to it', 'task "deploy": ".github/" is a protected path, and the host refuses each write to it'].join('\n'),
+  )
+  assert.equal(checkPlan({ ...plan, tasks: [{ ...deploy, files: ['src/deploy.ts'] }] }, [], isProtected).tasks.length, 1)
 })
 
 test('a wave holds ready tasks whose files do not overlap, up to the limit', () => {

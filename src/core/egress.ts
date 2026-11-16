@@ -97,8 +97,6 @@ export function checkEgress(egress: Egress, host: EgressHost): void {
     if (!value) throw new Error(`egress: the secret ${credential.secret} for ${name} is not set`)
     if (!validHeaderValue(value)) throw new Error(`egress: the secret ${credential.secret} for ${name} is not a valid header value`)
   }
-  const pending = host.lock?.pending() ?? []
-  if (egress.web_search && pending.length > 0) throw new Error(`egress: web_search is not possible while ${pending.join(', ')} is locked`)
 }
 
 const refused = (reason: string) => new Error(`egress refused: ${reason}`)

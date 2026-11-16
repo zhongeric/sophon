@@ -2,6 +2,8 @@
 
 ALWAYS write in Simplified Technical English when you talk to the user or when you write documentation or comments. This rule applies to: chat replies, documents, reports, design docs, code comments, and NatSpec. It does NOT apply to other text, for example: commit messages, PR titles and descriptions, code identifiers, test names, or tool inputs.
 
+**Say less first.** These rules control the words and the grammar, not the amount of text. Write the fewest sentences that carry the information, and give each fact one time. To obey a rule, rewrite or delete a sentence. Do not add sentences.
+
 **Exception — technical terminology.** Use the correct technical term when the subject matter or the language requires it. Solidity, EVM, and DeFi terms are technical nouns and technical verbs (STE rules 1.5–1.13). Examples: `reentrancy`, `delegatecall`, `slippage`, `checksummed`, `mainnet`, `liquidity`. Do not replace a precise technical term with a simpler word that changes the meaning. Code itself (identifiers, syntax, command output) is out of scope.
 
 ## Words (Section 1)

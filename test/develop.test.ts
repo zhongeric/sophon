@@ -8,7 +8,7 @@ import { PausedError } from '../src/core/questions.ts'
 import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
 import { fileLedger } from '../src/node/ledger.ts'
-import { developInput, developScript, developRepo, fakePulls, mergeCommit, runDevelop, sources } from './support/develop.ts'
+import { developInput, developScript, developRepo, fakePulls, mergeCommit, plan, runDevelop, sources } from './support/develop.ts'
 import { memoryChannel } from './support/fixture.ts'
 import { probeNetwork, scriptedDispatch, webSearch, type Turn } from './support/scripted-model.ts'
 
@@ -44,6 +44,9 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.match(outputs, /scope refused: .*EACCES/)
   assert.match(outputs, /checkpoint refused:.*test\/run.log:1: Remove test\/run.log from the change/)
   assert.doesNotMatch(outputs, /SCOPE WRITE ALLOWED|LOG COMMITTED/)
+  // The host ran the targeted tests at submit and refused the log with the wrong expectation, with the end of the failed output.
+  assert.match(outputs, /submit refused: .*the targeted tests failed \(test\/ops\.test\.ts\).*--- tests \(exit code 1\) ---.*sub and mul/)
+  assert.doesNotMatch(outputs, /FAILING LOG ACCEPTED/)
 
   // The PR is the run's branch, pushed without force. The first CI was red, the fix made it green.
   const show = (path: string) => execFileSync('git', ['--git-dir', origin, 'show', `factory/dev-add-sub-mul:${path}`]).toString()
@@ -213,6 +216,39 @@ test('develop: a run without CI blocks, and the resumed run with CI posts its ne
   const third = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls: github.pulls, runId: 'no-ci' })
   assert.equal(third.report, second.report)
   assert.equal(github.state.comments.length, 2)
+})
+
+test('develop: the planner sees the protected paths, the host refuses a plan that writes them, and the corrected plan runs', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo({
+    stack: 'TypeScript',
+    checks: { smoke: 'node -e "process.exit(0)"' },
+    tests: { pattern: '\\.test\\.ts$', command: 'env -u NODE_TEST_CONTEXT node --test {tests}' },
+    protect: ['wrangler.jsonc'],
+  })
+  const turns: Turn[] = []
+  const script = developScript()
+  const protectedPlan = { ...plan, tasks: plan.tasks.map((task) => (task.id === 'sub' ? { ...task, files: [...task.files, 'wrangler.jsonc', '.agent-factory.json'] } : task)) }
+  const result = await runDevelop(repo, runsDir(), {
+    runId: 'protected-plan',
+    pulls: fakePulls([false, true]).pulls,
+    dispatch: scriptedDispatch((turn) => {
+      if (turn.role !== 'planner' || turn.output !== null) return script(turn)
+      return {
+        cell: [
+          `try { await tools.submit_plan(${JSON.stringify(protectedPlan)}); text('PROTECTED PLAN ACCEPTED') } catch (error) { text('plan refused: ' + error) }`,
+          `await tools.submit_plan(${JSON.stringify(plan)})`,
+        ].join('\n'),
+      }
+    }, turns),
+  })
+  assert.equal(result.status, 'ready', result.report)
+  const planner = turns.filter((turn) => turn.role === 'planner')
+  assert.ok(planner[0]!.request.includes('Protected paths, which no task may write: .agent-factory.json, wrangler.jsonc'))
+  const output = planner.map((turn) => turn.output ?? '').join('\n')
+  // The output is JSON, so the quotes in the refusal can be escaped.
+  assert.match(output, /plan refused:.*task \W*sub\W*: \W*wrangler\.jsonc\W* is a protected path/)
+  assert.match(output, /task \W*sub\W*: \W*\.agent-factory\.json\W* is a protected path/)
+  assert.doesNotMatch(output, /PROTECTED PLAN ACCEPTED/)
 })
 
 test('develop: a blocked builder stops the run with the reason, before any PR', { timeout: 120_000 }, async () => {

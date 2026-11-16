@@ -122,7 +122,8 @@ export const submitPlan: Contracts.HostTool = {
   name: 'submit_plan',
   description:
     'Submit the plan one time: the four parts (smallest change, goals, non-goals, done checks), the sections that /review/plan-sections.txt names, and the tasks for the builders. ' +
-    'The host refuses a plan with an empty part, with no done check that has a command, or with tasks that depend on unknown tasks or on each other in a cycle.',
+    'The host refuses a plan with an empty part, with no done check that has a command, or with tasks that depend on unknown tasks or on each other in a cycle. ' +
+    'It also refuses a task whose files include a protected path, because the host refuses each write to it. The prompt lists the protected paths.',
   parameters: {
     type: 'object',
     properties: {
@@ -166,8 +167,11 @@ export const submitPlan: Contracts.HostTool = {
   },
 }
 
-/** Refuses a plan without its four parts, its required sections, or tasks that the host can schedule. */
-export function checkPlan(input: unknown, sections: string[]): Plan {
+/**
+ * Refuses a plan without its four parts, its required sections, or tasks that the host can schedule.
+ * `isProtected` tells which task files the host refuses to write, so a task with one of them can never finish.
+ */
+export function checkPlan(input: unknown, sections: string[], isProtected: (path: string) => boolean): Plan {
   const plan = input as Plan
   const filled = (list: unknown) => Array.isArray(list) && list.length > 0 && list.every((item) => typeof item === 'string' && item.trim() !== '')
   const problems: string[] = []
@@ -185,7 +189,10 @@ export function checkPlan(input: unknown, sections: string[]): Plan {
     if (ids.indexOf(task.id) !== ids.lastIndexOf(task.id)) problems.push(`task "${task.id}": the ID is not unique`)
     if (!task.title?.trim() || !task.work?.trim()) problems.push(`task "${task.id}": title and work are required`)
     if (!filled(task.files)) problems.push(`task "${task.id}": files is empty`)
-    else for (const path of task.files) if (/^\/|(^|\/)\.\.(\/|$)/.test(path)) problems.push(`task "${task.id}": "${path}" must be relative to the repository root, without ..`)
+    else
+      for (const path of task.files)
+        if (/^\/|(^|\/)\.\.(\/|$)/.test(path)) problems.push(`task "${task.id}": "${path}" must be relative to the repository root, without ..`)
+        else if (isProtected(path)) problems.push(`task "${task.id}": "${path}" is a protected path, and the host refuses each write to it`)
     if (!Array.isArray(task.depends_on)) problems.push(`task "${task.id}": depends_on must be a list`)
     else for (const id of task.depends_on) if (!ids.includes(id)) problems.push(`task "${task.id}": depends on the unknown task "${id}"`)
   }

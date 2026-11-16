@@ -31,9 +31,13 @@ Goal: remove AI residue and shipping noise. Use this checklist as a hard rule. E
 
 ## Docs and PR text
 
-- Verbose README sections that are not related to the change.
+- Text that a reader does not need: it repeats the code, the diff, the spec, the ask, or another section.
+- A doc section that the change makes longer than its readers need. Judge the whole section, not only the added
+  lines, and name the lines to cut.
+- README text that does not tell a user how to install, configure or run the project. Design, rationale and
+  internals go to the specs or to a code comment.
+- One sentence or paragraph for each case, where one rule, a table row or an example covers all of them.
 - Marketing fluff, emoji padding, decorative horizontal rules.
-- Prose that restates the diff without new constraints or rationale.
 - Latin abbreviations where STE forbids them (`e.g.`, `i.e.`, `etc.`) in STE-scoped writing.
 
 ## Severity for this track
@@ -43,4 +47,5 @@ Goal: remove AI residue and shipping noise. Use this checklist as a hard rule. E
 | Residue that hides a security bug | high or critical |
 | Dead code or sprawl that hides real paths | high |
 | Filler NatSpec, comments that restate code | medium |
+| Docs that grow past what their readers need | medium |
 | Style-only rename noise | low: do not report it unless the name is also obscure |

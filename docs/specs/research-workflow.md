@@ -69,6 +69,13 @@ The principles of the development workflow hold. These follow from them.
 | 10 Holdout | none | host | The egress refuses the holdout to agents from the start of the run. It refuses the holdout to box commands only after RG1. The host permits only `evaluate` in stage 10 and `reproduce` in stage 11 to read the holdout. In this stage, the host runs the domain's `evaluate` command on the holdout, with the frozen prereg. Its output is the outcome: recovered, inconsistent, excluded or insufficient. |
 | 11 Dossier | ready PR | writer, then the code review loop on the analysis code | Each number cites an artifact. Each item of the domain's checklist has a status: ruled out, open or not tested. Coverage and completeness. The host runs the domain's `reproduce` command on a clean box and compares the hashes. |
 
+### Scout
+
+A second, smaller workflow watches for new developments. A cron reads the domain's `feeds`, for example new papers,
+alerts and data releases. Screeners on the cheap tier match each item against the open programs and the notebook's
+interests. The host posts a weekly digest issue and opens proposal issues. A proposal becomes a program only when the
+user labels it. Scout is read-only and periodic: a cron trigger and a Durable Object alarm. Phase R4 builds it.
+
 ## 4. Research rules as rails
 
 | Rule | How the host enforces it |
@@ -143,7 +150,8 @@ reads it from the base branch, so a run cannot change its own rails.
       "sweep": "python -m search.sweep {prereg} {partition}",
       "evaluate": "python -m search.evaluate {prereg}",
       "reproduce": "python -m search.reproduce {prereg}"
-    }
+    },
+    "feeds": ["https://export.arxiv.org/rss/astro-ph"]
   }
 }
 ```
@@ -153,7 +161,7 @@ The egress refuses the holdout to agents from the start of the run, before a pre
 The prereg section "Holdout" refers to this file and does not define the holdout.
 
 The host takes the command strings from the base branch. `{prereg}` is the path of the frozen prereg, and
-`{partition}` identifies the current data partition.
+`{partition}` identifies the current data partition. `feeds` are the sources of scout (section 3).
 
 agent-factory holds the roles and their generic guides (`agents/research/*.md`). The domain's guides add to them,
 as profile guides do today.
@@ -167,6 +175,7 @@ as profile guides do today.
 - `src/core/claims.ts`: the submit tools of the survey, hypotheses, labels, objections and the dossier.
 - `src/core/sweep.ts`: partitions and the candidate table.
 - `src/cloudflare`: `ResearchRuns` and `/research` on a notebook issue.
+- `src/core/workflows/scout.ts`, and its cron trigger in `src/cloudflare` (phase R4).
 
 ## 7. Platforms
 
@@ -183,6 +192,8 @@ as profile guides do today.
 - **The box reaches the network directly** today (`enableInternet`), for setup. The holdout lock thus binds agents and
   not commands. Also, a box command can send notebook data or holdout data out of the run.
   Gap RG1 closes these two problems.
+- **Web search runs at the model provider**, outside the egress. The holdout lock cannot refuse the holdout to it, and
+  the egress does not log it. Research roles with egress get open web search all the same (RD9, RG10).
 - **Credentials for a registered archive** stay in the egress, as model keys stay in the dispatch.
 - **Fetched text can carry prompt injection.** The agents that read it write only in their scope. Only the host posts.
   Two outward channels stay: the egress requests of agents, and the box network for the code that a builder writes.
@@ -195,12 +206,13 @@ as profile guides do today.
 | --- | --- | --- |
 | RD1 | A swarm that agents steer, or fan-out that the host schedules | The host schedules. Agents get bounded subagents in a turn. |
 | RD2 | Agents that look at each target, or code that sweeps | Code sweeps. Agents write the search, screen and vet. |
-| RD3 | Blinding by prompt, or by data access | By data access: the domain config defines the holdout. The egress refuses the holdout to agents from the start of the run. It refuses the holdout to box commands only after RG1. Only the host evaluates it, in stage 10. |
+| RD3 | Blinding by prompt, or by data access | By data access: the domain config defines the holdout. The egress refuses the holdout to agents from the start of the run. It refuses the holdout to box commands only after RG1. Only the host evaluates it, in stage 10. Web search is outside the lock (RD9). |
 | RD4 | What counts as evidence | An artifact that a recorded command or fetch made, with a quote. |
 | RD5 | PASS means a discovery, or a calibrated result | A calibrated result. |
 | RD6 | The domain in agent-factory, or in the notebook | In the notebook. agent-factory holds only the workflow, the roles and the rails. |
 | RD7 | Local or Cloudflare first | Cloudflare. Local for tests and development. |
 | RD8 | One model tier, or tiers | Two tiers. The family swap holds for skeptics. |
+| RD9 | Web search for research roles: off while the holdout is locked, or open | Open. Web search runs at the provider, outside the egress and the lock. The user accepts that it can reach holdout data (RG10). |
 
 ## 10. Gaps
 
@@ -212,9 +224,10 @@ as profile guides do today.
 | RG4 | Archives change | Each fetch records its hash and time. `reproduce` reports a drift. |
 | RG5 | Many trials in one program | The host counts each trial. The dossier reports the count. |
 | RG6 | Submission to outside bodies | A later workflow with a `/go` for an exact scope. |
-| RG7 | New developments: papers, alerts and data releases | Not in this spec. A later, separate workflow can read the domain's feeds and open proposal issues. A proposal becomes a program only when the user labels it. |
+| RG7 | New developments: papers, alerts and data releases | Scout (section 3), in phase R4. A proposal becomes a program only when the user labels it. |
 | RG8 | Large sweeps on a rented machine | Not in R0. Large sweeps use a larger container. A remote box for a rented machine is a later change. |
 | RG9 | Programs in one notebook share the holdout | After the first outcome, the holdout is not blind to later programs. The dossier reports the count of holdout tests across the notebook. |
+| RG10 | Web search and the holdout | Web search runs at the provider, so the lock cannot refuse the holdout to it, and the egress does not log it (RD9). The report says that the holdout lock does not bind web search. |
 
 ## 11. Build plan
 
@@ -224,3 +237,4 @@ as profile guides do today.
 | R1 | The research workflow on Cloudflare: stages 0 to 6, 9 and 11, per-target analysis, no sweep and no holdout test. | A notebook run recovers a known set blind, with a completeness curve, in a dossier PR. |
 | R2 | The sweep, the screeners, the holdout test (stage 10) and the trial count. | A program over thousands of targets ends in a vetted top few or a calibrated null. |
 | R3 | Submission with a `/go`. | One submission that the user approved. |
+| R4 | Scout: the domain's feeds, the weekly digest and proposal issues. | Four weekly digests, and one proposal that the user takes. |

@@ -1,5 +1,5 @@
 import { resolve } from 'node:path'
-import { roles } from '../src/core/roles.ts'
+import { reviewRoles } from '../src/core/roles.ts'
 import { review, type RunContext } from '../src/core/steps.ts'
 import { credential } from '../src/node/credentials.ts'
 import { nodeRun } from '../src/node/platform.ts'
@@ -22,5 +22,5 @@ const context: RunContext = {
   tests: run.checker.tests,
 }
 const started = Date.now()
-const findings = await review(context, 'smoke.bugs', roles.bugs, { provider: 'claude', model: 'claude-haiku-5-5', thinking: 'low' }, { from: frozen.base, to: frozen.head }, '')
+const findings = await review(context, 'smoke.bugs', reviewRoles.bugs, { provider: 'claude', model: 'claude-haiku-5-5', thinking: 'low' }, { from: frozen.base, to: frozen.head }, '')
 console.log(JSON.stringify({ seconds: (Date.now() - started) / 1000, findings, report: run.ledger.get('report:smoke.bugs:task') }, null, 1))

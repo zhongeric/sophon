@@ -1,407 +1,167 @@
 # agent-factory
 
-A host for workflows of specialized agents, built on [nanocode-ts](https://github.com/nanocodexyz/nanocode-ts).
-It has two workflows:
+agent-factory runs workflows of specialized agents on [nanocode-ts](https://github.com/nanocodexyz/nanocode-ts).
+A host program owns the flow and the rules. Each agent gets one role, a new session, its own workspace, and a submit
+tool whose input the host checks. No agent sees another agent's conversation or decides what runs next.
 
-- the **code review loop**: context-free reviewers in parallel tracks, a gate, patch agents, and a second pass on
-  another model family, and
-- the **development workflow**: from an ask to a PR that is ready for your review, with builder agents for the
-  plan's tasks and the code review loop before the PR is ready.
+| Workflow | What it does | Status |
+| --- | --- | --- |
+| Code review loop | Context-free reviewers at the same time, a gate, patch agents, and a second pass on another model family | Built |
+| Development workflow | From an issue to a reviewed PR: intake, plan, builders, CI, then the review loop | Built |
+| Research workflow | Hypotheses and tests on public data, with preregistration and blinding | In progress |
 
-The design of the development workflow and of the profiles, with its decisions, is in
-[docs/specs/development-workflow.md](docs/specs/development-workflow.md). The design of a third workflow, research runs
-on public data, is in [docs/specs/research-workflow.md](docs/specs/research-workflow.md). It is not built yet.
+Each workflow runs locally as a CLI, or on Cloudflare as a Worker with one Durable Object for each PR or issue. The
+designs and their decisions are in [docs/specs](docs/specs).
 
-The host owns the flow and the hard rules. Each agent gets one role: its guidelines (`agents/*.md`),
-its workspace, its tools, and a submit tool whose input the host checks. No agent sees another agent's
-conversation, and no agent decides what runs next.
-
-The same workflow runs on two platforms:
-
-- **Local** (`src/node`): a CLI on your machine, with a git worktree, real check commands, and answers in
-  the terminal or on the PR.
-- **Cloudflare** (`src/cloudflare`): a Worker and one Durable Object per PR. A `/review` comment starts a run;
-  questions and the result appear as PR comments; the fixes go to a `factory/<run>` branch, and the repo's own CI
-  is the check.
-
-## How a run works
+## The review loop
 
 ```
 freeze ─▶ triage: light or full
 
-full:  step 1: minimize │ rules │ bugs ×1-4 │ anti-slop   (Opus 5.5, Sol: read-only, parallel)
-       + host findings ─▶ gate ─▶ patch ×1-4 by file (Opus 5.5) ─▶ commit
-       ─▶ step 2: late-minimize │ late-rules on the new diff   (each role on the other family)
-       + host findings ─▶ gate ─▶ patch ×1-4 by file (Sol) ─▶ commit
-       ─▶ late bugs ×1-4 on every fix since the freeze ─▶ gate ─▶ patch ×1-4 by file ─▶ commit
-       ─▶ checks ─▶ intent ─▶ PASS criteria ─▶ (optional) push + mark the PR ready
+full:  step 1: minimize │ rules │ bugs ×1-4 │ anti-slop     read-only, at the same time
+       ─▶ gate ─▶ patch ×1-4 by file ─▶ commit
+       ─▶ step 2: late-minimize │ late-rules on the new diff   each on the other model family
+       ─▶ gate ─▶ patch ─▶ commit ─▶ late bugs on every fix ─▶ gate ─▶ patch ─▶ commit
+       ─▶ checks ─▶ intent ─▶ PASS or FAIL
 
-light: host findings ─▶ gate ─▶ one reviewer that also fixes (Opus 5.5) ─▶ commit
-       ─▶ checks ─▶ PASS criteria ─▶ (optional) push + mark the PR ready
+light: one reviewer that also fixes ─▶ commit ─▶ checks ─▶ PASS or FAIL
 ```
 
-Triage comes from the **profiles** in `src/core/profiles.ts`, one for each stack: `solidity` (`src/**/*.sol`),
-`solidity-support` (Foundry tests and scripts), `typescript`, `python` and `docs`. A profile applies when its marker
-files exist, for example `foundry.toml`. The `python` profile applies when one of its marker files exists:
-`pyproject.toml` or `requirements.txt`. A profile gives the guides for its files, the paths that a change must not commit,
-and static rules. The light loop runs only when every changed file is docs or tests of a profile that allows it.
-Solidity `src/` and `script/` always get the full loop. Agent prompts and rule files (`agents/`, `AGENTS.md`,
-`CLAUDE.md`, `CONTRIBUTING*`) also always get the full loop. Triage also checks deleted paths and old paths of renames.
-`--full` forces the full loop. The host writes the decision as `TRIAGE path=light|full reason=...` at the top of
-the gate log and in the report.
+- **Triage.** A change to docs and tests only takes the light loop. Solidity `src/` and `script/`, agent prompts and
+  rule files (`agents/`, `AGENTS.md`, `CLAUDE.md`) always take the full loop. `--full` forces the full loop.
+- **Scale.** A diff over 600 lines splits across up to 4 bugs reviewers. Patch agents split the findings by file.
+- **Static rules.** Each profile has mechanical rules, for example a fixed Solidity pragma, or no `.env` file in the
+  change. The host checks the added lines and gives each break to the patch agent.
+- **Models.** Step 1 runs on Opus 5.5, with the rules track on Sol. Step 2 swaps the family of each role.
+- **Resume.** Each step's result goes to the run's ledger, so a stopped run continues where it stopped.
 
-The bugs review is the slowest track. On a diff above 600 changed lines, the host splits it across reviewers: one
-for each 600 lines, at most 4, with the files of one directory together. They run at the same time, and the host
-numbers their findings as one list. A patch step splits its findings by file across at most 4 patch agents that
-work at the same time on the same tree. Each agent writes only the files of its findings, and the files that it
-writes first. Info findings join the agent of their file, or one agent of their own. A fix that needs a file of
-another agent waits, and one more agent applies the waiting findings after the others. The host commits one time.
+## Rules the host enforces
 
-The static rules are the mechanical rules that a program can check: a fixed pragma, named imports, no revert
-strings, no `tx.origin` or `selfdestruct`, a comment before `unchecked` and `assembly`, the two test name shapes,
-no Latin abbreviations in docs, and no build output, logs or `.env` files in the change. The host checks the lines
-that the change adds, and gives each break to the patch agent as a `host-NNN` finding of the rules track.
-
-Each agent is a fresh nanocode session with its own journal scope. Each step's result goes into the run's
-ledger before the next step starts. A resumed run returns the recorded results of finished steps, and an
-agent that was mid-turn resumes from its journal. Locally, resume with `--run <id>`; on Cloudflare, an alarm
-resumes the run by itself.
-
-## Rules in code, not in prompts
-
-| Rule | How the host enforces it |
+| Rule | How |
 | --- | --- |
-| Context-free reviewers | Every agent is a new session. Reviewers get only the ask, the diff and the repo. |
-| Read-only tracks | Reviewers' `/repo` is a read-only file system. Writes fail with EROFS, in the file tools and in the shell. |
-| Agents stay in their workspace | The agent shell is nanocode's in-process virtual bash with its own environment. Cell `fetch`, shell network and web search are off. Paths cannot leave the tree, `.git` is hidden, and writes never follow a symlink. |
-| Test scope; one test run at a time | `run_tests` accepts only committed test files, runs the repository's configured command, and runs one command at a time across the host. |
-| Finding schema and evidence rule | `submit_findings` rejects a finding with a missing field, a location that is not a real file and line, or a quote that is not in the file near that line (or in the diff). The agent sees the reasons and can correct the call. |
-| Findings filter | The evidence check is the noise filter. Every finding that passes it goes to the patch agent, which applies it or rejects it with a reason. A rejected critical or high finding becomes a question to you, and the run passes only if you accept the rejection. |
-| Patch: log why for each item | `submit_patch_log` must list every finding ID one time, in applied or skipped. A patch agent beside others can also list a finding in deferred, and the agent after them must apply or skip it. |
-| Parallel patch agents do not collide | The host refuses an agent's writes to the files of another agent, and to a file that another agent wrote first (EACCES). The split and the first writes are in the ledger, so a resumed step keeps them. |
-| Light or full loop | Profile rules decide, not an agent. The light reviewer cannot write outside docs and tests. |
-| Mechanical style rules | The profiles' static rules run on the added lines before each gate. Their findings skip the evidence check, because the host quotes the line. |
-| Never weaken checks | Patch agents cannot write `.agent-factory.json` or the `protect` paths. Check commands come from the config only. The report lists patch edits outside the change and the findings. |
-| Model swap across passes | The run stops before any work if a step 2 agent uses the same family as its step 1 counterpart. The gate log records the families. |
-| Allowed models | Fable 5.2, Opus 5.5 and Sol by default. `ALLOWED_MODELS` (model IDs, comma-separated) replaces the list. The run stops before any work on another model. |
-| No API keys in prompts or files | Keys stay in the host's dispatch. They go only to their own provider's origin. Check commands get an allowlisted environment, never the host's keys. |
-| Open questions | A read-only questions agent runs beside the step 1 reviewers and posts its questions at once. A reviewer marks a finding that depends on your decision, and the gate holds it until you answer. Patch agents, later reviewers and the intent check read your answers. |
-| Missing key or input: stop | The run stops before it freezes anything. |
-| Ready PR, never draft | `--ship` pushes the fixes to the PR branch (no force) and marks the PR ready, only on PASS. |
-| A PR cannot change its own rails | On Cloudflare, the config (the profile defaults and `.agent-factory.json`) comes from the base branch. Locally, it comes from your working copy. |
+| Reviewers are context-free and read-only | Each agent is a new session. Writes to the reviewed tree fail. |
+| Findings need evidence | `submit_findings` refuses a finding whose quote is not at its file and line. |
+| Every finding gets an answer | The patch log lists each finding as applied or skipped, with a reason. A skipped critical or high finding fails the run, unless you accept it. |
+| Agents stay in their workspace | An in-process shell, with no network, a hidden `.git`, and no writes through a symlink. |
+| Checks stay strong | Agents cannot write `.agent-factory.json`, protected paths or `.github/`. Check commands come from the config. |
+| A PR cannot change its own rules | On Cloudflare, the config comes from the base branch. |
+| Allowed models | Fable 5.2, Opus 5.5 and Sol, or the list in `ALLOWED_MODELS`. Step 2 must use the other family. |
+| Keys stay in the host | A key goes only to its own provider. Check commands get an allowlisted environment. |
 
-### Trust boundary
+Checks run the repository's code, as CI does. For unattended local runs, use a machine that holds only what the run
+needs. On Cloudflare, code under review never runs in the Worker.
 
-Checks and `run_tests` run the repository's code on this machine, as CI does. That code is the change under
-review plus the patch agents' edits, so a prompt-injected patch agent can get code to run there. The host limits
-that: test files must be committed by the host, the environment is an allowlist (`PATH`, `HOME`, locale, and the
-config's `env` list), and host git ignores repository hooks and fsmonitor. `HOME` stays, so that code can read
-files in it, such as the `nc` login that `--claude-plan` uses. For unattended runs, use a machine or VM that holds
-only what the run needs. On Cloudflare, no code under review runs in the Worker: agents use the in-process shell
-only, and the checks are the repository's own CI.
-
-## Local setup
+## Setup
 
 ```bash
 npm install
-export ANTHROPIC_API_KEY=... OPENAI_API_KEY=...
+export ANTHROPIC_API_KEY=... OPENAI_API_KEY=...   # or pass --claude-plan to use your nc Claude login
 ```
 
-`--claude-plan` signs Claude requests with your `nc` Claude login instead of `ANTHROPIC_API_KEY`.
-The host never refreshes that login, because a refresh would sign `nc` out. Run `nc` once when it expires.
+A repository needs no config when a profile knows its stack:
 
-A target repository needs no setup when a profile knows its stack. The profiles whose marker files are at the root
-give the defaults:
+| Profile | Applies when | Checks and tests |
+| --- | --- | --- |
+| `solidity` | `foundry.toml` | `forge build`, `forge fmt --check`, `forge test` |
+| `typescript` | `package.json` and `tsconfig.json` | the `typecheck` script or `tsc`, `eslint`, `vitest` or `jest` |
+| `python` | `pyproject.toml` or `requirements.txt` | `ruff` or a compile check, and `pytest`, in a `.venv` |
 
-| Profile (markers) | Checks | Tests | Setup | Protected |
-| --- | --- | --- | --- | --- |
-| `solidity` (`foundry.toml`) | `forge build`, `forge fmt --check` on changed `.sol` files | `forge test --match-path {test}` for `*.t.sol` | `forge install`, when `.gitmodules` exists | `foundry.toml`, `remappings.txt` |
-| `typescript` (`package.json` and `tsconfig.json`) | the `typecheck` script (or `type-check`, `check-types`, `types`), else `tsc --noEmit`; `eslint` on changed files when it is a dependency | `vitest run` or `jest` when it is a dependency, for `*.test.*` and `*.spec.*` | the install of the lockfile's package manager: npm, pnpm or yarn | `package.json`, `tsconfig.json`, the lockfile |
-| `python` (`pyproject.toml` or `requirements.txt`) | `.venv/bin/ruff check --no-cache --force-exclude {files}` on changed `.py` and `.pyi` files when ruff is a dependency, else a compile in memory of these files: `python3 -B -c "import sys; [compile(open(f, 'rb').read(), f, 'exec') for f in sys.argv[1:]]" {files}` | `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider {tests} \|\| [ $? -eq 5 ]` for `test_*.py` and `*_test.py`, when pytest is a dependency | `python3 -m venv .venv` (git ignores it), then `.venv/bin/python -m pip install`. The install takes `requirements.txt` and the other root `requirements*.txt` files. It also takes the `dev` or `test` extras that hold ruff or pytest. The project install uses editable mode (`-e .`). Without a project install, setup installs the `[project]` dependencies and the `dev` or `test` extras that hold ruff or pytest. When only a dependency group or another extra holds a tool, setup installs the tool by name. | `pyproject.toml`, `requirements*.txt`, `uv.lock`, `poetry.lock`, `.venv/` |
-
-Every repository also protects `.github/`. When several profiles match, the checks and protected paths join, and
-the setup commands run one after the other. A local run, and a development run on Cloudflare, need at least one
-check: for another stack, add `.agent-factory.json` at the root. Each field that the file sets replaces the default
-of that field. `"tests": null` or `"setup": ""` turns a default off. For example:
-
-
-```json
-{
-  "stack": "Solidity+Foundry",
-  "checks": {
-    "build": "forge build",
-    "format": { "command": "forge fmt --check {files}", "files": "\\.sol$" }
-  },
-  "tests": { "pattern": "\\.t\\.sol$", "command": "forge test --match-path {test}" },
-  "guides": { "evm-cortex": "~/src/evm-cortex" },
-  "protect": ["foundry.toml", "remappings.txt"]
-}
-```
+For another stack, or to change a default, add `.agent-factory.json` at the root. Each field replaces its default:
 
 ```json
 {
   "stack": "TypeScript",
   "checks": { "typecheck": "npm run typecheck", "lint": { "command": "npx eslint {files}", "files": "\\.tsx?$" } },
   "tests": { "pattern": "\\.test\\.tsx?$", "command": "npx vitest run {tests}" },
-  "protect": ["package.json", "tsconfig.json", "eslint.config.js"]
+  "setup": "npm ci",
+  "protect": ["package.json", "tsconfig.json"]
 }
 ```
 
-- `{files}` is the changed files that match `files`. A check with no matching files is skipped.
-- A `*` in a `protect` entry matches zero or more characters in one path segment, never `/`. For example,
-  `requirements*.txt` matches `requirements-dev.txt` at the root. As an entry without `*`, the entry also matches a
-  directory prefix: `deploy*` protects `deploy-prod/run.sh`. An entry that ends with `/` matches only a directory
-  prefix.
-- `{tests}` runs the targeted tests in one command; `{test}` runs one command per test file.
-- Targeted tests are the changed test files plus the test files that name a changed source file.
-- `guides` are mounted read-only at `/guides/<name>`. The `solidity` profile reads `/guides/evm-cortex` when it
-  exists: a clone of [evm-cortex](https://github.com/ccashwell/evm-cortex).
-- The STE dictionary is at `/guides/ste` when `agents/guides/ste` holds it. The specification is not in this
-  repository: [agents/guides/ste/README.md](agents/guides/ste/README.md) tells you how to get it.
-- `env` lists extra environment variables that the checks need, for example `["ETH_RPC_URL", "FOUNDRY_PROFILE"]`.
-- `setup` runs one time in each new worktree before its first check, for example
-  `"npm ci --prefer-offline --no-audit --no-fund"` or `"forge install"`. Worktrees start without dependencies.
-- `merge` is `"squash"`, `"merge"` or `"rebase"`. It is the standing permission for the host to merge a ready
-  development PR with that method. Without it, the host does not merge. The host reads it from the same source as
-  the other rails: the base branch on Cloudflare, and your working copy locally. Agents cannot write
-  `.agent-factory.json`, thus a run cannot give itself the permission.
+- `{files}` is the changed files that match `files`. `{tests}` runs the targeted tests in one command, and `{test}`
+  runs one command for each test file.
+- `protect` lists paths that agents cannot write. A `*` matches inside one path segment.
+- `env` lists extra environment variables for the checks. `guides` mounts reference material at `/guides/<name>`.
+- `answerers` limits who can answer questions. `research` configures a research notebook
+  ([spec, section 6.3](docs/specs/research-workflow.md)).
+- Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
+  file that no test imports gets the test files that have its base name as a word. A builder's `run_checks` runs
+  only the checks. The targeted tests run one time, when the builder submits its build log.
+- `merge` (`"squash"`, `"merge"` or `"rebase"`) is the standing permission for the host to merge a ready development
+  PR with that method. Without it, the host does not merge.
 
-## Local usage
+The STE dictionary is optional: see [agents/guides/ste/README.md](agents/guides/ste/README.md).
+
+## Run locally
 
 ```bash
-npm run review -- --repo ~/src/app --pr 123                 # base, head and ask from the PR
+npm run review -- --repo ~/src/app --pr 123     # review a PR, add --ship to push the fixes and mark it ready on PASS
 npm run review -- --repo ~/src/app --base main --ask-file ask.md
-npm run review -- --run 20261113-101500-1a2b3c4d             # resume
-npm run review -- --repo ~/src/app --pr 123 --ship          # on PASS, push the fixes and mark the PR ready
-npm run review -- --repo ~/src/app --pr 123 --full          # the full loop, also for a docs or tests only change
+npm run develop -- --repo ~/src/app --ask "Add a fee switch, off by default"
+npm run review -- --run <id>                     # resume a run, also with npm run develop
 ```
 
-### Your answers
-
-Questions go to the PR as a comment with `--pr`, to the terminal when it is interactive, and otherwise to
-`runs/<run>/questions-<batch>.md`. Reply with `/answer` and one line per question (`Q1: b`, or your own words);
-`/answer recommended` takes every recommendation. Only replies from `answerers` in the config count (default: your
-`gh` login). With `--pr`, the run polls for your reply for `--wait` minutes (default 60), then exits with status 3.
-Resume it with `--run <id>` after you answer. A held finding is kept unless you answer "Do not fix it"; any other
-text goes to the patch agent as an instruction for that fix.
-
-The fixes stay on a local branch, `factory/<run>`, in a worktree at `runs/<run>/tree`. Apply them with
-`git merge --ff-only factory/<run>`. Remove a run with `git worktree remove runs/<run>/tree` and
-`git branch -D factory/<run>`. The host commits with your git config, so commit signing must work without a prompt.
-
-Each run writes:
-
-- `report.md`: PASS or FAIL, the triage line, the criteria, each step, the checks and the intent verdict
-- `gate-log.txt`: the triage line, then one line per finding with its gate decision, with the model family of each step
-- `state.json`: the ledger, with every finding, gate decision, patch log and turn report
-- `agents/<step>.events.jsonl` and `agents/<step>.sqlite`: each agent's event log and journal
-
-The artifact store of a run keeps its files in `runs/<run>/artifacts/`. An artifact is a file stored by the
-SHA-256 hex of its bytes, `<id>`, with its meta in `<id>.json`: the source, the media type, the size, the time and
-the labels. The same bytes give the same ID, and the first meta stays. A step can mount the store read-only at
-`/artifacts` in an agent workspace. No workflow uses the store yet.
-
-`--models file.json` overrides models per step and role, for example
-`{ "step1": { "bugs": { "provider": "claude", "model": "claude-opus-5-5", "thinking": "high" } } }`.
-The light loop's model is `light`. `ALLOWED_MODELS` in the environment replaces the allowed models.
-
-## Development workflow
-
-```
-intake ─▶ your answers confirm the ask and the route (spec or not, one or two review passes)
-       ─▶ spec, for a larger change ─▶ your answers to its decisions
-       ─▶ plan: smallest change, goals, non-goals, done checks, profile sections, tasks
-       ─▶ build: one builder for each task, each on its own branch; a wave of tasks with separate files
-          runs at the same time; the host merges each wave into factory/dev-<slug>
-       ─▶ push, draft PR ─▶ CI, with two fix rounds
-       ─▶ code review loop, once or twice, on the frozen package (ask, decisions, plan)
-       ─▶ push the review fixes ─▶ CI ─▶ criteria ─▶ ready PR and a report comment
-       ─▶ the host merges when the config has "merge". Else, you merge.
-```
-
-Intake, spec, planner and builders run on Opus 5.5. The review loop uses its own models.
-
-| Rule | How the host enforces it |
-| --- | --- |
-| No plan and no code before you confirm the ask | The intake questions and the host's route questions are one batch. The run waits for your answer. `--hotfix` takes every recommendation without asking. |
-| One planner, four parts | `submit_plan` refuses a plan with an empty part, with no done check that has a command, without the sections of its profiles (Solidity: interfaces, deployment sequence), or with tasks that depend on unknown tasks or on each other. |
-| A builder stays in its task | A builder can write only the files and directories of its task, never protected paths. Parallel builders work in separate worktrees, so one builder's half-done work never breaks another's checks. |
-| Static rules and forbidden paths gate every commit | `checkpoint` checks the added lines and the paths before it commits, and returns each problem to the builder. Build output, logs and `.env` files never enter the history. |
-| Nothing uncommitted, every file explained | `submit_build_log` refuses uncommitted work, and needs each changed file with a reason. A builder that cannot finish says why, and the run stops with that blocker. |
-| CI budget | Two CI-fix rounds after the build, then a blocker. A single task's fixes go to the same builder session. |
-| Review before ready | The code review loop runs on the result, once or twice. A red CI after the review fails the run, because a fix there would skip the review. |
-| Ready only on PASS | The PR stays draft unless the review loop passed, CI is green, and no forbidden path is in the change. A change to Solidity `src/` stays draft, because the Auditor workflow is not built yet. |
-| Merge only with standing permission | Without `merge` in the config, the host never merges. With it, the host merges only on PASS, after the PR is ready, and only at the head that CI checked: the merge call sends that SHA. The host tries one time for each run. A refusal is final, and a resumed run does not merge again. A refused merge leaves the PR ready, and the report gives the reason. After a merge, the host deletes only the remote branch of the run. Review runs (`--ship`) never merge. |
-
-```bash
-npm run develop -- --repo ~/src/app --ask "Add a fee switch to the vault, off by default"
-npm run develop -- --repo ~/src/app --ask-file ask.md --base develop --parallel 2
-npm run develop -- --run dev-20261113-201500                # resume after a pause
-npm run develop -- --repo ~/src/app --ask-file ask.md --issue 45   # the PR body says Closes #45
-```
-
-With `--issue <n>`, the PR body says `Closes #<n>`, thus GitHub closes the issue when the PR merges into the
-default branch. The report stays on the PR. When the host merges, the report gives the merge commit.
-
-The repository needs a config (the profile defaults or `.agent-factory.json`, as for the review loop), an origin on
-GitHub, and CI that runs on pull requests. The `gh` CLI must be logged in. Questions go to the terminal when it is interactive. Otherwise the
-intake and spec questions go to `runs/<run>/questions-<batch>.md`, and the review questions go to the PR. A run
-that waits for answers or for CI exits with status 3. Resume it with `--run <id>`.
-
-Each run writes `runs/<run>/`: `report.md`, `plan.md`, `spec.md` for a larger change, `state.json`, the agents'
-journals, and a worktree for each branch under `branches/`. Each review pass is a run of its own,
-`runs/<run>-review-<pass>/`. Remove the worktrees with `git worktree prune` after you delete a run directory.
+- **Questions** go to the PR, the terminal, or `runs/<run>/questions-<batch>.md`. Answer with `/answer` and one
+  line for each question (`Q1: b`, or your own words), or with `/answer recommended`.
+- **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
+  fixes are on the local branch `factory/<run>`.
+- **Models:** `--models file.json` sets the model of each role.
+- **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
 
 ## Cloudflare
 
-### What it needs
-
-- A Cloudflare account on **Workers Paid**. The Worker bundle is 5.3 MB gzipped (the Free plan allows 3 MB),
-  and a run uses up to 5 minutes of CPU per alarm (`limits.cpu_ms`).
-- For development runs: Cloudflare Containers on the account, and Docker on the machine that deploys.
-  `wrangler deploy` builds the build image from `containers/build/Dockerfile` (Node 22, git, Foundry) and pushes it.
-- A GitHub fine-grained token for the target repositories with: Contents read and write, Pull requests read and
-  write, Issues read and write, Actions read, Commit statuses read. Fine-grained tokens cannot call the Checks API,
-  so the run reads CI from GitHub Actions workflow runs and commit statuses.
-- A config from each repository's base branch: the profile defaults, and `.agent-factory.json` when it exists.
-  Review runs use `stack`, `protect` and `answerers`, and CI is their check. Development runs also use `checks`,
-  `tests` and `setup`, on the build container. The config's `env` list does not reach the container.
-- CI that runs on pushes to `factory/**` branches, for example `on: { push: { branches: ['factory/**'] } }`.
-  That CI runs the PR's code and the patch agents' edits with the repository's secrets. A PR author in the same
-  repository can already push such a branch, so this gives no new access. Fork PRs are refused for this reason.
-
-### Deploy
+You need Workers Paid, Containers for development runs, and Docker on the machine that deploys. The GitHub token is
+fine-grained, with read and write access to Contents, Pull requests and Issues, and read access to Actions and Commit
+statuses. Each target repository needs CI on pull requests and on pushes to `factory/**`. Fork PRs are refused,
+because that CI would run fork code with the repository secrets.
 
 ```bash
-npx wrangler login
 npx wrangler deploy
 for name in GITHUB_TOKEN GITHUB_WEBHOOK_SECRET ANTHROPIC_API_KEY OPENAI_API_KEY ADMIN_TOKEN ALLOWED_USERS; do
   npx wrangler secret put $name
 done
 ```
 
-`ALLOWED_USERS` is the GitHub logins, comma-separated, that can start runs and answer questions. Without it, no one
-can. `ALLOWED_MODELS` replaces the allowed models, as on the local platform.
+`ALLOWED_USERS` is the GitHub logins, comma-separated, that can start runs and answer questions.
 
-Put the STE dictionary in `agents/guides/ste` before you deploy ([how](agents/guides/ste/README.md)). The Worker
-bundles it when it is there. Without it, the agents apply the STE rules without lookups.
-
-The webhook is optional. Without it, start runs with `npm run remote` (below); the run still picks up your
-`/answer` comments and CI results by polling. With it, `/review` comments start runs and answers take effect at
-once: add a webhook to each repository with payload URL `https://<worker>/github/webhook`, content type
-`application/json`, the `GITHUB_WEBHOOK_SECRET`, and the events Issue comments, Issues, Pull requests, Workflow
-runs and Statuses.
-
-### Use
+`npm run remote` starts and follows runs. It reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from
+`.secrets/cloudflare.env`.
 
 ```bash
-npm run remote -- start acme/app#123            # or a PR URL; --ship pushes the fixes and marks the PR ready on PASS
-npm run remote -- start acme/app#123 --full     # the full loop, also for a docs or tests only change
-npm run remote -- develop acme/app#45           # a development run: the issue's title and body are the ask
-npm run remote -- develop acme/app#45 --base develop --parallel 2
-npm run remote -- resume acme/app#123           # a PR or an issue: after you answer, instead of waiting for the next poll
-npm run remote -- status acme/app#123
-npm run remote -- report acme/app#123
+npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full)
+npm run remote -- develop acme/app#45    # a development run on an issue (--base, --hotfix, --full, --parallel)
+npm run remote -- resume acme/app#45     # wake a paused run after you answer
+npm run remote -- status acme/app#45     # or report
+npm run metrics                          # CPU, memory and network of each build container
 ```
 
-`npm run remote` reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from `.secrets/cloudflare.env`.
+The webhook is optional. With it, a `/review` or `/develop` comment, or the `agent-review` or `agent-develop`
+label, starts a run, and answers take effect at once. Without it, runs poll for answers and CI. Point it at
+`https://<worker>/github/webhook`, with the events Issue comments, Issues, Pull requests, Workflow runs and Statuses.
 
-- With the webhook: comment `/review` on a PR, or add the `agent-review` label. `/review --ship` also pushes the
-  fixes to the PR branch and marks it ready on PASS. `/review --full` forces the full loop.
-- With the webhook: comment `/develop` on an issue, or add the `agent-develop` label. `/develop` takes the options
-  `--base <branch>`, `--hotfix`, `--full` and `--parallel <n>`. The intake and spec questions and the final report
-  go to the issue. The review questions go to the new PR. The PR says `Closes #<issue>`. The report on the issue
-  says if the host merged the PR, and gives the merge commit.
-- Answer questions with a `/answer` comment, as in [Your answers](#your-answers). The webhook resumes the run at
-  once; without it, the run checks again every `PAUSE_POLL_SECONDS` (default 60). Only unedited comments from
-  `ALLOWED_USERS` count. The config's `answerers` can narrow that list, never widen it.
-- The result is a PR comment with the criteria and the full report. The fixes are on `factory/<run>`.
-- The routes behind `Authorization: Bearer <ADMIN_TOKEN>`: `POST /runs/<owner>/<repo>/<pr>` starts a review run
-  (body `{"ship": true}` to ship, `{"full": true}` for the full loop), `POST /develop/<owner>/<repo>/<issue>` starts
-  a development run (body `{"base", "hotfix", "full", "parallel"}`), `POST /runs/.../resume` wakes the run of a PR or
-  issue and returns `resumed`, the `state` of the latest run and a `reason`, and `GET /runs/<owner>/<repo>/<number>`
-  and `.../report` return the status and the report. `npm run remote -- resume` prints the state and the reason,
-  and exits 1 when the run did not wake. `npx wrangler tail` shows each agent's tool calls.
-
-### How it works
-
-- `PullRequestRuns` is one Durable Object per PR. Its SQLite holds the run's ledger and output files, the
-  repository tree (nanocode's `SqlFileSystem`), and every agent session, each in its own journal scope.
-- The artifact store of a run is in two tables of the Durable Object SQLite. A row has a size limit, so the store
-  keeps the bytes in chunks of 1 MiB. The host refuses an artifact over 32 MiB, the limit on both platforms. The
-  store needs no new binding.
-- The freeze downloads the PR head tarball, steps the PR's files back to the merge base for one commit and
-  forward for a second, so nanocode's in-process git can diff and commit. The fixes go back through the Git Data API.
-- Alarms drive the run. A heartbeat alarm stays a minute ahead while the run works, so a run whose isolate
-  died (or hit the CPU limit) resumes from its ledger. A paused run (answers or CI) re-checks on an alarm, and
-  webhooks wake it early. A run that dies 5 times without finishing a step stops with a PR comment.
-- Limits: a PR with 3,000 or more files stops (GitHub lists no more). Files over the tree's size limit are
-  skipped. The whole tarball is held in memory during the freeze, so very large repositories can hit the 128 MB
-  limit.
-- `DevelopmentRuns` is one Durable Object per issue, with one Cloudflare Container. The brain stays in the object:
-  the ledger, every agent session, the GitHub token, and each branch as a tree in SQL with in-process git. A new
-  branch copies its start tree, `.git` included, so commit IDs agree across branches. Builders read and write the
-  tree through the same rails as on the local platform.
-- The container only runs commands. Before a check or a test, the object copies the branch's tree into a
-  directory of the container: all of it the first time, then only the files that changed. After a full copy it
-  runs `setup`. The container gets no secret and no git remote, so code under development never runs beside a
-  token. It stops after 30 minutes without a command, and the next copy starts again from the full tree.
-- Pushes go through the Git Data API. The review loop runs as a review run of the new PR, in that PR's object,
-  as a `/review` would. The development run waits for it, then takes its fixes from GitHub.
+A Durable Object holds the ledger, the repository tree and the agent sessions of each run. Alarms drive the run and
+resume it after a crash. Development runs run their checks in a Cloudflare Container that has no secrets. Commits
+and pushes go through the GitHub API.
+The object keeps the sync state of each container directory in SQL, so after a restart the next sync sends only the
+changed files and does not run the setup again.
+A development PR says `Closes #<issue>`.
 
 ## Layout
 
 ```
-agents/                    guidelines, one file per role, and shared rules (factory, reviewer, STE)
-agents/profiles/           the guides of each profile (Solidity, TypeScript, Python)
-agents/guides/ste/         where the STE dictionary goes (not in the repository), mounted at /guides/ste
-src/core/                  platform-neutral: it typechecks without Node types (tsconfig.core.json)
-  workflows/               the code review loop and the development workflow
-  profiles.ts              profiles: triage, guides, forbidden paths, plan sections and static rules for each stack
-  plan.ts                  intake, spec and plan: their submit tools, the host checks, and the build waves
-  develop-steps.ts         intake, spec, planner and builder steps; checkpoint, run_checks and the build log
-  ci.ts                    the CI of a commit on GitHub: Actions runs and commit statuses
-  platform.ts              what a platform supplies: Repo, Checker, Files, AgentStore, Guides
-  agent.ts                 one isolated nanocode agent: durable session, drive loop, host tools
-  steps.ts                 reviewer, patch, light, intent and questions steps with their submit tools
-  workspace.ts             the agent shell and the rails: read-only, protected paths, no symlink writes, .git hidden
-  findings.ts gate.ts      the evidence check; the gate that holds findings for your decision
-  questions.ts checks.ts   questions and /answer parsing; repository config and command checks
-src/node/                  the CLIs: git worktrees and branches, local machine, terminal/file/gh channels, PRs and
-                           CI through gh, nc plan login. develop.ts runs the development workflow, remote.ts
-                           drives the deployed Worker
-src/cloudflare/            the Worker and webhooks; the PullRequestRuns and DevelopmentRuns Durable Objects on one base
-                           (runs.ts); the GitHub repo, branches, PRs and CI; the build container (box.ts)
-containers/build/          the build image of development runs
-scripts/smoke.ts           one live reviewer against the test fixture (npm run smoke, uses --claude-plan auth)
+agents/            the guidelines of each role, with profiles/ for each stack and research/ for the research roles
+src/core/          the workflows, the rules and the agent host, with no platform code
+src/node/          the local CLIs
+src/cloudflare/    the Worker and the Durable Objects
+containers/build/  the build image of development runs
+docs/specs/        the designs and their decisions
 ```
-
-## Design notes
-
-- The late bugs pass runs when any patch changed code since the freeze, and reviews every fix since then. Thus
-  step 1 fixes also get a bugs review, not only step 2 fixes.
-- Step 2 has no diff to review when the step 1 patch changed nothing. The run records that and goes on.
-- Missing credentials stop the run before it starts. The host does not ask for them.
-- On Cloudflare, review agents cannot run tests during their turns; CI checks the result. Builders of development
-  runs can, on the build container.
-- On Cloudflare, in-process git reads a symlink as its target's content, so a PR that only retargets a symlink
-  shows no change to the reviewers. The fixes never change a symlink.
-- Triage uses profile rules, not a score from a model (D1). The light reviewer also applies the host findings.
-- Not built yet: the review bot loop after the PR is ready, and the Auditor workflow.
 
 ## Development
 
 ```bash
-npm run check   # types: Node, the core without Node types, and Cloudflare
-npm test        # unit tests; the review loop and the development workflow on Node against scripted Claude and
-                # Codex models, a local git origin and fake PRs and CI; and the Worker under wrangler dev
-                # against local GitHub, model and machine mocks
-FACTORY_CONTAINERS=1 node --test --test-name-pattern=develop test/cloudflare.test.ts
-                # the development run on the Worker with a real local build container (needs Docker)
+npm run check   # types: Node, the core without Node types, and the Worker
+npm test        # unit tests, both workflows against scripted models, and the Worker under wrangler dev
 ```
 
-[AGENTS.md](AGENTS.md) has the rules for changes to this repository, for people and for coding agents.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+[AGENTS.md](AGENTS.md) has the rules for changes to this repository. MIT license: see [LICENSE](LICENSE).
