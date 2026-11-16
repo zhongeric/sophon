@@ -99,6 +99,7 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
         code_mode: true,
         workspace: repoMount,
         workspace_tools: 'all',
+        // Web search runs at the provider, outside the egress and its lock (RD9 of the research spec).
         web_search: spec.egress?.web_search ?? false,
         subagents: spec.subagents ?? false,
         ...(spec.subagents ? { subagent_models: [{ harness: spec.provider, model: spec.model }] } : {}),

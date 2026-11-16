@@ -122,12 +122,11 @@ test('openAgent refuses an egress spec when the host has no EgressHost', async (
   assert.equal(run.turns.length, 0)
 })
 
-test('openAgent refuses web_search on while the lock has a pending pattern', async () => {
+test('openAgent allows web_search while the lock has a pending pattern: web search is outside the lock (RD9)', async () => {
   const run = egressSetup(() => ({ text: 'done' }), { lock: ['https://archive.example.org/holdout/'] })
-  await assert.rejects(openAgent(await run.spec(archive), run.host), /^Error: note: egress: web_search is not possible while https:\/\/archive\.example\.org\/holdout\/ is locked/)
-  assert.equal(run.host.ledger.get('session:note'), undefined)
-  const agent = await openAgent(await run.spec({ ...archive, web_search: false }), run.host)
+  const agent = await openAgent(await run.spec(archive), run.host)
   await agent.close()
+  assert.notEqual(run.host.ledger.get('session:note'), undefined)
 })
 
 test('an agent without egress is offline: the cell fetch fails, the request has no web search, the host fetch is never called', async () => {

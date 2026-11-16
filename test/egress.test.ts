@@ -576,10 +576,8 @@ test('checkEgress refuses a secret that is not a valid header value, and the mes
   }
 })
 
-test('checkEgress refuses web_search while the lock has a pending pattern', () => {
+test('checkEgress accepts web_search while the lock has a pending pattern: web search is outside the lock (RD9)', () => {
   const lock = runLock(fileLedger(ledgerPath()), ['https://api.example.com/holdout'])
-  assert.throws(() => checkEgress({ ...base, web_search: true }, checkHost(lock)), /web_search .* https:\/\/api\.example\.com\/holdout is locked/)
-  checkEgress({ ...base, web_search: false }, checkHost(lock))
-  lock.unlock('https://api.example.com/holdout')
   checkEgress({ ...base, web_search: true }, checkHost(lock))
+  assert.deepEqual(lock.pending(), ['https://api.example.com/holdout'])
 })
