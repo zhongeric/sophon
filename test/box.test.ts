@@ -97,7 +97,8 @@ test('a sync after the container stopped copies all of the tree and runs the set
   const tree = MemoryFileSystem.create({ files: { '/a.txt': 'a' } })
   const setup = { command: 'echo installed >> setup.txt', timeoutMs: 60_000 }
   const lines: string[] = []
-  const machine = boxMachine(box, 'work/x', () => syncWithSetup(box, store, tree, 'work/x', setup, (line) => lines.push(line)))
+  const pending = new Map<string, Promise<void>>()
+  const machine = boxMachine(box, 'work/x', () => syncWithSetup(box, store, pending, tree, 'work/x', setup, (line) => lines.push(line)))
   const check = () => machine.run('cat a.txt setup.txt', { env: [], timeoutMs: 60_000 })
 
   assert.deepEqual(await check(), { exit_code: 0, output: 'ainstalled\n' })
@@ -109,33 +110,65 @@ test('a sync after the container stopped copies all of the tree and runs the set
   assert.deepEqual([store.read('work/x'), sqlSyncs(sql, 'run-2').read('work/y'), sql.exec('select * from factory_sync_files').toArray()], [null, null, []])
   assert.deepEqual(await check(), { exit_code: 0, output: 'ainstalled\n' })
   assert.match(lines.at(-2) ?? '', /^sync work\/x: full, 1 files sent in \d+ ms$/)
-  assert.match(lines.at(-1) ?? '', /^setup work\/x: pass in \d+ ms$/)
+  assert.match(lines.at(-1) ?? '', /^setup work\/x: pass, 1 files in \d+ ms$/)
 })
 
-/** A machine with a branch directory work/x, a setup that counts its runs, and a store over SQL that outlives a store object. */
+/**
+ * A machine with a branch directory work/x, a setup that counts its runs, and a store over SQL that outlives a store
+ * object. When `failTar` is true, each tar command on the machine fails. Thus the test does not depend on the tar
+ * of the host.
+ */
 function syncFixture() {
   const root = mkdtempSync(join(tmpdir(), 'factory-sync-'))
   const commands: string[] = []
   const lines: string[] = []
-  const box = localBox(root, commands)
+  const local = localBox(root, commands)
+  const box: Box = {
+    start: () => local.start(),
+    async exec(argv, options) {
+      if (fixture.failTar && argv[0] === 'tar') {
+        commands.push(argv.join(' '))
+        return { exit_code: 1, output: 'tar: write error' }
+      }
+      return local.exec(argv, options)
+    },
+  }
   const sql = fakeSql()
   const tree = MemoryFileSystem.create({ files: { '/a.txt': 'a', '/src/b.ts': 'b' } })
   const setup = { command: 'test ! -f ../../fail && echo run >> setup.log', timeoutMs: 60_000 }
+  const pending = new Map<string, Promise<void>>()
   const fixture = {
+    failTar: false,
     commands,
     lines,
+    pending,
     root,
     sql,
     store: sqlSyncs(sql, 'run-1'),
     tree,
     dir: join(root, 'work/x'),
     marker: join(root, 'work/x.sync'),
-    sync: () => syncWithSetup(box, fixture.store, tree, 'work/x', setup, (line) => lines.push(line)),
+    sync: () => syncWithSetup(box, fixture.store, pending, tree, 'work/x', setup, (line) => lines.push(line)),
     setupRuns: () => readFileSync(join(root, 'work/x/setup.log'), 'utf8').split('\n').filter(Boolean).length,
     full: () => commands.some((command) => command.includes('rm -rf')),
   }
   return fixture
 }
+
+test('two concurrent syncs of one directory make one full copy and run the setup once', async () => {
+  const fixture = syncFixture()
+  await Promise.all([fixture.sync(), fixture.sync()])
+
+  assert.equal(fixture.commands.filter((command) => command.includes('rm -rf')).length, 1)
+  assert.equal(fixture.commands.filter((command) => command === 'tar -x -f -').length, 1)
+  assert.equal(fixture.lines.filter((line) => line.startsWith('setup work/x:')).length, 1)
+  assert.equal(fixture.setupRuns(), 1)
+  assert.equal(readFileSync(join(fixture.dir, 'a.txt'), 'utf8'), 'a')
+  assert.equal(readFileSync(join(fixture.dir, 'src/b.ts'), 'utf8'), 'b')
+  assert.equal(readFileSync(fixture.marker, 'utf8'), fixture.store.read('work/x')?.sync)
+  assert.match(fixture.lines.at(-1) ?? '', /^sync work\/x: changes, 0 files sent in \d+ ms$/)
+  assert.equal(fixture.pending.size, 0)
+})
 
 test('a sync after a restart of the object sends only the changes and runs no setup', async () => {
   const fixture = syncFixture()
@@ -175,7 +208,7 @@ test('a missing or a different marker gives a full copy and the setup', async ()
     assert.equal(existsSync(join(fixture.dir, 'stale.txt')), false)
     // The full copy removed setup.log, so one line shows that the setup ran again.
     assert.equal(fixture.setupRuns(), 1)
-    assert.match(fixture.lines.at(-1) ?? '', /^setup work\/x: pass in \d+ ms$/)
+    assert.match(fixture.lines.at(-1) ?? '', /^setup work\/x: pass, 2 files in \d+ ms$/)
   }
 })
 
@@ -185,7 +218,7 @@ test('a failed setup leaves no valid state, so the next sync is full and runs th
   await assert.rejects(fixture.sync(), /the setup command failed/)
   assert.equal(fixture.store.read('work/x'), null)
   assert.equal(existsSync(fixture.marker), false)
-  assert.match(fixture.lines.at(-1) ?? '', /^setup work\/x: fail in \d+ ms$/)
+  assert.match(fixture.lines.at(-1) ?? '', /^setup work\/x: fail, 2 files in \d+ ms$/)
 
   rmSync(join(fixture.root, 'fail'))
   fixture.commands.length = 0
@@ -197,11 +230,12 @@ test('a failed setup leaves no valid state, so the next sync is full and runs th
 test('a sync with changes removes the marker before its first write, so a failed copy leaves no valid state', async () => {
   const fixture = syncFixture()
   await fixture.sync()
-  // A file in place of the src directory makes the tar of the changes fail.
-  rmSync(join(fixture.dir, 'src'), { recursive: true })
-  writeFileSync(join(fixture.dir, 'src'), 'not a directory')
+  assert.equal(existsSync(fixture.marker), true)
+  fixture.failTar = true
   await fixture.tree.write('/src/b.ts', new TextEncoder().encode('changed'))
   await assert.rejects(fixture.sync(), /syncing work\/x failed/)
+  assert.equal(fixture.commands.at(-1), 'tar -x -f -')
+  assert.match(fixture.lines.at(-1) ?? '', /^sync work\/x: changes, 1 files failed in \d+ ms$/)
   assert.equal(fixture.store.read('work/x'), null)
   assert.equal(existsSync(fixture.marker), false)
 })

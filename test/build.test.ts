@@ -133,7 +133,7 @@ test('build: submit refuses the log when the setup fails, with the end of the se
   const cell = [write, checkpoint, trySubmit, log('npm ci fails')].join('\n')
   const { output, result } = await buildWith({ cell, machine, config })
 
-  assert.match(output, /submit refused: .*the targeted tests failed \(test\/add\.test\.ts\).*--- setup \(exit code 2\) ---.*npm ERR! lockfile is out of date/)
+  assert.match(output, /submit refused: .*the setup failed, so the targeted tests \(test\/add\.test\.ts\) did not run\. Fix the cause.*--- setup \(exit code 2\) ---.*npm ERR! lockfile is out of date/)
   assert.doesNotMatch(output, /LOG ACCEPTED/)
   assert.deepEqual(commands, ['npm ci'])
   assert.equal(result.blocked, 'npm ci fails')

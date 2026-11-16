@@ -36,14 +36,13 @@ export function sqlSyncs(sql: SyncSql, run: string): SyncStore {
       sql.exec('delete from factory_syncs where run = ? and dir = ?', run, dir)
     },
     save(dir, state: SyncState) {
-      sql.exec('delete from factory_syncs where run = ? and dir = ?', run, dir)
       const last = files(sql, run, dir)
       for (const path of last.keys()) if (!state.files.has(path)) sql.exec('delete from factory_sync_files where run = ? and dir = ? and path = ?', run, dir, path)
       for (const [path, stamp] of state.files) {
         if (last.get(path) !== stamp) sql.exec('insert or replace into factory_sync_files (run, dir, path, stamp) values (?, ?, ?, ?)', run, dir, path, stamp)
       }
       // The sync row comes last: only a complete manifest is valid.
-      sql.exec('insert into factory_syncs (run, dir, sync) values (?, ?, ?)', run, dir, state.sync)
+      sql.exec('insert or replace into factory_syncs (run, dir, sync) values (?, ?, ?)', run, dir, state.sync)
     },
     // The container is shared by all runs of the object, so its start clears the state of every run.
     clear() {

@@ -55,10 +55,11 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     const syncs = sqlSyncs(this.ctx.storage.sql, run)
     const box = this.box(syncs)
     const setup = input.config.setup
+    const pending = new Map<string, Promise<void>>()
     const checker = (branch: Branch) => {
       const dir = `work/${branch.name.replace(/[^A-Za-z0-9._-]/g, '-')}`
       // The setup runs after each full copy, so a container that came back empty installs its dependencies again.
-      const sync = () => syncWithSetup(box, syncs, branch.tree, dir, { command: setup, timeoutMs: setupTimeoutMs }, log)
+      const sync = () => syncWithSetup(box, syncs, pending, branch.tree, dir, { command: setup, timeoutMs: setupTimeoutMs }, log)
       return commandChecker(branch, { ...input.config, setup: undefined }, boxMachine(box, dir, sync))
     }
     const result = await develop(input, {

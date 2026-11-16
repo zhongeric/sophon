@@ -194,18 +194,20 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       if (changed.length === 0) throw new Error('no commits since the task started: checkpoint your work, or say in blocked why you cannot finish')
       const missing = changed.filter((path) => !log.changes.some((change) => change.path.replace(/^\/repo\//, '') === path))
       if (missing.length > 0) throw new Error(`list every changed file in changes: missing ${missing.join(', ')}`)
-      const runTests = context.config.tests ? checker.tests : null
+      const runTests = checker.tests
       const tests = runTests ? await targetedTests(branch, context.config, await branch.changedFiles(task.base, head)) : []
       if (!runTests || tests.length === 0) return log
       const failed = (await runTests(tests)).filter((result) => result.status !== 'pass')
-      if (failed.length > 0)
-        throw new Error(
-          [
-            `submit refused: the targeted tests failed (${tests.join(', ')}). Fix the cause, checkpoint and submit again. When you cannot fix it, submit with the reason in blocked.`,
-            ...failed.map(({ name, exit_code, output }) => `--- ${name} (exit code ${exit_code ?? 'none'}) ---\n${output.slice(-toolOutputTailChars)}`),
-          ].join('\n'),
-        )
-      return log
+      if (failed.length === 0) return log
+      const cause = failed.some(({ name }) => name === 'setup')
+        ? `the setup failed, so the targeted tests (${tests.join(', ')}) did not run`
+        : `the targeted tests failed (${tests.join(', ')})`
+      throw new Error(
+        [
+          `${cause}. Fix the cause, checkpoint and submit again. When you cannot fix it, submit with the reason in blocked.`,
+          ...failed.map(({ name, exit_code, output }) => `--- ${name} (exit code ${exit_code ?? 'none'}) ---\n${output.slice(-toolOutputTailChars)}`),
+        ].join('\n'),
+      )
     }),
   }
   const repo = allowFiles(guard(branch.tree, (path) => isProtected(context.config, path)), (path) => inScope(path, task.scope))

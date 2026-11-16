@@ -132,8 +132,8 @@ function importNames(content: string): Set<string> {
 
 /**
  * The targeted tests: the changed test files, and the test files whose direct import lines name the base name of a
- * changed source file. For a changed file that no test file imports, the test files that have its base name as a
- * word, so that files that the tests reach through a process, or files that are not code, keep their tests.
+ * changed source file. When no test file imports a changed file, the test files that have its base name as a word
+ * are also targeted. Thus a file that the tests reach through a process, or a file that is not code, keeps its tests.
  * Only committed test files that exist, in the order of committedFiles.
  */
 export async function targetedTests(repo: Tree, config: RepoConfig, changed: string[]): Promise<string[]> {

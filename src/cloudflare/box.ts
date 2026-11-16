@@ -162,13 +162,35 @@ export type SyncStore = {
  * Makes a directory of the machine hold `tree`, for the next command. The machine starts before the sync reads
  * `store`. A machine that starts is empty, and its start clears `store`.
  *
+ * The caller owns `pending` and shares it across its syncs. The syncs of one directory run one at a time.
+ * Without this queue, two syncs at the same time read the same state.
+ * Then the first removes the marker, and the second does a full copy while the first or its command uses the directory.
+ *
  * The marker `<dir>.sync` is beside the directory, so the tree and the checks never see it. It holds the sync ID
  * of the last complete sync. The sync sends only the changes when the stored ID and the marker agree. Else it
  * copies all of the tree and runs the setup again. Before the first write, the sync removes the stored state and
  * the marker. It writes them again only after the copy and the setup pass. Thus a sync or a setup that fails part
  * of the way always gives a full copy and the setup on the next sync.
  */
-export async function syncWithSetup(
+export function syncWithSetup(
+  box: Box,
+  store: SyncStore,
+  pending: Map<string, Promise<void>>,
+  tree: FileSystem.FileSystem,
+  dir: string,
+  setup: { command: string | undefined; timeoutMs: number },
+  log: (line: string) => void,
+): Promise<void> {
+  const current = (pending.get(dir) ?? Promise.resolve()).catch(() => {}).then(() => syncOnce(box, store, tree, dir, setup, log))
+  pending.set(dir, current)
+  const done = () => {
+    if (pending.get(dir) === current) pending.delete(dir)
+  }
+  current.then(done, done)
+  return current
+}
+
+async function syncOnce(
   box: Box,
   store: SyncStore,
   tree: FileSystem.FileSystem,
@@ -195,12 +217,19 @@ export async function syncWithSetup(
   }
   store.invalidate(dir)
   const base = agrees && last ? last.files : null
-  await syncTree(box, tree, dir, base, next)
-  log(`sync ${dir}: ${base ? 'changes' : 'full'}, ${base ? changed.length : next.size} files sent in ${Date.now() - started} ms`)
+  const kind = base ? 'changes' : 'full'
+  const count = base ? changed.length : next.size
+  try {
+    await syncTree(box, tree, dir, base, next)
+  } catch (error) {
+    log(`sync ${dir}: ${kind}, ${count} files failed in ${Date.now() - started} ms`)
+    throw error
+  }
+  log(`sync ${dir}: ${kind}, ${count} files sent in ${Date.now() - started} ms`)
   if (!base && setup.command) {
     const setupStarted = Date.now()
     const result = await box.exec(['bash', '-c', setup.command], { cwd: dir, env: boxEnv, timeoutMs: setup.timeoutMs })
-    log(`setup ${dir}: ${result.exit_code === 0 ? 'pass' : 'fail'} in ${Date.now() - setupStarted} ms`)
+    log(`setup ${dir}: ${result.exit_code === 0 ? 'pass' : 'fail'}, ${next.size} files in ${Date.now() - setupStarted} ms`)
     if (result.exit_code !== 0) throw new Error(`the setup command failed: ${result.output.slice(-2000)}`)
   }
   const sync = crypto.randomUUID()
