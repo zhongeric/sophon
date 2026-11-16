@@ -1,8 +1,8 @@
 import type { RootFiles } from './profiles.ts'
 
 /** A TOML value. Null is a number, boolean or date: the reader keeps no value for these scalars. */
-export type TomlValue = string | null | TomlValue[] | TomlTable
-export type TomlTable = { [key: string]: TomlValue }
+type TomlValue = string | null | TomlValue[] | TomlTable
+type TomlTable = { [key: string]: TomlValue }
 
 /** Sets an own property, so that a key such as __proto__ cannot change a prototype. */
 const put = <T extends TomlValue>(target: TomlTable, key: string, value: T): T => {
@@ -229,10 +229,10 @@ export function parseToml(text: string): TomlTable {
   }
 }
 
-/** A dependency: its name with PEP 503 normalization, and its PEP 440 version constraint, or '' for none. */
-export type Requirement = { name: string; constraint: string }
+/** A dependency with a PEP 503 name and a PEP 440 constraint: '' means none, and null means unsupported. */
+type Requirement = { name: string; constraint: string | null }
 
-export const normalizeName = (name: string) => name.toLowerCase().replace(/[-_.]+/g, '-')
+const normalizeName = (name: string) => name.toLowerCase().replace(/[-_.]+/g, '-')
 
 const requirementShape = /^\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(?:\[[^\]]*\])?\s*([^;@]*)/
 
@@ -253,27 +253,43 @@ export function requirementsFile(text: string): Requirement[] {
   })
 }
 
-/** A Poetry constraint as a PEP 440 constraint: `^` and `~` become ranges, `*` is no constraint, a bare version is exact. */
-export function poetryConstraint(spec: string): string {
-  const parts = spec.split(',').map((part) => part.trim()).filter((part) => part !== '' && part !== '*')
-  return parts
-    .map((part) => {
-      const range = /^([\^~])(?!=)\s*(\d+(?:\.\d+)*)(.*)$/.exec(part)
-      if (range?.[1] && range[2]) {
-        const numbers = range[2].split('.').map(Number)
-        // A caret allows changes after the first nonzero part. A tilde allows changes after the minor part.
-        const nonzero = numbers.findIndex((number) => number !== 0)
-        const at = range[1] === '^' ? (nonzero < 0 ? numbers.length - 1 : nonzero) : Math.min(1, numbers.length - 1)
-        const upper = [...numbers.slice(0, at), (numbers[at] ?? 0) + 1].join('.')
-        return `>=${range[2]}${range[3] ?? ''},<${upper}`
-      }
-      return /^\d/.test(part) ? `==${part}` : part.replace(/\s+/g, '')
-    })
-    .join(',')
+/** The pre-release, post-release and dev-release parts of a PEP 440 version. */
+const versionSuffix = '(?:[-_.]?(?:a|b|c|rc|alpha|beta|pre|preview)\\d*)?(?:[-_.]?(?:post|rev|r)\\d*)?(?:[-_.]?dev\\d*)?'
+const rangeShape = new RegExp(`^([\\^~])\\s*(\\d+(?:\\.\\d+)*)(${versionSuffix})$`, 'i')
+const comparisonShape = new RegExp(`^(===|==|!=|~=|<=|>=|<|>)?\\s*((?:\\d+!)?\\d+(?:\\.\\d+)*${versionSuffix}(?:\\+[a-z0-9]+(?:[-_.][a-z0-9]+)*|\\.\\*)?)$`, 'i')
+
+/**
+ * A Poetry constraint as a PEP 440 constraint: `^` and `~` become ranges, `*` is no constraint, a bare version is exact.
+ * A constraint with no direct PEP 440 form, for example `^7.0 || ^8.0`, gives null.
+ */
+export function poetryConstraint(spec: string): string | null {
+  const parts = spec.split(/,|\s+(?=[~^<>=!])/).map((part) => part.trim()).filter((part) => part !== '' && part !== '*')
+  const constraints = parts.map((part) => {
+    const range = rangeShape.exec(part)
+    if (range?.[1] && range[2]) {
+      const numbers = range[2].split('.').map(Number)
+      // A caret allows changes after the first nonzero part. A tilde allows changes after the minor part.
+      const nonzero = numbers.findIndex((number) => number !== 0)
+      const at = range[1] === '^' ? (nonzero < 0 ? numbers.length - 1 : nonzero) : Math.min(1, numbers.length - 1)
+      const upper = [...numbers.slice(0, at), (numbers[at] ?? 0) + 1].join('.')
+      return `>=${range[2]}${range[3] ?? ''},<${upper}`
+    }
+    const comparison = comparisonShape.exec(part)
+    const operator = comparison?.[1] ?? '=='
+    // PEP 440 allows a wildcard only after == and !=.
+    if (!comparison?.[2] || (comparison[2].endsWith('*') && operator !== '==' && operator !== '!=')) return null
+    if (comparison[2].includes('+') && operator !== '==' && operator !== '!=' && operator !== '===') return null
+    return operator + comparison[2]
+  })
+  return constraints.every((constraint) => constraint !== null) ? constraints.join(',') : null
 }
 
 const pep508List = (value: TomlValue | undefined): Requirement[] =>
   Array.isArray(value) ? value.flatMap((item) => (typeof item === 'string' ? (parseRequirement(item) ?? []) : [])) : []
+
+/** The PEP 508 strings of a list as written, with their markers and URLs. A string without a name does not count. */
+const pep508Strings = (value: TomlValue | undefined): string[] =>
+  Array.isArray(value) ? value.flatMap((item) => (typeof item === 'string' && parseRequirement(item) ? [item.trim()] : [])) : []
 
 /** A Poetry dependency table: names to a constraint, to an inline table with a version, or to a list of these. */
 const poetryList = (value: TomlValue | undefined): Requirement[] =>
@@ -285,17 +301,19 @@ const poetryList = (value: TomlValue | undefined): Requirement[] =>
     })
 
 /** The dependencies of a Python repository, from its root requirements*.txt files and its pyproject.toml. */
-export type PythonDependencies = {
+type PythonDependencies = {
   /** Each root requirements*.txt file, in name order. */
   requirements: { file: string; requirements: Requirement[] }[]
-  /** True when pyproject.toml has a [project], [tool.poetry] or [build-system] table, so that pip can install the project. */
+  /** True when pyproject.toml declares a project or a build system. pip decides whether the editable install succeeds. */
   installable: boolean
-  /** The [project] dependencies and the Poetry main dependencies. */
+  /** The dependencies that the project install gives: the [project] dependencies, and the Poetry main dependencies when poetry-core builds the project. */
   main: Requirement[]
-  /** The optional dependencies of [project], by extra name. */
+  /** The optional dependencies of [project], and the Poetry extras when poetry-core builds the project, by extra name. */
   extras: Record<string, Requirement[]>
-  /** The dependency groups, the Poetry groups and the Poetry dev-dependencies. */
+  /** The dependency groups, the Poetry groups, the Poetry dev-dependencies and the Poetry main dependencies that are not in main. */
   groups: Requirement[]
+  /** The normalized project name and the dependency strings as written, for an install without the project. */
+  project: { name: string | null; dependencies: string[]; extras: Record<string, string[]> }
 }
 
 /** The dependencies of the repository at `root`, or null when its pyproject.toml does not parse. */
@@ -312,26 +330,60 @@ export async function pythonDependencies(root: RootFiles): Promise<PythonDepende
   const project = table(pyproject.project)
   const tool = table(pyproject.tool)
   const poetry = table(tool.poetry)
+  const buildSystem = pyproject['build-system']
+  const installable = isTable(buildSystem) || isTable(pyproject.project) || isTable(tool.poetry)
+  // Only poetry-core reads [tool.poetry.dependencies]. With a [project] table, poetry-core 2 can ignore them.
+  const backend = table(buildSystem)['build-backend']
+  const poetryBuilds = typeof backend === 'string' && backend.startsWith('poetry.') && !isTable(pyproject.project)
+  const poetryMain = poetryList(poetry.dependencies)
+  // The reader keeps no boolean value, so an optional key makes the dependency optional, even for optional = false.
+  const optional = new Set(
+    Object.entries(table(poetry.dependencies))
+      .filter(([, spec]) => Object.hasOwn(table(spec), 'optional'))
+      .map(([name]) => normalizeName(name)),
+  )
+  const builtByPoetry = (requirement: Requirement) => poetryBuilds && !optional.has(requirement.name)
+  const poetryExtras = Object.entries(table(poetry.extras)).map(([extra, names]): [string, Requirement[]] => {
+    const listed = new Set(Array.isArray(names) ? names.flatMap((name) => (typeof name === 'string' ? [normalizeName(name)] : [])) : [])
+    return [normalizeName(extra), poetryMain.filter((entry) => optional.has(entry.name) && listed.has(entry.name))]
+  })
+  const projectExtras = Object.entries(table(project['optional-dependencies']))
   return {
     requirements,
-    installable: isTable(pyproject.project) || isTable(tool.poetry) || isTable(pyproject['build-system']),
-    main: [...pep508List(project.dependencies), ...poetryList(poetry.dependencies)],
-    extras: Object.fromEntries(Object.entries(table(project['optional-dependencies'])).map(([extra, list]) => [normalizeName(extra), pep508List(list)])),
+    installable,
+    main: [...pep508List(project.dependencies), ...poetryMain.filter(builtByPoetry)],
+    extras: Object.fromEntries([
+      ...projectExtras.map(([extra, list]): [string, Requirement[]] => [normalizeName(extra), pep508List(list)]),
+      ...(poetryBuilds ? poetryExtras : []),
+    ]),
     groups: [
       // pep508List skips the {include-group = "..."} tables of a dependency group.
       ...Object.values(table(pyproject['dependency-groups'])).flatMap(pep508List),
       ...poetryList(poetry['dev-dependencies']),
       ...Object.values(table(poetry.group)).flatMap((group) => poetryList(table(group).dependencies)),
+      ...poetryMain.filter((entry) => !builtByPoetry(entry)),
     ],
+    project: {
+      name: typeof project.name === 'string' ? normalizeName(project.name) : null,
+      dependencies: pep508Strings(project.dependencies),
+      extras: Object.fromEntries(projectExtras.map(([extra, list]) => [normalizeName(extra), pep508Strings(list)])),
+    },
   }
 }
 
-/** The tools that turn on the default lint check and the default tests. */
+/** The tools that turn on the default ruff check and the default pytest tests. */
 const pythonTools = ['ruff', 'pytest']
 const pip = '.venv/bin/python -m pip install'
 
 /** A shell argument, quoted when it holds a character that the shell reads, for example `[`, `<` or a space. */
 const shellArg = (value: string) => (/^[\w.,=~+\-/:@%]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`)
+
+const installRequirement = (requirement: Requirement): string => {
+  if (requirement.constraint === null) {
+    throw new Error(`Cannot install ${requirement.name}: its Poetry constraint in pyproject.toml has no supported PEP 440 form. Use a PEP 440 constraint or set a custom setup command.`)
+  }
+  return requirement.name + requirement.constraint
+}
 
 /** An editable install with setuptools can write *.egg-info into the tree, and the host commits each file that git does not ignore. */
 const ignoreEggInfo = `for d in *.egg-info src/*.egg-info; do if [ -d "$d" ]; then printf '*\\n' > "$d/.gitignore"; fi; done`
@@ -339,7 +391,8 @@ const ignoreEggInfo = `for d in *.egg-info src/*.egg-info; do if [ -d "$d" ]; th
 /**
  * The setup commands of a Python repository, and the tools of pythonTools that the setup installs. The setup makes
  * .venv and makes git ignore it. It installs requirements.txt, the other root requirements files and the project
- * extras that hold a tool, and the project. Then it installs by name each tool that only a group or another extra holds.
+ * extras that hold a tool, and the project. When pip cannot build the project, it installs the main dependencies and
+ * these extras without the project. Then it installs by name each tool that only a group or another extra holds.
  */
 export async function pythonSetup(root: RootFiles): Promise<{ commands: string[]; tools: string[] }> {
   const commands = ['python3 -m venv .venv', `printf '*\\n' > .venv/.gitignore`]
@@ -353,14 +406,28 @@ export async function pythonSetup(root: RootFiles): Promise<{ commands: string[]
     if (file !== 'requirements.txt' && tools.length > 0) commands.push(`${pip} -r ${shellArg(file)}`)
     for (const tool of tools) installed.add(tool)
   }
+  const extras = ['dev', 'test'].filter((extra) => holds(dependencies.extras[extra] ?? []).length > 0)
+  const selected = [dependencies.main, ...extras.map((extra) => dependencies.extras[extra] ?? [])]
   if (dependencies.installable) {
-    const extras = ['dev', 'test'].filter((extra) => holds(dependencies.extras[extra] ?? []).length > 0)
-    commands.push(`${pip} -e ${shellArg(extras.length > 0 ? `.[${extras.join(',')}]` : '.')}`, ignoreEggInfo)
-    for (const list of [dependencies.main, ...extras.map((extra) => dependencies.extras[extra] ?? [])]) for (const tool of holds(list)) installed.add(tool)
+    const listed = new Set(
+      [...dependencies.project.dependencies, ...extras.flatMap((extra) => dependencies.project.extras[extra] ?? [])]
+        .filter((requirement) => parseRequirement(requirement)?.name !== dependencies.project.name),
+    )
+    const listedNames = new Set([...listed].map((requirement) => parseRequirement(requirement)?.name))
+    // If the Poetry install fails, its main dependencies and selected extras still need an install by name.
+    for (const requirement of selected.flat()) {
+      if (!listedNames.has(requirement.name) && requirement.name !== dependencies.project.name) {
+        listed.add(installRequirement(requirement))
+        listedNames.add(requirement.name)
+      }
+    }
+    const fallback = listed.size > 0 ? `${pip} ${[...listed].map(shellArg).join(' ')}` : ':'
+    commands.push(`(${pip} -e ${shellArg(extras.length > 0 ? `.[${extras.join(',')}]` : '.')} || ${fallback})`, ignoreEggInfo)
   }
+  for (const list of selected) for (const tool of holds(list)) installed.add(tool)
   const others = [...dependencies.groups, ...Object.values(dependencies.extras).flat()]
   const byName = pythonTools.flatMap((tool) => (installed.has(tool) ? [] : others.filter((requirement) => requirement.name === tool).slice(0, 1)))
-  if (byName.length > 0) commands.push(`${pip} ${byName.map((requirement) => shellArg(requirement.name + requirement.constraint)).join(' ')}`)
+  if (byName.length > 0) commands.push(`${pip} ${byName.map((requirement) => shellArg(installRequirement(requirement))).join(' ')}`)
   for (const requirement of byName) installed.add(requirement.name)
   return { commands, tools: pythonTools.filter((tool) => installed.has(tool)) }
 }

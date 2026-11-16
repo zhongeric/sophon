@@ -116,7 +116,7 @@ give the defaults:
 | --- | --- | --- | --- | --- |
 | `solidity` (`foundry.toml`) | `forge build`, `forge fmt --check` on changed `.sol` files | `forge test --match-path {test}` for `*.t.sol` | `forge install`, when `.gitmodules` exists | `foundry.toml`, `remappings.txt` |
 | `typescript` (`package.json` and `tsconfig.json`) | the `typecheck` script (or `type-check`, `check-types`, `types`), else `tsc --noEmit`; `eslint` on changed files when it is a dependency | `vitest run` or `jest` when it is a dependency, for `*.test.*` and `*.spec.*` | the install of the lockfile's package manager: npm, pnpm or yarn | `package.json`, `tsconfig.json`, the lockfile |
-| `python` (`pyproject.toml` or `requirements.txt`) | `.venv/bin/ruff check --no-cache {files}` on changed `.py` and `.pyi` files when ruff is a dependency, else a compile in memory of these files: `python3 -B -c "import sys; [compile(open(f, 'rb').read(), f, 'exec') for f in sys.argv[1:]]" {files}` | `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider {tests}` for `test_*.py` and `*_test.py`, when pytest is a dependency | `python3 -m venv .venv` (git ignores it), then `.venv/bin/python -m pip install` of `requirements.txt`, of the other root `requirements*.txt` files and the `dev` or `test` extras that hold ruff or pytest, and of the project as editable (`-e .`) when `pyproject.toml` has a `[project]`, `[tool.poetry]` or `[build-system]` table. A tool that only a dependency group or another extra holds is installed by name. | `pyproject.toml`, `requirements*.txt`, `uv.lock`, `poetry.lock` |
+| `python` (`pyproject.toml` or `requirements.txt`) | `.venv/bin/ruff check --no-cache --force-exclude {files}` on changed `.py` and `.pyi` files when ruff is a dependency, else a compile in memory of these files: `python3 -B -c "import sys; [compile(open(f, 'rb').read(), f, 'exec') for f in sys.argv[1:]]" {files}` | `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider {tests} \|\| [ $? -eq 5 ]` for `test_*.py` and `*_test.py`, when pytest is a dependency | `python3 -m venv .venv` (git ignores it), then `.venv/bin/python -m pip install`. The install takes `requirements.txt` and the other root `requirements*.txt` files. It also takes the `dev` or `test` extras that hold ruff or pytest. The project install uses editable mode (`-e .`). Without a project install, setup installs the `[project]` dependencies and the `dev` or `test` extras that hold ruff or pytest. When only a dependency group or another extra holds a tool, setup installs the tool by name. | `pyproject.toml`, `requirements*.txt`, `uv.lock`, `poetry.lock`, `.venv/` |
 
 Every repository also protects `.github/`. When several profiles match, the checks and protected paths join, and
 the setup commands run one after the other. A local run, and a development run on Cloudflare, need at least one
@@ -148,7 +148,9 @@ of that field. `"tests": null` or `"setup": ""` turns a default off. For example
 
 - `{files}` is the changed files that match `files`. A check with no matching files is skipped.
 - A `*` in a `protect` entry matches zero or more characters in one path segment, never `/`. For example,
-  `requirements*.txt` matches `requirements-dev.txt` at the root.
+  `requirements*.txt` matches `requirements-dev.txt` at the root. As an entry without `*`, the entry also matches a
+  directory prefix: `deploy*` protects `deploy-prod/run.sh`. An entry that ends with `/` matches only a directory
+  prefix.
 - `{tests}` runs the targeted tests in one command; `{test}` runs one command per test file.
 - Targeted tests are the changed test files plus the test files that name a changed source file.
 - `guides` are mounted read-only at `/guides/<name>`. The `solidity` profile reads `/guides/evm-cortex` when it

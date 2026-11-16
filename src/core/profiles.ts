@@ -25,7 +25,7 @@ export type StaticRule = {
 /** One stack's rules, in one place. The workflows ask the matched profiles, and never branch on a stack. */
 export type Profile = {
   id: string
-  /** Files at the repository root that must all exist for the profile to apply, for example foundry.toml. */
+  /** Files at the repository root that must exist for the profile to apply (see markerMatch), for example foundry.toml. */
   markers: string[]
   /** With 'any', the profile applies when one of its markers exists. The default is 'all'. */
   markerMatch?: 'all' | 'any'
@@ -249,8 +249,6 @@ const typescript: Profile = {
   },
 }
 
-const pythonFiles = '\\.pyi?$'
-
 /** Compiles each file in memory, so that the check writes no bytecode into the tree. */
 const pythonCompile = `python3 -B -c "import sys; [compile(open(f, 'rb').read(), f, 'exec') for f in sys.argv[1:]]" {files}`
 
@@ -267,18 +265,19 @@ const python: Profile = {
   planSections: [],
   async defaults(root) {
     const setup = await pythonSetup(root)
+    const files = python.files.source
     // The check is not named lint, so that it does not replace the eslint check of a TypeScript profile in the same repository.
     const checks: RepoConfig['checks'] = setup.tools.includes('ruff')
-      ? { ruff: { command: '.venv/bin/ruff check --no-cache {files}', files: pythonFiles } }
-      : { compile: { command: pythonCompile, files: pythonFiles } }
+      ? { ruff: { command: '.venv/bin/ruff check --no-cache --force-exclude {files}', files } }
+      : { compile: { command: pythonCompile, files } }
     return {
       stack: 'Python',
       checks,
       ...(setup.tools.includes('pytest')
-        ? { tests: { pattern: '(^|/)(test_[^/]*|[^/]*_test)\\.py$', command: 'PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider {tests}' } }
+        ? { tests: { pattern: '(^|/)(test_[^/]*|[^/]*_test)\\.py$', command: 'PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider {tests} || [ $? -eq 5 ]' } }
         : {}),
       setup: setup.commands.join(' && '),
-      protect: ['pyproject.toml', 'requirements*.txt', 'uv.lock', 'poetry.lock'],
+      protect: ['pyproject.toml', 'requirements*.txt', 'uv.lock', 'poetry.lock', '.venv/'],
     }
   },
 }

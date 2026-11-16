@@ -88,5 +88,12 @@ test('a star in a protect entry matches characters in one path segment', () => {
   assert.equal(isProtected(config, '/aXb(c)+d'), false)
   const all = { stack: 'Python', checks: { smoke: 'true' }, protect: ['*'] }
   assert.equal(isProtected(all, '/setup.py'), true)
-  assert.equal(isProtected(all, '/src/setup.py'), false)
+  assert.equal(isProtected(all, '/src/setup.py'), true)
+  const dirs = { stack: 'Python', checks: { smoke: 'true' }, protect: ['deploy*', 'config/*', 'pkg*'] }
+  assert.equal(isProtected(dirs, '/deploy-prod'), true)
+  assert.equal(isProtected(dirs, '/deploy-prod/run.sh'), true)
+  assert.equal(isProtected(dirs, '/config/prod/keys.json'), true)
+  assert.equal(isProtected(dirs, '/config'), false)
+  assert.equal(isProtected(dirs, '/pkg-a/x.py'), true)
+  assert.equal(isProtected(dirs, '/src/pkg-a/x.py'), false)
 })

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -58,9 +58,9 @@ const venv = "python3 -m venv .venv && printf '*\\n' > .venv/.gitignore"
 const pip = '.venv/bin/python -m pip install'
 const eggInfo = `for d in *.egg-info src/*.egg-info; do if [ -d "$d" ]; then printf '*\\n' > "$d/.gitignore"; fi; done`
 const compile = { compile: { command: `python3 -B -c "import sys; [compile(open(f, 'rb').read(), f, 'exec') for f in sys.argv[1:]]" {files}`, files: '\\.pyi?$' } }
-const ruff = { ruff: { command: '.venv/bin/ruff check --no-cache {files}', files: '\\.pyi?$' } }
-const pytest = { pattern: '(^|/)(test_[^/]*|[^/]*_test)\\.py$', command: 'PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider {tests}' }
-const pythonProtect = ['.github/', 'pyproject.toml', 'requirements*.txt', 'uv.lock', 'poetry.lock']
+const ruff = { ruff: { command: '.venv/bin/ruff check --no-cache --force-exclude {files}', files: '\\.pyi?$' } }
+const pytest = { pattern: '(^|/)(test_[^/]*|[^/]*_test)\\.py$', command: 'PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider {tests} || [ $? -eq 5 ]' }
+const pythonProtect = ['.github/', 'pyproject.toml', 'requirements*.txt', 'uv.lock', 'poetry.lock', '.venv/']
 
 test('a Python repository with only requirements.txt gets a venv, the install of the file, and ruff only when the file names it', async () => {
   assert.deepEqual(await profileDefaults(root({ 'requirements.txt': 'numpy==2.0\n' })), {
@@ -74,20 +74,21 @@ test('a Python repository with only requirements.txt gets a venv, the install of
 })
 
 test('a Python project installs itself, and the dev and test extras that hold ruff or pytest', async () => {
-  const main = '[project]\nname = "app"\ndependencies = ["ruff", "pytest>=8"]\n'
+  const buildSystem = '[build-system]\nrequires = ["setuptools"]\n'
+  const main = buildSystem + '[project]\nname = "app"\ndependencies = ["ruff", "pytest>=8"]\n'
   assert.deepEqual(await profileDefaults(root({ 'pyproject.toml': main })), {
     stack: 'Python',
     checks: ruff,
     tests: pytest,
-    setup: `${venv} && ${pip} -e . && ${eggInfo}`,
+    setup: `${venv} && (${pip} -e . || ${pip} ruff 'pytest>=8') && ${eggInfo}`,
     protect: pythonProtect,
   })
 
-  const extras = '[project]\nname = "app"\n[project.optional-dependencies]\ndev = ["pytest"]\ntest = ["ruff"]\ndocs = ["sphinx"]\n'
+  const extras = buildSystem + '[project]\nname = "app"\n[project.optional-dependencies]\ndev = ["pytest"]\ntest = ["ruff"]\ndocs = ["sphinx"]\n'
   const both = await profileDefaults(root({ 'pyproject.toml': extras, 'requirements.txt': 'numpy\n' }))
   assert.deepEqual(
     [both.checks, both.tests, both.setup],
-    [ruff, pytest, `${venv} && ${pip} -r requirements.txt && ${pip} -e '.[dev,test]' && ${eggInfo}`],
+    [ruff, pytest, `${venv} && ${pip} -r requirements.txt && (${pip} -e '.[dev,test]' || ${pip} pytest ruff) && ${eggInfo}`],
   )
 })
 
@@ -106,7 +107,7 @@ test('a Python repository installs the other requirements files that hold ruff o
   const grouped = await profileDefaults(root({ 'pyproject.toml': groups }))
   assert.deepEqual(
     [grouped.checks, grouped.tests, grouped.setup],
-    [ruff, pytest, `${venv} && ${pip} -e . && ${eggInfo} && ${pip} 'ruff>=0.4.2,<0.5' 'pytest>=8,<9'`],
+    [ruff, pytest, `${venv} && (${pip} -e . || :) && ${eggInfo} && ${pip} 'ruff>=0.4.2,<0.5' 'pytest>=8,<9'`],
   )
 
   const toolOnly = await profileDefaults(root({ 'pyproject.toml': '[dependency-groups]\ndev = ["pytest"]\n[tool.ruff]\nline-length = 100\n' }))
@@ -129,7 +130,7 @@ test('a Python and TypeScript repository joins the defaults in profile order, an
   assert.deepEqual(Object.keys(both.checks ?? {}), ['typecheck', 'lint', 'ruff'])
   assert.deepEqual(both.tests, pytest)
   assert.equal(both.setup, `npm ci --prefer-offline --no-audit --no-fund && ${venv} && ${pip} -r requirements.txt`)
-  assert.deepEqual(both.protect, ['.github/', 'package.json', 'tsconfig.json', 'package-lock.json', 'pyproject.toml', 'requirements*.txt', 'uv.lock', 'poetry.lock'])
+  assert.deepEqual(both.protect, ['.github/', 'package.json', 'tsconfig.json', 'package-lock.json', 'pyproject.toml', 'requirements*.txt', 'uv.lock', 'poetry.lock', '.venv/'])
 })
 
 test('the defaults of several profiles join, and a repository with no profile gets only the protected CI paths', async () => {
@@ -176,7 +177,11 @@ test('locally, a repository without .agent-factory.json gets the defaults of its
 
   const python = mkdtempSync(join(tmpdir(), 'factory-config-'))
   writeFileSync(join(python, 'requirements.txt'), 'numpy\n')
-  writeFileSync(join(python, 'requirements-dev.txt'), 'ruff\n')
+  mkdirSync(join(python, 'requirements'))
+  writeFileSync(join(python, 'requirements', 'dev.txt'), 'ruff\n')
+  symlinkSync(join('requirements', 'dev.txt'), join(python, 'requirements-dev.txt'))
+  symlinkSync('missing.txt', join(python, 'requirements-gone.txt'))
+  symlinkSync('loop', join(python, 'loop'))
   mkdirSync(join(python, 'requirements-old.txt'))
   const listed = await loadRepoConfig(python)
   assert.deepEqual([listed.stack, Object.keys(listed.checks)], ['Python', ['ruff']])
