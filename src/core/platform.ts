@@ -69,11 +69,34 @@ export type Checker = {
   tests: ((tests: string[]) => Promise<CheckResult[]>) | null
 }
 
-/** The run's artifacts, such as report.md and gate-log.txt. */
+/** The output files of the run, such as report.md and gate-log.txt. */
 export type Files = {
   write(name: string, text: string): void
   append(name: string, text: string): void
   exists(name: string): boolean
+}
+
+/** Where an artifact came from, so that a later step can fetch it or run it again. */
+export type ArtifactSource = { url: string; method: string } | { command: string }
+
+/** The meta that the caller gives to `Artifacts.put`. The store sets the size and the time. */
+export type ArtifactInput = { source: ArtifactSource; media_type: string; labels?: Record<string, string> }
+
+/** The stored meta of an artifact. `created` is the time of the first put, in milliseconds since the epoch. */
+export type ArtifactMeta = { source: ArtifactSource; media_type: string; labels: Record<string, string>; size: number; created: number }
+
+/**
+ * The content-addressed store of one run. The ledger keeps artifact IDs, never bulk data. The ID is the SHA-256
+ * lowercase hex of the bytes, so the same bytes give the same ID, and the first meta stays.
+ */
+export type Artifacts = {
+  put(bytes: Uint8Array, meta: ArtifactInput): Promise<string>
+  /** Null for an unknown or malformed ID. */
+  get(id: string): Promise<Uint8Array | null>
+  /** Null for an unknown or malformed ID. */
+  meta(id: string): Promise<ArtifactMeta | null>
+  /** Every artifact, in the order of `created`, then of ID. */
+  list(): Promise<{ id: string; meta: ArtifactMeta }[]>
 }
 
 /** Where agent sessions keep their journals and events. */

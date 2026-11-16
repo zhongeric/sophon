@@ -1,5 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import { Bash, FileSystem, MemoryFileSystem, Mount } from 'nanocode-ts/bash'
+import { artifactsFileSystem } from './artifacts.ts'
+import type { Artifacts } from './platform.ts'
 
 /** Names that agents never see in a repository tree. */
 const hidden = new Set(['.git'])
@@ -80,12 +82,15 @@ export type WorkspaceLayout = {
   review: Record<string, string>
   /** Reference material, mounted read-only under /guides/<name>. */
   guides?: Record<string, FileSystem.FileSystem>
+  /** The artifact store of the run, mounted as a live, read-only view at /artifacts. */
+  artifacts?: Artifacts
 }
 
 export const repoMount = '/repo'
 
 /**
- * The workspace of one agent: a virtual shell over /repo, /review and /guides. The shell runs text tools
+ * The workspace of one agent: a virtual shell over /repo, /review, /guides and, when the layout has a store,
+ * /artifacts. The shell runs text tools
  * in-process, so an agent cannot start real processes or reach the network from it.
  */
 export async function createWorkspace(layout: WorkspaceLayout): Promise<Contracts.WorkspaceHost> {
@@ -94,6 +99,7 @@ export async function createWorkspace(layout: WorkspaceLayout): Promise<Contract
     '/review': readOnly(MemoryFileSystem.create({ files: layout.review })),
   }
   for (const [name, fs] of Object.entries(layout.guides ?? {})) mounts[`/guides/${name}`] = readOnly(fs)
+  if (layout.artifacts) mounts['/artifacts'] = artifactsFileSystem(layout.artifacts)
   const bash = await Bash.create({
     cwd: repoMount,
     fetch: async () => {

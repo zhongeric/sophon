@@ -185,6 +185,11 @@ Each run writes:
 - `state.json`: the ledger, with every finding, gate decision, patch log and turn report
 - `agents/<step>.events.jsonl` and `agents/<step>.sqlite`: each agent's event log and journal
 
+The artifact store of a run keeps its files in `runs/<run>/artifacts/`. An artifact is a file stored by the
+SHA-256 hex of its bytes, `<id>`, with its meta in `<id>.json`: the source, the media type, the size, the time and
+the labels. The same bytes give the same ID, and the first meta stays. A step can mount the store read-only at
+`/artifacts` in an agent workspace. No workflow uses the store yet.
+
 `--models file.json` overrides models per step and role, for example
 `{ "step1": { "bugs": { "provider": "claude", "model": "claude-opus-5-5", "thinking": "high" } } }`.
 The light loop's model is `light`. `ALLOWED_MODELS` in the environment replaces the allowed models.
@@ -302,8 +307,11 @@ npm run remote -- report acme/app#123
 
 ### How it works
 
-- `PullRequestRuns` is one Durable Object per PR. Its SQLite holds the run's ledger and artifacts, the
+- `PullRequestRuns` is one Durable Object per PR. Its SQLite holds the run's ledger and output files, the
   repository tree (nanocode's `SqlFileSystem`), and every agent session, each in its own journal scope.
+- The artifact store of a run is in two tables of the Durable Object SQLite. A row has a size limit, so the store
+  keeps the bytes in chunks of 1 MiB. The host refuses an artifact over 32 MiB, the limit on both platforms. The
+  store needs no new binding.
 - The freeze downloads the PR head tarball, steps the PR's files back to the merge base for one commit and
   forward for a second, so nanocode's in-process git can diff and commit. The fixes go back through the Git Data API.
 - Alarms drive the run. A heartbeat alarm stays a minute ahead while the run works, so a run whose isolate
