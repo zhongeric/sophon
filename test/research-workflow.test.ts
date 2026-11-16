@@ -114,6 +114,25 @@ test('research: intake with a cap, surveys through the egress, two generators, t
   assert.equal(again.length, 0)
 })
 
+test('research: a Drop answer at the approval removes the hypothesis without a freeze or a new round', { timeout: 120_000 }, async () => {
+  const { repo, base } = notebook()
+  const turns: Turn[] = []
+  const { channel, posted } = memoryChannel({ pick: '/answer\nQ1: a, c', 'approve.1': '/answer\nQ1: a\nQ2: c' })
+  const { result } = await runResearch(repo, runsDir(), researchInput(base, 'drop'), { channel, dispatch: scriptedDispatch(researchScript(), turns) })
+
+  assert.equal(result.status, 'frozen', result.report)
+  assert.deepEqual(
+    posted.map((batch) => batch.batch),
+    ['intake', 'pick', 'approve.1'],
+  )
+  assert.deepEqual(
+    result.frozen.map((entry) => entry.path),
+    ['prereg/hyp-001-v2.md'],
+  )
+  assert.equal(turns.filter((turn) => turn.role === 'preregistrar' && turn.output === null).length, 2)
+  assert.match(result.report, /dropped hyp-003/)
+})
+
 test('research: a fresh run creates the next version when the base has an identical prereg', { timeout: 120_000 }, async () => {
   const { repo } = notebook()
   const previous = await freezePrereg({

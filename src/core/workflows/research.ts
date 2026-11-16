@@ -78,7 +78,7 @@ const defaultParallel = 3
 const defaultCap = 25
 const noCap = 'No cap'
 const noneOption = 'None'
-const approveOptions = ['Approve and freeze', 'Reject (write the reason)']
+const approveOptions = ['Approve and freeze', 'Reject (write the reason)', 'Drop the hypothesis']
 const frozenKey = 'frozen'
 /** The cap of the intake answer, after the host applied it. Null is no cap. */
 const capKey = 'cap'
@@ -124,6 +124,8 @@ type ReportState = {
   picked: string[] | null
   branch: string | null
   frozen: Freeze[]
+  /** The picked hypotheses that the user dropped at the approval. They get no freeze. */
+  dropped: string[]
 }
 
 type Pending = { hypothesis: NumberedHypothesis; revision?: { round: number; reason: string } }
@@ -149,7 +151,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   const { budgetOverride, ...recorded } = input
   ledger.put('input', recorded)
 
-  const state: ReportState = { input, intake: null, surveys: [], hypotheses: [], picked: null, branch: null, frozen: [] }
+  const state: ReportState = { input, intake: null, surveys: [], hypotheses: [], picked: null, branch: null, frozen: [], dropped: [] }
   const context: ResearchContext = {
     host: {
       module: deps.module,
@@ -252,6 +254,10 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     const rejected: Pending[] = []
     for (const [index, draft] of drafts.entries()) {
       const answer = approvals[index]?.answer ?? ''
+      if (drops(answer)) {
+        state.dropped.push(pending[index]!.hypothesis.id)
+        continue
+      }
       if (!approves(answer)) {
         rejected.push({ hypothesis: pending[index]!.hypothesis, revision: { round, reason: answer === approveOptions[1] ? 'The user gave no reason.' : answer } })
         continue
@@ -263,7 +269,9 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     }
     pending = rejected
   }
-  return finish('frozen', `The run froze ${state.frozen.length} preregs on ${branchName}, did not push the branch, and stopped before stage 5.`)
+  if (state.frozen.length === 0) return finish('stopped', 'You dropped each picked hypothesis, so the run froze no prereg.')
+  const dropped = state.dropped.length > 0 ? `, dropped ${state.dropped.join(', ')}` : ''
+  return finish('frozen', `The run froze ${state.frozen.length} preregs on ${branchName}${dropped}, did not push the branch, and stopped before stage 5.`)
 }
 
 /** Stops the run when a frozen file on the run branch is missing, or has another hash than the ledger records. */
@@ -388,7 +396,7 @@ function parsePicks(answer: string, hypotheses: NumberedHypothesis[]): Parsed<st
 function approveQuestion(draft: Prereg, index: number): Question {
   return {
     id: `Q${index + 1}`,
-    question: `Approve the prereg of ${draft.hypothesis} for the freeze? To reject it, write the reason.`,
+    question: `Approve the prereg of ${draft.hypothesis} for the freeze? To reject it, write the reason. To drop the hypothesis without a freeze, answer Drop.`,
     why: [
       `Known recall: ${draft.known_recall}.`,
       ...draft.sections.map((section) => `${section.name.trim()}: ${section.text.trim()}`),
@@ -402,6 +410,7 @@ function approveQuestion(draft: Prereg, index: number): Question {
 }
 
 const approves = (answer: string) => answer === approveOptions[0] || /^\s*(yes|approve)\b/i.test(answer)
+const drops = (answer: string) => answer === approveOptions[2] || /^\s*drop\b/i.test(answer)
 
 function renderReport(state: ReportState, status: ResearchStatus, note: string, answers: Answer[], usage: string[]): string {
   return [
