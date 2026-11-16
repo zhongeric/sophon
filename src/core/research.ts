@@ -17,6 +17,8 @@ export type ResearchConfig = {
   prereg_sections: string[]
   commands: { known: string; inject: string; evaluate: string; reproduce: string; sweep?: string }
   credentials?: Record<string, ResearchCredential>
+  /** Normalized https URLs for scout (R4). The host reads them, thus egress does not limit their hosts. */
+  feeds?: string[]
 }
 
 /**
@@ -80,6 +82,22 @@ function egressList(value: unknown, key: string, fail: Fail): string[] {
   return hosts
 }
 
+/** Gives each URL in the normalized form of the URL parser, as parseHoldout does. */
+function feedList(value: unknown, key: string, fail: Fail): string[] {
+  if (!Array.isArray(value) || value.length === 0) return fail(key, 'must be a non-empty list of https URLs')
+  const feeds: string[] = []
+  value.forEach((item, index) => {
+    const at = `${key}[${index}]`
+    const text = nonEmptyString(item, at, fail)
+    const url = URL.canParse(text) ? new URL(text) : null
+    if (url?.protocol !== 'https:') return fail(at, `must be an https URL: ${text}`)
+    if (url.username !== '' || url.password !== '') fail(at, `must not have a user or a password: ${text}`)
+    if (feeds.includes(url.href)) fail(at, `repeats the URL ${url.href}`)
+    feeds.push(url.href)
+  })
+  return feeds
+}
+
 /** A placeholder is {name} that does not follow a $, so that a shell ${VAR} stays permitted. */
 const placeholder = /(?<!\$)\{([A-Za-z_][A-Za-z0-9_]*)\}/g
 
@@ -127,7 +145,7 @@ function credentials(value: unknown, key: string, egress: string[], fail: Fail):
   return parsed
 }
 
-const researchKeys = ['egress', 'holdout', 'lenses', 'guides', 'checklist', 'prereg_sections', 'commands', 'credentials']
+const researchKeys = ['egress', 'holdout', 'lenses', 'guides', 'checklist', 'prereg_sections', 'commands', 'credentials', 'feeds']
 
 /** Parses the research field of .agent-factory.json. Each error names `source` and the bad key. */
 export function parseResearchConfig(value: unknown, source: string): ResearchConfig {
@@ -153,6 +171,7 @@ export function parseResearchConfig(value: unknown, source: string): ResearchCon
   }
   if (commands.sweep !== undefined) config.commands.sweep = command(commands.sweep, 'research.commands.sweep', [...prereg, 'partition'], fail)
   if (research.credentials !== undefined) config.credentials = credentials(research.credentials, 'research.credentials', egress, fail)
+  if (research.feeds !== undefined) config.feeds = feedList(research.feeds, 'research.feeds', fail)
   return config
 }
 

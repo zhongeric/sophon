@@ -21,6 +21,7 @@ const example = {
     evaluate: 'python -m search.evaluate {prereg}',
     reproduce: 'python -m search.reproduce {prereg}',
   },
+  feeds: ['https://export.arxiv.org/rss/astro-ph'],
 }
 
 const parse = (research: unknown) => parseRepoConfig(JSON.stringify({ stack: 'Python', research }), source).research
@@ -135,6 +136,20 @@ test('credentials map an egress host to a header and the name of an environment 
   rejects(bad({ header: 'X-Key', secret: 'sk-ant-123' }), `${at}.secret`, /name of an environment variable/)
   rejects(bad({ header: 'X-Key', secret: '1KEY' }), `${at}.secret`, /name of an environment variable/)
   rejects(bad({ header: 'X-Key', secret: 'GITHUB_TOKEN' }), `${at}.secret`, /secret of the host/)
+})
+
+test('feeds are normalized https URLs without repeats, and their hosts need not be in egress', () => {
+  const feeds = ['HTTPS://Feeds.Other.ORG:443/rss', 'https://export.arxiv.org/rss/astro-ph']
+  assert.deepEqual(parse(research({ feeds }))?.feeds, ['https://feeds.other.org/rss', 'https://export.arxiv.org/rss/astro-ph'])
+  const { feeds: _, ...without } = example
+  assert.equal('feeds' in (parse(without) ?? {}), false)
+  rejects(research({ feeds: [] }), 'research.feeds', /non-empty list/)
+  rejects(research({ feeds: 'https://export.arxiv.org/rss/astro-ph' }), 'research.feeds', /non-empty list/)
+  rejects(research({ feeds: ['https://a.org/rss', 7] }), 'research.feeds[1]', /non-empty string/)
+  rejects(research({ feeds: ['https://a.org/rss', 'http://a.org/rss'] }), 'research.feeds[1]', /https URL/)
+  rejects(research({ feeds: ['https://a.org/rss', 'a.org/rss'] }), 'research.feeds[1]', /https URL/)
+  rejects(research({ feeds: ['https://a.org/rss', 'https://user@a.org/rss'] }), 'research.feeds[1]', /user or a password/)
+  rejects(research({ feeds: ['https://a.org/rss', 'https://A.org:443/rss'] }), 'research.feeds[1]', /repeats the URL https:\/\/a\.org\/rss/)
 })
 
 /** Files in memory: `list` gives the files directly in a directory, or null when no file is under it. */
