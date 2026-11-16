@@ -238,6 +238,9 @@ export function budgetGate(options: {
           why: 'The host opens no more agent turns until the spend is below the budget. To raise the budget, write a new USD number above the spend.',
           options: [raiseOption, stopOption],
           recommendation: stopOption,
+          // Spend over the budget is the user's decision (D11).
+          level: 'user',
+          rule: 'spend',
         },
       ]
       await ask.post(batch, questions)

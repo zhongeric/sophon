@@ -1,5 +1,5 @@
 import type { Contracts } from 'nanocode-ts'
-import { checkQuestions, questionsSchema, type Answer, type Question } from './questions.ts'
+import { checkQuestions, decisionLists, questionsSchema, type Answer, type Question } from './questions.ts'
 import { StopError } from './stop.ts'
 
 /** What the intake agent understood of the ask, and how it routes the ask. */
@@ -17,7 +17,7 @@ export type Intake = {
 export const submitIntake: Contracts.HostTool = {
   name: 'submit_intake',
   description:
-    'Submit the intake one time: your summary of the ask, a PR title, a branch slug, the route (larger change, review passes) with the reason, and the questions that only the user can decide.',
+    'Submit the intake one time: your summary of the ask, a PR title, a branch slug, the route (larger change, review passes) with the reason, and your open questions, each with a level by D11.',
   parameters: {
     type: 'object',
     properties: {
@@ -52,13 +52,19 @@ export const confirmOptions = ['Yes, go on', 'No, stop the run']
 export const specOptions = ['Write a spec first', 'Plan now']
 export const passOptions = ['One pass', 'Two passes']
 
-/** The host's questions after the intake agent's: confirm the ask, then the route. One batch, so one round trip. */
+/**
+ * The host's questions after the intake agent's: confirm the ask, then the route. They are run questions (D11), so the host
+ * takes the intake agent's recommendation. When the intake agent raises a user question, the batch goes to the user anyway,
+ * so the confirmation goes too, with rule scope: the user sees the summary and can correct it or stop the run.
+ * One batch, so a user question of the intake agent needs one round trip.
+ */
 export function routeQuestions(intake: Intake): Question[] {
   const next = (offset: number) => `Q${intake.questions.length + offset}`
+  const confirm: Pick<Question, 'level' | 'rule'> = intake.questions.some((question) => question.level === 'user') ? { level: 'user', rule: 'scope' } : { level: 'run' }
   return [
-    { id: next(1), question: 'Is this the ask? Correct it in your own words if it is not.', why: intake.summary, options: confirmOptions, recommendation: confirmOptions[0]! },
-    { id: next(2), question: 'Write a spec before the plan?', why: intake.reason, options: specOptions, recommendation: specOptions[intake.larger ? 0 : 1]! },
-    { id: next(3), question: 'How many review loop passes?', why: intake.reason, options: passOptions, recommendation: passOptions[intake.passes - 1]! },
+    { id: next(1), question: 'Is this the ask? Correct it in your own words if it is not.', why: intake.summary, options: confirmOptions, recommendation: confirmOptions[0]!, ...confirm },
+    { id: next(2), question: 'Write a spec before the plan?', why: intake.reason, options: specOptions, recommendation: specOptions[intake.larger ? 0 : 1]!, level: 'run' },
+    { id: next(3), question: 'How many review loop passes?', why: intake.reason, options: passOptions, recommendation: passOptions[intake.passes - 1]!, level: 'run' },
   ]
 }
 
@@ -83,7 +89,7 @@ export const specSections = ['Summary', 'Surfaces', 'Edge cases', 'Out of scope'
 
 export const submitSpec: Contracts.HostTool = {
   name: 'submit_spec',
-  description: `Submit the spec one time, in Markdown with the sections ${specSections.join(', ')}. Also submit each decision that the user can overrule as a question with options and your recommendation.`,
+  description: `Submit the spec one time, in Markdown with the sections ${specSections.join(', ')}. Also submit each decision as a question with options, your recommendation and a level by D11. Only a user question goes to the user.`,
   parameters: {
     type: 'object',
     properties: { spec: { type: 'string', description: 'The spec in Markdown' }, decisions: questionsSchema },
@@ -122,7 +128,8 @@ export const submitPlan: Contracts.HostTool = {
   name: 'submit_plan',
   description:
     'Submit the plan one time: the four parts (smallest change, goals, non-goals, done checks), the sections that /review/plan-sections.txt names, and the tasks for the builders. ' +
-    'The host refuses a plan with an empty part, with no done check that has a command, or with tasks that depend on unknown tasks or on each other in a cycle.',
+    'The host refuses a plan with an empty part, with no done check that has a command, or with tasks that depend on unknown tasks or on each other in a cycle. ' +
+    'It also refuses a task whose files include a protected path, because the host refuses each write to it. The prompt lists the protected paths.',
   parameters: {
     type: 'object',
     properties: {
@@ -166,8 +173,11 @@ export const submitPlan: Contracts.HostTool = {
   },
 }
 
-/** Refuses a plan without its four parts, its required sections, or tasks that the host can schedule. */
-export function checkPlan(input: unknown, sections: string[]): Plan {
+/**
+ * Refuses a plan without its four parts, its required sections, or tasks that the host can schedule.
+ * `isProtected` tells which task files the host refuses to write, so a task with one of them can never finish.
+ */
+export function checkPlan(input: unknown, sections: string[], isProtected: (path: string) => boolean): Plan {
   const plan = input as Plan
   const filled = (list: unknown) => Array.isArray(list) && list.length > 0 && list.every((item) => typeof item === 'string' && item.trim() !== '')
   const problems: string[] = []
@@ -185,7 +195,10 @@ export function checkPlan(input: unknown, sections: string[]): Plan {
     if (ids.indexOf(task.id) !== ids.lastIndexOf(task.id)) problems.push(`task "${task.id}": the ID is not unique`)
     if (!task.title?.trim() || !task.work?.trim()) problems.push(`task "${task.id}": title and work are required`)
     if (!filled(task.files)) problems.push(`task "${task.id}": files is empty`)
-    else for (const path of task.files) if (/^\/|(^|\/)\.\.(\/|$)/.test(path)) problems.push(`task "${task.id}": "${path}" must be relative to the repository root, without ..`)
+    else
+      for (const path of task.files)
+        if (/^\/|(^|\/)\.\.(\/|$)/.test(path)) problems.push(`task "${task.id}": "${path}" must be relative to the repository root, without ..`)
+        else if (isProtected(path)) problems.push(`task "${task.id}": "${path}" is a protected path, and the host refuses each write to it`)
     if (!Array.isArray(task.depends_on)) problems.push(`task "${task.id}": depends_on must be a list`)
     else for (const id of task.depends_on) if (!ids.includes(id)) problems.push(`task "${task.id}": depends on the unknown task "${id}"`)
   }
@@ -202,6 +215,12 @@ export const inScope = (path: string, files: string[]) => files.some((entry) => 
 /** Reads the most builders at the same time from user input. Only an integer of 1 or more is valid. */
 export function parseParallel(text: string): number {
   if (!/^\s*\d+\s*$/.test(text) || Number(text) < 1) throw new StopError(`--parallel must be an integer of 1 or more, not ${JSON.stringify(text)}`)
+  return Number(text)
+}
+
+/** The issue that the PR of a local run closes. */
+export function parseIssue(text: string): number {
+  if (!/^\s*\d+\s*$/.test(text) || Number(text) < 1) throw new StopError(`--issue must be an issue number of 1 or more, not ${JSON.stringify(text)}`)
   return Number(text)
 }
 
@@ -266,12 +285,12 @@ export function renderPlan(plan: Plan, options: { tasks: boolean }): string {
   ].join('\n')
 }
 
-/** The frozen package for the review loop: the verbatim ask, the user's decisions, and the plan without its tasks. */
+/** The frozen package for the review loop: the verbatim ask, the decisions of the user and of the run, and the plan without its tasks. */
 export function frozenAsk(ask: string, decisions: Answer[], plan: Plan): string {
   return [
     ask.trim(),
     '',
-    ...(decisions.length > 0 ? ['## Decisions of the user', '', ...decisions.map((answer) => `- ${answer.question} **${answer.answer}**`), ''] : []),
+    ...decisionLists(decisions, { user: '## Decisions of the user', run: '## Decisions the run made' }),
     '# Plan',
     '',
     renderPlan(plan, { tasks: false }),

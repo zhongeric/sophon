@@ -1,4 +1,5 @@
 import { readCi } from '../core/ci.ts'
+import { mergePull } from '../core/merge.ts'
 import type { PullRequests } from '../core/platform.ts'
 import type { GitHub } from './github.ts'
 
@@ -19,6 +20,7 @@ export function githubPulls(gh: GitHub, owner: string, repo: string, baseRef: st
       if (pull.draft)
         await gh.graphql('mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }', { id: pull.node_id })
     },
+    merge: (pr, { method, sha }) => mergePull((path, body) => gh.json('PUT', path, body), (path) => gh.json('GET', path), `${api}/pulls/${pr}`, method, sha),
     async comment(pr, body) {
       await gh.json('POST', `${api}/issues/${pr}/comments`, { body })
     },

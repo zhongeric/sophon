@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
@@ -10,6 +10,7 @@ import type { AgentStore, Files, Guides, PullRequests } from '../core/platform.t
 import { profileDefaults, type RootFiles } from '../core/profiles.ts'
 import type { Credentials } from '../core/providers.ts'
 import type { Channel } from '../core/questions.ts'
+import { loadResearchDomain, type ResearchConfig, type ResearchDomain, type ResearchFiles } from '../core/research.ts'
 import { StopError } from '../core/stop.ts'
 import type { Prices } from '../core/usage.ts'
 import { codeReviewLoop, type LoopDeps } from '../core/workflows/code-review-loop.ts'
@@ -50,6 +51,46 @@ export async function loadRepoConfig(repo: string, path?: string): Promise<RepoC
   requireChecks(config, repo)
   const guides = Object.entries(config.guides ?? {}).map(([name, guide]) => [name, guide.replace(/^~(?=\/)/, homedir())])
   return { ...config, guides: Object.fromEntries(guides) }
+}
+
+/**
+ * The status of a path relative to `repo`, or null when the path is missing or a part of it is a symlink. The
+ * contents API on Cloudflare does not give symlinks as files or directories, and a symlink can point out of the
+ * repository, so the two readers both ignore symlinks.
+ */
+function plainStat(repo: string, path: string) {
+  try {
+    let current = repo
+    let info = statSync(repo, { throwIfNoEntry: false }) ?? null
+    for (const part of path.split('/').filter((part) => part !== '' && part !== '.')) {
+      if (!info?.isDirectory()) return null
+      current = join(current, part)
+      info = lstatSync(current, { throwIfNoEntry: false }) ?? null
+      if (!info || info.isSymbolicLink()) return null
+    }
+    return info
+  } catch {
+    return null
+  }
+}
+
+/** The files of a working copy at paths relative to its root, without symlinks, as the reader on Cloudflare. */
+function diskFiles(repo: string): ResearchFiles {
+  return {
+    read: async (path) => (plainStat(repo, path)?.isFile() ? readFileSync(join(repo, path), 'utf8') : null),
+    async list(dir) {
+      if (!plainStat(repo, dir)?.isDirectory()) return null
+      return readdirSync(join(repo, dir)).filter((name) => plainStat(repo, `${dir}/${name}`)?.isFile() ?? false)
+    },
+  }
+}
+
+/**
+ * The research domain from the working copy. The paths of the research config are relative to the repository root,
+ * also when the config comes from a file in another directory.
+ */
+export async function loadResearch(repo: string, research: ResearchConfig): Promise<ResearchDomain> {
+  return loadResearchDomain(research, diskFiles(repo), `in ${repo}`)
 }
 
 /** Host guides from agents/, plus the repository's guides from its config. */

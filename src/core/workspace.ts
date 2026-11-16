@@ -84,14 +84,16 @@ export type WorkspaceLayout = {
   guides?: Record<string, FileSystem.FileSystem>
   /** The artifact store of the run, mounted as a live, read-only view at /artifacts. */
   artifacts?: Artifacts
+  /** The host fetch of the shell. The caller of an agent with an egress gives the same hostFetch as the agent. */
+  fetch?: typeof fetch
 }
 
 export const repoMount = '/repo'
 
 /**
  * The workspace of one agent: a virtual shell over /repo, /review, /guides and, when the layout has a store,
- * /artifacts. The shell runs text tools in-process, so an agent cannot start real processes or reach the network
- * from it.
+ * /artifacts. The shell runs text tools in-process, so an agent cannot start real processes from it. The shell reaches
+ * the network only through the fetch of the layout. Without it, the shell refuses each request.
  */
 export async function createWorkspace(layout: WorkspaceLayout): Promise<Contracts.WorkspaceHost> {
   const mounts: Record<string, FileSystem.FileSystem> = {
@@ -102,9 +104,11 @@ export async function createWorkspace(layout: WorkspaceLayout): Promise<Contract
   if (layout.artifacts) mounts['/artifacts'] = artifactsFileSystem(layout.artifacts)
   const bash = await Bash.create({
     cwd: repoMount,
-    fetch: async () => {
-      throw new Error('network access is off in this workspace')
-    },
+    fetch:
+      layout.fetch ??
+      (async () => {
+        throw new Error('network access is off in this workspace')
+      }),
     fs: Mount.create(MemoryFileSystem.create(), { mounts }),
   })
   return bash.workspace()

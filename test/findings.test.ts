@@ -61,6 +61,16 @@ test('the evidence rule rejects missing fields, unknown files, and quotes that a
   ])
 })
 
+test('needs_decision needs a D11 rule', async () => {
+  const held = { ...finding, needs_decision: true, decision: 'Cut the CLI from the ask?' }
+  const { errors } = await checkFindings({ findings: [held, { ...held, rule: 'taste' }] }, sources)
+  assert.deepEqual(errors, [
+    'findings[0]: needs_decision needs a D11 rule: scope, capability, spend, decision',
+    'findings[1]: needs_decision needs a D11 rule: scope, capability, spend, decision',
+  ])
+  assert.deepEqual(await checkFindings({ findings: [{ ...held, rule: 'scope' }] }, sources), { findings: [{ ...held, rule: 'scope' }], errors: [] })
+})
+
 test('locations are path:line or path:start-end, relative to /repo', () => {
   assert.deepEqual(parseLocation('/repo/src/a.ts:3-9'), { path: 'src/a.ts', start: 3, end: 9 })
   assert.deepEqual(parseLocation('./src/a.ts:3'), { path: 'src/a.ts', start: 3, end: 3 })

@@ -1,5 +1,6 @@
 import type { Contracts } from 'nanocode-ts'
 import { isArtifactId } from './artifacts.ts'
+import { isRule, rules, type Rule } from './questions.ts'
 
 export const severities = ['critical', 'high', 'medium', 'low', 'info'] as const
 export type Severity = (typeof severities)[number]
@@ -19,6 +20,8 @@ export type Finding = {
   needs_decision?: boolean
   /** That choice, in one sentence. Required with needs_decision. */
   decision?: string
+  /** The D11 rule that makes the choice the user's. Required with needs_decision. */
+  rule?: Rule
 }
 
 type Submitted = Omit<Finding, 'id' | 'track'>
@@ -53,9 +56,16 @@ export const submitFindings: Contracts.HostTool = {
             recommendation: { type: 'string', description: 'A concrete fix direction' },
             needs_decision: {
               type: 'boolean',
-              description: 'True only when the right fix depends on a product or design choice that the ask and the decisions leave open',
+              description:
+                'True only when the right fix depends on a choice that the ask and the decisions leave open, and that choice is the user\'s by a D11 rule. It needs that rule in rule',
             },
             decision: { type: 'string', description: 'With needs_decision: the choice that the user must make, in one sentence' },
+            rule: {
+              type: 'string',
+              enum: [...rules],
+              description:
+                'With needs_decision: the D11 rule. scope: the choice removes or adds scope compared with the ask. capability: it changes capabilities across workflows. spend: it commits spend over the budget or an irreversible or public action. decision: it departs from a recorded D or RD row',
+            },
           },
           required: [...fields],
           additionalProperties: false,
@@ -84,32 +94,47 @@ export async function checkFindings(input: unknown, sources: Sources): Promise<C
   if (!Array.isArray(list)) return { findings: [], errors: ['findings must be an array'] }
   const errors: string[] = []
   const findings: Submitted[] = []
-  const artifacts = sources.artifact && artifactReader(sources.artifact.bind(sources))
+  const check = evidenceChecker(sources)
   for (const [index, item] of list.entries()) {
-    const problems = await checkFinding(item as Record<string, unknown>, sources, artifacts)
+    const problems = await checkFinding(item as Record<string, unknown>, check)
     if (problems.length > 0) errors.push(...problems.map((problem) => `findings[${index}]: ${problem}`))
     else findings.push(normalizeLocation(item as Submitted))
   }
   return errors.length > 0 ? { findings: [], errors } : { findings, errors: [] }
 }
 
-async function checkFinding(item: Record<string, unknown>, sources: Sources, artifacts: ArtifactReader | undefined): Promise<string[]> {
+async function checkFinding(item: Record<string, unknown>, check: EvidenceCheck): Promise<string[]> {
   const missing = fields.filter((field) => typeof item[field] !== 'string' || (item[field] as string).trim() === '')
   if (missing.length > 0) return [`missing ${missing.join(', ')}`]
   const finding = item as Submitted
   if (!severities.includes(finding.severity)) return [`severity must be one of ${severities.join(', ')}`]
   if (finding.needs_decision && !finding.decision?.trim()) return ['needs_decision needs the decision, in one sentence']
-
-  const location = parseLocation(finding.location)
-  if (!location) {
-    // List the artifact forms only when this review can read artifacts, so that a code reviewer uses file locations.
-    const forms = artifacts ? artifactLocationForms : 'path:line or path:start-end'
-    return [`location "${finding.location}" is not ${forms}`]
-  }
-  return 'path' in location ? checkFileEvidence(finding, location, sources) : checkArtifactEvidence(finding, location, artifacts)
+  if (finding.needs_decision && !isRule(finding.rule)) return [`needs_decision needs a D11 rule: ${rules.join(', ')}`]
+  return check(finding)
 }
 
-async function checkFileEvidence(finding: Submitted, location: FileLocation, sources: Sources): Promise<string[]> {
+/** A location and the quote that the agent read there. */
+export type Evidence = { location: string; evidence: string }
+export type EvidenceCheck = (item: Evidence) => Promise<string[]>
+
+/**
+ * Makes the evidence check for one submit call: it gives the problems of one location and its quote, with the messages of submit_findings.
+ * Make a new check for each call, because the check keeps each artifact that it read until the call ends.
+ */
+export function evidenceChecker(sources: Sources): EvidenceCheck {
+  const artifacts = sources.artifact && artifactReader(sources.artifact.bind(sources))
+  return async (item) => {
+    const location = parseLocation(item.location)
+    if (!location) {
+      // List the artifact forms only when this review can read artifacts, so that a code reviewer uses file locations.
+      const forms = artifacts ? artifactLocationForms : 'path:line or path:start-end'
+      return [`location "${item.location}" is not ${forms}`]
+    }
+    return 'path' in location ? checkFileEvidence(item, location, sources) : checkArtifactEvidence(item, location, artifacts)
+  }
+}
+
+async function checkFileEvidence(finding: Evidence, location: FileLocation, sources: Sources): Promise<string[]> {
   const file = await sources.read(location.path)
   if (file === null) {
     if (sources.artifact && location.path.startsWith('artifact:')) {
@@ -129,7 +154,7 @@ async function checkFileEvidence(finding: Submitted, location: FileLocation, sou
 }
 
 /** The diff is not a source for an artifact quote, because an artifact is not in the reviewed tree. */
-async function checkArtifactEvidence(finding: Submitted, location: ArtifactLocation, artifacts: ArtifactReader | undefined): Promise<string[]> {
+async function checkArtifactEvidence(finding: Evidence, location: ArtifactLocation, artifacts: ArtifactReader | undefined): Promise<string[]> {
   const { artifact: id, lines: range } = location
   if (!artifacts) return [`location "${finding.location}": this review has no artifact store`]
   const text = await artifacts(id)
@@ -181,7 +206,7 @@ type ArtifactText = { lines(): string[]; squashed(): string }
 type ArtifactEntry = ArtifactText | 'unknown' | 'binary'
 type ArtifactReader = (id: string) => Promise<ArtifactEntry>
 
-/** Reads and decodes each artifact one time for each submit_findings call, because many findings can cite the same large artifact. */
+/** Reads and decodes each artifact one time for each submit call, because many findings can cite the same large artifact. */
 function artifactReader(read: (id: string) => Promise<Uint8Array | null>): ArtifactReader {
   const cache = new Map<string, Promise<ArtifactEntry>>()
   const load = async (id: string): Promise<ArtifactEntry> => {

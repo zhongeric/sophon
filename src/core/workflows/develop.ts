@@ -1,17 +1,17 @@
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../ci.ts'
-import type { RepoConfig } from '../checks.ts'
+import type { MergeMethod, RepoConfig } from '../checks.ts'
 import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
-import type { AgentStore, Branch, Branches, Checker, Files, Guides, PullRequests } from '../platform.ts'
+import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeResult, PullRequests } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
-import { asker, commentLimit, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
+import { asker, commentLimit, decisionLists, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
 import { BudgetStop, belowBudget, budgetGate, checkPriced, resolveBudget, usageOf, usageSection, zeroTokens, type Prices, type RunUsage, type UsageRow } from '../usage.ts'
-import { checkAllowedModels, checkFamilySwap, defaultAllowedModels, loopModelIds, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
+import { checkAllowedModels, checkFamilySwap, decisionSections, defaultAllowedModels, loopModelIds, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
 
 export type DevelopModels = Record<'intake' | 'spec' | 'planner' | 'builder', ModelChoice>
 
@@ -43,6 +43,8 @@ export type DevelopInput = {
   budget?: number
   /** A budget of the current invocation, for example --budget on a resume. It replaces the budget, and the ledger does not record it. */
   budgetOverride?: number
+  /** The issue that the PR closes. */
+  issue?: number
 }
 
 /** `budget` is what remains of the development budget, so that the review loop stays inside it. */
@@ -73,8 +75,18 @@ export type DevelopDeps = {
 }
 
 export type DevelopStatus = 'ready' | 'failed' | 'blocked' | 'stopped'
-/** `resume` says what the user does before the same run can go on, for example add CI. It is null when a new run is necessary. */
-export type DevelopResult = { status: DevelopStatus; pr: { number: number; url: string } | null; branch: string | null; report: string; resume: string | null }
+/**
+ * `resume` says what the user does before the same run can go on, for example add CI. It is null when a new run is
+ * necessary. `merge` is null unless the host merged the PR.
+ */
+export type DevelopResult = {
+  status: DevelopStatus
+  pr: { number: number; url: string } | null
+  branch: string | null
+  report: string
+  resume: string | null
+  merge: { method: MergeMethod; sha: string } | null
+}
 
 /** CI-fix rounds after the build, then a blocker (G6). */
 export const ciFixRounds = 2
@@ -83,6 +95,8 @@ const ciGraceMs = 3 * 60_000
 /** The most that GitHub's clock and the host's clock can differ. */
 const clockSkewMs = 30_000
 const defaultParallel = 3
+/** The longest reason of a refused merge or a failed branch delete in the report. */
+const reasonChars = 300
 
 type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failures: string }
 /** A review pass. Records of older runs have no usage: it counts as zero. */
@@ -100,7 +114,7 @@ export function checkDevelopModels(models: DevelopModels, allowed = defaultAllow
 
 /**
  * The development workflow, steps 0 to 9, with its order and hard rules in code:
- * intake and the user's confirmation, a spec for a larger change, one plan, builders for the plan's tasks (in
+ * intake and the confirmation of the ask, a spec for a larger change, one plan, builders for the plan's tasks (in
  * parallel when their files do not overlap, each on its own branch), a draft PR, CI with a fix budget, the code
  * review loop once or twice, CI again, and a ready PR only when every criterion holds. Every step is in the
  * ledger, so the same run ID resumes after a pause or a crash without repeating finished steps. When the user stops
@@ -116,7 +130,7 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
   }
 }
 
-type Finish = (status: DevelopStatus, criteria: Criterion[], note: string, resumable?: boolean) => Promise<DevelopResult>
+type Finish = (status: DevelopStatus, criteria: Criterion[], note: string, resumable?: boolean, merge?: DevelopResult['merge']) => Promise<DevelopResult>
 
 /** The steps of develop(). It sets `stop.finish`, so that develop() can write the report of a run that stops at the budget. */
 async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { finish?: Finish }): Promise<DevelopResult> {
@@ -163,7 +177,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     return questions.wait(batch)
   }
 
-  const finish: Finish = async (status, criteria, note, resumable = false) => {
+  const finish: Finish = async (status, criteria, note, resumable = false, merge = null) => {
     const limit = budget.limit()
     const usage = usageSection([...usageOf(ledger).agents, ...spentPasses().map(reviewRow)], prices, limit === undefined ? undefined : { limit, spent: budget.spent() })
     const report = renderReport(state, status, criteria, note, decisions(ledger), usage)
@@ -173,19 +187,21 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
       await pulls.comment(state.pr.number, report.length > commentLimit ? `${report.slice(0, commentLimit)}\n\n(cut: see report.md of run ${input.runId})` : report)
       ledger.put('commented', report)
     }
-    ledger.put('result', { status, pr: state.pr, branch: state.branch })
-    return { status, pr: state.pr, branch: state.branch, report, resume: resumable ? note : null }
+    ledger.put('result', { status, pr: state.pr, branch: state.branch, merge })
+    return { status, pr: state.pr, branch: state.branch, report, resume: resumable ? note : null, merge }
   }
   stop.finish = finish
 
-  // 0. Intake: no plan and no code until the user confirms the ask.
+  // 0. Intake: no plan and no code before the ask is confirmed. The route questions are run questions (D11), so the run
+  // takes the recommendations of the intake agent. The run asks the user only when the intake agent raises a user question.
   const intook = await step(ledger, 'intake', () => intake(context, 'intake', models.intake, view))
   state.intake = intook
-  const routed = route(intook, await ask('intake', [...intook.questions, ...routeQuestions(intook)]))
+  const intakeAnswers = await ask('intake', [...intook.questions, ...routeQuestions(intook)])
+  const routed = route(intook, intakeAnswers)
   state.route = routed
   if (routed.stop) return finish('stopped', [], 'You stopped the run at intake.')
 
-  // 1. Spec, for a larger change. Its decisions are one batch of questions, so the user can overrule them.
+  // 1. Spec, for a larger change. Its decisions are one batch of questions. Only its user questions go to the user (D11).
   let spec: string | null = null
   if (routed.spec) {
     const written = await step(ledger, 'spec', () => writeSpec(context, 'spec', models.spec, view))
@@ -336,7 +352,16 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const solidity = active.find((profile) => profile.id === 'solidity')
   const audit = solidity !== undefined && changed.some((path) => solidity.files.test(path))
   const criteria: Criterion[] = [
-    { name: 'Ask confirmed', ok: true, detail: input.hotfix ? 'hotfix: the host took every recommendation' : 'you answered the intake questions' },
+    // The marks of the answers tell who confirmed the ask. A ledger from before D11 posted every question, also the route questions.
+    {
+      name: 'Ask confirmed',
+      ok: true,
+      detail: input.hotfix
+        ? 'hotfix: the host took every recommendation'
+        : intakeAnswers.some((answer) => answer.decidedBy !== 'run')
+          ? 'you answered the intake questions'
+          : 'the run took the recommendations of the intake agent (D11)',
+    },
     { name: 'Plan with its four parts', ok: true, detail: `${planned.tasks.length} tasks in ${scheduled.length} waves` },
     { name: 'Every task built', ok: true, detail: state.built.map((entry) => entry.task.id).join(', ') },
     {
@@ -353,8 +378,35 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     ...(audit ? [{ name: 'Auditor for Solidity src/', ok: false, detail: 'required, not built yet. Audit the change before you merge. The PR stays draft.' }] : []),
   ]
   const pass = criteria.every((criterion) => criterion.ok)
-  if (pass) await step(ledger, 'ready', async () => (await pulls.ready(state.pr!.number), true))
-  return finish(pass ? 'ready' : 'failed', criteria, pass ? 'Ready for your review. You merge.' : 'The PR stays draft.')
+  if (!pass) return finish('failed', criteria, 'The PR stays draft.')
+  const pr = state.pr!.number
+  await step(ledger, 'ready', async () => (await pulls.ready(pr), true))
+  const method = input.config.merge
+  if (!method) return finish('ready', criteria, 'Ready for your review. You merge.')
+
+  // 9. The merge, only with the standing permission and only at the head that the final CI checked. The step records a
+  // refusal as a result, so that a resumed run never tries the merge again.
+  const merged = await step(ledger, 'merge', async (): Promise<MergeResult> => {
+    try {
+      return await pulls.merge(pr, { method, sha: final })
+    } catch (error) {
+      return { merged: false, reason: reasonOf(error) }
+    }
+  })
+  if (!merged.merged) return finish('ready', criteria, `Not merged: ${merged.reason}. The PR stays ready for your review. You merge.`)
+  const deleted = await step(ledger, 'delete-branch', async (): Promise<{ deleted: true } | { deleted: false; reason: string }> => {
+    try {
+      await branches.deleteRemote(branchName)
+      return { deleted: true }
+    } catch (error) {
+      return { deleted: false, reason: reasonOf(error) }
+    }
+  })
+  const note = [
+    `Merged by the host (${method}): ${merged.sha}.`,
+    ...(deleted.deleted ? [] : [`The host did not delete the branch ${branchName}: ${deleted.reason}.`]),
+  ].join(' ')
+  return finish('ready', criteria, note, false, { method, sha: merged.sha })
 }
 
 /**
@@ -389,6 +441,9 @@ async function watchCi(ledger: Ledger, pulls: PullRequests, timing: DevelopDeps[
     await new Promise((resolve) => setTimeout(resolve, timing.pollMs))
   }
 }
+
+/** An error as one line for the finish note of the report. */
+const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().slice(0, reasonChars)
 
 const noCi = (sha: string) => `No CI ran on ${sha.slice(0, 12)}. Add CI that runs on pull requests, push again, and resume the run.`
 
@@ -437,11 +492,12 @@ function prBody(input: DevelopInput, answers: Answer[], planText: string): strin
   return [
     `agent-factory run \`${input.runId}\` (${input.source}) opened this draft PR. It stays draft until the review loop passes and CI is green.`,
     '',
+    ...(input.issue ? [`Closes #${input.issue}`, ''] : []),
     '# Ask',
     '',
     ...input.ask.trim().split('\n').map((line) => `> ${line}`),
     '',
-    ...(answers.length > 0 ? ['# Decisions of the user', '', ...answers.map((answer) => `- ${answer.question} **${answer.answer}**`), ''] : []),
+    ...decisionLists(answers, { user: '# Decisions of the user', run: '# Decisions the run made' }),
     planText,
   ].join('\n')
 }
@@ -509,9 +565,6 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
       : []),
     ...usage,
     '',
-    '## Your decisions',
-    '',
-    ...(answers.length > 0 ? answers.map((answer) => `- ${answer.question} **${answer.answer}**${answer.recommended ? ' (recommended)' : ''}`) : ['- none asked']),
-    '',
+    ...decisionSections(answers),
   ].join('\n')
 }

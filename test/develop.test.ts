@@ -12,9 +12,9 @@ import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { nodeDevelop } from '../src/node/platform.ts'
-import { developInput, developScript, developRepo, fakePulls, runDevelop, sources } from './support/develop.ts'
+import { developInput, developScript, developRepo, fakePulls, mergeCommit, plan, runDevelop, scopeQuestion, sources } from './support/develop.ts'
 import { credentials, memoryChannel, module } from './support/fixture.ts'
-import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
+import { probeNetwork, scriptedDispatch, webSearch, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
 
@@ -24,16 +24,21 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   const { channel, posted } = memoryChannel()
   const github = fakePulls([false, true])
   const prices = { 'claude-opus-5-5': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 }, 'gpt-6.1-sol': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 } }
-  const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(developScript(), turns), prices, pulls: github.pulls, runId: 'dev' })
+  const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(probeNetwork(developScript(), 'builder'), turns), prices, pulls: github.pulls, runId: 'dev' })
 
   assert.equal(result.status, 'ready', result.report)
   assert.equal(result.branch, 'factory/dev-add-sub-mul')
 
-  // The user confirmed the ask and the route in one batch before any plan.
-  assert.deepEqual(posted.map((entry) => entry.batch), ['intake'])
-  assert.deepEqual(posted[0]!.questions.map((question) => question.question.split('?')[0]), ['Is this the ask', 'Write a spec before the plan', 'How many review loop passes'])
+  // The intake agent raised no user question, so the run took its recommendations for the ask and the route, and asked nothing (D11).
+  assert.deepEqual(posted, [])
   const first = (role: string) => turns.findIndex((turn) => turn.role === role)
   assert.ok(first('intake') < first('planner') && first('planner') < first('builder'))
+  // The development and review roles have no egress: the cell fetch and the shell of a builder fail, and no model request
+  // has the web search tool.
+  const probes = turns.filter((turn) => turn.role === 'builder' && turn.output).map((turn) => turn.output).join('\n')
+  assert.match(probes, /cell fetch: .*network access is off/)
+  assert.match(probes, /shell fetch: .*network access is off/)
+  assert.ok(!turns.some((turn) => webSearch.test(turn.request)))
 
   // sub and mul built in the same wave, the tests after both. Each builder could write only its own files.
   const builds = turns.filter((turn) => turn.role === 'builder' && turn.output === null).map((turn) => /Build task ([a-z]+)|Fix the CI failure/.exec(turn.request)?.[1] ?? 'ci-fix')
@@ -43,6 +48,9 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.match(outputs, /scope refused: .*EACCES/)
   assert.match(outputs, /checkpoint refused:.*test\/run.log:1: Remove test\/run.log from the change/)
   assert.doesNotMatch(outputs, /SCOPE WRITE ALLOWED|LOG COMMITTED/)
+  // The host ran the targeted tests at submit and refused the log with the wrong expectation, with the end of the failed output.
+  assert.match(outputs, /submit refused: .*the targeted tests failed \(test\/ops\.test\.ts\).*--- tests \(exit code 1\) ---.*sub and mul/)
+  assert.doesNotMatch(outputs, /FAILING LOG ACCEPTED/)
 
   // The PR is the run's branch, pushed without force. The first CI was red, the fix made it green.
   const show = (path: string) => execFileSync('git', ['--git-dir', origin, 'show', `factory/dev-add-sub-mul:${path}`]).toString()
@@ -57,13 +65,24 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   // The review loop reviewed the frozen package: the ask, the decisions and the plan.
   assert.ok(turns.some((turn) => turn.role === 'intent'))
   const review = JSON.parse(readFileSync(join(result.dir, '..', 'dev-review-1', 'state.json'), 'utf8')) as { input: { ask: string } }
-  assert.match(review.input.ask, /^Add sub and mul next to add, with tests\.\n\n## Decisions of the user\n\n- Is this the ask\?[\s\S]*## Non-goals\n\n- No division/)
+  assert.match(review.input.ask, /^Add sub and mul next to add, with tests\.\n\n## Decisions the run made\n\n- Is this the ask\?[\s\S]*## Non-goals\n\n- No division/)
+  assert.match(github.state.opened[0]!.body, /# Decisions the run made\n\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\*/)
+  assert.doesNotMatch(github.state.opened[0]!.body, /# Decisions of the user/)
 
   assert.match(result.report, /^# Development run: READY/)
   assert.match(result.report, /^- \[x\] Every task built: sub, mul, tests$/m)
   assert.doesNotMatch(result.report, /- \[ \]/)
   assert.match(result.report, /- Pass 1: PASS, `TRIAGE path=full reason=not-docs-or-tests/)
+  assert.match(result.report, /^- \[x\] Ask confirmed: the run took the recommendations of the intake agent/m)
+  assert.match(result.report, /## Your decisions\n\n- none asked\n\n## Decisions the run made\n\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\* \(recommended\)/)
   assert.equal(github.state.comments.length, 1)
+
+  // Without the merge permission, the host does not merge and does not delete the branch.
+  assert.match(result.report, /^Ready for your review\. You merge\.$/m)
+  assert.deepEqual(github.state.merges, [])
+  assert.equal(result.merge, null)
+  assert.doesNotMatch(github.state.opened[0]!.body, /Closes/)
+  await git(origin, 'rev-parse', '--verify', 'refs/heads/factory/dev-add-sub-mul')
 
   // The Usage section: the development agents, the review pass with the USD of all its agents, and the total.
   assert.match(result.report, /^## Usage$/m)
@@ -73,23 +92,130 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.doesNotMatch(result.report, /^Budget:/m)
 })
 
-test('develop: a run without intake answers pauses, and resumes without asking again or repeating the intake', { timeout: 120_000 }, async () => {
+test('develop: with the merge permission, the host merges the ready PR at the checked head and deletes only the remote branch', { timeout: 120_000 }, async () => {
+  const { repo, origin } = developRepo(undefined, { merge: 'squash' })
+  const dir = runsDir()
+  const github = fakePulls([false, true])
+  const input = await developInput(repo, 'merged', { issue: 12 })
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), input, pulls: github.pulls, runId: 'merged' })
+
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(github.state.ready, [9])
+  const head = (await git(repo, 'rev-parse', 'refs/heads/factory/dev-add-sub-mul')).trim()
+  assert.equal(github.state.shas.at(-1), head)
+  assert.deepEqual(github.state.merges, [{ pr: 9, method: 'squash', sha: head }])
+  assert.match(github.state.opened[0]!.body, /opened this draft PR\. .*\n\nCloses #12\n\n# Ask\n/)
+  assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
+  assert.match(result.report, new RegExp(`^Merged by the host \\(squash\\): ${mergeCommit}\\.$`, 'm'))
+  assert.equal(github.state.comments.length, 1)
+  assert.ok(github.state.comments[0]!.includes(`Merged by the host (squash): ${mergeCommit}.`))
+  assert.deepEqual(fileLedger(join(result.dir, 'state.json')).get('result'), { status: 'ready', pr: result.pr, branch: result.branch, merge: result.merge })
+  // Only the remote branch is gone. The local branch stays.
+  await assert.rejects(git(origin, 'rev-parse', '--verify', 'refs/heads/factory/dev-add-sub-mul'))
+  await git(repo, 'show-ref', '--verify', '--quiet', 'refs/heads/factory/dev-add-sub-mul')
+
+  // A resumed run does not merge again and posts no new comment.
+  const again = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), input, pulls: github.pulls, runId: 'merged' })
+  assert.equal(again.report, result.report)
+  assert.deepEqual(again.merge, result.merge)
+  assert.equal(github.state.merges.length, 1)
+  assert.equal(github.state.comments.length, 1)
+})
+
+test('develop: a refused merge and a merge error leave the PR ready with the reason, and a resumed run does not merge again', { timeout: 240_000 }, async () => {
+  const cases = [
+    { reason: 'Head branch was modified', merge: () => ({ merged: false as const, reason: 'Head branch was modified' }) },
+    {
+      reason: 'socket hang up',
+      merge: () => {
+        throw new Error('socket hang up')
+      },
+    },
+  ]
+  for (const { reason, merge } of cases) {
+    const { repo, origin } = developRepo(undefined, { merge: 'rebase' })
+    const dir = runsDir()
+    const github = fakePulls([false, true], { merge })
+    const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls: github.pulls, runId: 'refused' })
+    assert.equal(result.status, 'ready', result.report)
+    assert.deepEqual(github.state.ready, [9])
+    assert.equal(github.state.merges.length, 1)
+    assert.equal(github.state.merges[0]!.method, 'rebase')
+    assert.equal(result.merge, null)
+    assert.match(result.report, new RegExp(`^Not merged: ${reason}\\. The PR stays ready for your review\\. You merge\\.$`, 'm'))
+    await git(origin, 'rev-parse', '--verify', 'refs/heads/factory/dev-add-sub-mul')
+
+    const again = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls: github.pulls, runId: 'refused' })
+    assert.equal(again.report, result.report)
+    assert.equal(github.state.merges.length, 1, reason)
+    assert.equal(github.state.comments.length, 1, reason)
+  }
+})
+
+test('develop: a merge whose branch delete fails keeps the run merged and notes the branch', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo(undefined, { merge: 'merge' })
+  const github = fakePulls([false, true], {
+    merge: () => {
+      // origin goes away after the merge, so the branch delete fails.
+      execFileSync('git', ['remote', 'set-url', 'origin', join(repo, 'absent.git')], { cwd: repo })
+      return { merged: true, sha: mergeCommit }
+    },
+  })
+  const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript(), []), pulls: github.pulls, runId: 'undeleted' })
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(result.merge, { method: 'merge', sha: mergeCommit })
+  assert.match(result.report, new RegExp(`^Merged by the host \\(merge\\): ${mergeCommit}\\. The host did not delete the branch factory/dev-add-sub-mul: .+\\.$`, 'm'))
+})
+
+test('develop: a run that fails a criterion with the merge permission does not merge', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo(undefined, { merge: 'squash' })
+  // CI is green on the build, the review loop fixes the test, and CI is red on the final head.
+  const github = fakePulls([true, false])
+  const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript({ reviewFix: true }), []), pulls: github.pulls, runId: 'failed' })
+  assert.equal(result.status, 'failed', result.report)
+  assert.match(result.report, /^- \[ \] CI green on the head/m)
+  assert.deepEqual(github.state.merges, [])
+  assert.deepEqual(github.state.ready, [])
+  assert.equal(result.merge, null)
+})
+
+test('develop: a user question of the intake agent pauses the run, and the run resumes without asking again or repeating the intake', { timeout: 120_000 }, async () => {
   const { repo } = developRepo()
   const dir = runsDir()
   const { channel, posted, replies } = memoryChannel({ intake: null })
+  const script = developScript({ askScope: true })
   const first: Turn[] = []
   await assert.rejects(
-    runDevelop(repo, dir, { channel, dispatch: scriptedDispatch(developScript(), first), pulls: fakePulls().pulls, runId: 'pause' }),
+    runDevelop(repo, dir, { channel, dispatch: scriptedDispatch(script, first), pulls: fakePulls().pulls, runId: 'pause' }),
     (error: unknown) => error instanceof PausedError,
   )
   assert.ok(!first.some((turn) => turn.role === 'planner'))
+  // The user question goes to the user with the confirmation of the ask. The other route questions are run questions.
+  assert.deepEqual(posted.map((entry) => entry.batch), ['intake'])
+  assert.deepEqual(posted[0]!.questions.map((question) => [question.id, question.question, question.level, question.rule]), [
+    ['Q1', scopeQuestion.question, 'user', 'scope'],
+    ['Q2', 'Is this the ask? Correct it in your own words if it is not.', 'user', 'scope'],
+  ])
+  assert.equal(posted[0]!.questions[1]!.why, 'Adds sub() and mul() next to add(), with tests.')
 
   replies.intake = '/answer recommended'
   const second: Turn[] = []
-  const result = await runDevelop(repo, dir, { channel, dispatch: scriptedDispatch(developScript(), second), pulls: fakePulls().pulls, runId: 'pause' })
+  const result = await runDevelop(repo, dir, { channel, dispatch: scriptedDispatch(script, second), pulls: fakePulls().pulls, runId: 'pause' })
   assert.equal(result.status, 'ready', result.report)
   assert.equal(posted.length, 1)
   assert.ok(!second.some((turn) => turn.role === 'intake'))
+  assert.match(result.report, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
+  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\* \(recommended\)\n\n## Decisions the run made\n\n- Write a spec before the plan\?/)
+})
+
+test('develop: a hotfix takes the recommendation of every question, and marks only the run questions as decided by the run', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const { channel, posted } = memoryChannel({ intake: null })
+  const input = { ...(await developInput(repo, 'hotfix')), hotfix: true }
+  const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(developScript({ askScope: true, blockSub: true }), []), input, pulls: fakePulls().pulls, runId: 'hotfix' })
+  assert.equal(result.status, 'blocked', result.report)
+  assert.deepEqual(posted, [])
+  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\* \(recommended\)\n\n## Decisions the run made\n\n- Write a spec before the plan\?/)
 })
 
 test('develop: CI that another branch ran on the same commit does not count until the push gets CI of its own', { timeout: 120_000 }, async () => {
@@ -127,13 +253,47 @@ test('develop: a run without CI blocks, and the resumed run with CI posts its ne
   assert.equal(github.state.comments.length, 2)
 })
 
+test('develop: the planner sees the protected paths, the host refuses a plan that writes them, and the corrected plan runs', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo({
+    stack: 'TypeScript',
+    checks: { smoke: 'node -e "process.exit(0)"' },
+    tests: { pattern: '\\.test\\.ts$', command: 'env -u NODE_TEST_CONTEXT node --test {tests}' },
+    protect: ['wrangler.jsonc'],
+  })
+  const turns: Turn[] = []
+  const script = developScript()
+  const protectedPlan = { ...plan, tasks: plan.tasks.map((task) => (task.id === 'sub' ? { ...task, files: [...task.files, 'wrangler.jsonc', '.agent-factory.json'] } : task)) }
+  const result = await runDevelop(repo, runsDir(), {
+    runId: 'protected-plan',
+    pulls: fakePulls([false, true]).pulls,
+    dispatch: scriptedDispatch((turn) => {
+      if (turn.role !== 'planner' || turn.output !== null) return script(turn)
+      return {
+        cell: [
+          `try { await tools.submit_plan(${JSON.stringify(protectedPlan)}); text('PROTECTED PLAN ACCEPTED') } catch (error) { text('plan refused: ' + error) }`,
+          `await tools.submit_plan(${JSON.stringify(plan)})`,
+        ].join('\n'),
+      }
+    }, turns),
+  })
+  assert.equal(result.status, 'ready', result.report)
+  const planner = turns.filter((turn) => turn.role === 'planner')
+  assert.ok(planner[0]!.request.includes('Protected paths, which no task may write: .agent-factory.json, wrangler.jsonc'))
+  const output = planner.map((turn) => turn.output ?? '').join('\n')
+  // The output is JSON, so the quotes in the refusal can be escaped.
+  assert.match(output, /plan refused:.*task \W*sub\W*: \W*wrangler\.jsonc\W* is a protected path/)
+  assert.match(output, /task \W*sub\W*: \W*\.agent-factory\.json\W* is a protected path/)
+  assert.doesNotMatch(output, /PROTECTED PLAN ACCEPTED/)
+})
+
 test('develop: a blocked builder stops the run with the reason, before any PR', { timeout: 120_000 }, async () => {
-  const { repo } = developRepo()
+  const { repo } = developRepo(undefined, { merge: 'squash' })
   const github = fakePulls()
   const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript({ blockSub: true }), []), pulls: github.pulls, runId: 'blocked' })
   assert.equal(result.status, 'blocked')
   assert.match(result.report, /Task sub is blocked: sub needs a package that is not installed/)
   assert.equal(github.state.opened.length, 0)
+  assert.deepEqual(github.state.merges, [])
 })
 
 test('develop: a test command writes outside the task scope, checkpoint refuses, and the builder submits a blocked log', { timeout: 120_000 }, async () => {
@@ -390,6 +550,41 @@ test('Node GitHub: failureLog returns a link when gh fails', async () => {
     const job = { name: 'CI', run: 12, url: 'https://ci.example/12', created: new Date().toISOString(), done: true, ok: false }
     assert.equal(await pulls.failureLog(job), 'No log: see https://ci.example/12 (gh run view: log expired)')
     assert.equal(await pulls.failureLog({ ...job, run: null }), 'No log: see https://ci.example/12')
+  } finally {
+    if (path === undefined) delete process.env.PATH
+    else process.env.PATH = path
+  }
+})
+
+test('Node GitHub: merge calls the merge API at the head in one call, and a refusal of gh goes to the core step', async () => {
+  const dir = runsDir()
+  const calls = join(dir, 'calls')
+  const gh = (script: string) => writeFileSync(join(dir, 'gh'), `#!/bin/sh\necho "$*" >> "${calls}"\n${script}\n`, { mode: 0o755 })
+  const logged = () => readFileSync(calls, 'utf8').split('\n').filter(Boolean)
+  const path = process.env.PATH
+  process.env.PATH = `${dir}:${path ?? ''}`
+  try {
+    const pulls = ghPullRequests(dir, 'main')
+    gh(`printf '%s' '{"sha":"abc123","merged":true,"message":"Pull Request successfully merged"}'`)
+    assert.deepEqual(await pulls.merge(9, { method: 'squash', sha: 'f00d' }), { merged: true, sha: 'abc123' })
+    // The answer gives the merge commit, so no later call can turn a merged PR into a refusal.
+    assert.deepEqual(logged(), ['api repos/{owner}/{repo}/pulls/9/merge --method PUT -f merge_method=squash -f sha=f00d'])
+
+    gh(`printf '%s' '{"merged":false,"message":"Pull Request is not mergeable"}'`)
+    assert.deepEqual(await pulls.merge(9, { method: 'merge', sha: 'f00d' }), { merged: false, reason: 'Pull Request is not mergeable' })
+
+    // A base branch that requires a merge queue: the API refuses, and the host never calls gh pr merge, which can queue the PR.
+    gh(`printf 'gh: Changes must be made through the merge queue (HTTP 405)' >&2\nexit 1`)
+    await assert.rejects(pulls.merge(9, { method: 'rebase', sha: 'f00d' }), {
+      message: 'gh api repos/{owner}/{repo}/pulls/9/merge: gh: Changes must be made through the merge queue (HTTP 405)',
+    })
+    assert.deepEqual(logged().filter((line) => !line.startsWith('api ')), [])
+
+    // A resumed run: GitHub refuses the merge of a PR that it already merged at the head, and the host reads the merge.
+    gh(`case "$*" in *merge*) printf 'gh: Pull Request is not mergeable (HTTP 405)' >&2; exit 1;; esac
+printf '%s' '{"merged":true,"merge_commit_sha":"abc123","head":{"sha":"f00d"}}'`)
+    assert.deepEqual(await pulls.merge(9, { method: 'squash', sha: 'f00d' }), { merged: true, sha: 'abc123' })
+    assert.deepEqual(logged().slice(-2), ['api repos/{owner}/{repo}/pulls/9/merge --method PUT -f merge_method=squash -f sha=f00d', 'api repos/{owner}/{repo}/pulls/9'])
   } finally {
     if (path === undefined) delete process.env.PATH
     else process.env.PATH = path

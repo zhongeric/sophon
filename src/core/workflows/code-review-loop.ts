@@ -6,8 +6,8 @@ import { step, type Ledger } from '../ledger.ts'
 import type { AgentStore, Checker, Files, Frozen, Guides, Repo } from '../platform.ts'
 import { isLight, profilesById, staticFindings, triage, triageLine, type Triage } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
-import { asker, decisions, type Answer, type Channel } from '../questions.ts'
-import { roles, type ModelChoice } from '../roles.ts'
+import { asker, decisionLists, decisions, type Answer, type Channel } from '../questions.ts'
+import { reviewRoles, type ModelChoice } from '../roles.ts'
 import { askQuestions, intent, light, patch, review, splitReview, type LightLog, type PatchLog, type PatchOutcome, type Range, type RunContext, type Verdict } from '../steps.ts'
 import { StopError } from '../stop.ts'
 import { BudgetStop, budgetGate, checkPriced, resolveBudget, spendOf, usageOf, usageSection, type Prices, type RunUsage } from '../usage.ts'
@@ -208,7 +208,8 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       assignIds(staticFindings(await repo.diff(range.from, range.to), await repo.changedFiles(range.from, range.to), active), 'rules', prefix),
     )
 
-  // A patch agent may reject a finding with a reason. A rejected critical or high finding goes to the user.
+  // A patch agent may reject a finding with a reason. The rejection of a critical or high finding is a run question (D11):
+  // the run does not accept it, so the criterion fails without a pause.
   const rejections: { id: string; accepted: boolean }[] = []
   const runPatch = async <Log extends PatchLog>(name: string, result: GateResult, run: () => Promise<PatchOutcome<Log>>): Promise<PatchOutcome<Log>> => {
     const outcome = await step(ledger, name, run)
@@ -250,7 +251,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     // The bugs review is the slowest track: on a large diff, the host splits it across reviewers.
     const step1 = await Promise.all(
       step1Roles.map((id) =>
-        step(ledger, `step1.${id}`, () => (id === 'bugs' ? splitReview : review)(context, `step1.${id}`, roles[id], input.models.step1[id], step1Range, '')),
+        step(ledger, `step1.${id}`, () => (id === 'bugs' ? splitReview : review)(context, `step1.${id}`, reviewRoles[id], input.models.step1[id], step1Range, '')),
       ),
     )
     const host1 = await hostCheck('step1.host', step1Range, 'host')
@@ -269,7 +270,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       const note = 'This is the step 2 pass. The diff is the patch that the step 1 patch agent applied, not the original change.'
       const late = await Promise.all(
         (['late-minimize', 'late-rules'] as const).map((id) =>
-          step(ledger, `step2.${id}`, () => review(context, `step2.${id}`, roles[id], input.models.step2[id], range, note)),
+          step(ledger, `step2.${id}`, () => review(context, `step2.${id}`, reviewRoles[id], input.models.step2[id], range, note)),
         ),
       )
       const host2 = await hostCheck('step2.host', range, 'late-host')
@@ -289,7 +290,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       const note =
         'This is the late bugs pass. The diff holds every fix that the patch agents applied after the review froze the change. Check that each fix is correct and breaks nothing around it.'
       const bugs = await step(ledger, 'step2.late-bugs', () =>
-        splitReview(context, 'step2.late-bugs', roles['late-bugs'], input.models.step2['late-bugs'], range, note),
+        splitReview(context, 'step2.late-bugs', reviewRoles['late-bugs'], input.models.step2['late-bugs'], range, note),
       )
       // The step 2 patch is the one commit that no host check saw yet.
       const host3 = patch2?.changed ? await hostCheck('step2.late-bugs-host', { from: patch2.before, to: patch2.after }, 'late-bugs-host') : []
@@ -394,9 +395,10 @@ function evaluate(run: { gateLog: boolean; checks: CheckResult[]; verdict: Verdi
     {
       name: 'No critical or high finding left unapplied without your OK',
       ok: refused.length === 0,
+      // The run decides a rejection (D11). Only a ledger from before D11 can have a rejection that the user accepted.
       detail:
         refused.length > 0
-          ? `you did not accept the rejection of ${refused.map((rejection) => rejection.id).join(', ')}`
+          ? `the rejection of ${refused.map((rejection) => rejection.id).join(', ')} is not accepted`
           : run.rejections.length > 0
             ? `you accepted the rejection of ${run.rejections.map((rejection) => rejection.id).join(', ')}`
             : 'the patch agents applied every critical and high finding',
@@ -467,9 +469,11 @@ function renderReport(run: ReportInput): string {
     ...(run.verdict ? ['## Intent', '', run.verdict.summary, ...run.verdict.gaps.map((gap) => `- gap: ${gap}`), ''] : []),
     ...run.usage,
     '',
-    '## Your decisions',
-    '',
-    ...(run.decisions.length > 0 ? run.decisions.map((answer) => `- ${answer.question} **${answer.answer}**${answer.recommended ? ' (recommended)' : ''}`) : ['- none asked']),
-    '',
+    ...decisionSections(run.decisions),
   ].join('\n')
+}
+
+/** The decisions of the user, then the decisions that the run made (D11), as report sections. */
+export function decisionSections(answers: Answer[]): string[] {
+  return decisionLists(answers, { user: '## Your decisions', run: '## Decisions the run made' }, { empty: { user: '- none asked', run: '- none' }, recommended: true })
 }

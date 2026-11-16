@@ -5,7 +5,7 @@ import { assignIds, checkFindings, parseLocation, submitFindings, type Finding }
 import { step } from './ledger.ts'
 import type { Checker, Frozen, Guides, Repo } from './platform.ts'
 import { checkQuestions, decisionsFile, decisionsLine, submitQuestions, type Question } from './questions.ts'
-import { instructions, roles, type ModelChoice, type Role } from './roles.ts'
+import { instructions, reviewRoles, type ModelChoice, type Role } from './roles.ts'
 import { bugsShards, diffFiles, diffOf, fileOwners, patchGroups, type PatchGroup } from './split.ts'
 import { allowFiles, createWorkspace, guard, readOnly } from './workspace.ts'
 
@@ -298,7 +298,7 @@ async function patchTurn<Log extends PatchLog = PatchLog>(
     '',
     'Edit the files in /repo. Then call submit_patch_log one time.',
   ].join('\n')
-  return runTurn<Log>(context.host, spec(context, id, roles.patch, model, workspace, tools), prompt, 'submit_patch_log')
+  return runTurn<Log>(context.host, spec(context, id, reviewRoles.patch, model, workspace, tools), prompt, 'submit_patch_log')
 }
 
 function patchIntro(mode: PatchMode, ids: string): string[] {
@@ -392,7 +392,7 @@ export async function light(
     '',
     'Edit the files in /repo. Then call submit_light_log one time.',
   ].join('\n')
-  const log = await runTurn<LightLog>(context.host, spec(context, id, roles.light, model, workspace, tools), prompt, 'submit_light_log')
+  const log = await runTurn<LightLog>(context.host, spec(context, id, reviewRoles.light, model, workspace, tools), prompt, 'submit_light_log')
   return commitEdits(context, before, log, options.kept, options.message)
 }
 
@@ -432,7 +432,7 @@ export async function intent(context: RunContext, id: string, model: ModelChoice
     '',
     'Call submit_verdict one time.',
   ].join('\n')
-  return runTurn(context.host, spec(context, id, roles.intent, model, workspace, tools), prompt, 'submit_verdict')
+  return runTurn(context.host, spec(context, id, reviewRoles.intent, model, workspace, tools), prompt, 'submit_verdict')
 }
 
 /** A read-only agent that finds the decisions that only the user can make. Runs beside the step 1 reviewers. */
@@ -449,5 +449,5 @@ export async function askQuestions(context: RunContext, id: string, model: Model
     '',
     'Call submit_questions one time, with an empty list when the ask settles everything.',
   ].join('\n')
-  return runTurn(context.host, spec(context, id, roles.questions, model, workspace, tools), prompt, 'submit_questions')
+  return runTurn(context.host, spec(context, id, reviewRoles.questions, model, workspace, tools), prompt, 'submit_questions')
 }

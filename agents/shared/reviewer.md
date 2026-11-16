@@ -23,8 +23,17 @@ The host checks each location and each quote against the files and the diff. It 
 - low: a minor quality issue with no user harm.
 - info: style, or a note.
 
-Claim the severity that the evidence supports. Every finding that passes the evidence check goes to a patch agent. The patch agent applies it, or rejects it with a reason. When it rejects a critical or high finding, the host asks the user.
+Claim the severity that the evidence supports. Every finding that passes the evidence check goes to a patch agent. The patch agent applies it, or rejects it with a reason. When it rejects a critical or high finding, the run does not accept the rejection, and the criterion for that finding fails.
 
 ## Decisions for the user
 
-Set `needs_decision` only when the right fix depends on a product or design choice that the ask and /review/decisions.md leave open. Write that choice in `decision`, in one sentence. The host asks the user before the finding goes to a patch agent.
+Set `needs_decision` only when the right fix depends on an open choice. The ask and /review/decisions.md do not settle an open choice. The choice must also obey one of these D11 rules:
+
+- `scope`: it changes the scope of the ask.
+- `capability`: it changes the capabilities of agents.
+- `spend`: it changes the spend.
+- `decision`: it changes a recorded D or RD row.
+
+When you set `needs_decision`, write the choice in `decision`, in one sentence. Give the rule in `rule`. The host asks the user before the finding goes to a patch agent.
+
+For every other choice, do not set `needs_decision`. The patch agent decides.

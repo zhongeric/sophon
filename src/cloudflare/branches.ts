@@ -8,6 +8,27 @@ import { base64, copyTree, encodePath, nameStatus, restoreFromGitHub, treeGit, t
 
 type Tree = { scope: string; start: string }
 
+async function remoteExists(gh: GitHub, api: string, name: string): Promise<boolean> {
+  try {
+    await gh.json('GET', `${api}/git/ref/heads/${encodePath(name)}`)
+    return true
+  } catch (error) {
+    if (error instanceof GitHubError && error.status === 404) return false
+    throw error
+  }
+}
+
+/** Deletes a branch on GitHub. A branch that is not there is not an error, but a refused delete is. */
+export async function deleteRemoteBranch(gh: GitHub, api: string, name: string): Promise<void> {
+  try {
+    await gh.json('DELETE', `${api}/git/refs/heads/${encodePath(name)}`)
+  } catch (error) {
+    if (!(error instanceof GitHubError) || (error.status !== 404 && error.status !== 422)) throw error
+    // GitHub answers 422 for a ref that does not exist. It also answers 422 when it refuses to delete a ref, for example a protected branch.
+    if (error.status === 422 && (await remoteExists(gh, api, name))) throw error
+  }
+}
+
 /** The most files that the compare of GitHub lists. */
 const compareFileLimit = 300
 
@@ -169,14 +190,7 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
       return branchOf(name, entry)
     },
     async exists(name) {
-      if (trees()[name]) return true
-      try {
-        await gh.json('GET', `${api}/git/ref/heads/${encodePath(name)}`)
-        return true
-      } catch (error) {
-        if (error instanceof GitHubError && error.status === 404) return false
-        throw error
-      }
+      return Boolean(trees()[name]) || (await remoteExists(gh, api, name))
     },
     async push(branch) {
       const entry = trees()[branch.name]
@@ -191,5 +205,6 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
       }
       return sha
     },
+    deleteRemote: (name) => deleteRemoteBranch(gh, api, name),
   }
 }

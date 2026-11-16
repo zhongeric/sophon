@@ -40,8 +40,16 @@ test("the user's answers settle the held findings", () => {
   assert.deepEqual(settle(result, [{ id: 'bugs-002', answer: skipOption }]).kept, [])
 })
 
-test('a rejected finding becomes a question that defaults to not accepting', () => {
+test('a rejected finding becomes a run question that defaults to not accepting', () => {
   const question = rejectionQuestion(finding('bugs-001', 'critical'), 'callers depend on it', 'Q1')
   assert.equal(question.recommendation, 'Do not accept')
+  assert.equal(question.level, 'run')
+  assert.equal(question.rule, undefined)
   assert.match(question.question, /did not apply bugs-001 \(critical\)/)
+})
+
+test('a held finding becomes a user question with the D11 rule of the finding', () => {
+  const question = findingQuestion(finding('bugs-002', 'high', { decision: 'Cut the CLI?', needs_decision: true, rule: 'scope' }), 'Q1')
+  assert.equal(question.level, 'user')
+  assert.equal(question.rule, 'scope')
 })

@@ -91,7 +91,10 @@ export function github(token: string, api = 'https://api.github.com', fetcher: t
     }
   }
   return {
-    json: async <T>(method: string, path: string, body?: unknown) => (await (await send(method, path, 'application/vnd.github+json', body)).json()) as T,
+    json: async <T>(method: string, path: string, body?: unknown) => {
+      const response = await send(method, path, 'application/vnd.github+json', body)
+      return (response.status === 204 ? undefined : await response.json()) as T
+    },
     raw: (path, accept) => send('GET', path, accept),
     async graphql<T>(query: string, variables: Record<string, unknown>) {
       const result = (await (await send('POST', '/graphql', 'application/vnd.github+json', { query, variables })).json()) as { data?: T; errors?: unknown }

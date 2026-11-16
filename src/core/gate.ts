@@ -1,4 +1,5 @@
 import type { Finding, Severity } from './findings.ts'
+import type { Question } from './questions.ts'
 
 /**
  * What happens to a finding after the evidence check: the patch agents get it (`keep`), the user decides
@@ -37,10 +38,13 @@ function summarize(decisions: Decision[]): GateResult {
   return { kept: pick('keep'), held: pick('ask'), decisions, log: decisions.map(formatDecision) }
 }
 
-/** The question that asks the user to decide one held finding. */
-export function findingQuestion(finding: Finding, id: string) {
+/** The question that asks the user to decide one held finding, with the D11 rule of the finding. */
+export function findingQuestion(finding: Finding, id: string): Question {
   return {
     id,
+    level: 'user',
+    // checkFindings refuses needs_decision without a rule, so the fallback is only for the type.
+    rule: finding.rule ?? 'decision',
     question: `${finding.id} at ${finding.location}: ${finding.title}. Fix it?`,
     why: `${finding.decision ?? 'The right fix depends on a decision that the ask leaves open.'} Trigger: ${finding.trigger}. Impact: ${finding.impact}. Suggested fix: ${finding.recommendation}.`,
     options: [fixOption, skipOption],
@@ -63,10 +67,14 @@ export function settle(result: GateResult, answers: UserDecision[]): GateResult 
 export const acceptRejection = 'Accept the rejection'
 export const refuseRejection = 'Do not accept'
 
-/** Asks the user about a critical or high finding that a patch agent did not apply. */
-export function rejectionQuestion(finding: Finding, reason: string, id: string) {
+/**
+ * The question about a critical or high finding that a patch agent did not apply. It is a run question (D11),
+ * so its recommendation "Do not accept" applies and the criterion fails.
+ */
+export function rejectionQuestion(finding: Finding, reason: string, id: string): Question {
   return {
     id,
+    level: 'run',
     question: `The patch agent did not apply ${finding.id} (${finding.severity}) at ${finding.location}: ${finding.title}. Accept that?`,
     why: `The patch agent's reason: ${reason}. Trigger: ${finding.trigger}. Impact: ${finding.impact}.`,
     options: [acceptRejection, refuseRejection],

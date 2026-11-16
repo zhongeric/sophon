@@ -12,14 +12,14 @@ import { resumeInput } from '../src/node/cli.ts'
 import { changedFiles, diff, touchedFiles } from '../src/node/git.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { fixed, fixtureRepo, gitSource, lightFixed, loopInput, memoryChannel, runLoop, script, scriptFor } from './support/fixture.ts'
-import { scriptedDispatch, type Script, type Turn } from './support/scripted-model.ts'
+import { probeNetwork, scriptedDispatch, webSearch, type Script, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
 
 test('the loop reviews, gates, patches, swaps families, checks and passes', async () => {
   const repo = fixtureRepo()
   const turns: Turn[] = []
-  const result = await runLoop(repo, 'e2e', runsDir(), { dispatch: scriptedDispatch(script, turns) })
+  const result = await runLoop(repo, 'e2e', runsDir(), { dispatch: scriptedDispatch(probeNetwork(script, 'minimize'), turns) })
 
   assert.equal(result.pass, true, result.report)
   assert.equal(execFileSync('git', ['show', `${result.branch}:src/math.ts`], { cwd: repo }).toString(), fixed)
@@ -32,6 +32,10 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   assert.match(outputs('patch'), /"status\\":\\"pass/)
   // With a test runner, no agent hears that it has none.
   assert.ok(!turns.some((turn) => turn.request.includes('This run has no run_tests tool')))
+  // The review roles have no egress: the cell fetch and the shell fail, and no model request has the web search tool.
+  assert.match(outputs('minimize'), /cell fetch: .*network access is off/)
+  assert.match(outputs('minimize'), /shell fetch: .*network access is off/)
+  assert.ok(!turns.some((turn) => webSearch.test(turn.request)))
 
   const providers = (role: string) => new Set(turns.filter((turn) => turn.role === role).map((turn) => turn.provider))
   for (const role of ['minimize', 'bugs', 'anti-slop', 'patch', 'questions', 'late-rules', 'intent']) assert.deepEqual(providers(role), new Set(['claude']))
@@ -68,8 +72,9 @@ test('at the cost budget, the run asks to raise it or to stop, and a stop ends t
   const asked = posted.find((entry) => entry.batch.startsWith('budget.'))
   assert.ok(asked, JSON.stringify(posted.map((entry) => entry.batch)))
   assert.equal(asked.questions[0]!.recommendation, 'Stop the run')
-  // The step 1 agents spent more than the budget, so no patch agent opened.
-  assert.ok(turns.some((turn) => turn.role === 'bugs'))
+  // The step 1 reviewers spent more than the budget, so no patch agent opened. The bugs reviewer starts last, after the
+  // diff split, so the budget can stop it before its first turn.
+  assert.ok(turns.some((turn) => ['minimize', 'rules', 'anti-slop', 'bugs'].includes(turn.role)))
   assert.ok(!turns.some((turn) => turn.role === 'patch'))
   assert.deepEqual([result.pass, result.stopped], [false, true])
   assert.ok(result.usage.usd >= 0.05)
@@ -269,22 +274,49 @@ test('ALLOWED_MODELS replaces the allowed list', async () => {
   assert.equal(turns.length, 0)
 })
 
-test("a critical finding that the patch agent rejects goes to the user, and only the user's acceptance clears it", async () => {
-  const rejecting = scriptFor({ rejectBug: true, tests: true })
-  const criterion = (result: { criteria: { name: string; ok: boolean; detail: string }[] }) =>
-    result.criteria.find((entry) => entry.name === 'No critical or high finding left unapplied without your OK')!
+test('the run does not accept the rejection of a critical finding: no question to the user, and the criterion fails', async () => {
+  const { channel, posted } = memoryChannel()
+  const result = await runLoop(fixtureRepo(), 'refused', runsDir(), { channel, dispatch: scriptedDispatch(scriptFor({ rejectBug: true, tests: true }), []) })
+  const criterion = result.criteria.find((entry) => entry.name === 'No critical or high finding left unapplied without your OK')!
+  assert.deepEqual(posted.map((entry) => entry.batch), ['ask'])
+  assert.deepEqual([criterion.ok, criterion.detail, result.pass], [false, 'the rejection of bugs-001 is not accepted', false])
+  assert.match(result.report, /## Decisions the run made\n\n- The patch agent did not apply bugs-001 \(critical\) at src\/math\.ts:6: Subtract b in sub\. Accept that\? \*\*Do not accept\*\*/)
+  assert.doesNotMatch(result.report.split('## Decisions the run made')[0]!, /did not apply bugs-001/)
+})
 
-  const refused = memoryChannel()
-  const first = await runLoop(fixtureRepo(), 'refused', runsDir(), { channel: refused.channel, dispatch: scriptedDispatch(rejecting, []) })
-  const asked = refused.posted.find((entry) => entry.batch === 'step1.patch.rejections')
-  assert.equal(asked?.questions.length, 1)
-  assert.match(asked!.questions[0]!.question, /did not apply bugs-001 \(critical\)/)
-  assert.match(asked!.questions[0]!.why, /callers depend on the sum/)
-  assert.deepEqual([criterion(first).ok, first.pass], [false, false])
+test('a resumed ledger from before D11, where the user accepted the rejection of a critical finding, keeps that OK', async () => {
+  const repo = fixtureRepo()
+  const dir = runsDir()
+  const dispatch = () => scriptedDispatch(scriptFor({ rejectBug: true, tests: true }), [])
+  await runLoop(repo, 'accepted', dir, { dispatch: dispatch() })
 
-  const accepted = memoryChannel({ 'step1.patch.rejections': '/answer\nQ1: a' })
-  const second = await runLoop(fixtureRepo(), 'accepted', runsDir(), { channel: accepted.channel, dispatch: scriptedDispatch(rejecting, []) })
-  assert.deepEqual([criterion(second).ok, criterion(second).detail], [true, 'you accepted the rejection of bugs-001'])
+  // Rewrite the ledger as a run from before D11: the questions have no level, and the user accepted the rejection.
+  type Entry = { id: string; question: string }
+  const path = join(dir, 'accepted', 'state.json')
+  const state = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+  const key = Object.keys(state).find((name) => /^answers:.*\.rejections$/.test(name))
+  assert.ok(key)
+  const accepted = (state[key] as Entry[]).map(({ id, question }) => ({ id, question, answer: 'Accept the rejection', recommended: false }))
+  const questionsKey = key.replace(/^answers:/, 'questions:')
+  state[key] = accepted
+  state[questionsKey] = (state[questionsKey] as Record<string, unknown>[]).map(({ level: _level, rule: _rule, ...question }) => question)
+  state['decisions'] = [...(state['decisions'] as Entry[]).filter((entry) => !accepted.some((answer) => answer.question === entry.question)), ...accepted]
+  writeFileSync(path, JSON.stringify(state, null, 2))
+
+  const { channel, posted } = memoryChannel()
+  const result = await runLoop(repo, 'accepted', dir, { channel, dispatch: dispatch() })
+  const criterion = result.criteria.find((entry) => entry.name === 'No critical or high finding left unapplied without your OK')!
+  assert.deepEqual(posted, [])
+  assert.deepEqual([criterion.ok, criterion.detail], [true, 'you accepted the rejection of bugs-001'])
+  assert.match(result.report.split('## Decisions the run made')[0]!, /- The patch agent did not apply bugs-001 .*\*\*Accept the rejection\*\*\n/)
+})
+
+test('a run with only run questions asks nothing and lists them as decisions that the run made', async () => {
+  const { channel, posted } = memoryChannel()
+  const result = await runLoop(fixtureRepo(), 'run-only', runsDir(), { channel, dispatch: scriptedDispatch(scriptFor({ runQuestion: true, tests: true }), []) })
+  assert.equal(result.pass, true, result.report)
+  assert.deepEqual(posted, [])
+  assert.match(result.report, /## Your decisions\n\n- none asked\n\n## Decisions the run made\n\n- May sub return a negative number\? \*\*Yes, return -2\*\* \(recommended\)/)
 })
 
 /** Lines `export const <name><i> = <i>` for i from 0, with some values replaced. */

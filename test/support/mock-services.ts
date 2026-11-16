@@ -8,7 +8,8 @@ import { scriptedDispatch, type Script, type Turn } from './scripted-model.ts'
 
 export type MockComment = { id: number; issue: number; user: { login: string }; body: string; created_at: string; updated_at: string; html_url: string }
 type TreeEntry = { path: string; mode: string; type: string; sha: string | null }
-type Pull = { head: string; title: string; body: string; draft: boolean; headRepo?: string }
+/** `merged` is the merge commit, after the host merged the PR. */
+type Pull = { head: string; title: string; body: string; draft: boolean; headRepo?: string; merged?: string }
 
 /**
  * GitHub, Anthropic, OpenAI and a build machine on one local port, for the Cloudflare host under wrangler dev.
@@ -46,6 +47,10 @@ export async function mockServices(
     commands: [] as { argv: string[]; cwd: string }[],
     /** The HTTP status of the workflow-runs endpoint, so that a test can withhold the Actions permission. */
     ciStatus: 200,
+    /** The PR merges that the host made, with the squash commit on main of each. */
+    merges: [] as { pr: number; method: string; sha: string; commit: string }[],
+    /** The branches that the host deleted. Their entries stay in refs, so that fileAt still reads them. */
+    deleted: [] as string[],
   }
   let next = Math.max(100, ...pulls.keys(), ...issues.keys())
   let ids = 0
@@ -73,10 +78,22 @@ export async function mockServices(
     draft: pull.draft,
     head: { ref: pull.head, repo: { full_name: pull.headRepo ?? `${options.owner}/${options.name}` }, sha: shaOf(pull.head) },
     html_url: `https://github.com/${options.owner}/${options.name}/pull/${number}`,
+    merge_commit_sha: pull.merged ?? null,
+    merged: pull.merged !== undefined,
     node_id: `PR_${number}`,
     number,
     title: pull.title,
   })
+  /** The entries of a directory at a ref, as the contents API lists them: the root, or the directory at `dir`. */
+  const entriesAt = (ref: string, dir?: string) =>
+    text(['ls-tree', ref, ...(dir ? ['--', `${dir}/`] : [])])
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        const [meta = '', path = ''] = line.split('\t')
+        const [mode, type] = meta.split(' ')
+        return { name: path.slice(path.lastIndexOf('/') + 1), path, type: type === 'tree' ? 'dir' : type === 'commit' ? 'submodule' : mode === '120000' ? 'symlink' : 'file' }
+      })
   const machineRoot = mkdtempSync(join(tmpdir(), 'factory-machine-'))
 
   const read = (request: IncomingMessage) =>
@@ -176,6 +193,25 @@ export async function mockServices(
         const head = shaOf(pull.head)!
         return json(response, 200, page(url, changes(text(['merge-base', 'main', head]), head)))
       }
+      const mergeRoute = new RegExp(`^PUT ${api}/pulls/(\\d+)/merge$`).exec(route)
+      if (mergeRoute && pulls.has(Number(mergeRoute[1]))) {
+        const number = Number(mergeRoute[1])
+        const pull = pulls.get(number)!
+        const fields = input()
+        const method = string(fields.merge_method, 'merge_method')
+        if (!['squash', 'merge', 'rebase'].includes(method)) throw new Error(`${route}: merge_method must be squash, merge or rebase`)
+        const sha = string(fields.sha, 'sha')
+        if (pull.merged) return json(response, 405, { message: 'Pull Request is not mergeable' })
+        if (sha !== shaOf(pull.head)) return json(response, 409, { message: 'Head branch was modified. Review and try the merge again.' })
+        if (pull.draft) return json(response, 405, { message: 'Pull Request is still a draft' })
+        // Every method merges as a squash: the tests read only the tree on main.
+        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
+        const commit = text(['commit-tree', `${sha}^{tree}`, '-p', shaOf('main')!, '-m', `${pull.title} (#${number})`], undefined, identity)
+        git(['update-ref', 'refs/heads/main', commit])
+        pull.merged = commit
+        state.merges.push({ commit, method, pr: number, sha })
+        return json(response, 200, { merged: true, message: 'Pull Request successfully merged', sha: commit })
+      }
       const issueRoute = new RegExp(`^GET ${api}/issues/(\\d+)$`).exec(route)
       if (issueRoute) {
         const number = Number(issueRoute[1])
@@ -197,21 +233,15 @@ export async function mockServices(
       }
       if (route === `GET ${api}/contents`) {
         // The root listing: the profiles look for their markers and lockfiles here.
-        const entries = text(['ls-tree', url.searchParams.get('ref')!])
-          .split('\n')
-          .filter(Boolean)
-          .map((line) => {
-            const [meta = '', name = ''] = line.split('\t')
-            const [mode, type] = meta.split(' ')
-            return { name, path: name, type: type === 'tree' ? 'dir' : type === 'commit' ? 'submodule' : mode === '120000' ? 'symlink' : 'file' }
-          })
-        return json(response, 200, entries)
+        return json(response, 200, entriesAt(url.searchParams.get('ref')!))
       }
       if (route.startsWith(`GET ${api}/contents/`)) {
         const path = decodeURIComponent(url.pathname.slice(`${api}/contents/`.length))
         const ref = url.searchParams.get('ref')!
         const listing = text(['ls-tree', ref, '--', path])
         if (!listing) return json(response, 404, { message: 'Not Found' })
+        // A directory gives the array of its entries, as on GitHub.
+        if (request.headers.accept !== 'application/vnd.github.raw' && listing.split(/\s/)[1] === 'tree') return json(response, 200, entriesAt(ref, path))
         const content = git(['show', `${ref}:${path}`])
         if (request.headers.accept === 'application/vnd.github.raw') {
           response.writeHead(200, { 'content-type': 'application/octet-stream' })
@@ -263,6 +293,15 @@ export async function mockServices(
         git(['update-ref', ref, sha])
         state.refs.set(ref, sha)
         return json(response, 201, { ref })
+      }
+      if (route.startsWith(`DELETE ${api}/git/refs/heads/`)) {
+        const name = decodeURIComponent(url.pathname.slice(`${api}/git/refs/heads/`.length))
+        if (!shaOf(`refs/heads/${name}`)) return json(response, 422, { message: 'Reference does not exist' })
+        git(['update-ref', '-d', `refs/heads/${name}`])
+        state.deleted.push(name)
+        response.writeHead(204)
+        response.end()
+        return
       }
       if (request.method === 'PATCH' && url.pathname.startsWith(`${api}/git/refs/`)) {
         const ref = `refs/${decodeURIComponent(url.pathname.slice(`${api}/git/refs/`.length))}`

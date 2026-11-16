@@ -1,7 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import type { CiJob } from './ci.ts'
-import type { CheckResult } from './checks.ts'
+import type { CheckResult, MergeMethod } from './checks.ts'
 
 /** The frozen review target. `base` and `head` are commit IDs that `Repo.diff` accepts. */
 export type Frozen = { base: string; head: string; branch: string; location: string }
@@ -49,7 +49,15 @@ export type Branches = {
   exists(name: string): Promise<boolean>
   /** Pushes the branch to origin, never with force, and returns the commit ID that GitHub has for its head. */
   push(branch: Branch): Promise<string>
+  /**
+   * Deletes the branch on origin only. The local branch and its worktree stay. A branch that is already absent on
+   * origin counts as deleted, for example when the repository deletes head branches after a merge.
+   */
+  deleteRemote(name: string): Promise<void>
 }
+
+/** The result of a merge. GitHub can refuse a merge, for example for a conflict, a changed head or a check that is not green. */
+export type MergeResult = { merged: true; sha: string } | { merged: false; reason: string }
 
 /** The pull requests and the CI of the repository on GitHub. */
 export type PullRequests = {
@@ -57,6 +65,8 @@ export type PullRequests = {
   open(options: { head: string; title: string; body: string }): Promise<{ number: number; url: string }>
   /** Marks a draft PR ready for review. */
   ready(pr: number): Promise<void>
+  /** Merges the PR only when its head is still `sha`. A refusal by GitHub is a result, not an error. */
+  merge(pr: number, options: { method: MergeMethod; sha: string }): Promise<MergeResult>
   comment(pr: number, body: string): Promise<void>
   ci(sha: string): Promise<CiJob[]>
   /** The end of the log of a failed job, for the agent that fixes it. */
@@ -65,7 +75,11 @@ export type PullRequests = {
 
 /** Runs the repository's checks. `tests` runs test files during agent turns, or is null where the platform cannot. */
 export type Checker = {
-  checks(changed: string[]): Promise<CheckResult[]>
+  /**
+   * Runs the configured checks on the changed files, then their targeted tests. The tests run by default. With
+   * `tests: false`, only the setup and the configured checks run.
+   */
+  checks(changed: string[], options?: { tests?: boolean }): Promise<CheckResult[]>
   tests: ((tests: string[]) => Promise<CheckResult[]>) | null
 }
 
