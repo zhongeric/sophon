@@ -3,11 +3,12 @@ import module from 'nanocode-ts/nanocode_wasm.wasm'
 import { commandChecker, requireChecks } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Branch } from '../core/platform.ts'
-import { commentChannel, commentLimit, PausedError, type Comments } from '../core/questions.ts'
+import { commentChannel, PausedError, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { addTokens, parsePrices, zeroTokens, type RunUsage } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
-import { defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels, type ReviewRequest } from '../core/workflows/develop.ts'
+import { cutReport, defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels, type ReviewRequest } from '../core/workflows/develop.ts'
+import { developAnnouncement } from './announcements.ts'
 import { boxMachine, containerBox, httpBox, syncWithSetup, type Box, type SyncStore } from './box.ts'
 import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
@@ -48,7 +49,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
   }
 
   protected announcement(run: string, request: DevelopRequest) {
-    return `agent-factory started development run \`${run}\` for @${request.by}. Questions for you will appear here; answer them with a \`/answer\` comment. The PR and the report come when the work is ready, or a blocker when it cannot be.`
+    return developAnnouncement(run, request.by)
   }
 
   protected async execute(run: string, request: DevelopRequest, ledger: Ledger, gh: GitHub, comments: Comments) {
@@ -85,8 +86,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     })
     // A run that waits for the user, for example for CI, stops on an error, so that the admin resume starts it again from its ledger.
     if (result.resume) throw new StopError(result.resume)
-    const summary = result.report.length > commentLimit ? `${result.report.slice(0, commentLimit)}\n\n(cut: see the report of run \`${run}\`)` : result.report
-    return { passed: result.status === 'ready', summary }
+    return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
   }
 
   private box(syncs: SyncStore): Box {

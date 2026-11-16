@@ -75,17 +75,7 @@ export const letter = (index: number) => String.fromCharCode(97 + index)
 export function render(runId: string, batch: string, questions: Question[]): string {
   return [
     marker(runId, batch),
-    `### agent-factory needs your input (run \`${runId}\`)`,
-    '',
-    'Reply with a comment that starts with `/answer`. Give one line for each question that you answer. A question that you leave out takes the recommendation.',
-    '',
-    '```',
-    '/answer',
-    `${questions[0]?.id ?? 'Q1'}: b`,
-    `${questions[1]?.id ?? 'Q2'}: your own words also work`,
-    '```',
-    '',
-    'Reply `/answer recommended` to take every recommendation.',
+    'Reply with a `/answer` comment and one `Q<n>: <letter or your own words>` line for each question. A question that you leave out takes the recommendation. `/answer recommended` takes all recommendations.',
     '',
     ...questions.flatMap((question) => [
       `**${question.id}.** ${question.question}`,
