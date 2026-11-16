@@ -132,7 +132,7 @@ export const questionsSchema = {
         type: 'string',
         enum: ['user', 'run'],
         description:
-          'D11: user only when the choice (1) removes or adds scope compared with the ask, (2) changes capabilities across workflows ' +
+          'D11: user only when the choice (1) removes or adds scope compared with the ask (a reading of an unclear ask that keeps its intent does not), (2) changes capabilities across workflows ' +
           '(network and web search, protected paths, secrets, allowed models, blinding), (3) commits spend over the budget or an irreversible or public action, ' +
           'or (4) departs from a recorded D or RD row. Every other question is run: the host takes your recommendation at once and does not ask the user.',
       },

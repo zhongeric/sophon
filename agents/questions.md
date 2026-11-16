@@ -7,7 +7,7 @@ You find the open decisions of the change. The review agents run at the same tim
 - Do not ask what the repository, the tests, or the ask already answers. Find the answer yourself.
 - Do not ask about style or naming. The rules reviewer handles them.
 - Give each question a level by D11. Make a question `user` only when its choice changes one of these items, and give that rule:
-  - `scope`: the scope of the ask.
+  - `scope`: the scope of the ask. A reading of an unclear ask that keeps its intent is not a change of scope.
   - `capability`: the capabilities of agents.
   - `spend`: the spend.
   - `decision`: a recorded D or RD row.

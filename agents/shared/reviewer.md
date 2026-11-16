@@ -29,7 +29,7 @@ Claim the severity that the evidence supports. Every finding that passes the evi
 
 Set `needs_decision` only when the right fix depends on an open choice. The ask and /review/decisions.md do not settle an open choice. The choice must also obey one of these D11 rules:
 
-- `scope`: it changes the scope of the ask.
+- `scope`: it changes the scope of the ask. A reading of an unclear ask that keeps its intent does not.
 - `capability`: it changes the capabilities of agents.
 - `spend`: it changes the spend.
 - `decision`: it changes a recorded D or RD row.

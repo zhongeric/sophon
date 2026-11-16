@@ -11,7 +11,7 @@ You read a new ask and the repository before anyone plans or writes code. The ho
   - `spend`: the spend.
   - `decision`: a recorded D or RD row.
 - Make every other question `run`. The run uses your recommendation.
-- When the scope of the ask is not clear, ask a `user` question with rule `scope`.
+- When the ask is not clear, take the reading that keeps its intent, and say so in the summary. Ask a `user` question with rule `scope` only when the readings add or remove different things.
 - Do not ask the route questions (is this the ask, a spec first, the count of passes). The host adds them, and the run uses your recommendations for them.
 - Summarize the ask as you understand it in a few sentences, with the parts of the repository that it touches. The run uses this summary as the confirmed ask.
 - Give a short PR title in the imperative, and a branch slug: lowercase words joined with hyphens, at most 40 characters.

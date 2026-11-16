@@ -64,7 +64,7 @@ export const submitFindings: Contracts.HostTool = {
               type: 'string',
               enum: [...rules],
               description:
-                'With needs_decision: the D11 rule. scope: the choice removes or adds scope compared with the ask. capability: it changes capabilities across workflows. spend: it commits spend over the budget or an irreversible or public action. decision: it departs from a recorded D or RD row',
+                'With needs_decision: the D11 rule. scope: the choice removes or adds scope compared with the ask, and is not a reading of an unclear ask that keeps its intent. capability: it changes capabilities across workflows. spend: it commits spend over the budget or an irreversible or public action. decision: it departs from a recorded D or RD row',
             },
           },
           required: [...fields],
