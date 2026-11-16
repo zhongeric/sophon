@@ -3,13 +3,59 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { checkQuestions, commentChannel, parseAnswers, render, type PrComment, type Question } from '../src/core/questions.ts'
+import type { Ledger } from '../src/core/ledger.ts'
+import {
+  asker,
+  checkQuestions,
+  commentChannel,
+  decisions,
+  decisionsFile,
+  parseAnswers,
+  PausedError,
+  render,
+  type Channel,
+  type PrComment,
+  type Question,
+} from '../src/core/questions.ts'
 import { fileChannel } from '../src/node/channels.ts'
 
 const questions: Question[] = [
-  { id: 'Q1', question: 'Round down or up?', why: 'src/fee.ts', options: ['down', 'up'], recommendation: 'down' },
-  { id: 'Q2', question: 'Keep the old event?', why: 'src/Vault.sol', options: ['yes', 'no'], recommendation: 'yes' },
+  { id: 'Q1', question: 'Round down or up?', why: 'src/fee.ts', options: ['down', 'up'], recommendation: 'down', level: 'user', rule: 'scope' },
+  { id: 'Q2', question: 'Keep the old event?', why: 'src/Vault.sol', options: ['yes', 'no'], recommendation: 'yes', level: 'user', rule: 'decision' },
 ]
+
+const memoryLedger = (entries: Record<string, unknown> = {}): Ledger => {
+  const map = new Map(Object.entries(entries))
+  return { get: <T>(key: string) => map.get(key) as T | undefined, put: (key, value) => void map.set(key, value) }
+}
+
+/** A channel that records each post and each read, and answers with `reply`, or not yet when it is null. */
+const recordingChannel = (reply: string | null = '/answer recommended') => {
+  const posted: { batch: string; questions: Question[] }[] = []
+  const read: Question[][] = []
+  const channel: Channel = {
+    async post(_runId, batch, list) {
+      posted.push({ batch, questions: list })
+      return { batch, ref: `memory:${batch}`, at: '2026-11-16T10:00:00Z' }
+    },
+    async answers(_posted, list) {
+      read.push(list)
+      return reply === null ? null : parseAnswers(reply, list)
+    },
+    where: (where) => where.ref,
+  }
+  return { channel, posted, read }
+}
+
+const ask = (id: string, level: 'user' | 'run'): Question => ({
+  id,
+  question: `${id}?`,
+  why: 'src/fee.ts',
+  options: ['a', 'b'],
+  recommendation: 'a',
+  level,
+  ...(level === 'user' ? { rule: 'scope' as const } : {}),
+})
 
 test('a reply selects options by letter, keeps free text, and leaves out questions at the recommendation', () => {
   assert.deepEqual(parseAnswers('/answer\nQ1: b', questions), [
@@ -22,9 +68,139 @@ test('a reply selects options by letter, keeps free text, and leaves out questio
 })
 
 test('questions need two options and a recommendation from them', () => {
-  assert.deepEqual(checkQuestions({ questions: [{ question: 'a?', why: 'b', options: ['x', 'y'], recommendation: 'y' }] })[0]?.id, 'Q1')
-  assert.throws(() => checkQuestions({ questions: [{ question: 'a?', why: 'b', options: ['x'], recommendation: 'x' }] }), /at least two options/)
-  assert.throws(() => checkQuestions({ questions: [{ question: 'a?', why: 'b', options: ['x', 'y'], recommendation: 'z' }] }), /one of the options/)
+  assert.deepEqual(checkQuestions({ questions: [{ question: 'a?', why: 'b', options: ['x', 'y'], recommendation: 'y', level: 'run' }] })[0]?.id, 'Q1')
+  assert.throws(() => checkQuestions({ questions: [{ question: 'a?', why: 'b', options: ['x'], recommendation: 'x', level: 'run' }] }), /at least two options/)
+  assert.throws(() => checkQuestions({ questions: [{ question: 'a?', why: 'b', options: ['x', 'y'], recommendation: 'z', level: 'run' }] }), /one of the options/)
+})
+
+test('questions need a level, and a user question needs a D11 rule', () => {
+  const base = { question: 'a?', why: 'b', options: ['x', 'y'], recommendation: 'y' }
+  assert.throws(
+    () => checkQuestions({ questions: [base, { ...base, level: 'later' }, { ...base, level: 'user' }, { ...base, level: 'user', rule: 'taste' }] }),
+    (error: Error) => {
+      assert.equal(
+        error.message,
+        [
+          'questions[0]: level must be user or run',
+          'questions[1]: level must be user or run',
+          'questions[2]: a user question needs a rule: scope, capability, spend, decision',
+          'questions[3]: a user question needs a rule: scope, capability, spend, decision',
+        ].join('\n'),
+      )
+      return true
+    },
+  )
+  assert.deepEqual(
+    checkQuestions({ questions: [{ ...base, level: 'run', rule: 'scope' }, { ...base, level: 'user', rule: 'spend' }] }),
+    [
+      { id: 'Q1', ...base, level: 'run' },
+      { id: 'Q2', ...base, level: 'user', rule: 'spend' },
+    ],
+  )
+})
+
+test('a batch of run questions never posts, and wait gives the recommendations as decisions of the run', async () => {
+  const ledger = memoryLedger()
+  const { channel, posted, read } = recordingChannel(null)
+  const questions = asker(ledger, channel, 'run-1', () => {})
+  await questions.post('intake', [ask('Q1', 'run'), ask('Q2', 'run')])
+  const answers = await questions.wait('intake')
+  assert.deepEqual(posted, [])
+  assert.deepEqual(read, [])
+  assert.deepEqual(answers, [
+    { id: 'Q1', question: 'Q1?', answer: 'a', recommended: true, decidedBy: 'run' },
+    { id: 'Q2', question: 'Q2?', answer: 'a', recommended: true, decidedBy: 'run' },
+  ])
+  assert.deepEqual(decisions(ledger), answers)
+})
+
+test('a mixed batch posts only the user questions with their IDs, and wait gives every answer in order, one time', async () => {
+  const ledger = memoryLedger()
+  const { channel, posted, read } = recordingChannel(null)
+  const batch = [ask('Q1', 'run'), ask('Q2', 'user'), ask('Q3', 'run'), ask('Q4', 'user')]
+  const first = asker(ledger, channel, 'run-1', () => {})
+  await first.post('spec', batch)
+  assert.deepEqual(posted, [{ batch: 'spec', questions: [batch[1], batch[3]] }])
+  await assert.rejects(first.wait('spec'), PausedError)
+  assert.deepEqual(decisions(ledger).map((answer) => [answer.id, answer.decidedBy]), [
+    ['Q1', 'run'],
+    ['Q3', 'run'],
+  ])
+
+  // The resumed run posts and waits again: no second post, and no decision twice.
+  const { channel: answered, posted: reposted, read: reread } = recordingChannel('/answer\nQ4: b')
+  const second = asker(ledger, answered, 'run-1', () => {})
+  await second.post('spec', batch)
+  const answers = await second.wait('spec')
+  assert.deepEqual(reposted, [])
+  assert.deepEqual(reread, [[batch[1], batch[3]]])
+  assert.deepEqual(answers.map((answer) => [answer.id, answer.answer, answer.decidedBy]), [
+    ['Q1', 'a', 'run'],
+    ['Q2', 'a', undefined],
+    ['Q3', 'a', 'run'],
+    ['Q4', 'b', undefined],
+  ])
+  await second.post('spec', batch)
+  assert.deepEqual(await second.wait('spec'), answers)
+  assert.deepEqual(decisions(ledger).map((answer) => answer.id), ['Q1', 'Q3', 'Q2', 'Q4'])
+  assert.equal(read.length, 1)
+})
+
+test('a run-only batch records its decisions one time, also when the run posts it again', async () => {
+  const ledger = memoryLedger()
+  const { channel } = recordingChannel()
+  const questions = asker(ledger, channel, 'run-1', () => {})
+  await questions.post('intake', [ask('Q1', 'run')])
+  await questions.wait('intake')
+  await questions.post('intake', [ask('Q1', 'run')])
+  await questions.wait('intake')
+  assert.equal(decisions(ledger).length, 1)
+})
+
+test('a batch from before D11 has no levels, so its questions post, and its recorded answers stay', async () => {
+  const { level: _level, rule: _rule, ...legacy } = ask('Q1', 'user')
+  const ledger = memoryLedger()
+  const { channel, posted } = recordingChannel('/answer\nQ1: b')
+  const questions = asker(ledger, channel, 'run-1', () => {})
+  await questions.post('ask', [legacy as Question])
+  assert.deepEqual(posted, [{ batch: 'ask', questions: [legacy] }])
+  assert.deepEqual(await questions.wait('ask'), [{ id: 'Q1', question: 'Q1?', answer: 'b', recommended: false }])
+
+  // A resumed run of an old ledger: the batch posted without levels, and the new code gives run questions.
+  const old = memoryLedger({ 'questions:intake': [legacy], 'posted:intake': { batch: 'intake', ref: 'memory:intake', at: '2026-11-16T10:00:00Z' } })
+  const resumed = recordingChannel('/answer\nQ1: b')
+  const again = asker(old, resumed.channel, 'run-1', () => {})
+  await again.post('intake', [ask('Q1', 'run')])
+  assert.deepEqual(resumed.posted, [])
+  assert.equal((await again.wait('intake'))[0]?.answer, 'b')
+
+  const recorded = [{ id: 'Q1', question: 'Q1?', answer: 'b', recommended: false }]
+  const done = asker(memoryLedger({ 'answers:intake': recorded }), resumed.channel, 'run-1', () => {})
+  await done.post('intake', [ask('Q1', 'run')])
+  assert.deepEqual(await done.wait('intake'), recorded)
+})
+
+test('with --hotfix, every question takes its recommendation, and run questions are marked', () => {
+  const ledger = memoryLedger()
+  const { channel, posted } = recordingChannel()
+  const answers = asker(ledger, channel, 'run-1', () => {}).recommend('intake', [ask('Q1', 'user'), ask('Q2', 'run')])
+  assert.deepEqual(posted, [])
+  assert.deepEqual(answers, [
+    { id: 'Q1', question: 'Q1?', answer: 'a', recommended: true },
+    { id: 'Q2', question: 'Q2?', answer: 'a', recommended: true, decidedBy: 'run' },
+  ])
+})
+
+test("decisions.md lists the user's decisions, then the decisions that the run made", () => {
+  assert.deepEqual(decisionsFile(memoryLedger()), {})
+  const user = { id: 'Q1', question: 'Cut the CLI?', answer: 'No', recommended: false }
+  const run = { id: 'Q2', question: 'How many passes?', answer: 'One pass', recommended: true, decidedBy: 'run' as const }
+  const file = decisionsFile(memoryLedger({ decisions: [run, user] }))['/decisions.md'] ?? ''
+  assert.match(file, /^# Decisions of the user\n\nThese answers settle open points of the ask\. Follow them\.\n\n- Cut the CLI\?\n  Answer: No\n\n## Decisions the run made\n\n/)
+  assert.match(file, /took the recommendation/)
+  assert.match(file, /- How many passes\?\n  Answer: One pass\n$/)
+  const runOnly = decisionsFile(memoryLedger({ decisions: [run] }))['/decisions.md'] ?? ''
+  assert.match(runOnly, /^# Decisions of the user\n\n.*\n\n- none\n\n## Decisions the run made/)
 })
 
 test('the PR channel posts one comment and reads only later, unedited /answer replies from the answerers, in any case', async () => {

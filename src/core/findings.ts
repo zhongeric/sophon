@@ -1,5 +1,6 @@
 import type { Contracts } from 'nanocode-ts'
 import { isArtifactId } from './artifacts.ts'
+import { isRule, rules, type Rule } from './questions.ts'
 
 export const severities = ['critical', 'high', 'medium', 'low', 'info'] as const
 export type Severity = (typeof severities)[number]
@@ -19,6 +20,8 @@ export type Finding = {
   needs_decision?: boolean
   /** That choice, in one sentence. Required with needs_decision. */
   decision?: string
+  /** The D11 rule that makes the choice the user's. Required with needs_decision. */
+  rule?: Rule
 }
 
 type Submitted = Omit<Finding, 'id' | 'track'>
@@ -53,9 +56,16 @@ export const submitFindings: Contracts.HostTool = {
             recommendation: { type: 'string', description: 'A concrete fix direction' },
             needs_decision: {
               type: 'boolean',
-              description: 'True only when the right fix depends on a product or design choice that the ask and the decisions leave open',
+              description:
+                'True only when the right fix depends on a choice that the ask and the decisions leave open, and that choice is the user\'s by a D11 rule. It needs that rule in rule',
             },
             decision: { type: 'string', description: 'With needs_decision: the choice that the user must make, in one sentence' },
+            rule: {
+              type: 'string',
+              enum: [...rules],
+              description:
+                'With needs_decision: the D11 rule. scope: the choice removes or adds scope compared with the ask. capability: it changes capabilities across workflows. spend: it commits spend over the budget or an irreversible or public action. decision: it departs from a recorded D or RD row',
+            },
           },
           required: [...fields],
           additionalProperties: false,
@@ -99,6 +109,7 @@ async function checkFinding(item: Record<string, unknown>, check: EvidenceCheck)
   const finding = item as Submitted
   if (!severities.includes(finding.severity)) return [`severity must be one of ${severities.join(', ')}`]
   if (finding.needs_decision && !finding.decision?.trim()) return ['needs_decision needs the decision, in one sentence']
+  if (finding.needs_decision && !isRule(finding.rule)) return [`needs_decision needs a D11 rule: ${rules.join(', ')}`]
   return check(finding)
 }
 

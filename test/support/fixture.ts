@@ -89,6 +89,8 @@ const openQuestion = {
   why: 'The ask does not say what sub(3, 5) returns (src/math.ts).',
   options: ['Yes, return -2', 'No, throw an error'],
   recommendation: 'Yes, return -2',
+  level: 'user',
+  rule: 'scope',
 }
 
 /**
@@ -99,9 +101,10 @@ export const script = scriptFor({ tests: true })
 
 /**
  * The scripted agents. Without `tests`, as on Cloudflare where CI runs the tests, no agent calls run_tests.
- * `holdBug` marks the bug as the user's decision. `rejectBug` makes the patch agent reject it.
+ * `holdBug` marks the bug as the user's decision. `rejectBug` makes the patch agent reject it. `runQuestion` makes the
+ * open question a run question, so that the run does not ask the user.
  */
-export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBug?: boolean }): Script {
+export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBug?: boolean; runQuestion?: boolean }): Script {
   const runTests = (code: string) => (options.tests ? [code] : [])
   return ({ role, output }) => {
   if (output !== null) return { text: 'done' }
@@ -119,7 +122,7 @@ export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBu
       return {
         cell: [
           ...runTests(`text(JSON.stringify(await tools.run_tests({ tests: ['test/sub.test.ts'] })))`),
-          findings([options.holdBug ? { ...bug, decision: 'Should sub throw on a negative result?', needs_decision: true } : bug]),
+          findings([options.holdBug ? { ...bug, decision: 'Should sub throw on a negative result?', needs_decision: true, rule: 'scope' } : bug]),
         ].join('\n'),
       }
     case 'patch':
@@ -139,7 +142,7 @@ export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBu
       }
     case 'questions':
       return {
-        cell: `await tools.submit_questions({ questions: [${JSON.stringify(openQuestion)}] })`,
+        cell: `await tools.submit_questions({ questions: [${JSON.stringify(options.runQuestion ? { ...openQuestion, level: 'run' } : openQuestion)}] })`,
       }
     case 'intent':
       return { cell: `await tools.submit_verdict({ satisfied: true, gaps: [], summary: 'sub subtracts b from a' })` }

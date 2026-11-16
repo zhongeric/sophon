@@ -58,20 +58,28 @@ Each stage below lists who does the work, what the host enforces, and where the 
 - **Work:** record the ask verbatim. A read-only intake agent reads the repo and the ask, and lists the open
   questions and product calls, each with a recommendation. It explores the code first instead of asking what the
   code answers.
-- **Rails:** no plan and no code until the ask is **confirmed**. The host adds three questions to the intake agent's
-  batch: "Is this the ask?" with the agent's summary, a spec or not, and one or two review passes, each with the
-  agent's recommendation and reason (P4). The user's `/answer` to that one batch is the confirmation. A
-  free-text correction of the summary goes on, as a decision for the planner. The host records which stack profiles
-  apply (section 4).
-- **The user:** answers the intake questions. A small hotfix can skip the confirmation when the user marks it so
-  (`--hotfix`).
+- **Rails:** no plan and no code until the ask is **confirmed**. The host adds three route questions to the intake
+  agent's batch: "Is this the ask?" with the agent's summary, a spec or not, and one or two review passes, each with
+  the agent's recommendation and reason (P4).
+  - The route questions are `run` level (D11), so the host uses the intake agent's recommendations at once.
+  - The confirmation of the ask becomes a question to the user only when the intake agent asks a `user` question.
+    For example, the agent asks a question with rule `scope` when the scope of the ask is not clear. The user's
+    `/answer` to that batch is then the confirmation.
+  - When the batch has no `user` question, the run continues without a pause. The report lists the recommendations
+    as decisions that the run made.
+  - A free-text correction of the summary goes on, as a decision for the planner. The host records which stack
+    profiles apply (section 4).
+- **The user:** answers the `user` questions of the intake, when there are some. A small hotfix skips them when the
+  user marks it so (`--hotfix`): the host uses every recommendation, as before D11.
 
 ### 1. Spec, for larger changes
 
 - **Who:** a spec agent, in the role of a product manager. Read-only.
 - **When:** the intake marks the ask as a larger change, or the user says "start with a spec".
 - **Output:** a short spec with edge cases, every product surface, out-of-scope items, and the product decisions
-  that the user can overrule. The host posts it, and the run pauses for the user's answers to its decisions.
+  that the user can overrule. Each decision is also a question with a level (D11). The host posts only the `user`
+  decisions, and the run pauses for the user's answers to them. For the `run` decisions, the host uses the
+  recommendation at once and records them as decisions that the run made.
 
 ### 2. Plan
 
@@ -284,14 +292,15 @@ text that ships.
 
 | Moment | Why | Channel |
 | --- | --- | --- |
-| Intake questions and confirmation | product calls belong to the user | PR or issue comment, or the terminal |
-| Spec review, when the user asks for one | the spec makes product decisions | same |
-| Held findings in the gate | decisions that only the user can make | same |
+| `user` questions of the intake, which also confirm the ask | scope, capabilities, spend and recorded decisions belong to the user (D11) | PR or issue comment, or the terminal |
+| `user` decisions of the spec, when there is a spec | the same rules (D11) | same |
+| Held findings in the gate | the finding names a D11 rule, so only the user can make the decision | same |
 | Blockers | token scope, missing secrets, failed budgets | same |
 | Merge | the user owns the merge | GitHub |
 | Any paid, external or mainnet action | an agent never approves spend or a broadcast | a `/go` that names the exact scope, deploy workflow only |
 
-Everything else runs without the user.
+Everything else runs without the user. For a `run` question, the host uses the recommendation and records it as a
+decision that the run made (D11).
 
 ## 7. Platforms
 
@@ -316,7 +325,7 @@ Each decision records a conflict between two rules, and the choice.
 
 | # | Conflict | Decision |
 | --- | --- | --- |
-| D1 | **Findings filter.** A scoring gate that keeps only the findings above a score, or a filter that keeps every finding with real evidence. | **No scoring gate.** The evidence check filters. Patch agents apply or reject every finding. A rejected critical or high finding goes to the user. Reviewers mark findings that need the user's decision. Triage uses profile rules, not a score. |
+| D1 | **Findings filter.** A scoring gate that keeps only the findings above a score, or a filter that keeps every finding with real evidence. | **No scoring gate.** The evidence check filters. Patch agents apply or reject every finding. The rejection of a critical or high finding is a `run` question with the recommendation "Do not accept" (D11), so the rejection fails the run. Reviewers mark findings that need the user's decision, each with a D11 rule. Triage uses profile rules, not a score. |
 | D2 | **Evidence track.** Four tracks with the evidence rule in each, or a fifth Evidence reviewer. | Four tracks. The host's evidence check (real quotes at real lines) is stronger than a fifth agent. |
 | D3 | **Models.** Which models, and how the passes get variance. | Step 1 spreads the tracks over the two families: Rules on Sol, Minimize, Bugs, Anti-slop and Patch on Opus 5.5. Each step 2 role swaps family. Fable 5.2 costs more for each token, thus no default role uses it. A models file or `MODELS` can give it a role. The host refuses models outside the allowed list. `ALLOWED_MODELS` replaces the list. |
 | D4 | **Draft during review.** "Never draft" against "draft until PASS". | Draft while the run works, ready after PASS. |
@@ -326,6 +335,7 @@ Each decision records a conflict between two rules, and the choice.
 | D8 | **Tests first against a lazy draft.** evm-cortex says tests first. The plan rules say a lazy first draft. | The draft includes its tests, and done-looks-like names them. A bug fix starts with a failing test. |
 | D9 | **Solidity style conflicts.** Test names (three schemes), error names (`ManagerLocked` or `Oracle_StalePrice`), event tense, immutable case, pinned compiler (0.8.24, 0.8.26, 0.8.28), NatSpec on internal functions, coverage (90% or 100%), ReentrancyGuard scope (all external calls or value paths only). | One precedence rule: repo rules > the `solidity` profile > evm-cortex. The D9 picks below are the values of the profile, in `agents/profiles/solidity.md`. |
 | D10 | **Questions at once or one at a time.** | Batch per stage. On an async channel, each round trip costs minutes or hours. |
+| D11 | **Which questions go to the user.** Ask the user about each open choice, or let the run decide most choices. In one afternoon, runs posted 137 questions, and only two of them needed the user. | A question goes to the user only when the choice obeys one of these rules: (1) `scope`: it removes or adds scope compared with the ask. (2) `capability`: it changes what agents can get to or do across workflows (network and web search, protected paths, secrets, allowed models, blinding). (3) `spend`: it commits spend over the budget, or a permanent or public action (a merge without standing permission, a deploy, a publication). (4) `decision`: it does not agree with a recorded D or RD row. Such a question is `user` level and names its rule. Every other question is `run` level: the host uses the recommendation at once, with no post and no pause, and records it as a decision that the run made. The route questions of step 0 and the rejection question of a critical or high finding are `run` level. A held finding is `user` level, with the rule of the finding. The budget question at the cap (#11, see RG2 in `research-workflow.md`) is `user` level, with rule `spend`. A question from an older ledger without a level counts as `user` level. |
 
 ### D9 picks
 
@@ -350,7 +360,7 @@ Each decision records a conflict between two rules, and the choice.
 | P1 | Entry point | `npm run develop` first. GitHub issues and `/develop` on Cloudflare come in phase 3. |
 | P2 | Platform | Phase 1 runs on the local platform. |
 | P3 | Branch and PR | The work goes to `factory/dev-<slug>` from the base. The host opens a draft PR through `gh`. |
-| P4 | Larger changes | The intake agent recommends a spec stage and one or two review passes, with a reason. The user can overrule both in the answers. |
+| P4 | Larger changes | The intake agent recommends a spec stage and one or two review passes, with a reason. These route questions are `run` level, so the run uses both recommendations (D11). |
 | P5 | CI-fix budget | Two rounds, then a blocker. |
 | P6 | Models | Intake, spec, planner and builders on Opus 5.5. |
 | P7 | Static rules | They gate each builder checkpoint, and they are host findings in the review loop. |

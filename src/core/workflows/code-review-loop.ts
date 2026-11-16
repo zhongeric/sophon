@@ -6,7 +6,7 @@ import { step, type Ledger } from '../ledger.ts'
 import type { AgentStore, Checker, Files, Frozen, Guides, Repo } from '../platform.ts'
 import { isLight, profilesById, staticFindings, triage, triageLine, type Triage } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
-import { asker, decisions, type Answer, type Channel } from '../questions.ts'
+import { asker, decisions, splitDecisions, type Answer, type Channel } from '../questions.ts'
 import { reviewRoles, type ModelChoice } from '../roles.ts'
 import { askQuestions, intent, light, patch, review, splitReview, type LightLog, type PatchLog, type PatchOutcome, type Range, type RunContext, type Verdict } from '../steps.ts'
 import { StopError } from '../stop.ts'
@@ -190,7 +190,8 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       assignIds(staticFindings(await repo.diff(range.from, range.to), await repo.changedFiles(range.from, range.to), active), 'rules', prefix),
     )
 
-  // A patch agent may reject a finding with a reason. A rejected critical or high finding goes to the user.
+  // A patch agent may reject a finding with a reason. The rejection of a critical or high finding is a run question (D11):
+  // the run does not accept it, so the criterion fails without a pause.
   const rejections: { id: string; accepted: boolean }[] = []
   const runPatch = async <Log extends PatchLog>(name: string, result: GateResult, run: () => Promise<PatchOutcome<Log>>): Promise<PatchOutcome<Log>> => {
     const outcome = await step(ledger, name, run)
@@ -350,9 +351,10 @@ function evaluate(run: { gateLog: boolean; checks: CheckResult[]; verdict: Verdi
     {
       name: 'No critical or high finding left unapplied without your OK',
       ok: refused.length === 0,
+      // The run decides a rejection (D11). Only a ledger from before D11 can have a rejection that the user accepted.
       detail:
         refused.length > 0
-          ? `you did not accept the rejection of ${refused.map((rejection) => rejection.id).join(', ')}`
+          ? `the rejection of ${refused.map((rejection) => rejection.id).join(', ')} is not accepted`
           : run.rejections.length > 0
             ? `you accepted the rejection of ${run.rejections.map((rejection) => rejection.id).join(', ')}`
             : 'the patch agents applied every critical and high finding',
@@ -417,9 +419,13 @@ function renderReport(run: ReportInput): string {
     ...run.checks.map((check) => `- ${check.name}: ${check.status}${check.command ? ` (\`${check.command}\`)` : ''}`),
     '',
     ...(run.verdict ? ['## Intent', '', run.verdict.summary, ...run.verdict.gaps.map((gap) => `- gap: ${gap}`), ''] : []),
-    '## Your decisions',
-    '',
-    ...(run.decisions.length > 0 ? run.decisions.map((answer) => `- ${answer.question} **${answer.answer}**${answer.recommended ? ' (recommended)' : ''}`) : ['- none asked']),
-    '',
+    ...decisionSections(run.decisions),
   ].join('\n')
+}
+
+/** The decisions of the user, then the decisions that the run made (D11), as report sections. */
+export function decisionSections(answers: Answer[]): string[] {
+  const { user, run } = splitDecisions(answers)
+  const line = (answer: Answer) => `- ${answer.question} **${answer.answer}**${answer.recommended ? ' (recommended)' : ''}`
+  return ['## Your decisions', '', ...(user.length > 0 ? user.map(line) : ['- none asked']), '', '## Decisions the run made', '', ...(run.length > 0 ? run.map(line) : ['- none']), '']
 }

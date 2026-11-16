@@ -8,7 +8,7 @@ import { PausedError } from '../src/core/questions.ts'
 import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
 import { fileLedger } from '../src/node/ledger.ts'
-import { developScript, developRepo, fakePulls, runDevelop, sources } from './support/develop.ts'
+import { developInput, developScript, developRepo, fakePulls, runDevelop, scopeQuestion, sources } from './support/develop.ts'
 import { memoryChannel } from './support/fixture.ts'
 import { probeNetwork, scriptedDispatch, webSearch, type Turn } from './support/scripted-model.ts'
 
@@ -24,9 +24,8 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.equal(result.status, 'ready', result.report)
   assert.equal(result.branch, 'factory/dev-add-sub-mul')
 
-  // The user confirmed the ask and the route in one batch before any plan.
-  assert.deepEqual(posted.map((entry) => entry.batch), ['intake'])
-  assert.deepEqual(posted[0]!.questions.map((question) => question.question.split('?')[0]), ['Is this the ask', 'Write a spec before the plan', 'How many review loop passes'])
+  // The intake agent raised no user question, so the run took its recommendations for the ask and the route, and asked nothing (D11).
+  assert.deepEqual(posted, [])
   const first = (role: string) => turns.findIndex((turn) => turn.role === role)
   assert.ok(first('intake') < first('planner') && first('planner') < first('builder'))
   // The development and review roles have no egress: the cell fetch and the shell of a builder fail, and no model request
@@ -58,32 +57,52 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   // The review loop reviewed the frozen package: the ask, the decisions and the plan.
   assert.ok(turns.some((turn) => turn.role === 'intent'))
   const review = JSON.parse(readFileSync(join(result.dir, '..', 'dev-review-1', 'state.json'), 'utf8')) as { input: { ask: string } }
-  assert.match(review.input.ask, /^Add sub and mul next to add, with tests\.\n\n## Decisions of the user\n\n- Is this the ask\?[\s\S]*## Non-goals\n\n- No division/)
+  assert.match(review.input.ask, /^Add sub and mul next to add, with tests\.\n\n## Decisions the run made\n\n- Is this the ask\?[\s\S]*## Non-goals\n\n- No division/)
+  assert.match(github.state.opened[0]!.body, /# Decisions the run made\n\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\*/)
+  assert.doesNotMatch(github.state.opened[0]!.body, /# Decisions of the user/)
 
   assert.match(result.report, /^# Development run: READY/)
   assert.match(result.report, /^- \[x\] Every task built: sub, mul, tests$/m)
   assert.doesNotMatch(result.report, /- \[ \]/)
   assert.match(result.report, /- Pass 1: PASS, `TRIAGE path=full reason=not-docs-or-tests/)
+  assert.match(result.report, /^- \[x\] Ask confirmed: the run took the recommendations of the intake agent/m)
+  assert.match(result.report, /## Your decisions\n\n- none asked\n\n## Decisions the run made\n\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\* \(recommended\)/)
   assert.equal(github.state.comments.length, 1)
 })
 
-test('develop: a run without intake answers pauses, and resumes without asking again or repeating the intake', { timeout: 120_000 }, async () => {
+test('develop: a user question of the intake agent pauses the run, and the run resumes without asking again or repeating the intake', { timeout: 120_000 }, async () => {
   const { repo } = developRepo()
   const dir = runsDir()
   const { channel, posted, replies } = memoryChannel({ intake: null })
+  const script = developScript({ askScope: true })
   const first: Turn[] = []
   await assert.rejects(
-    runDevelop(repo, dir, { channel, dispatch: scriptedDispatch(developScript(), first), pulls: fakePulls().pulls, runId: 'pause' }),
+    runDevelop(repo, dir, { channel, dispatch: scriptedDispatch(script, first), pulls: fakePulls().pulls, runId: 'pause' }),
     (error: unknown) => error instanceof PausedError,
   )
   assert.ok(!first.some((turn) => turn.role === 'planner'))
+  // Only the user question goes to the user: the route questions are run questions.
+  assert.deepEqual(posted.map((entry) => entry.batch), ['intake'])
+  assert.deepEqual(posted[0]!.questions.map((question) => [question.id, question.question, question.level, question.rule]), [['Q1', scopeQuestion.question, 'user', 'scope']])
 
   replies.intake = '/answer recommended'
   const second: Turn[] = []
-  const result = await runDevelop(repo, dir, { channel, dispatch: scriptedDispatch(developScript(), second), pulls: fakePulls().pulls, runId: 'pause' })
+  const result = await runDevelop(repo, dir, { channel, dispatch: scriptedDispatch(script, second), pulls: fakePulls().pulls, runId: 'pause' })
   assert.equal(result.status, 'ready', result.report)
   assert.equal(posted.length, 1)
   assert.ok(!second.some((turn) => turn.role === 'intake'))
+  assert.match(result.report, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
+  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n\n## Decisions the run made\n\n- Is this the ask\?/)
+})
+
+test('develop: a hotfix takes the recommendation of every question, and marks only the run questions as decided by the run', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const { channel, posted } = memoryChannel({ intake: null })
+  const input = { ...(await developInput(repo, 'hotfix')), hotfix: true }
+  const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(developScript({ askScope: true, blockSub: true }), []), input, pulls: fakePulls().pulls, runId: 'hotfix' })
+  assert.equal(result.status, 'blocked', result.report)
+  assert.deepEqual(posted, [])
+  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n\n## Decisions the run made\n\n- Is this the ask\?/)
 })
 
 test('develop: CI that another branch ran on the same commit does not count until the push gets CI of its own', { timeout: 120_000 }, async () => {

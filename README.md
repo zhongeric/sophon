@@ -76,7 +76,7 @@ resumes the run by itself.
 | Agents stay in their workspace | The agent shell is nanocode's in-process virtual bash with its own environment. Cell `fetch`, shell network and web search are off. Paths cannot leave the tree, `.git` is hidden, and writes never follow a symlink. |
 | Test scope; one test run at a time | `run_tests` accepts only committed test files, runs the repository's configured command, and runs one command at a time across the host. |
 | Finding schema and evidence rule | `submit_findings` rejects a finding with a missing field, a location that is not a real file and line, or a quote that is not in the file near that line (or in the diff). The agent sees the reasons and can correct the call. |
-| Findings filter | The evidence check is the noise filter. Every finding that passes it goes to the patch agent, which applies it or rejects it with a reason. A rejected critical or high finding becomes a question to you, and the run passes only if you accept the rejection. |
+| Findings filter | The evidence check is the noise filter. Every finding that passes it goes to the patch agent, which applies it or rejects it with a reason. A rejected critical or high finding is not a question to you: the run does not accept the rejection, and the run fails (D11). |
 | Patch: log why for each item | `submit_patch_log` must list every finding ID one time, in applied or skipped. A patch agent beside others can also list a finding in deferred, and the agent after them must apply or skip it. |
 | Parallel patch agents do not collide | The host refuses an agent's writes to the files of another agent, and to a file that another agent wrote first (EACCES). The split and the first writes are in the ledger, so a resumed step keeps them. |
 | Light or full loop | Profile rules decide, not an agent. The light reviewer cannot write outside docs and tests. |
@@ -85,7 +85,7 @@ resumes the run by itself.
 | Model swap across passes | The run stops before any work if a step 2 agent uses the same family as its step 1 counterpart. The gate log records the families. |
 | Allowed models | Fable 5.2, Opus 5.5 and Sol by default. `ALLOWED_MODELS` (model IDs, comma-separated) replaces the list. The run stops before any work on another model. |
 | No API keys in prompts or files | Keys stay in the host's dispatch. They go only to their own provider's origin. Check commands get an allowlisted environment, never the host's keys. |
-| Open questions | A read-only questions agent runs beside the step 1 reviewers and posts its questions at once. A reviewer marks a finding that depends on your decision, and the gate holds it until you answer. Patch agents, later reviewers and the intent check read your answers. |
+| Open questions | A read-only questions agent runs beside the step 1 reviewers. The host posts its `user` questions at once and uses the recommendation for the others (D11). A reviewer marks a finding that depends on your decision, with its D11 rule, and the gate holds it until you answer. Patch agents, later reviewers and the intent check read your answers and the decisions that the run made. |
 | Missing key or input: stop | The run stops before it freezes anything. |
 | Ready PR, never draft | `--ship` pushes the fixes to the PR branch (no force) and marks the PR ready, only on PASS. |
 | A PR cannot change its own rails | On Cloudflare, the config (the profile defaults and `.agent-factory.json`) comes from the base branch. Locally, it comes from your working copy. |
@@ -230,6 +230,11 @@ npm run review -- --repo ~/src/app --pr 123 --full          # the full loop, als
 
 ### Your answers
 
+Only `user` questions come to you. A question is `user` level when its choice changes the scope of the ask, changes
+what agents can get to or do (capability), commits spend or a public action, or does not agree with a recorded
+decision (D11 in the design). For every other question, the run uses the recommendation at once, with no pause. The
+report lists these under "Decisions the run made", apart from "Your decisions".
+
 Questions go to the PR as a comment with `--pr`, to the terminal when it is interactive, and otherwise to
 `runs/<run>/questions-<batch>.md`. Reply with `/answer` and one line per question (`Q1: b`, or your own words);
 `/answer recommended` takes every recommendation. Only replies from `answerers` in the config count (default: your
@@ -260,8 +265,9 @@ The light loop's model is `light`. `ALLOWED_MODELS` in the environment replaces 
 ## Development workflow
 
 ```
-intake ─▶ your answers confirm the ask and the route (spec or not, one or two review passes)
-       ─▶ spec, for a larger change ─▶ your answers to its decisions
+intake ─▶ the run uses the recommended route (spec or not, one or two review passes)
+          and waits for your answers only when intake asks a user question (D11)
+       ─▶ spec, for a larger change ─▶ your answers to its user decisions, if any
        ─▶ plan: smallest change, goals, non-goals, done checks, profile sections, tasks
        ─▶ build: one builder for each task, each on its own branch; a wave of tasks with separate files
           runs at the same time; the host merges each wave into factory/dev-<slug>
@@ -274,7 +280,7 @@ Intake, spec, planner and builders run on Opus 5.5. The review loop uses its own
 
 | Rule | How the host enforces it |
 | --- | --- |
-| No plan and no code before you confirm the ask | The intake questions and the host's route questions are one batch. The run waits for your answer. `--hotfix` takes every recommendation without asking. |
+| No plan and no code before the ask is confirmed | The intake questions and the host's route questions are one batch. The route questions are `run` level, so the run uses the recommendations of the intake agent. The run waits for your answer only when the intake agent asks a `user` question, for example about the scope of the ask (D11). `--hotfix` takes every recommendation without asking. |
 | One planner, four parts | `submit_plan` refuses a plan with an empty part, with no done check that has a command, without the sections of its profiles (Solidity: interfaces, deployment sequence), or with tasks that depend on unknown tasks or on each other. |
 | A builder stays in its task | A builder can write only the files and directories of its task, never protected paths. Parallel builders work in separate worktrees, so one builder's half-done work never breaks another's checks. |
 | Static rules and forbidden paths gate every commit | `checkpoint` checks the added lines and the paths before it commits, and returns each problem to the builder. Build output, logs and `.env` files never enter the history. |

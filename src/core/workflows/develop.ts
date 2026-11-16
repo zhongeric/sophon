@@ -7,10 +7,10 @@ import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type 
 import type { AgentStore, Branch, Branches, Checker, Files, Guides, PullRequests } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
-import { asker, commentLimit, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
+import { asker, commentLimit, decisions, PausedError, splitDecisions, type Answer, type Channel, type Question } from '../questions.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
-import { checkAllowedModels, checkFamilySwap, defaultAllowedModels, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
+import { checkAllowedModels, checkFamilySwap, decisionSections, defaultAllowedModels, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
 
 export type DevelopModels = Record<'intake' | 'spec' | 'planner' | 'builder', ModelChoice>
 
@@ -91,7 +91,7 @@ export function checkDevelopModels(models: DevelopModels, allowed = defaultAllow
 
 /**
  * The development workflow, steps 0 to 9, with its order and hard rules in code:
- * intake and the user's confirmation, a spec for a larger change, one plan, builders for the plan's tasks (in
+ * intake and the confirmation of the ask, a spec for a larger change, one plan, builders for the plan's tasks (in
  * parallel when their files do not overlap, each on its own branch), a draft PR, CI with a fix budget, the code
  * review loop once or twice, CI again, and a ready PR only when every criterion holds. Every step is in the
  * ledger, so the same run ID resumes after a pause or a crash without repeating finished steps.
@@ -136,14 +136,15 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
     return { status, pr: state.pr, branch: state.branch, report, resume: resumable ? note : null }
   }
 
-  // 0. Intake: no plan and no code until the user confirms the ask.
+  // 0. Intake: no plan and no code before the ask is confirmed. The route questions are run questions (D11), so the run
+  // takes the recommendations of the intake agent. The run asks the user only when the intake agent raises a user question.
   const intook = await step(ledger, 'intake', () => intake(context, 'intake', models.intake, view))
   state.intake = intook
   const routed = route(intook, await ask('intake', [...intook.questions, ...routeQuestions(intook)]))
   state.route = routed
   if (routed.stop) return finish('stopped', [], 'You stopped the run at intake.')
 
-  // 1. Spec, for a larger change. Its decisions are one batch of questions, so the user can overrule them.
+  // 1. Spec, for a larger change. Its decisions are one batch of questions. Only its user questions go to the user (D11).
   let spec: string | null = null
   if (routed.spec) {
     const written = await step(ledger, 'spec', () => writeSpec(context, 'spec', models.spec, view))
@@ -277,7 +278,7 @@ export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<D
   const solidity = active.find((profile) => profile.id === 'solidity')
   const audit = solidity !== undefined && changed.some((path) => solidity.files.test(path))
   const criteria: Criterion[] = [
-    { name: 'Ask confirmed', ok: true, detail: input.hotfix ? 'hotfix: the host took every recommendation' : 'you answered the intake questions' },
+    { name: 'Ask confirmed', ok: true, detail: confirmation(input, intook.questions) },
     { name: 'Plan with its four parts', ok: true, detail: `${planned.tasks.length} tasks in ${scheduled.length} waves` },
     { name: 'Every task built', ok: true, detail: state.built.map((entry) => entry.task.id).join(', ') },
     {
@@ -331,6 +332,13 @@ async function watchCi(ledger: Ledger, pulls: PullRequests, timing: DevelopDeps[
   }
 }
 
+/** How the ask was confirmed. A question from a ledger before D11 has no level, so it counts as a user question. */
+function confirmation(input: DevelopInput, intakeQuestions: Question[]): string {
+  if (input.hotfix) return 'hotfix: the host took every recommendation'
+  if (intakeQuestions.some((question) => question.level !== 'run')) return 'you answered the intake questions'
+  return 'the run took the recommendations of the intake agent (D11)'
+}
+
 const noCi = (sha: string) => `No CI ran on ${sha.slice(0, 12)}. Add CI that runs on pull requests, push again, and resume the run.`
 
 function buildPrompt(task: PlanTask): string {
@@ -375,6 +383,8 @@ function renderTask(task: PlanTask, built: { task: PlanTask; log: BuildLog }[]):
 
 /** The PR description: the frozen package, written by the host (G7). */
 function prBody(input: DevelopInput, answers: Answer[], planText: string): string {
+  const { user, run } = splitDecisions(answers)
+  const section = (title: string, list: Answer[]) => (list.length > 0 ? [title, '', ...list.map((answer) => `- ${answer.question} **${answer.answer}**`), ''] : [])
   return [
     `agent-factory run \`${input.runId}\` (${input.source}) opened this draft PR. It stays draft until the review loop passes and CI is green.`,
     '',
@@ -382,7 +392,8 @@ function prBody(input: DevelopInput, answers: Answer[], planText: string): strin
     '',
     ...input.ask.trim().split('\n').map((line) => `> ${line}`),
     '',
-    ...(answers.length > 0 ? ['# Decisions of the user', '', ...answers.map((answer) => `- ${answer.question} **${answer.answer}**`), ''] : []),
+    ...section('# Decisions of the user', user),
+    ...section('# Decisions the run made', run),
     planText,
   ].join('\n')
 }
@@ -440,9 +451,6 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
           '',
         ]
       : []),
-    '## Your decisions',
-    '',
-    ...(answers.length > 0 ? answers.map((answer) => `- ${answer.question} **${answer.answer}**${answer.recommended ? ' (recommended)' : ''}`) : ['- none asked']),
-    '',
+    ...decisionSections(answers),
   ].join('\n')
 }

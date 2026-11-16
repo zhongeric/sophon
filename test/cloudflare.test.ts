@@ -179,7 +179,8 @@ test('on Cloudflare, deleted source files and the old paths of renamed source fi
 
 test('on Cloudflare, a missing permission stops the run at once, and resume continues it from the ledger', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo()
-  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  // The open question is a run question, so the run asks nothing on the PR (D11).
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ runQuestion: true, tests: false }) })
   mock.state.ciStatus = 403
   const worker = await startWorker(vars(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}`
@@ -187,8 +188,6 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
   const modelCalls = () => mock.state.requests.filter((route) => route.startsWith('POST /v1/')).length
   try {
     await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin, method: 'POST' })
-    await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
-    mock.comment('maintainer', '/answer recommended')
     const stopped = await until(() => mock.state.comments.find((entry) => entry.body.includes('stopped run')), 120_000, describe)
     assert.match(stopped.body, /HTTP 403.* Check the permissions of GITHUB_TOKEN\. .*npm run remote -- resume acme\/app#7/)
     assert.equal(mock.state.requests.filter((route) => route.endsWith('/actions/runs')).length, 1)
@@ -201,6 +200,8 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
     assert.deepEqual(await (await resume(7)).json(), { reason: 'started the run again from its ledger after the error', resumed: true, state: 'error' })
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/)
+    assert.ok(!mock.state.comments.some((entry) => entry.body.includes('agent-factory:questions')), describe())
+    assert.match(done.body, /## Decisions the run made\n\n- May sub return a negative number\? \*\*Yes, return -2\*\*/)
     // Only the intent check was left: the reviewers and patch agents did not run again.
     assert.ok(modelCalls() - calls <= 2, `${modelCalls() - calls} model calls after resume`)
 
@@ -232,13 +233,11 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     const issueComment = { action: 'created', comment: { body: '/develop', user: { login: 'maintainer' } }, issue: { number: 5 }, repository }
     const started = (await (await sendWebhook(worker.url, secret, 'issue_comment', issueComment)).json()) as { run: string; started: boolean }
     assert.equal(started.started, true)
-    const asked = await until(() => on(5).find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
-    assert.match(asked.body, /Is this the ask\?/)
-    mock.comment('maintainer', '/answer recommended', 5)
-    await sendWebhook(worker.url, secret, 'issue_comment', { ...issueComment, comment: { body: '/answer recommended', user: { login: 'maintainer' } } })
-
+    // The intake agent raised no user question, so the run takes its recommendations and does not ask on the issue (D11).
     const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
     assert.match(done.body, /^# Development run: READY/, done.body)
+    assert.ok(!on(5).some((entry) => entry.body.includes('agent-factory:questions')), describe())
+    assert.match(done.body, /## Decisions the run made\n\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\*/)
     const [number, pull] = [...mock.state.pulls].find(([, entry]) => entry.head === 'factory/dev-add-sub-mul')!
     assert.equal(pull.draft, false)
     assert.match(pull.body, /# Ask\n\n> Add sub and mul/)
