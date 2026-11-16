@@ -99,6 +99,7 @@ The STE dictionary is optional: see [agents/guides/ste/README.md](agents/guides/
 npm run review -- --repo ~/src/app --pr 123     # review a PR, add --ship to push the fixes and mark it ready on PASS
 npm run review -- --repo ~/src/app --base main --ask-file ask.md
 npm run develop -- --repo ~/src/app --ask "Add a fee switch, off by default"
+node --disable-warning=ExperimentalWarning src/node/research.ts --repo ~/src/notebook --program-file program.md
 npm run review -- --run <id>                     # resume a run, also with npm run develop
 ```
 
