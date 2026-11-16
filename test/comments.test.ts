@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { developAnnouncement, reviewAnnouncement } from '../src/cloudflare/announcements.ts'
 import { renderPlan } from '../src/core/plan.ts'
-import { render, type Answer, type Question } from '../src/core/questions.ts'
+import { commentLimit, render, type Answer, type Question } from '../src/core/questions.ts'
 import { defaultModels } from '../src/core/workflows/code-review-loop.ts'
-import { defaultDevelopModels, prBody, type DevelopInput } from '../src/core/workflows/develop.ts'
+import { cutReport, defaultDevelopModels, prBody, type DevelopInput } from '../src/core/workflows/develop.ts'
 import { plan } from './support/develop.ts'
 import { visible, visibleLines, visibleWords } from './support/visible.ts'
 
@@ -50,6 +50,41 @@ test('the PR body without an issue has no Closes line', () => {
   const text = body(plan.smallest_change)
   assert.doesNotMatch(text, /Closes/)
   assert.equal(visible(text).trim(), plan.smallest_change)
+})
+
+test('the PR body keeps the line breaks of a long smallest change that it cuts', () => {
+  const paragraph = Array.from({ length: 100 }, (_, index) => `word${index}`).join(' ')
+  const smallest = `${paragraph}\n\n- first item\n- second item\n\n${paragraph}`
+  const shown = visible(prBody(input, [], '# Plan', smallest)).trim()
+  assert.match(shown, /^word0 [\s\S]* word99\n\n- first item\n- second item\n\nword0 [\s\S]* …$/)
+  assert.equal(shown.split(/\s+/).length, 141)
+})
+
+test('the PR body closes a code fence at the cutoff before the details block', () => {
+  for (const fence of ['```', '~~~', '````', '~~~~~']) {
+    const start = `Add this example.\n\n- First item\n- Second item\n\n   ${fence}text\n${fence.slice(1)}\n${fence}not-a-close\n`
+    const smallest = `${start}${'word '.repeat(200)}\n${fence}`
+    const text = body(smallest, 12)
+    const shown = text.slice(0, text.indexOf('<details>'))
+    assert.ok(shown.startsWith(`Closes #12\n\n${start}`))
+    // Check the fence directly because visible() does not parse Markdown code blocks.
+    assert.ok(shown.endsWith(` …\n${fence}\n\n`), shown)
+    assert.ok(visibleWords(text) <= 150)
+    assert.ok(details(text).includes(smallest))
+  }
+})
+
+test('the PR body keeps complete code fences unchanged', () => {
+  const smallest = 'Add this example.\n\n```text\nexample\n```\n\n~~~text\nexample\n~~~~\n\nKeep this paragraph.'
+  assert.equal(visible(body(smallest)).trim(), smallest)
+})
+
+test('a cut report closes its open details block, so that the cut note stays visible', () => {
+  const report = `# Development run: READY\n\n<details><summary>Run details</summary>\n\n${'x'.repeat(commentLimit)}\n\n</details>`
+  const cut = cutReport(report, '(cut: see report.md)')
+  assert.ok(cut.endsWith('</details>\n\n(cut: see report.md)'))
+  assert.equal(visible(cut).trim(), '# Development run: READY\n\n\n\n(cut: see report.md)')
+  assert.equal(cutReport('short', '(cut)'), 'short')
 })
 
 test('the question comment has the marker, one line about how to answer, then every question', () => {

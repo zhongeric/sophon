@@ -184,7 +184,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     deps.files.write('report.md', report)
     // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
     if (state.pr && ledger.get('commented') !== report) {
-      await pulls.comment(state.pr.number, report.length > commentLimit ? `${report.slice(0, commentLimit)}\n\n(cut: see report.md of run ${input.runId})` : report)
+      await pulls.comment(state.pr.number, cutReport(report, `(cut: see report.md of run ${input.runId})`))
       ledger.put('commented', report)
     }
     ledger.put('result', { status, pr: state.pr, branch: state.branch, merge })
@@ -490,16 +490,32 @@ function renderTask(task: PlanTask, built: { task: PlanTask; log: BuildLog }[]):
 /** The PR description shows at most this many words of the smallest change, so that it stays short for any plan. */
 const prWords = 140
 
+function closeFence(markdown: string): string {
+  let fence = ''
+  for (const line of markdown.split('\n')) {
+    if (fence) {
+      const close = /^ {0,3}(`+|~+)[ \t]*$/.exec(line)?.[1]
+      if (close && close[0] === fence[0] && close.length >= fence.length) fence = ''
+    } else {
+      fence = /^ {0,3}(`{3,}(?!.*`)|~{3,})/.exec(line)?.[1] ?? ''
+    }
+  }
+  return fence ? `${markdown}\n${fence}` : markdown
+}
+
 /**
  * The PR description, written by the host (G7). Only `Closes #<issue>` and the smallest change are visible. The frozen
  * package (the run, the ask, the decisions and the plan) is in one collapsed block.
  */
 export function prBody(input: DevelopInput, answers: Answer[], planText: string, smallestChange: string): string {
-  const words = smallestChange.trim().split(/\s+/)
-  const shown = words.length > prWords ? `${words.slice(0, prWords).join(' ')} …` : smallestChange.trim()
+  const trimmed = smallestChange.trim()
+  // Cut at the start of the first word over the limit, so that the line breaks of the shown words stay.
+  const over = [...trimmed.matchAll(/\S+/g)][prWords]
+  const shown = over ? `${trimmed.slice(0, over.index).trimEnd()} …` : trimmed
   return [
     ...(input.issue ? [`Closes #${input.issue}`, ''] : []),
-    shown,
+    // Close an open code fence so that GitHub does not show the details block as code.
+    closeFence(shown),
     '',
     '<details><summary>Run, ask, decisions and plan</summary>',
     '',
@@ -514,6 +530,17 @@ export function prBody(input: DevelopInput, answers: Answer[], planText: string,
     '',
     '</details>',
   ].join('\n')
+}
+
+/**
+ * Cuts a report to the comment limit. The cut can remove the closing `</details>` tag, so this function closes the block
+ * before the note. Thus the note stays visible.
+ */
+export function cutReport(report: string, note: string): string {
+  if (report.length <= commentLimit) return report
+  const head = report.slice(0, commentLimit)
+  const open = head.lastIndexOf('<details>') > head.lastIndexOf('</details>')
+  return `${head}${open ? '\n\n</details>' : ''}\n\n${note}`
 }
 
 type ReportState = {
@@ -542,7 +569,6 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
   const triage = (report: string) => /^- Triage: (.*)$/m.exec(report)?.[1] ?? ''
   const failed = criteria.filter((criterion) => !criterion.ok)
   const criterionLine = (criterion: Criterion) => `- [${criterion.ok ? 'x' : ' '}] ${criterion.name}: ${criterion.detail}`
-  // The result first: the status, the PR, the note and the failed criteria. The details are in one collapsed block.
   return [
     `# Development run: ${status.toUpperCase()}`,
     '',
