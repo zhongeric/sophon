@@ -43,6 +43,8 @@ export const sources = {
   mul: 'export function mul(a: number, b: number): number {\n  return a * b\n}\n',
   test: (product: number) =>
     `import assert from 'node:assert/strict'\nimport { test } from 'node:test'\nimport { mul } from '../src/mul.ts'\nimport { sub } from '../src/sub.ts'\n\ntest('sub and mul', () => {\n  assert.equal(sub(5, 3), 2)\n  assert.equal(mul(2, 3), ${product})\n})\n`,
+  /** The test that the tests builder submits after the refusal: it passes, but does not test mul yet. */
+  subTest: "import assert from 'node:assert/strict'\nimport { test } from 'node:test'\nimport { sub } from '../src/sub.ts'\n\ntest('sub', () => {\n  assert.equal(sub(5, 3), 2)\n})\n",
 }
 
 const intake = { title: 'Add sub and mul', summary: 'Adds sub() and mul() next to add(), with tests.', slug: 'add-sub-mul', larger: false, passes: 1, reason: 'Two small functions.', questions: [] }
@@ -61,19 +63,20 @@ export const plan = {
 const log = (summary: string, path: string, tests: string[] = []) => `await tools.submit_build_log(${JSON.stringify({ summary, changes: [{ path, why: summary }], tests, blocked: '' })})`
 
 const wrongProduct = {
-  location: 'test/ops.test.ts:8',
-  title: 'Expect 6 from mul(2, 3)',
-  trigger: 'the test runs mul(2, 3)',
-  impact: 'the test fails on correct code',
+  location: 'test/ops.test.ts:6',
+  title: 'Test mul(2, 3)',
+  trigger: 'mul returns a wrong product',
+  impact: 'no test finds the wrong product',
   severity: 'high',
-  evidence: 'assert.equal(mul(2, 3), 5)',
-  recommendation: 'expect 6',
+  evidence: 'assert.equal(sub(5, 3), 2)',
+  recommendation: 'expect 6 from mul(2, 3)',
 }
 
 /**
  * The scripted development agents. The sub builder tries to write outside its scope, the tests builder tries to
- * commit a log file and then commits a test with a wrong expectation, and the CI fixer corrects it. Reviewers find
- * nothing, unless `reviewFix`: then the bugs reviewer finds the wrong expectation and the patch agent corrects it.
+ * commit a log file and then commits a test with a wrong expectation. The host refuses that log because the test
+ * fails, so the builder submits a test of sub only, and the CI fixer adds mul to it. Reviewers find nothing, unless
+ * `reviewFix`: then the bugs reviewer finds the missing mul test and the patch agent adds it.
  */
 export function developScript(options: { blockSub?: boolean; reviewFix?: boolean } = {}): Script {
   return ({ role, output, request }) => {
@@ -121,7 +124,10 @@ export function developScript(options: { blockSub?: boolean; reviewFix?: boolean
             `await tools.Bash({ command: 'rm /repo/test/run.log' })`,
             `await tools.Write({ file_path: '/repo/test/ops.test.ts', content: ${JSON.stringify(sources.test(5))} })`,
             `await tools.checkpoint({ message: 'test sub and mul' })`,
-            log('tests for sub and mul', 'test/ops.test.ts', ['test/ops.test.ts']),
+            `try { ${log('tests for sub and mul', 'test/ops.test.ts', ['test/ops.test.ts'])}; text('FAILING LOG ACCEPTED') } catch (error) { text('submit refused: ' + error) }`,
+            `await tools.Write({ file_path: '/repo/test/ops.test.ts', content: ${JSON.stringify(sources.subTest)} })`,
+            `await tools.checkpoint({ message: 'test sub' })`,
+            log('tests for sub', 'test/ops.test.ts', ['test/ops.test.ts']),
           ].join('\n'),
         }
       }
@@ -163,7 +169,7 @@ export function fakePulls(ci: boolean[] = [false], options: { stale?: boolean } 
       return [...(options.stale ? [old] : []), job(new Date().toISOString(), 'CI (pull_request)')]
     },
     async failureLog() {
-      return 'test/ops.test.ts: mul(2, 3): expected 5, got 6'
+      return 'test/ops.test.ts: no test of mul(2, 3)'
     },
   }
   return { pulls, state }

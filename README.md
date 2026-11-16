@@ -84,6 +84,9 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
 - `env` lists extra environment variables for the checks. `guides` mounts reference material at `/guides/<name>`.
 - `answerers` limits who can answer questions. `research` configures a research notebook
   ([spec, section 6.3](docs/specs/research-workflow.md)).
+- Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
+  file that no test imports gets the test files that have its base name as a word. A builder's `run_checks` runs
+  only the checks. The targeted tests run one time, when the builder submits its build log.
 
 The STE dictionary is optional: see [agents/guides/ste/README.md](agents/guides/ste/README.md).
 
@@ -136,6 +139,8 @@ label, starts a run, and answers take effect at once. Without it, runs poll for 
 A Durable Object holds the ledger, the repository tree and the agent sessions of each run. Alarms drive the run and
 resume it after a crash. Development runs run their checks in a Cloudflare Container that has no secrets. Commits
 and pushes go through the GitHub API.
+The object keeps the sync state of each container directory in SQL, so after a restart the next sync sends only the
+changed files and does not run the setup again.
 
 ## Layout
 

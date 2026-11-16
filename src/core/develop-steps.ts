@@ -1,7 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { runTurn, submitOnce, type AgentHost, type AgentSpec, type HostTools } from './agent.ts'
-import { callRunTests, isProtected, protectedEntries, runTestsTool, type RepoConfig } from './checks.ts'
+import { callRunTests, isProtected, protectedEntries, runTestsTool, targetedTests, type RepoConfig } from './checks.ts'
 import { checkIntake, checkPlan, checkSpec, inScope, submitIntake, submitPlan, submitSpec, type Intake, type Plan, type Spec } from './plan.ts'
 import type { Branch, Checker, Guides } from './platform.ts'
 import { staticFindings, type Profile } from './profiles.ts'
@@ -93,7 +93,9 @@ const checkpointTool: Contracts.HostTool = {
 
 const runChecksTool: Contracts.HostTool = {
   name: 'run_checks',
-  description: "Run the repository's configured checks (for example typecheck, lint, build) and its targeted tests on the files that the work changed, on the real machine. Returns each status and the end of its output.",
+  description:
+    "Run the repository's configured checks (for example typecheck, lint, build) on the files that the work changed, on the real machine. It runs no tests. Returns each status and the end of its output. " +
+    'The targeted tests run when you submit. While you work, use run_tests for the test files.',
   parameters: { type: 'object', properties: {}, additionalProperties: false },
 }
 
@@ -101,7 +103,8 @@ const submitBuildLog: Contracts.HostTool = {
   name: 'submit_build_log',
   description:
     'Submit what you built, one time, after your last checkpoint. List every file that your commits changed, with the reason. ' +
-    'When you cannot finish, say why in blocked, and the host reports it to the user. Else blocked is an empty string.',
+    'When you cannot finish, say why in blocked, and the host reports it to the user. Else blocked is an empty string. ' +
+    'When you submit, the host runs the targeted tests of the changes of the task, and refuses the log when one fails. A blocked log runs no tests.',
   parameters: {
     type: 'object',
     properties: {
@@ -129,7 +132,7 @@ export type BuildTask = {
   /** The profiles whose static rules gate each checkpoint. */
   active: Profile[]
   checker: Checker
-  /** The commit that the work started from, for the files that run_checks checks. */
+  /** The commit that the work started from, for the files that run_checks checks and the targeted tests at submit. */
   base: string
   review: Record<string, string>
   prompt: string
@@ -141,7 +144,8 @@ export type BuildTask = {
  * One builder turn. The agent can write only the files in its scope of the branch.
  * The agent commits through checkpoint, runs the checks and its tests, and submits a build log.
  * The host refuses a checkpoint that breaks a static rule or adds a forbidden path.
- * The host refuses a completed log with uncommitted work. A blocked log can report uncommitted work.
+ * The host refuses a completed log with uncommitted work, or when a targeted test of the changes since `base` fails.
+ * A blocked log can report uncommitted work, and runs no tests.
  */
 export async function build(context: DevelopContext, task: BuildTask): Promise<BuildLog> {
   const { branch, checker } = task
@@ -172,7 +176,7 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       definition: runChecksTool,
       async call() {
         const changed = [...new Set([...(await branch.changedFiles(task.base, await branch.head())), ...(await branch.pending()).changed])]
-        const results = await checker.checks(changed)
+        const results = await checker.checks(changed, { tests: false })
         return results.map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-toolOutputTailChars) }))
       },
     },
@@ -191,7 +195,20 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       if (changed.length === 0) throw new Error('no commits since the task started: checkpoint your work, or say in blocked why you cannot finish')
       const missing = changed.filter((path) => !log.changes.some((change) => change.path.replace(/^\/repo\//, '') === path))
       if (missing.length > 0) throw new Error(`list every changed file in changes: missing ${missing.join(', ')}`)
-      return log
+      const runTests = checker.tests
+      const tests = runTests ? await targetedTests(branch, context.config, await branch.changedFiles(task.base, head)) : []
+      if (!runTests || tests.length === 0) return log
+      const failed = (await runTests(tests)).filter((result) => result.status !== 'pass')
+      if (failed.length === 0) return log
+      const cause = failed.some(({ name }) => name === 'setup')
+        ? `the setup failed, so the targeted tests (${tests.join(', ')}) did not run`
+        : `the targeted tests failed (${tests.join(', ')})`
+      throw new Error(
+        [
+          `${cause}. Fix the cause, checkpoint and submit again. When you cannot fix it, submit with the reason in blocked.`,
+          ...failed.map(({ name, exit_code, output }) => `--- ${name} (exit code ${exit_code ?? 'none'}) ---\n${output.slice(-toolOutputTailChars)}`),
+        ].join('\n'),
+      )
     }),
   }
   const repo = allowFiles(guard(branch.tree, (path) => isProtected(context.config, path)), (path) => inScope(path, task.scope))
