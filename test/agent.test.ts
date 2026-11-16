@@ -22,6 +22,29 @@ const submitNote: Contracts.HostTool = {
   parameters: { type: 'object', properties: { note: { type: 'string' } }, required: ['note'], additionalProperties: false },
 }
 
+test('a turn whose prompt changed since it started, for example after a deploy, resumes with its recorded prompt', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'factory-agent-'))
+  const turns: Turn[] = []
+  const dispatch = scriptedDispatch(() => ({ text: 'done' }), turns)
+  const host = (): AgentHost => ({ module, store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')), ledger: fileLedger(join(dir, 'state.json')), credentials, dispatch, log: () => {} })
+  const spec = async (): Promise<AgentSpec> => ({
+    id: 'note',
+    provider: 'claude',
+    model: 'claude-opus-5-5',
+    instructions: 'Agent role: note',
+    workspace: await createWorkspace({ repo: MemoryFileSystem.create(), review: {} }),
+    tools: {},
+  })
+  const first = await openAgent(await spec(), host())
+  assert.equal((await first.ask('task', 'Write a note.\n- Decisions of the user: /review/decisions.md')).status, 'completed')
+  await first.close()
+  const second = await openAgent(await spec(), host())
+  const report = await second.ask('task', 'Write a note.\n- Decisions: /review/decisions.md')
+  await second.close()
+  assert.equal(report.status, 'completed')
+  assert.equal(turns.length, 1)
+})
+
 test('a turn that failed on a model error asks again under a new request ID when the run resumes', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'factory-agent-'))
   const turns: Turn[] = []
