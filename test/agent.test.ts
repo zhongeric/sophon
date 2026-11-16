@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import type { Contracts } from 'nanocode-ts'
+import { AgentRuntime, type Contracts } from 'nanocode-ts'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import { openAgent, runTurn, submitOnce, type AgentHost, type AgentSpec } from '../src/core/agent.ts'
 import { runLock, type Egress } from '../src/core/egress.ts'
@@ -21,48 +21,6 @@ const submitNote: Contracts.HostTool = {
   description: 'Submit the note one time.',
   parameters: { type: 'object', properties: { note: { type: 'string' } }, required: ['note'], additionalProperties: false },
 }
-
-test('a turn that failed on a model error asks again under a new request ID when the run resumes', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'factory-agent-'))
-  const turns: Turn[] = []
-  const scripted = scriptedDispatch((turn) => (turn.output === null ? { cell: "await tools.submit_note({ note: 'done' }); text('submitted')" } : { text: 'done' }), turns)
-  let credit = false
-  const dispatch: Contracts.RuntimeOptions['dispatch'] = async (...args) =>
-    credit
-      ? scripted(...args)
-      : new Response(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Your credit balance is too low' } }), {
-          headers: { 'content-type': 'application/json' },
-          status: 400,
-        })
-  // Each host reads the ledger and the journals from disk, as a resumed run does.
-  const host = (): AgentHost => ({
-    module,
-    store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
-    ledger: fileLedger(join(dir, 'state.json')),
-    credentials,
-    dispatch,
-    log: () => {},
-  })
-  const spec = async (on: AgentHost): Promise<AgentSpec> => ({
-    id: 'note',
-    provider: 'claude',
-    model: 'claude-opus-5-5',
-    instructions: 'Agent role: note',
-    workspace: await createWorkspace({ repo: MemoryFileSystem.create(), review: {} }),
-    tools: submitOnce(on, 'output:note', submitNote, async (input) => input),
-  })
-
-  const first = host()
-  await assert.rejects(runTurn(first, await spec(first), 'Write a note.', 'submit_note'), /note: turn failed/)
-  assert.equal(turns.length, 0)
-
-  credit = true
-  const second = host()
-  assert.deepEqual(await runTurn(second, await spec(second), 'Write a note.', 'submit_note'), { note: 'done' })
-  assert.ok(turns.length > 0)
-  assert.match(turns[0]!.request, /Your last turn stopped with an error/)
-  assert.equal(second.ledger.get('retries:note:task'), 1)
-})
 
 /** Two hosts on the same files, as a run and its resumed run. Each logs to `lines`, and each submit_note call counts. */
 function resumeSetup() {
@@ -92,7 +50,31 @@ function resumeSetup() {
   return { host, spec, changed, submits: () => submits }
 }
 
-const noteScript: Script = (turn) => (turn.output === null ? { cell: "await tools.submit_note({ note: 'done' }); text('submitted')" } : { text: 'done' })
+test('a turn that failed on a model error asks again under a new request ID when the run resumes', async () => {
+  const run = resumeSetup()
+  const turns: Turn[] = []
+  const scripted = scriptedDispatch((turn) => (turn.output === null ? { cell: "await tools.submit_note({ note: 'done' }); text('submitted')" } : { text: 'done' }), turns)
+  let credit = false
+  const dispatch: Contracts.RuntimeOptions['dispatch'] = async (...args) =>
+    credit
+      ? scripted(...args)
+      : new Response(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Your credit balance is too low' } }), {
+          headers: { 'content-type': 'application/json' },
+          status: 400,
+        })
+
+  const first = run.host(dispatch)
+  await assert.rejects(runTurn(first, await run.spec(first), 'Write a note.', 'submit_note'), /note: turn failed/)
+  assert.equal(turns.length, 0)
+
+  credit = true
+  const second = run.host(dispatch)
+  assert.deepEqual(await runTurn(second, await run.spec(second), 'Write a note.', 'submit_note'), { note: 'done' })
+  assert.ok(turns.length > 0)
+  assert.match(turns[0]!.request, /Your last turn stopped with an error/)
+  assert.equal(second.ledger.get('retries:note:task'), 1)
+})
+
 const changedLine = 'note: the prompt of turn task changed, so the turn continues with the prompt of its journal'
 
 test('a resumed ask with a changed prompt drives the pending journal turn without a new request for its finished cell', async () => {
@@ -148,7 +130,7 @@ test('a resumed ask with a changed prompt drives the pending journal turn withou
 test('a resumed ask with a changed prompt returns the report of the finished journal turn with no model request', async () => {
   const run = resumeSetup()
   const turns: Turn[] = []
-  const dispatch = scriptedDispatch(noteScript, turns)
+  const dispatch = scriptedDispatch((turn) => (turn.output === null ? { cell: "await tools.submit_note({ note: 'done' }); text('submitted')" } : { text: 'done' }), turns)
   const first = run.host(dispatch)
   const firstAgent = await openAgent(await run.spec(first), first)
   const finished = await firstAgent.ask('task', 'Write note A.')
@@ -166,6 +148,31 @@ test('a resumed ask with a changed prompt returns the report of the finished jou
   assert.equal(turns.length, requests)
   assert.equal(run.submits(), 1)
   assert.deepEqual(run.changed(), [changedLine])
+})
+
+test('a resumed ask with a changed prompt still fails when the journal has no turn for the request ID', async (t) => {
+  const run = resumeSetup()
+  const dispatch = scriptedDispatch((turn) => (turn.output === null ? { cell: "await tools.submit_note({ note: 'done' }); text('submitted')" } : { text: 'done' }), [])
+  const first = run.host(dispatch)
+  const firstAgent = await openAgent(await run.spec(first), first)
+  assert.equal((await firstAgent.ask('task', 'Write note A.')).status, 'completed')
+  await firstAgent.close()
+
+  // The submit of the resumed runtime gets a conflict from the journal, but its turn view is empty.
+  const instantiate = AgentRuntime.instantiate.bind(AgentRuntime)
+  t.mock.method(AgentRuntime, 'instantiate', async (...args: Parameters<typeof instantiate>) => {
+    const runtime = await instantiate(...args)
+    t.mock.method(runtime, 'turn', async () => null)
+    return runtime
+  })
+  const second = run.host(dispatch)
+  const agent = await openAgent(await run.spec(second), second)
+  try {
+    await assert.rejects(agent.ask('task', 'Write note B.'), /note: turn task exists with another prompt/)
+  } finally {
+    await agent.close()
+  }
+  assert.deepEqual(run.changed(), [])
 })
 
 test('a rejected beforeTurn opens no agent, and a completed turn leaves the usage of the agent in the ledger', async () => {
