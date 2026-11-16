@@ -14,6 +14,8 @@ import { fixed, fixtureRepo, gitSource, lightFixed, loopInput, memoryChannel, ru
 import { scriptedDispatch, type Script, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
+/** The web search tool in a model request: a nested Code Mode tool, or a provider tool. */
+const webSearch = /`WebSearch`|"type":"web_search/
 
 test('the loop reviews, gates, patches, swaps families, checks and passes', async () => {
   const repo = fixtureRepo()
@@ -31,6 +33,8 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   assert.match(outputs('patch'), /"status\\":\\"pass/)
   // With a test runner, no agent hears that it has none.
   assert.ok(!turns.some((turn) => turn.request.includes('This run has no run_tests tool')))
+  // The review roles have no egress, so no model request has the web search tool.
+  assert.ok(!turns.some((turn) => webSearch.test(turn.request)))
 
   const providers = (role: string) => new Set(turns.filter((turn) => turn.role === role).map((turn) => turn.provider))
   for (const role of ['minimize', 'bugs', 'anti-slop', 'patch', 'questions', 'late-rules', 'intent']) assert.deepEqual(providers(role), new Set(['claude']))

@@ -13,6 +13,8 @@ import { memoryChannel } from './support/fixture.ts'
 import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
+/** The web search tool in a model request: a nested Code Mode tool, or a provider tool. */
+const webSearch = /`WebSearch`|"type":"web_search/
 
 test('develop: intake, plan, parallel builders on their own branches, draft PR, a CI fix, the review loop, a ready PR', { timeout: 120_000 }, async () => {
   const { repo, origin } = developRepo()
@@ -29,6 +31,9 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.deepEqual(posted[0]!.questions.map((question) => question.question.split('?')[0]), ['Is this the ask', 'Write a spec before the plan', 'How many review loop passes'])
   const first = (role: string) => turns.findIndex((turn) => turn.role === role)
   assert.ok(first('intake') < first('planner') && first('planner') < first('builder'))
+  // The development and review roles have no egress, so no model request has the web search tool.
+  assert.ok(turns.length > 0)
+  assert.ok(!turns.some((turn) => webSearch.test(turn.request)))
 
   // sub and mul built in the same wave, the tests after both. Each builder could write only its own files.
   const builds = turns.filter((turn) => turn.role === 'builder' && turn.output === null).map((turn) => /Build task ([a-z]+)|Fix the CI failure/.exec(turn.request)?.[1] ?? 'ci-fix')

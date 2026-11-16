@@ -116,7 +116,7 @@ Each is a separate PR. Each is also useful to the other workflows, or is off for
 | --- | --- | --- |
 | Usage and a cost budget | `agent.ts` (`model.call.completed` events), the ledger, the reports | G6, RG2. |
 | Artifacts | `platform.ts` and both platforms | A content-addressed store. Local: a directory. Cloudflare: the run's object storage. The ledger holds IDs, never bulk data. |
-| Egress with provenance | `agent.ts` (`web_search`, `fetch`), `workspace.ts` (shell `fetch`) | A role can reach allowlisted origins. The egress refuses the holdout to agents from intake and sets a maximum size for each request. Each response is an artifact. The other roles stay offline. |
+| Egress with provenance | `agent.ts` (`web_search`, `fetch`), `workspace.ts` (shell `fetch`) | A role can reach allowlisted origins. The egress refuses the holdout to agents from intake and sets a maximum size for each request. Each response is an artifact. The other roles stay offline. Now, `egress.ts` has the egress, the run lock and the artifact of each response, and `openAgent` and the shell use it. No role has an egress yet. Subsequent PRs connect the egress to the platform hosts and add the holdout. |
 | Evidence on artifacts | `findings.ts` | A location can be `artifact:<id>` with a line or no line. The fragment rules stay. |
 | `python` profile | `profiles.ts`, the build image | Notebooks are Python. The repository's setup installs the domain's packages. |
 | Roles by workflow | `roles.ts` | The research roles in a table of their own. |

@@ -79,3 +79,20 @@ test('the guard keeps the same rails on a virtual file system', async () => {
   assert.equal(new TextDecoder().decode(await fs.read('/src/b.ts')), 'b')
   assert.equal(new TextDecoder().decode(await fs.read('/package.json')), '{}')
 })
+
+test('a shell with a layout fetch sends curl through that fetch, and a shell without it refuses', async () => {
+  const fetched: string[] = []
+  const fetch = async (input: string | URL | Request): Promise<Response> => {
+    fetched.push(input instanceof Request ? input.url : String(input))
+    return new Response('archive page', { headers: { 'content-type': 'text/plain' } })
+  }
+  const online = await createWorkspace({ repo: MemoryFileSystem.create(), review: {}, fetch })
+  const result = await run(online, 'curl -s https://archive.example.org/paper')
+  assert.equal(result.stdout, 'archive page')
+  assert.deepEqual(fetched, ['https://archive.example.org/paper'])
+  const offline = await createWorkspace({ repo: MemoryFileSystem.create(), review: {} })
+  const refused = await run(offline, 'curl https://archive.example.org/paper')
+  assert.match(refused.stderr, /network access is off in this workspace/, JSON.stringify(refused))
+  assert.notEqual(refused.exit_code, 0)
+  assert.equal(fetched.length, 1)
+})
