@@ -188,6 +188,19 @@ test('a rate limit on all 3 tries throws a rate-limited error', async () => {
   assert.equal(calls.length, 3)
 })
 
+test('a token function is called before each try, so a retry uses the new token', async () => {
+  const steps = [answer(502), answer(200, { ok: true })]
+  const authorizations: string[] = []
+  const fetcher: typeof fetch = async (_input, init) => {
+    authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+    return steps.shift() ?? answer(500)
+  }
+  let tokens = 0
+  const client = github(async () => `token${++tokens}`, 'https://api.test', fetcher, { sleep: async () => {} })
+  assert.deepEqual(await client.json('GET', '/repos/acme/app'), { ok: true })
+  assert.deepEqual(authorizations, ['Bearer token1', 'Bearer token2'])
+})
+
 test('refusedCredential is true only for a 401 or a 403 that is not a rate limit', () => {
   assert.equal(refusedCredential(new GitHubError(401, 'x')), true)
   assert.equal(refusedCredential(new GitHubError(403, 'x')), true)

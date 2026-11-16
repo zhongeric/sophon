@@ -55,11 +55,14 @@ function rateLimitWait(response: Response, tryNumber: number): number | undefine
   return Math.max(backoff(tryNumber), Number.isFinite(seconds) ? seconds * 1_000 : 0)
 }
 
-export function github(token: string, api = 'https://api.github.com', fetcher: typeof fetch = fetch, options: GitHubOptions = {}): GitHub {
+/** A fixed token, or a function that gives the token. The client calls the function before each try, so a token can change during a long run. */
+export type GitHubToken = string | (() => Promise<string>)
+
+export function github(token: GitHubToken, api = 'https://api.github.com', fetcher: typeof fetch = fetch, options: GitHubOptions = {}): GitHub {
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
-  const headers = (accept: string) => ({
+  const headers = (accept: string, bearer: string) => ({
     accept,
-    authorization: `Bearer ${token}`,
+    authorization: `Bearer ${bearer}`,
     'user-agent': 'agent-factory',
     'x-github-api-version': '2022-11-28',
   })
@@ -68,11 +71,12 @@ export function github(token: string, api = 'https://api.github.com', fetcher: t
     const repeatable = method === 'GET' || method === 'PATCH' || (method === 'POST' && gitObjectPath.test(path))
     for (let tryNumber = 1; ; tryNumber++) {
       const last = tryNumber >= maxTries
+      const bearer = typeof token === 'string' ? token : await token()
       let response: Response
       try {
         response = await fetcher(`${api}${path}`, {
           body: body === undefined ? undefined : JSON.stringify(body),
-          headers: { ...headers(accept), ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
+          headers: { ...headers(accept, bearer), ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
           method,
         })
       } catch (error) {

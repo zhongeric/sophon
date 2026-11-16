@@ -19,7 +19,17 @@ type Pull = { head: string; title: string; body: string; draft: boolean; headRep
  */
 export async function mockServices(
   repo: string,
-  options: { owner: string; name: string; pr?: number; script: Script; botLogin: string; headRepo?: string; issues?: Record<number, { title: string; body: string }> },
+  options: {
+    owner: string
+    name: string
+    pr?: number
+    script: Script
+    botLogin: string
+    headRepo?: string
+    issues?: Record<number, { title: string; body: string }>
+    /** A GitHub App: its slug, whether it is installed on the repository, and the life of its installation tokens. */
+    app?: { slug: string; installed: boolean; expiresInSeconds?: number }
+  },
 ) {
   const git = (args: string[], input?: Buffer, env: Record<string, string> = {}) =>
     execFileSync('git', args, { cwd: repo, env: { ...process.env, ...env }, input, maxBuffer: 64 * 1024 * 1024, stdio: 'pipe' })
@@ -43,6 +53,8 @@ export async function mockServices(
     /** The refs that the host set, with their commits. */
     refs: new Map<string, string>(),
     requests: [] as string[],
+    /** The authorization header of each request, so that a test can see which credential the host used. */
+    authorizations: [] as { route: string; authorization: string }[],
     /** The commands that the machine ran, with their directories. */
     commands: [] as { argv: string[]; cwd: string }[],
     /** The HTTP status of the workflow-runs endpoint, so that a test can withhold the Actions permission. */
@@ -54,6 +66,7 @@ export async function mockServices(
   }
   let next = Math.max(100, ...pulls.keys(), ...issues.keys())
   let ids = 0
+  let installationTokens = 0
   const comment = (login: string, body: string, issue = options.pr ?? 0): MockComment => {
     const id = ++ids
     const at = new Date(Date.now() + id).toISOString()
@@ -149,6 +162,7 @@ export async function mockServices(
       return value.map((item, index) => string(item, `${name}[${index}]`))
     }
     state.requests.push(route)
+    state.authorizations.push({ authorization: request.headers.authorization ?? '', route })
     try {
       if (route === 'POST /v1/messages' || route === 'POST /v1/responses') {
         const reply = await dispatch(
@@ -174,6 +188,12 @@ export async function mockServices(
         return json(response, 200, { data: {} })
       }
       if (route === `GET ${api}`) return json(response, 200, { default_branch: 'main' })
+      if (route === `GET ${api}/installation`) return options.app?.installed ? json(response, 200, { id: 42 }) : json(response, 404, { message: 'Not Found' })
+      if (options.app && route === 'GET /app') return json(response, 200, { slug: options.app.slug })
+      if (options.app?.installed && route === 'POST /app/installations/42/access_tokens') {
+        const expires_at = new Date(Date.now() + (options.app.expiresInSeconds ?? 3_600) * 1_000).toISOString()
+        return json(response, 201, { expires_at, token: `ghs_installation${++installationTokens}` })
+      }
       if (route === `GET ${api}/pulls`) {
         const head = url.searchParams.get('head')?.split(':')[1]
         return json(response, 200, [...pulls].filter(([, pull]) => pull.head === head).map(([number, pull]) => view(number, pull)))

@@ -5,14 +5,20 @@ import { PausedError, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { githubComments } from './comments.ts'
 import type { DevelopmentRuns } from './develop.ts'
-import { github, GitHubError, refusedCredential, type GitHub } from './github.ts'
+import { GitHubError, refusedCredential, type GitHub } from './github.ts'
+import { githubAccess, type InstallationTokens } from './github-app.ts'
 import type { PullRequestRuns } from './run.ts'
 import { createTables, sqlFiles, sqlLedger } from './storage.ts'
 
 export type Env = {
   PULL_REQUESTS: DurableObjectNamespace<PullRequestRuns>
   DEVELOPMENT_RUNS: DurableObjectNamespace<DevelopmentRuns>
-  GITHUB_TOKEN: string
+  /** The token of the runs when the GitHub App secrets are not set. */
+  GITHUB_TOKEN?: string
+  /** With GITHUB_APP_PRIVATE_KEY, runs call GitHub as the App. */
+  GITHUB_APP_ID?: string
+  /** The private key of the App, in PKCS#8 PEM. */
+  GITHUB_APP_PRIVATE_KEY?: string
   GITHUB_WEBHOOK_SECRET: string
   ANTHROPIC_API_KEY?: string
   OPENAI_API_KEY?: string
@@ -90,6 +96,7 @@ export function credentialsFor(env: Env, providers: Iterable<Provider>): Credent
  */
 export abstract class Runs<Request extends RunRequest> extends DurableObject<Env> {
   busy = false
+  tokens: InstallationTokens = new Map()
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -152,11 +159,16 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     await this.ctx.storage.setAlarm(Date.now() + heartbeatMs)
     const request = JSON.parse(row.request) as Request
     const ledger = progressLedger(sqlLedger(this.ctx.storage.sql, row.run))
-    const gh = github(this.env.GITHUB_TOKEN, this.env.GITHUB_API_URL)
     const target = `${request.owner}/${request.repo}#${this.number(request)}`
-    const comments = githubComments(gh, request.owner, request.repo, this.number(request))
+    // Without a client, the run cannot post: a failed GitHub setup goes only to the state note.
+    let comments: Comments | undefined
+    let app = false
     let next: number | null = null
     try {
+      const access = await githubAccess(this.env, request.owner, request.repo, this.tokens)
+      app = access.app
+      const posts = githubComments(access.gh, request.owner, request.repo, this.number(request))
+      comments = posts
       if (row.state === 'running') {
         // The last invocation died mid-run. Count it, so that a crash that repeats stops instead of looping.
         const restarts = (ledger.get<number>('restarts') ?? 0) + 1
@@ -164,10 +176,10 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
         if (restarts > maxRestarts) throw new StopError(`the run died ${maxRestarts} times without finishing a step, for example on the memory or CPU limit`)
       }
       this.setState(row.run, 'running', '')
-      await once(ledger, 'announced', () => comments.post(this.announcement(row.run, request)))
-      const result = await this.execute(row.run, request, ledger, gh, comments)
+      await once(ledger, 'announced', () => posts.post(this.announcement(row.run, request)))
+      const result = await this.execute(row.run, request, ledger, access.gh, posts)
       this.setState(row.run, result.passed ? 'passed' : 'failed', '')
-      await once(ledger, 'summary', () => comments.post(result.summary))
+      await once(ledger, 'summary', () => posts.post(result.summary))
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (error instanceof PausedError) {
@@ -182,9 +194,9 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
         const permanent = error instanceof StopError || refusedCredential(error)
         if (permanent || attempts >= maxAttempts) {
           this.setState(row.run, 'error', message)
-          const hint = error instanceof GitHubError ? ' Check the permissions of GITHUB_TOKEN.' : ''
+          const hint = error instanceof GitHubError ? (app ? ' Check the permissions of the GitHub App.' : ' Check the permissions of GITHUB_TOKEN.') : ''
           await comments
-            .post(`agent-factory stopped run \`${row.run}\`: ${message}${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${target}\`.`)
+            ?.post(`agent-factory stopped run \`${row.run}\`: ${message}${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${target}\`.`)
             .catch(() => undefined)
         } else {
           this.setState(row.run, 'queued', `attempt ${attempts} failed: ${message}`)
