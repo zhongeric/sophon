@@ -37,8 +37,8 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   for (const role of ['rules', 'late-minimize', 'late-bugs']) assert.deepEqual(providers(role), new Set(['codex']))
 
   const gateLog = readFileSync(join(result.dir, 'gate-log.txt'), 'utf8')
-  assert.match(gateLog, /# Step 1 \| model_family=claude\+codex \| minimize=claude-opus-5-5 rules=gpt-6.1-sol bugs=claude-fable-5-2/)
-  assert.match(gateLog, /# Step 2 \| model_family=codex\+claude \| late-minimize=gpt-6.1-sol late-rules=claude-fable-5-2/)
+  assert.match(gateLog, /# Step 1 \| model_family=claude\+codex \| minimize=claude-opus-5-5 rules=gpt-6.1-sol bugs=claude-opus-5-5/)
+  assert.match(gateLog, /# Step 2 \| model_family=codex\+claude \| late-minimize=gpt-6.1-sol late-rules=claude-opus-5-5/)
   assert.match(gateLog, /FINDING bugs-001 \| track=bugs \| severity=critical \| ACTION=keep/)
   assert.match(gateLog, /FINDING min-001 \| track=minimize \| severity=low \| ACTION=keep/)
   assert.match(result.report, /skipped: min-001 \(inlining adds nothing\)/)
@@ -218,7 +218,7 @@ test('ALLOWED_MODELS replaces the allowed list', async () => {
   const turns: Turn[] = []
   await assert.rejects(
     runLoop(repo, 'allowed-setting', runsDir(), { dispatch: scriptedDispatch(script, turns), input }),
-    /outside the allowed list \(claude-sonnet-5-5, claude-opus-5-5\): gpt-6\.1-sol, claude-fable-5-2$/,
+    /outside the allowed list \(claude-sonnet-5-5, claude-opus-5-5\): gpt-6\.1-sol$/,
   )
   assert.equal(turns.length, 0)
 })
