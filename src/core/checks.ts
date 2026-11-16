@@ -70,9 +70,14 @@ function matchesProtectEntry(entry: string, relative: string): boolean {
   return new RegExp(entry.endsWith('/') ? `^${source}/` : `^${source}(/|$)`).test(relative)
 }
 
+/** The entries that no change may write: the config file first, then the protect entries of the config. */
+export function protectedEntries(config: RepoConfig): string[] {
+  return [repoConfigFile, ...(config.protect ?? [])]
+}
+
 export function isProtected(config: RepoConfig, path: string): boolean {
   const relative = path.replace(/^\/+/, '')
-  return [repoConfigFile, ...(config.protect ?? [])].some((entry) => matchesProtectEntry(entry, relative))
+  return protectedEntries(config).some((entry) => matchesProtectEntry(entry, relative))
 }
 
 export type CheckResult = {
