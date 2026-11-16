@@ -1,4 +1,5 @@
 import { AgentRuntime, Contracts } from 'nanocode-ts'
+import { checkEgress, egressFetch, type Egress, type EgressHost } from './egress.ts'
 import type { Ledger } from './ledger.ts'
 import type { AgentStore } from './platform.ts'
 import { dispatcher, type Credentials, type Provider } from './providers.ts'
@@ -17,6 +18,8 @@ export type AgentSpec = {
   workspace: Contracts.WorkspaceHost
   tools: HostTools
   subagents?: boolean
+  /** The network access of the agent. Without it, the agent is offline. */
+  egress?: Egress
 }
 
 export type AgentHost = {
@@ -26,12 +29,33 @@ export type AgentHost = {
   credentials: Credentials
   /** Replaces the credentialed dispatch, for scripted models in tests. */
   dispatch?: Contracts.RuntimeOptions['dispatch']
+  /** The artifacts, the lock and the secrets of the egress. Only an agent with an egress uses it. */
+  egress?: EgressHost
   log(line: string): void
 }
 
 export type Agent = {
   ask(requestId: string, prompt: string): Promise<Contracts.TurnReport>
   close(): Promise<void>
+}
+
+/**
+ * The one host fetch of an agent, for its Code Mode cells and its shell. Without an egress, it refuses each request.
+ * With an egress, the host must have an EgressHost and the spec must pass checkEgress.
+ */
+export function hostFetch(agentId: string, egress: Egress | undefined, host: AgentHost): typeof fetch {
+  if (!egress) {
+    return async () => {
+      throw new Error('network access is off for agents')
+    }
+  }
+  if (!host.egress) throw new Error(`${agentId}: the spec has an egress, but the host has no egress`)
+  try {
+    checkEgress(egress, host.egress)
+  } catch (error) {
+    throw new Error(`${agentId}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  return egressFetch(agentId, egress, host.egress, (line) => host.log(line))
 }
 
 const finished = new Set(['completed', 'failed', 'cancelled'])
@@ -45,6 +69,8 @@ const maxReconnects = 3
 export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent> {
   const credential = host.credentials[spec.provider]
   if (!credential) throw new Error(`${spec.id}: no credential for ${spec.provider}`)
+  // The egress check comes before the session opens, so a refused spec starts no session.
+  const agentFetch = hostFetch(spec.id, spec.egress, host)
   const scope = host.store.scope(spec.id)
   const sessionKey = `session:${spec.id}`
   const sessionId = host.ledger.get<string>(sessionKey) ?? Contracts.sessionUuid()
@@ -73,16 +99,14 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
         code_mode: true,
         workspace: repoMount,
         workspace_tools: 'all',
-        web_search: false,
+        web_search: spec.egress?.web_search ?? false,
         subagents: spec.subagents ?? false,
         ...(spec.subagents ? { subagent_models: [{ harness: spec.provider, model: spec.model }] } : {}),
         tools: Object.values(spec.tools).map((tool) => tool.definition),
       },
       {
         dispatch: host.dispatch ?? dispatcher(host.credentials, spec.provider),
-        fetch: async () => {
-          throw new Error('network access is off for agents')
-        },
+        fetch: agentFetch,
         tools: {
           call(name, input, _signal, context) {
             const tool = spec.tools[name]
