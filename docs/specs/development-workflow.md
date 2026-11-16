@@ -174,7 +174,16 @@ Each stage below lists who does the work, what the host enforces, and where the 
 
 - The host posts the report: PR link, head SHA, triage line, review loop and Auditor verdicts with models per step,
   checks. It keeps "ready for human review" separate from "merge-ready".
-- The host never merges, except in repos where the user gave standing permission.
+- The host never merges, except in repos where the user gave standing permission. The `merge` field of
+  `.agent-factory.json` (`"squash"`, `"merge"` or `"rebase"`) gives it. The host reads the field from the same source
+  as the other rails, thus a run cannot give itself the permission.
+- With the permission, the host merges only on PASS, after the PR is ready, and only at the head SHA that CI
+  checked. The merge is a ledger step: the host tries it one time for each run, and a resumed run does not merge
+  again.
+- The PR body of a run with an issue says `Closes #<issue>`, thus GitHub closes the issue when the PR merges.
+- When GitHub refuses the merge, the PR stays ready, and the report gives the reason.
+- After a merge, the host deletes only the remote branch of the run, and the report gives the merge commit.
+- Review runs never merge, because the host does not merge a PR of a person.
 
 ## 4. Profiles
 

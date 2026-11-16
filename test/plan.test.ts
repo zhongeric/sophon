@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { checkIntake, checkPlan, checkSpec, frozenAsk, parseParallel, route, routeQuestions, waves, type Plan, type PlanTask } from '../src/core/plan.ts'
+import { checkIntake, checkPlan, checkSpec, frozenAsk, parseIssue, parseParallel, route, routeQuestions, waves, type Plan, type PlanTask } from '../src/core/plan.ts'
 
 const intake = { title: 'Add sub', summary: 'Adds sub() to src/math.ts.', slug: 'add-sub', larger: false, passes: 1, reason: 'One small function.', questions: [] }
 const answer = (id: string, text: string) => ({ id, question: id, answer: text, recommended: false })
@@ -34,6 +34,11 @@ test('the host asks to confirm the ask and the route in the same batch, and read
 test('the builder count is an integer of 1 or more', () => {
   assert.equal(parseParallel('2'), 2)
   for (const text of ['abc', '3x', '0', '-1', '1.5', '']) assert.throws(() => parseParallel(text), /--parallel must be an integer of 1 or more/, text)
+})
+
+test('the issue of a local run is a number of 1 or more', () => {
+  assert.equal(parseIssue('12'), 12)
+  for (const text of ['0', '-1', '1.5', 'abc', '']) assert.throws(() => parseIssue(text), /--issue must be an issue number of 1 or more, not /, text)
 })
 
 test('the spec needs its sections as headings', () => {

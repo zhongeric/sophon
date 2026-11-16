@@ -123,6 +123,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       models: { develop: { ...defaultDevelopModels, ...overrides.develop }, review: mergeModels(overrides) },
       runId: run,
       source: `${request.owner}/${request.repo}#${request.issue}`,
+      issue: request.issue,
       ...(request.hotfix ? { hotfix: true } : {}),
       ...(request.full ? { full: true } : {}),
       ...(request.parallel ? { parallel: request.parallel } : {}),

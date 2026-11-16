@@ -161,6 +161,13 @@ test('each field of .agent-factory.json replaces its default, and null or an emp
   assert.throws(() => requireChecks(resolveRepoConfig({}, null), 'acme/app'), /acme\/app has no checks: no profile gives default checks/)
 })
 
+test('the merge field is the standing merge permission: squash, merge or rebase, and nothing else', () => {
+  for (const merge of ['squash', 'merge', 'rebase']) assert.equal(parseRepoConfig(manifest({ merge }), 'test').merge, merge)
+  assert.equal('merge' in parseRepoConfig(manifest({}), 'test'), false)
+  for (const merge of [null, true, 'fast-forward', 'Squash'])
+    assert.throws(() => parseRepoConfig(manifest({ merge }), '.agent-factory.json'), { message: '.agent-factory.json: merge must be "squash", "merge" or "rebase"' }, String(merge))
+})
+
 test('locally, a repository without .agent-factory.json gets the defaults of its working copy, and needs at least one check', async () => {
   const repo = mkdtempSync(join(tmpdir(), 'factory-config-'))
   await assert.rejects(loadRepoConfig(repo), /has no checks/)

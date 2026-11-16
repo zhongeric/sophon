@@ -87,6 +87,8 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
 - Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
   file that no test imports gets the test files that have its base name as a word. A builder's `run_checks` runs
   only the checks. The targeted tests run one time, when the builder submits its build log.
+- `merge` (`"squash"`, `"merge"` or `"rebase"`) is the standing permission for the host to merge a ready development
+  PR with that method. Without it, the host does not merge.
 
 The STE dictionary is optional: see [agents/guides/ste/README.md](agents/guides/ste/README.md).
 
@@ -104,6 +106,7 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 - **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
   fixes are on the local branch `factory/<run>`.
 - **Models:** `--models file.json` sets the model of each role.
+- **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
 
 ## Cloudflare
 
@@ -141,6 +144,7 @@ resume it after a crash. Development runs run their checks in a Cloudflare Conta
 and pushes go through the GitHub API.
 The object keeps the sync state of each container directory in SQL, so after a restart the next sync sends only the
 changed files and does not run the setup again.
+A development PR says `Closes #<issue>`.
 
 ## Layout
 
