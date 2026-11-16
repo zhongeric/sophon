@@ -8,8 +8,8 @@ import { scriptedDispatch, type Script, type Turn } from './scripted-model.ts'
 
 export type MockComment = { id: number; issue: number; user: { login: string }; body: string; created_at: string; updated_at: string; html_url: string }
 type TreeEntry = { path: string; mode: string; type: string; sha: string | null }
-/** `merged` is the merge commit, after the host merged the PR. */
-type Pull = { head: string; title: string; body: string; draft: boolean; headRepo?: string; merged?: string }
+/** `merged` is the merge commit, after the host merged the PR. `closed` is a PR closed without a merge. */
+type Pull = { head: string; title: string; body: string; draft: boolean; headRepo?: string; merged?: string; closed?: boolean }
 
 /**
  * GitHub, Anthropic, OpenAI and a build machine on one local port, for the Cloudflare host under wrangler dev.
@@ -93,8 +93,10 @@ export async function mockServices(
     html_url: `https://github.com/${options.owner}/${options.name}/pull/${number}`,
     merge_commit_sha: pull.merged ?? null,
     merged: pull.merged !== undefined,
+    merged_at: pull.merged === undefined ? null : '2026-11-16T12:00:00Z',
     node_id: `PR_${number}`,
     number,
+    state: pull.merged === undefined && !pull.closed ? 'open' : 'closed',
     title: pull.title,
   })
   /** The entries of a directory at a ref, as the contents API lists them: the root, or the directory at `dir`. */
@@ -196,7 +198,9 @@ export async function mockServices(
       }
       if (route === `GET ${api}/pulls`) {
         const head = url.searchParams.get('head')?.split(':')[1]
-        return json(response, 200, [...pulls].filter(([, pull]) => pull.head === head).map(([number, pull]) => view(number, pull)))
+        const wanted = url.searchParams.get('state') ?? 'open'
+        const listed = [...pulls].filter(([, pull]) => pull.head === head).map(([number, pull]) => view(number, pull))
+        return json(response, 200, wanted === 'all' ? listed : listed.filter((pull) => pull.state === wanted))
       }
       if (route === `POST ${api}/pulls`) {
         const fields = input()
@@ -276,6 +280,16 @@ export async function mockServices(
       if (route.startsWith(`GET ${api}/git/commits/`)) {
         const sha = url.pathname.split('/').at(-1)!
         return json(response, 200, { sha, tree: { sha: text(['rev-parse', `${sha}^{tree}`]) } })
+      }
+      if (route.startsWith(`GET ${api}/git/matching-refs/heads/`)) {
+        const prefix = decodeURIComponent(url.pathname.slice(`${api}/git/matching-refs/`.length))
+        const refs = text(['for-each-ref', '--format=%(refname) %(objectname)', `refs/${prefix.replace(/\/$/, '')}`])
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => line.split(' '))
+          .filter(([ref = '']) => ref.startsWith(`refs/${prefix}`))
+          .map(([ref, sha]) => ({ object: { sha, type: 'commit' }, ref }))
+        return json(response, 200, page(url, refs))
       }
       if (route.startsWith(`GET ${api}/git/ref/heads/`)) {
         const name = decodeURIComponent(url.pathname.slice(`${api}/git/ref/heads/`.length))
@@ -357,5 +371,12 @@ export async function mockServices(
       return null
     }
   }
-  return { close: () => server.close(), comment, fileAt, headSha: shaOf('feature'), machineRoot, state, url }
+  /** Sets a PR to merged or to closed without a merge, as the user does on GitHub. A merged PR does not change main. */
+  const closePull = (number: number, merged: boolean) => {
+    const pull = pulls.get(number)
+    if (!pull) throw new Error(`mock has no PR ${number}`)
+    if (merged) pull.merged = shaOf(pull.head)!
+    else pull.closed = true
+  }
+  return { close: () => server.close(), closePull, comment, fileAt, headSha: shaOf('feature'), machineRoot, state, url }
 }

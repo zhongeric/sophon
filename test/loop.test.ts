@@ -4,11 +4,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import type { Repo } from '../src/core/platform.ts'
 import { profiles, staticFindings, triage } from '../src/core/profiles.ts'
 import { PausedError, type Channel } from '../src/core/questions.ts'
 import { StopError } from '../src/core/stop.ts'
 import { allowedModelsFrom, defaultAllowedModels, defaultModels, type LoopInput } from '../src/core/workflows/code-review-loop.ts'
-import { resumeInput } from '../src/node/cli.ts'
+import { branchLine, resumeInput } from '../src/node/cli.ts'
 import { changedFiles, diff, touchedFiles } from '../src/node/git.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { fixed, fixtureRepo, gitSource, lightFixed, loopInput, memoryChannel, runLoop, script, scriptFor } from './support/fixture.ts'
@@ -55,6 +56,81 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   assert.match(result.report, /^\| \*\*Total\*\* \| {2}\| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$0\.0000 \(2 models without a price\) \|$/m)
   assert.equal(result.stopped, false)
   assert.ok(result.usage.tokens.input > 0)
+
+  // A --base run keeps its fix branch for the user (decision 5), and only its worktree goes.
+  assert.equal(execFileSync('git', ['rev-parse', result.branch], { cwd: repo }).toString().trim(), result.final)
+  assert.ok(!existsSync(join(result.dir, 'tree')))
+  assert.deepEqual(result.pruned, { deleted: [], kept: [{ name: result.branch, reason: 'unapplied review fixes' }], failed: [] })
+  assert.doesNotMatch(result.report, /## Branches/)
+  assert.equal(branchLine(result, repo), `Fixes are on factory/e2e. Apply them with: git -C ${repo} merge --ff-only factory/e2e`)
+})
+
+const hasBranch = (repo: string, name: string) => {
+  try {
+    execFileSync('git', ['rev-parse', '--verify', `refs/heads/${name}`], { cwd: repo, stdio: 'pipe' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+test('a shipped run deletes its fix branch as applied, without a read of the PR state', async () => {
+  const repo = fixtureRepo()
+  const input = { ...(await loopInput(repo, 'ship')), pr: 7, ship: { pr: 7, headRef: 'feature' } }
+  const calls: string[] = []
+  const stub = (real: Repo): Repo => ({
+    ...real,
+    ship: async ({ pr, headRef }) => {
+      calls.push(`ship ${pr} ${headRef}`)
+    },
+    pullState: async () => {
+      calls.push('pullState')
+      return 'open'
+    },
+    deleteBranch: async () => {
+      calls.push('deleteBranch')
+      await real.deleteBranch()
+    },
+  })
+  const result = await runLoop(repo, 'ship', runsDir(), { dispatch: scriptedDispatch(script, []), input, repo: stub })
+
+  assert.equal(result.pass, true, result.report)
+  assert.deepEqual(calls, ['ship 7 feature', 'deleteBranch'])
+  assert.equal(hasBranch(repo, 'factory/ship'), false)
+  assert.ok(!existsSync(join(result.dir, 'tree')))
+  assert.match(result.report, /^## Branches\n\n- deleted factory\/ship \(applied\)$/m)
+  assert.equal(branchLine(result, repo), 'Deleted factory/ship: applied by --ship.')
+})
+
+test('a failed run whose PR closed deletes its fix branch as stranded', async () => {
+  const repo = fixtureRepo()
+  const input = { ...(await loopInput(repo, 'closed')), pr: 7 }
+  const dispatch = scriptedDispatch(scriptFor({ rejectBug: true, tests: true }), [])
+  const result = await runLoop(repo, 'closed', runsDir(), { dispatch, input, repo: (real) => ({ ...real, pullState: async () => 'closed' }) })
+
+  assert.equal(result.pass, false)
+  assert.equal(hasBranch(repo, 'factory/closed'), false)
+  assert.match(result.report, /^- deleted factory\/closed \(stranded\)$/m)
+  assert.equal(branchLine(result, repo), 'Deleted factory/closed: the PR closed without a merge.')
+})
+
+test('a failed delete is a note in the report, and the run still passes', async () => {
+  const repo = fixtureRepo()
+  const input = { ...(await loopInput(repo, 'refused-delete')), pr: 7 }
+  const stub = (real: Repo): Repo => ({
+    ...real,
+    pullState: async () => 'merged',
+    deleteBranch: async () => {
+      throw new Error('remote: permission denied')
+    },
+  })
+  const result = await runLoop(repo, 'refused-delete', runsDir(), { dispatch: scriptedDispatch(script, []), input, repo: stub })
+
+  assert.equal(result.pass, true, result.report)
+  assert.deepEqual(result.pruned?.failed, [{ name: 'factory/refused-delete', reason: 'remote: permission denied' }])
+  assert.match(result.report, /^## Branches\n\n- not deleted factory\/refused-delete: remote: permission denied$/m)
+  assert.equal(hasBranch(repo, 'factory/refused-delete'), true)
+  assert.ok(!existsSync(join(result.dir, 'tree')))
 })
 
 /** USD per million tokens: each scripted model call (8 input and 4 output tokens) costs $0.012. */

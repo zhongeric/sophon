@@ -2,7 +2,9 @@ import type { Contracts } from 'nanocode-ts'
 import { SqlFileSystem } from 'nanocode-ts/bash'
 import type { Ledger } from '../core/ledger.ts'
 import type { Frozen, Repo } from '../core/platform.ts'
+import type { PullState } from '../core/prune.ts'
 import { StopError } from '../core/stop.ts'
+import { deleteRemoteBranch } from './branches.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { base64, encodePath, nameStatus, restoreFromGitHub, treeGit, treeWriter, writeTarball, type ChangedFile } from './trees.ts'
 
@@ -16,7 +18,7 @@ export type GitHubRepo = Repo & {
   publish(): Promise<string>
 }
 
-type PullView = { head: { sha: string; ref: string }; base: { ref: string }; draft: boolean; node_id: string }
+type PullView = { head: { sha: string; ref: string }; base: { ref: string }; draft: boolean; node_id: string; state: string; merged_at: string | null }
 type Compare = { merge_base_commit: { sha: string } }
 
 /** GitHub lists at most this many files of a pull request. */
@@ -169,5 +171,13 @@ export function githubRepo(options: {
       if (view.draft)
         await gh.graphql('mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }', { id: view.node_id })
     },
+
+    async pullState(pr): Promise<PullState> {
+      const view = await gh.json<PullView>('GET', `${api}/pulls/${pr}`)
+      return view.merged_at ? 'merged' : view.state === 'closed' ? 'closed' : 'open'
+    },
+    deleteBranch: () => deleteRemoteBranch(gh, api, options.branch),
+    // The SQL tree is Durable Object data of the run, and it stays.
+    release: async () => {},
   }
 }
