@@ -6,9 +6,10 @@ import { fileURLToPath } from 'node:url'
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { commandChecker, parseRepoConfig, readRepoConfig, requireChecks, resolveRepoConfig, type RepoConfig } from '../core/checks.ts'
-import type { AgentStore, Files, Guides, PullRequests } from '../core/platform.ts'
+import type { AgentStore, Files, Guides, PullRequests, Signing } from '../core/platform.ts'
 import { profileDefaults, type RootFiles } from '../core/profiles.ts'
 import type { Credentials } from '../core/providers.ts'
+import type { SigningRecord } from '../core/signing.ts'
 import type { Channel } from '../core/questions.ts'
 import { loadResearchDomain, type ResearchConfig, type ResearchDomain, type ResearchFiles } from '../core/research.ts'
 import { StopError } from '../core/stop.ts'
@@ -193,6 +194,9 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
   const branchesDir = join(dir, 'branches')
   mkdirSync(branchesDir, { recursive: true })
   const commits: GitCommits = { unsigned: false }
+  const signing = nodeSigning(options.repo, commits)
+  // The answer for the development branch. Each review pass of that branch uses it and does not call GitHub again.
+  let recorded: SigningRecord | undefined
   const host = { credentials: options.credentials, dispatch: options.dispatch, log: options.log, module: options.module, prices: options.prices }
   return {
     ...host,
@@ -203,7 +207,13 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
     guides: await nodeGuides(input.config),
     channel: options.channel,
     branches: gitBranches(options.repo, branchesDir, commits),
-    signing: nodeSigning(options.repo, commits),
+    signing: {
+      check: signing.check,
+      async apply(record) {
+        recorded = record
+        await signing.apply(record)
+      },
+    },
     pulls: options.pulls,
     checker: (branch) => commandChecker(branch, input.config, localMachine(worktreePath(branchesDir, branch.name))),
     async review({ runId, ask, head, branch, full, pr, budget }) {
@@ -213,7 +223,8 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
       const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, headRef: branch, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}), ...(budget !== undefined ? { budgetOverride: budget } : {}), stopAtBudget: true }
       // The pass runs again after a raise with a new remaining budget, so the budget is an override, not the recorded value.
       // At the budget, the pass stops without a question, and the development run asks with the run totals.
-      return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr) })
+      const passSigning: Signing = { apply: run.signing.apply, check: async (branches) => recorded ?? run.signing.check(branches) }
+      return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr), signing: passSigning })
     },
     ci: options.ci,
   }

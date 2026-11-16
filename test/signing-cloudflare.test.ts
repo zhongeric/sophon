@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { github } from '../src/cloudflare/github.ts'
+import { github, GitHubError } from '../src/cloudflare/github.ts'
 import { githubSigning } from '../src/cloudflare/signing.ts'
 import { signingLine } from '../src/core/signing.ts'
 import { StopError } from '../src/core/stop.ts'
 
 const branch = 'factory/dev-x'
-const rules = `/repos/o/r/rules/branches/${encodeURIComponent(branch)}`
+const rules = `/repos/o/r/rules/branches/${encodeURIComponent(branch)}?per_page=100&page=1`
 const classic = `/repos/o/r/branches/${encodeURIComponent(branch)}/protection/required_signatures`
 
 /** The signing adapter on the github() client and a fake fetch that answers each path from a script. A path without an answer gives 404. */
@@ -78,14 +78,15 @@ test('a 403 from the rules endpoint stops in check', async () => {
   await assert.rejects(signing.check([branch]), (error) => error instanceof StopError && /403/.test(error.message) && error.message.includes(rules))
 })
 
-test('a 500 that stays after the retries stops in check', async () => {
+// Not a StopError: the run loop tries the run again.
+test('a 500 that stays after the retries rejects in check without a StopError', async () => {
   const { calls, signing } = scripted({ [rules]: answer(500, { message: 'Server Error' }) })
-  await assert.rejects(signing.check([branch]), (error) => error instanceof StopError && /500/.test(error.message))
+  await assert.rejects(signing.check([branch]), (error) => error instanceof Error && !(error instanceof StopError) && /500/.test(error.message))
   assert.deepEqual(calls, [rules, rules, rules])
 })
 
-test('a rate limit on the rules endpoint stops in check', async () => {
+test('a rate limit on the rules endpoint rejects in check with the GitHubError', async () => {
   const limited = () => new Response('{}', { headers: { 'retry-after': '3600' }, status: 429 })
   const { signing } = scripted({ [rules]: limited })
-  await assert.rejects(signing.check([branch]), (error) => error instanceof StopError && error.message.includes(rules))
+  await assert.rejects(signing.check([branch]), (error) => error instanceof GitHubError && error.rateLimited)
 })

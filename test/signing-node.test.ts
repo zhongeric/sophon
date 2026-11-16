@@ -96,25 +96,26 @@ test('only a github.com URL names a GitHub repository', () => {
 test('check reads the rules of the branch through gh api', async () => {
   const repo = signingRepo()
   execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/o/r.git'], { cwd: repo })
-  const none = scriptedGh({ 'repos/o/r/rules/branches/factory%2Fdev-x': [] })
+  const none = scriptedGh({ 'repos/o/r/rules/branches/factory%2Fdev-x?per_page=100&page=1': [] })
   assert.deepEqual(await nodeSigning(repo, { unsigned: false }, none.run).check(['factory/dev-x']), {
     origin: true,
     branches: [{ branch: 'factory/dev-x', rulesets: [], classic: 'none' }],
     mode: 'unsigned',
   })
-  assert.deepEqual(none.calls, ['api repos/o/r/rules/branches/factory%2Fdev-x', 'api repos/o/r/branches/factory%2Fdev-x/protection/required_signatures'])
+  assert.deepEqual(none.calls, ['api repos/o/r/rules/branches/factory%2Fdev-x?per_page=100&page=1', 'api repos/o/r/branches/factory%2Fdev-x/protection/required_signatures'])
 
   const rule = scriptedGh({
-    'repos/o/r/rules/branches/main': [{ type: 'required_signatures', ruleset_id: 7 }],
+    'repos/o/r/rules/branches/main?per_page=100&page=1': [{ type: 'required_signatures', ruleset_id: 7 }],
     'repos/o/r/rulesets/7': { id: 7, name: 'Protect main' },
   })
   assert.deepEqual(await nodeSigning(repo, { unsigned: false }, rule.run).check(['main']), signed)
 
-  const broken = scriptedGh({ 'repos/o/r/rules/branches/main': new Error('gh api repos/o/r/rules/branches/main: gh: Server Error (HTTP 500)') })
-  await assert.rejects(nodeSigning(repo, { unsigned: false }, broken.run).check(['main']), (error) => error instanceof StopError && /500/.test(error.message))
+  // A 5xx and a call without an answer can go away, so they are not a StopError.
+  const broken = scriptedGh({ 'repos/o/r/rules/branches/main?per_page=100&page=1': new Error('gh api repos/o/r/rules/branches/main: gh: Server Error (HTTP 500)') })
+  await assert.rejects(nodeSigning(repo, { unsigned: false }, broken.run).check(['main']), (error) => error instanceof Error && !(error instanceof StopError) && /500/.test(error.message))
 
-  const offline = scriptedGh({ 'repos/o/r/rules/branches/main': new Error('gh api repos/o/r/rules/branches/main: error connecting to api.github.com') })
-  await assert.rejects(nodeSigning(repo, { unsigned: false }, offline.run).check(['main']), StopError)
+  const offline = scriptedGh({ 'repos/o/r/rules/branches/main?per_page=100&page=1': new Error('gh api repos/o/r/rules/branches/main: error connecting to api.github.com') })
+  await assert.rejects(nodeSigning(repo, { unsigned: false }, offline.run).check(['main']), (error) => error instanceof Error && !(error instanceof StopError) && /error connecting/.test(error.message))
 })
 
 test('apply of a signed record stops when git cannot sign', async () => {
@@ -129,10 +130,21 @@ test('apply of a signed record stops when git cannot sign', async () => {
   assert.equal(refs(repo), before)
 })
 
-test('apply of a signed record makes no test signature when commit.gpgsign is off', async () => {
+test('apply of a signed record stops when a rule requires signatures and commit.gpgsign is off', async () => {
   const repo = signingRepo()
   execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: repo })
-  await nodeSigning(repo, { unsigned: true }, noGh).apply(signed)
+  await assert.rejects(
+    nodeSigning(repo, { unsigned: true }, noGh).apply(signed),
+    (error) => error instanceof StopError && error.message.includes('Protect main') && error.message.includes('commit.gpgsign'),
+  )
+})
+
+test('apply of a signed record with only an unreadable classic protection continues when commit.gpgsign is off', async () => {
+  const repo = signingRepo()
+  execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: repo })
+  const commits: GitCommits = { unsigned: true }
+  await nodeSigning(repo, commits, noGh).apply({ origin: true, branches: [{ branch: 'main', rulesets: [], classic: 'unreadable' }], mode: 'signed' })
+  assert.equal(commits.unsigned, false)
 })
 
 test('apply of an unsigned record sets unsigned commits', async () => {

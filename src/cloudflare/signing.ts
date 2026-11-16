@@ -1,5 +1,5 @@
 import type { Signing } from '../core/platform.ts'
-import { commitMode, readSignatureRules, signingLine, type GitHubAnswer } from '../core/signing.ts'
+import { commitMode, readSignatureRules, type GitHubAnswer } from '../core/signing.ts'
 import { StopError } from '../core/stop.ts'
 import { GitHubError, type GitHub } from './github.ts'
 
@@ -9,24 +9,23 @@ export function githubSigning(gh: GitHub, owner: string, repo: string): Signing 
     try {
       return { body: await gh.json<unknown>('GET', path), status: 200 }
     } catch (error) {
-      // A rate limit is not an answer about the rules, so it rejects and the run stops.
+      // A rate limit rejects the request, so the run loop tries again.
       if (error instanceof GitHubError && !error.rateLimited) return { body: null, status: error.status }
       throw error
     }
   }
   return {
     async check(branches) {
-      if (branches.length === 0) return { branches: [], mode: 'unsigned', origin: true }
       const rules = await readSignatureRules(get, `/repos/${owner}/${repo}`, branches)
       // A classic 403 alone continues unsigned: the decision of the user.
       return { branches: rules, mode: commitMode(rules, { signUnknown: false }), origin: true }
     },
     async apply(record) {
       if (record.mode !== 'signed') return
-      const reason = signingLine(record).replace(/^Commits: signed \((.*)\)$/, '$1')
-      const branches = record.branches.filter((rule) => rule.rulesets.length > 0 || rule.classic === 'required').map((rule) => rule.branch)
+      const required = record.branches.filter((rule) => rule.rulesets.length > 0 || rule.classic === 'required')
+      const labels = [...new Set(required.flatMap((rule) => [...rule.rulesets, ...(rule.classic === 'required' ? ['classic protection'] : [])]))]
       throw new StopError(
-        `Branch ${branches.join(', ')} requires signed commits (${reason}). The Cloudflare host commits through the Git Data API, and these commits are unsigned. Run with the local host, or change the rule.`,
+        `Branch ${required.map((rule) => rule.branch).join(', ')} requires signed commits (${labels.join(', ')}). The Cloudflare host commits through the Git Data API, and these commits are unsigned. Run with the local host, or change the rule.`,
       )
     },
   }

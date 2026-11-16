@@ -17,7 +17,7 @@ function scripted(answers: Record<string, GitHubAnswer | Error>) {
   return { get, calls }
 }
 
-const rules = (branch: string) => `${api}/rules/branches/${encodeURIComponent(branch)}`
+const rules = (branch: string, page = 1) => `${api}/rules/branches/${encodeURIComponent(branch)}?per_page=100&page=${page}`
 const classic = (branch: string) => `${api}/branches/${encodeURIComponent(branch)}/protection/required_signatures`
 const signatureRule = (id: number) => ({ type: 'required_signatures', ruleset_id: id, ruleset_source_type: 'Repository', ruleset_source: 'o/r' })
 
@@ -75,11 +75,12 @@ test('a classic 403 is unreadable and signs only with signUnknown', async () => 
   assert.equal(commitMode(branches, { signUnknown: false }), 'unsigned')
 })
 
-for (const status of [403, 500]) {
-  test(`a ${status} from the rules endpoint stops the run`, async () => {
+// A 429 or a 5xx can go away, so it is not a StopError and the run loop of the Cloudflare host tries the run again.
+for (const status of [403, 429, 500]) {
+  test(`a ${status} from the rules endpoint rejects the check`, async () => {
     const { get } = scripted({ [rules('main')]: { status, body: {} } })
     await assert.rejects(readSignatureRules(get, api, ['main']), (error: Error) => {
-      assert.ok(error instanceof StopError)
+      assert.equal(error instanceof StopError, status === 403)
       assert.match(error.message, /branch main/)
       assert.ok(error.message.includes(rules('main')))
       assert.ok(error.message.includes(String(status)))
@@ -88,27 +89,50 @@ for (const status of [403, 500]) {
   })
 }
 
-test('a 500 from the classic endpoint stops the run', async () => {
+test('a 500 from the classic endpoint stops the run without a StopError', async () => {
   const { get } = scripted({ [rules('main')]: { status: 200, body: [] }, [classic('main')]: { status: 500, body: {} } })
   await assert.rejects(readSignatureRules(get, api, ['main']), (error: Error) => {
-    assert.ok(error instanceof StopError)
+    assert.ok(!(error instanceof StopError))
     assert.ok(error.message.includes(classic('main')))
     assert.ok(error.message.includes('500'))
     return true
   })
 })
 
-test('a get without an answer stops the run', async () => {
-  const { get } = scripted({ [rules('main')]: new Error('connection reset') })
-  await assert.rejects(readSignatureRules(get, api, ['main']), (error: Error) => {
-    assert.ok(error instanceof StopError)
-    assert.ok(error.message.includes(rules('main')))
-    assert.match(error.message, /connection reset/)
-    return true
-  })
-  const classicFails = scripted({ [rules('main')]: { status: 200, body: [] }, [classic('main')]: new Error('timeout') })
-  await assert.rejects(readSignatureRules(classicFails.get, api, ['main']), StopError)
+test('a get without an answer rejects with its own error', async () => {
+  const reset = new Error('connection reset')
+  const { get } = scripted({ [rules('main')]: reset })
+  await assert.rejects(readSignatureRules(get, api, ['main']), (error) => error === reset)
+  const timeout = new Error('timeout')
+  const classicFails = scripted({ [rules('main')]: { status: 200, body: [] }, [classic('main')]: timeout })
+  await assert.rejects(readSignatureRules(classicFails.get, api, ['main']), (error) => error === timeout)
 })
+
+test('a required_signatures rule on the second page gives signed commits', async () => {
+  const deletion = (id: number) => ({ type: 'deletion', ruleset_id: id })
+  const { get, calls } = scripted({
+    [rules('main')]: { status: 200, body: Array.from({ length: 100 }, (_, index) => deletion(index + 10)) },
+    [rules('main', 2)]: { status: 200, body: [signatureRule(7)] },
+    [`${api}/rulesets/7`]: { status: 200, body: { id: 7, name: 'Protect main' } },
+  })
+  const branches = await readSignatureRules(get, api, ['main'])
+  assert.deepEqual(branches, [{ branch: 'main', rulesets: ['Protect main'], classic: 'none' }])
+  assert.deepEqual(calls.slice(0, 2), [rules('main'), rules('main', 2)])
+})
+
+const malformed: [string, Record<string, GitHubAnswer>][] = [
+  ['a rule without a type', { [rules('main')]: { status: 200, body: [{ ruleset_id: 7 }] } }],
+  ['a rule that is not an object', { [rules('main')]: { status: 200, body: ['required_signatures'] } }],
+  ['a required_signatures rule without a ruleset_id', { [rules('main')]: { status: 200, body: [{ type: 'required_signatures', ruleset_id: '7' }] } }],
+  ['a classic answer with a string enabled', { [rules('main')]: { status: 200, body: [] }, [classic('main')]: { status: 200, body: { enabled: 'true' } } }],
+  ['a classic answer without enabled', { [rules('main')]: { status: 200, body: [] }, [classic('main')]: { status: 200, body: {} } }],
+]
+for (const [name, answers] of malformed) {
+  test(`${name} stops the run`, async () => {
+    const { get } = scripted(answers)
+    await assert.rejects(readSignatureRules(get, api, ['main']), (error: Error) => error instanceof StopError && /branch main/.test(error.message))
+  })
+}
 
 test('a failed ruleset name call gives the label ruleset <id>', async () => {
   const { get } = scripted({
@@ -121,9 +145,9 @@ test('a failed ruleset name call gives the label ruleset <id>', async () => {
 })
 
 test('the branch name is URL-encoded', async () => {
-  const { get, calls } = scripted({ ['repos/o/r/rules/branches/factory%2Fdev-x']: { status: 200, body: [] } })
+  const { get, calls } = scripted({ ['repos/o/r/rules/branches/factory%2Fdev-x?per_page=100&page=1']: { status: 200, body: [] } })
   await readSignatureRules(get, 'repos/o/r', ['factory/dev-x'])
-  assert.deepEqual(calls, ['repos/o/r/rules/branches/factory%2Fdev-x', 'repos/o/r/branches/factory%2Fdev-x/protection/required_signatures'])
+  assert.deepEqual(calls, ['repos/o/r/rules/branches/factory%2Fdev-x?per_page=100&page=1', 'repos/o/r/branches/factory%2Fdev-x/protection/required_signatures'])
 })
 
 test('signingLine gives each form of the Commits line', () => {

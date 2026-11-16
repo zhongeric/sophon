@@ -164,7 +164,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   // A resume without --budget must not apply the override again, so the recorded input does not keep it.
   const { budgetOverride, ...recorded } = input
   ledger.put('input', recorded)
-  // Before the first commit, also of freeze. A review with --base only pushes no branch.
+  // Freeze commits, so the check runs before it. A review with --base only pushes no branch.
   const headRef = input.headRef ?? input.ship?.headRef
   const signing = await step(ledger, 'signing', () => deps.signing.check(headRef === undefined ? [] : [headRef]))
   await deps.signing.apply(signing)

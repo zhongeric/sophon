@@ -62,7 +62,7 @@ export async function trackedFiles(tree: string): Promise<string[]> {
 }
 
 /** Commits every change in the worktree. Does nothing when nothing changed. */
-export async function commitAll(tree: string, message: string, commits: GitCommits = { unsigned: false }): Promise<void> {
+export async function commitAll(tree: string, message: string, commits: GitCommits): Promise<void> {
   await git(tree, 'add', '-A')
   const staged = await git(tree, 'diff', '--cached', '--name-only')
   if (staged.trim() !== '') await git(tree, ...signature(commits), 'commit', '--no-verify', '-m', message)

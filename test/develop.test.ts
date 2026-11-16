@@ -319,6 +319,18 @@ test('develop: a signing stop after the plan ends the run before any builder and
   await assert.rejects(git(repo, 'show-ref', '--verify', '--quiet', 'refs/heads/factory/dev-add-sub-mul'))
 })
 
+test('develop: a review pass uses the signing answer of the development branch and does not check again', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  const checked: string[][] = []
+  const record = { origin: true, branches: [{ branch: 'factory/dev-add-sub-mul', rulesets: [], classic: 'none' as const }], mode: 'unsigned' as const }
+  const signing = (node: Signing): Signing => ({ ...node, check: async (branches) => (checked.push(branches), record) })
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls: fakePulls([false, true]).pulls, runId: 'signing-pass', signing })
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(checked, [['factory/dev-add-sub-mul']])
+  assert.deepEqual(fileLedger(join(dir, 'signing-pass-review-1', 'state.json')).get('step:signing'), { result: record })
+})
+
 test('develop: a test command writes outside the task scope, checkpoint refuses, and the builder submits a blocked log', { timeout: 120_000 }, async () => {
   const { repo } = developRepo({
     stack: 'TypeScript',

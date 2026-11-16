@@ -44,16 +44,21 @@ export function nodeSigning(repo: string, commits: GitCommits, run: Gh = gh(repo
       const url = await originUrl(repo)
       const github = url === null ? null : githubRepository(url)
       if (!github) return { origin: false, branches: [], mode: 'unsigned' }
-      if (branches.length === 0) return { origin: true, branches: [], mode: 'unsigned' }
       const rules = await readSignatureRules(ghGet(run), `repos/${github.owner}/${github.repo}`, branches)
       return { origin: true, branches: rules, mode: commitMode(rules, { signUnknown: true }) }
     },
     async apply(record) {
       commits.unsigned = record.mode === 'unsigned'
       if (record.mode === 'unsigned') return
-      // With commit.gpgsign off, the push rejection stops the run (spec edge case), so there is no key to check here.
       const sign = (await git(repo, 'config', '--type=bool', '--default=false', '--get', 'commit.gpgsign')).trim()
-      if (sign !== 'true') return
+      if (sign !== 'true') {
+        // An unreadable classic protection alone can be no requirement, so the run continues. When GitHub requires signatures, it rejects the push.
+        if (!record.branches.some((rule) => rule.rulesets.length > 0 || rule.classic === 'required')) return
+        throw new StopError(
+          `${signingLine(record)}, but commit.gpgsign is off in the git config, so GitHub rejects the unsigned commits of the host. ` +
+            'Set commit.gpgsign to true, with gpg.format and user.signingkey that give a key that signs without a prompt.',
+        )
+      }
       // A commit object of the empty tree with no ref: git signs it with gpg.format, gpg.program and user.signingkey, as each host commit.
       try {
         const empty = (await git(repo, 'hash-object', '-t', 'tree', '/dev/null')).trim()

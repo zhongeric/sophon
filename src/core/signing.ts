@@ -13,9 +13,12 @@ export type GitHubAnswer = { status: number; body: unknown }
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null
 
+const pageSize = 100
+
 /**
  * Reads the rulesets and the classic protection that require signed commits on each branch. `api` is the
  * repository's API path, as readCi takes it. `get` resolves for every HTTP answer and rejects only when there is no answer.
+ * A rejection is not an answer about the rules, so it goes to the caller unchanged and is not a StopError.
  */
 export async function readSignatureRules(get: (path: string) => Promise<GitHubAnswer>, api: string, branches: string[]): Promise<BranchRule[]> {
   const labels = new Map<number, Promise<string>>()
@@ -34,36 +37,38 @@ export async function readSignatureRules(get: (path: string) => Promise<GitHubAn
   const result: BranchRule[] = []
   for (const branch of branches) {
     const name = encodeURIComponent(branch)
-    const rulesPath = `${api}/rules/branches/${name}`
-    const rules = await ask(get, rulesPath, branch)
-    if (rules.status !== 200) throw failed(branch, rulesPath, `answered ${rules.status}`)
-    if (!Array.isArray(rules.body)) throw failed(branch, rulesPath, 'answered 200 without an array of rules')
     const ids = new Set<number>()
-    for (const rule of rules.body) {
-      if (isObject(rule) && rule.type === 'required_signatures' && typeof rule.ruleset_id === 'number') ids.add(rule.ruleset_id)
+    for (let page = 1; ; page++) {
+      const rulesPath = `${api}/rules/branches/${name}?per_page=${pageSize}&page=${page}`
+      const rules = await get(rulesPath)
+      if (rules.status !== 200) throw failed(branch, rulesPath, `answered ${rules.status}`, rules.status)
+      if (!Array.isArray(rules.body)) throw failed(branch, rulesPath, 'answered 200 without an array of rules')
+      for (const rule of rules.body) {
+        if (!isObject(rule) || typeof rule.type !== 'string') throw failed(branch, rulesPath, 'answered 200 with a rule without a type')
+        if (rule.type !== 'required_signatures') continue
+        if (typeof rule.ruleset_id !== 'number') throw failed(branch, rulesPath, 'answered 200 with a required_signatures rule without a ruleset_id')
+        ids.add(rule.ruleset_id)
+      }
+      if (rules.body.length < pageSize) break
     }
     const rulesets = [...new Set(await Promise.all([...ids].map(label)))]
     const classicPath = `${api}/branches/${name}/protection/required_signatures`
-    const classic = await ask(get, classicPath, branch)
-    if (classic.status === 200) result.push({ branch, rulesets, classic: isObject(classic.body) && classic.body.enabled === true ? 'required' : 'none' })
-    else if (classic.status === 404) result.push({ branch, rulesets, classic: 'none' })
+    const classic = await get(classicPath)
+    if (classic.status === 200) {
+      if (!isObject(classic.body) || typeof classic.body.enabled !== 'boolean') throw failed(branch, classicPath, 'answered 200 without a boolean enabled')
+      result.push({ branch, rulesets, classic: classic.body.enabled ? 'required' : 'none' })
+    } else if (classic.status === 404) result.push({ branch, rulesets, classic: 'none' })
     // Decision of the user: the endpoint needs Administration read, so a 403 is an unknown answer, not a stop.
     else if (classic.status === 403) result.push({ branch, rulesets, classic: 'unreadable' })
-    else throw failed(branch, classicPath, `answered ${classic.status}`)
+    else throw failed(branch, classicPath, `answered ${classic.status}`, classic.status)
   }
   return result
 }
 
-async function ask(get: (path: string) => Promise<GitHubAnswer>, path: string, branch: string): Promise<GitHubAnswer> {
-  try {
-    return await get(path)
-  } catch (error) {
-    throw failed(branch, path, `gave no answer: ${error instanceof Error ? error.message : String(error)}`)
-  }
-}
-
-function failed(branch: string, path: string, problem: string): StopError {
-  return new StopError(`Cannot read the signature rules of branch ${branch}: GET ${path} ${problem}`)
+/** A 429 or a 5xx can go away, so it is not a StopError: the run loop of the Cloudflare host tries the run again. */
+function failed(branch: string, path: string, problem: string, status = 200): Error {
+  const message = `Cannot read the signature rules of branch ${branch}: GET ${path} ${problem}`
+  return status === 429 || status >= 500 ? new Error(message) : new StopError(message)
 }
 
 /** Signed when a ruleset or classic protection requires signatures, or when only an unreadable classic protection is left and `signUnknown` is true. */
