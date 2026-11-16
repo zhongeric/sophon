@@ -214,9 +214,10 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
   }
 })
 
-test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, runs the review loop there, takes its fixes, and marks the PR ready', { timeout: 300_000 }, async () => {
+test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, runs the review loop there, takes its fixes, marks the PR ready, and merges it', { timeout: 300_000 }, async () => {
   const { repo } = developRepo({
     checks: { machine: 'test -f .setup-done' },
+    merge: 'squash',
     setup: 'touch .setup-done',
     stack: 'TypeScript',
     tests: { command: 'env -u NODE_TEST_CONTEXT node --test {tests}', pattern: '\\.test\\.ts$' },
@@ -242,6 +243,7 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     const [number, pull] = [...mock.state.pulls].find(([, entry]) => entry.head === 'factory/dev-add-sub-mul')!
     assert.equal(pull.draft, false)
     assert.match(pull.body, /# Ask\n\n> Add sub and mul/)
+    assert.match(pull.body, /Closes #5/)
     const branch = 'refs/heads/factory/dev-add-sub-mul'
     assert.deepEqual([mock.fileAt(branch, 'src/sub.ts'), mock.fileAt(branch, 'src/mul.ts'), mock.fileAt(branch, 'test/run.log')], [sources.sub, sources.mul, null])
     // The review loop's fix is on the run's branch: the branch moved to the review's commit, without force.
@@ -258,6 +260,14 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     // The review loop ran as a review run of the new PR, and the report went to the PR and the issue.
     assert.ok(on(number).some((entry) => entry.body.startsWith('### agent-factory: PASS')), describe())
     assert.ok(on(number).some((entry) => entry.body.startsWith('# Development run: READY')))
+
+    // With the standing permission, the host merged the PR at the head that the final CI checked, then deleted only the run's branch.
+    assert.deepEqual(mock.state.merges.map(({ pr, method, sha }) => ({ pr, method, sha })), [{ method: 'squash', pr: number, sha: mock.state.refs.get(branch) }])
+    const merged = `Merged by the host (squash): ${mock.state.merges[0]!.commit}.`
+    assert.ok(done.body.includes(merged), done.body)
+    assert.ok(on(number).some((entry) => entry.body.startsWith('# Development run: READY') && entry.body.includes(merged)))
+    assert.deepEqual(mock.state.deleted, ['factory/dev-add-sub-mul'])
+    assert.deepEqual([mock.fileAt('refs/heads/main', 'src/sub.ts'), mock.fileAt('refs/heads/main', 'src/mul.ts')], [sources.sub, sources.mul])
     const status = (await (await fetch(`${worker.url}/runs/acme/app/5`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: { run: string; state: string }[] }
     assert.deepEqual(status.runs.map((run) => run.state), ['passed'])
   } finally {

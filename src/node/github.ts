@@ -3,6 +3,7 @@ import type { PullRequests } from '../core/platform.ts'
 import { gh } from './channels.ts'
 
 const logTailChars = 6_000
+const reasonChars = 300
 
 /** The PRs and CI of the repository at `repo`, through the gh CLI and its login. */
 export function ghPullRequests(repo: string, baseRef: string): PullRequests {
@@ -17,6 +18,19 @@ export function ghPullRequests(repo: string, baseRef: string): PullRequests {
     },
     async ready(pr) {
       if ((JSON.parse(await run(['pr', 'view', String(pr), '--json', 'isDraft'])) as { isDraft: boolean }).isDraft) await run(['pr', 'ready', String(pr)])
+    },
+    async merge(pr, { method, sha }) {
+      try {
+        await run(['pr', 'merge', String(pr), `--${method}`, '--match-head-commit', sha])
+        type View = { state: string; mergeCommit: { oid: string } | null }
+        const view = JSON.parse(await run(['pr', 'view', String(pr), '--json', 'state,mergeCommit'])) as View
+        if (view.state === 'MERGED' && view.mergeCommit?.oid) return { merged: true, sha: view.mergeCommit.oid }
+        // For example, a merge queue keeps the PR open.
+        return { merged: false, reason: `the PR is ${view.state} after gh pr merge` }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { merged: false, reason: message.replace(/\s+/g, ' ').trim().slice(0, reasonChars) }
+      }
     },
     async comment(pr, body) {
       await run(['pr', 'comment', String(pr), '--body-file', '-'], body)

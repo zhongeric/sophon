@@ -161,6 +161,10 @@ of that field. `"tests": null` or `"setup": ""` turns a default off. For example
 - `env` lists extra environment variables that the checks need, for example `["ETH_RPC_URL", "FOUNDRY_PROFILE"]`.
 - `setup` runs one time in each new worktree before its first check, for example
   `"npm ci --prefer-offline --no-audit --no-fund"` or `"forge install"`. Worktrees start without dependencies.
+- `merge` is `"squash"`, `"merge"` or `"rebase"`. It is the standing permission for the host to merge a ready
+  development PR with that method. Without it, the host does not merge. The host reads it from the same source as
+  the other rails: the base branch on Cloudflare, and your working copy locally. Agents cannot write
+  `.agent-factory.json`, thus a run cannot give itself the permission.
 
 ## Local usage
 
@@ -211,7 +215,8 @@ intake ─▶ your answers confirm the ask and the route (spec or not, one or tw
           runs at the same time; the host merges each wave into factory/dev-<slug>
        ─▶ push, draft PR ─▶ CI, with two fix rounds
        ─▶ code review loop, once or twice, on the frozen package (ask, decisions, plan)
-       ─▶ push the review fixes ─▶ CI ─▶ criteria ─▶ ready PR and a report comment. You merge.
+       ─▶ push the review fixes ─▶ CI ─▶ criteria ─▶ ready PR and a report comment
+       ─▶ the host merges when the config has "merge". Else, you merge.
 ```
 
 Intake, spec, planner and builders run on Opus 5.5. The review loop uses its own models.
@@ -226,12 +231,17 @@ Intake, spec, planner and builders run on Opus 5.5. The review loop uses its own
 | CI budget | Two CI-fix rounds after the build, then a blocker. A single task's fixes go to the same builder session. |
 | Review before ready | The code review loop runs on the result, once or twice. A red CI after the review fails the run, because a fix there would skip the review. |
 | Ready only on PASS | The PR stays draft unless the review loop passed, CI is green, and no forbidden path is in the change. A change to Solidity `src/` stays draft, because the Auditor workflow is not built yet. |
+| Merge only with standing permission | Without `merge` in the config, the host never merges. With it, the host merges only on PASS, after the PR is ready, and only at the head that CI checked: the merge call sends that SHA. The host tries one time for each run. A refusal is final, and a resumed run does not merge again. A refused merge leaves the PR ready, and the report gives the reason. After a merge, the host deletes only the remote branch of the run. Review runs (`--ship`) never merge. |
 
 ```bash
 npm run develop -- --repo ~/src/app --ask "Add a fee switch to the vault, off by default"
 npm run develop -- --repo ~/src/app --ask-file ask.md --base develop --parallel 2
 npm run develop -- --run dev-20261113-201500                # resume after a pause
+npm run develop -- --repo ~/src/app --ask-file ask.md --issue 45   # the PR body says Closes #45
 ```
+
+With `--issue <n>`, the PR body says `Closes #<n>`, thus GitHub closes the issue when the PR merges into the
+default branch. The report stays on the PR. When the host merges, the report gives the merge commit.
 
 The repository needs a config (the profile defaults or `.agent-factory.json`, as for the review loop), an origin on
 GitHub, and CI that runs on pull requests. The `gh` CLI must be logged in. Questions go to the terminal when it is interactive. Otherwise the
@@ -300,7 +310,8 @@ npm run remote -- report acme/app#123
   fixes to the PR branch and marks it ready on PASS. `/review --full` forces the full loop.
 - With the webhook: comment `/develop` on an issue, or add the `agent-develop` label. `/develop` takes the options
   `--base <branch>`, `--hotfix`, `--full` and `--parallel <n>`. The intake and spec questions and the final report
-  go to the issue. The review questions go to the new PR.
+  go to the issue. The review questions go to the new PR. The PR says `Closes #<issue>`. The report on the issue
+  says if the host merged the PR, and gives the merge commit.
 - Answer questions with a `/answer` comment, as in [Your answers](#your-answers). The webhook resumes the run at
   once; without it, the run checks again every `PAUSE_POLL_SECONDS` (default 60). Only unedited comments from
   `ALLOWED_USERS` count. The config's `answerers` can narrow that list, never widen it.

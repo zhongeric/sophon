@@ -191,5 +191,13 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
       }
       return sha
     },
+    async deleteRemote(name) {
+      try {
+        await gh.json('DELETE', `${api}/git/refs/heads/${encodePath(name)}`)
+      } catch (error) {
+        // GitHub answers 422 or 404 for a ref that does not exist.
+        if (!(error instanceof GitHubError) || (error.status !== 404 && error.status !== 422)) throw error
+      }
+    },
   }
 }

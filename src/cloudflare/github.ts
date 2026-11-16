@@ -1,5 +1,6 @@
 /** The GitHub REST and GraphQL calls that the Cloudflare host makes, signed with one token. */
 export type GitHub = {
+  /** The JSON of the answer, or undefined for a 204 answer, which has no body. */
   json<T>(method: string, path: string, body?: unknown): Promise<T>
   raw(path: string, accept: string): Promise<Response>
   graphql<T>(query: string, variables: Record<string, unknown>): Promise<T>
@@ -91,7 +92,12 @@ export function github(token: string, api = 'https://api.github.com', fetcher: t
     }
   }
   return {
-    json: async <T>(method: string, path: string, body?: unknown) => (await (await send(method, path, 'application/vnd.github+json', body)).json()) as T,
+    async json<T>(method: string, path: string, body?: unknown) {
+      const response = await send(method, path, 'application/vnd.github+json', body)
+      // A DELETE answers 204 with no body.
+      if (response.status === 204) return undefined as T
+      return (await response.json()) as T
+    },
     raw: (path, accept) => send('GET', path, accept),
     async graphql<T>(query: string, variables: Record<string, unknown>) {
       const result = (await (await send('POST', '/graphql', 'application/vnd.github+json', { query, variables })).json()) as { data?: T; errors?: unknown }

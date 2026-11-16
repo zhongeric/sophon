@@ -6,6 +6,9 @@ import { StopError } from './stop.ts'
 
 export type Check = string | { command: string; files?: string }
 
+export type MergeMethod = 'squash' | 'merge' | 'rebase'
+const mergeMethods: readonly unknown[] = ['squash', 'merge', 'rebase'] satisfies MergeMethod[]
+
 /** The target repository's checks and rails: the profile defaults, and .agent-factory.json. Agents cannot change it. */
 export type RepoConfig = {
   stack: string
@@ -22,6 +25,8 @@ export type RepoConfig = {
   /** GitHub logins whose PR replies answer questions. */
   answerers?: string[]
   timeout_ms?: number
+  /** The standing permission for the host to merge a ready development PR, with this method. Without it, the host does not merge. */
+  merge?: MergeMethod
 }
 
 export const repoConfigFile = '.agent-factory.json'
@@ -32,6 +37,7 @@ export function parseRepoConfig(text: string, source: string): Partial<RepoConfi
   if (config.checks !== undefined && (typeof config.checks !== 'object' || config.checks === null))
     throw new StopError(`${source}: checks must be an object of named commands`)
   if (config.tests && !/\{tests?\}/.test(config.tests.command)) throw new StopError(`${source}: tests.command needs {test} or {tests}`)
+  if ('merge' in config && !mergeMethods.includes(config.merge)) throw new StopError(`${source}: merge must be "squash", "merge" or "rebase"`)
   return config
 }
 

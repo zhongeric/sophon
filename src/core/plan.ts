@@ -205,6 +205,12 @@ export function parseParallel(text: string): number {
   return Number(text)
 }
 
+/** The issue that the PR of a local run closes. */
+export function parseIssue(text: string): number {
+  if (!/^\s*\d+\s*$/.test(text) || Number(text) < 1) throw new StopError(`--issue must be an issue number of 1 or more, not ${JSON.stringify(text)}`)
+  return Number(text)
+}
+
 const overlap = (a: string[], b: string[]) => a.some((x) => b.some((y) => within(x, y) || within(y, x)))
 
 /**

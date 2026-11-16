@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { github, GitHubError, refusedCredential } from '../src/cloudflare/github.ts'
+import { github, GitHubError, refusedCredential, type GitHub } from '../src/cloudflare/github.ts'
+import { githubPulls } from '../src/cloudflare/pulls.ts'
 
 const answer = (status: number, body: unknown = {}, headers: Record<string, string> = {}) => new Response(JSON.stringify(body), { headers, status })
 
@@ -192,4 +193,37 @@ test('refusedCredential is true only for a 401 or a 403 that is not a rate limit
   assert.equal(refusedCredential(new GitHubError(403, 'x', true)), false)
   assert.equal(refusedCredential(new GitHubError(502, 'x')), false)
   assert.equal(refusedCredential(new Error('x')), false)
+})
+
+test('json gives undefined for a 204 answer without a body', async () => {
+  const { calls, client } = scripted(new Response(null, { status: 204 }))
+  assert.equal(await client.json('DELETE', '/repos/acme/app/git/refs/heads/x'), undefined)
+  assert.deepEqual(calls, ['DELETE https://api.test/repos/acme/app/git/refs/heads/x'])
+})
+
+test('a PR merge sends the method and the head, and a refusal of GitHub is a result', async () => {
+  const calls: { method: string; path: string; body: unknown }[] = []
+  const answers: (unknown | Error)[] = [
+    { merged: true, sha: 'abc123', message: 'Pull Request successfully merged' },
+    new GitHubError(409, 'GitHub PUT /repos/acme/app/pulls/7/merge answered HTTP 409: Head branch was modified'),
+  ]
+  const stub: GitHub = {
+    async json<T>(method: string, path: string, body?: unknown) {
+      calls.push({ method, path, body })
+      const answer = answers.shift()
+      if (answer instanceof Error) throw answer
+      return answer as T
+    },
+    raw: async () => new Response(null),
+    graphql: async () => {
+      throw new Error('no GraphQL')
+    },
+  }
+  const pulls = githubPulls(stub, 'acme', 'app', 'main')
+  assert.deepEqual(await pulls.merge(7, { method: 'squash', sha: 'f00d' }), { merged: true, sha: 'abc123' })
+  assert.deepEqual(calls, [{ method: 'PUT', path: '/repos/acme/app/pulls/7/merge', body: { merge_method: 'squash', sha: 'f00d' } }])
+  assert.deepEqual(await pulls.merge(7, { method: 'rebase', sha: 'f00d' }), {
+    merged: false,
+    reason: 'GitHub PUT /repos/acme/app/pulls/7/merge answered HTTP 409: Head branch was modified',
+  })
 })

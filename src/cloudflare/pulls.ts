@@ -1,6 +1,6 @@
 import { readCi } from '../core/ci.ts'
 import type { PullRequests } from '../core/platform.ts'
-import type { GitHub } from './github.ts'
+import { GitHubError, type GitHub } from './github.ts'
 
 const logTailChars = 6_000
 
@@ -18,6 +18,17 @@ export function githubPulls(gh: GitHub, owner: string, repo: string, baseRef: st
       const pull = await gh.json<Pull>('GET', `${api}/pulls/${pr}`)
       if (pull.draft)
         await gh.graphql('mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId } }', { id: pull.node_id })
+    },
+    async merge(pr, { method, sha }) {
+      try {
+        const answer = await gh.json<{ merged: boolean; sha?: string; message?: string }>('PUT', `${api}/pulls/${pr}/merge`, { merge_method: method, sha })
+        if (answer.merged && answer.sha) return { merged: true, sha: answer.sha }
+        return { merged: false, reason: answer.message ?? 'GitHub did not merge the PR' }
+      } catch (error) {
+        // GitHub refuses a merge with 405 (not mergeable), 409 (the head changed) or 422 (the settings).
+        if (error instanceof GitHubError) return { merged: false, reason: error.message }
+        throw error
+      }
     },
     async comment(pr, body) {
       await gh.json('POST', `${api}/issues/${pr}/comments`, { body })
