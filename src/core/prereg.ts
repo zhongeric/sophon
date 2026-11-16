@@ -119,15 +119,17 @@ export async function freezePrereg(prereg: Prereg, amendment: { previous?: Froze
 /**
  * True when a path is prereg/ or inside it, for the protect rail. The path is relative to the repository root,
  * absolute in the repository tree, or under /repo. A path that uses .. to leave prereg/ is not inside it.
+ * A .. at the root of an absolute path stays at the root, as in POSIX. A relative path that leaves the root is not inside.
  */
 export function isPreregPath(path: string): boolean {
+  const absolute = path.startsWith('/')
   const parts: string[] = []
   for (const part of path.split('/')) {
     if (part === '' || part === '.') continue
     if (part === '..') {
-      if (parts.pop() === undefined) return false
+      if (parts.pop() === undefined && !absolute) return false
     } else parts.push(part)
   }
-  if (path.startsWith('/') && parts[0] === 'repo') parts.shift()
+  if (absolute && parts[0] === 'repo') parts.shift()
   return parts[0] === 'prereg'
 }

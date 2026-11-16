@@ -104,7 +104,7 @@ test('an amendment needs the earlier version, a reason and the same hypothesis',
 })
 
 test('the path helper finds paths under prereg/', () => {
-  for (const path of ['prereg/x', './prereg/x', '/repo/prereg/x', '/prereg/x', 'prereg', 'prereg/a/../b.md', 'prereg//hyp-001-v1.md'])
+  for (const path of ['prereg/x', './prereg/x', '/repo/prereg/x', '/prereg/x', 'prereg', 'prereg/a/../b.md', 'prereg//hyp-001-v1.md', '/../prereg/x', '/repo/../../prereg/x'])
     assert.equal(isPreregPath(path), true, path)
   for (const path of ['prereg-old/x', 'prereg/../x', './prereg/../../prereg/x', '../prereg/x', 'src/prereg/x', 'repo/prereg/x', '/repo/src/x', '', '.'])
     assert.equal(isPreregPath(path), false, path)

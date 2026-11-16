@@ -2,7 +2,7 @@ import type { Contracts } from 'nanocode-ts'
 import { isArtifactId } from './artifacts.ts'
 import { evidenceChecker, severities, type Evidence, type EvidenceCheck, type Severity } from './findings.ts'
 
-/** What the research checks read. The host gives the domain data and the stores. The checks never read the config. */
+/** What the research checks read: the notebook and the run store. */
 export type ResearchSources = {
   /** Reads a file of the notebook, or returns null when it does not exist. */
   read(path: string): Promise<string | null>
@@ -33,8 +33,8 @@ type SubmittedObjection = Omit<Objection, 'id'>
 
 export type Responses = { addressed: { id: string; change: string; artifacts: string[] }[]; conceded: { id: string; reason: string }[] }
 
-export const outcomes = ['candidate', 'null'] as const
-export const checklistStatuses = ['ruled_out', 'open', 'not_tested'] as const
+const outcomes = ['candidate', 'null'] as const
+const checklistStatuses = ['ruled_out', 'open', 'not_tested'] as const
 export type ChecklistStatus = (typeof checklistStatuses)[number]
 /** A ruled_out item has a location and evidence. The other statuses do not need them. */
 export type ChecklistEntry = { item: string; status: ChecklistStatus; location?: string; evidence?: string }
@@ -181,7 +181,10 @@ function reject(problems: string[]): void {
   if (problems.length > 0) throw new Error(problems.join('\n'))
 }
 
-/** The evidence check of submit_findings, on the notebook and the run store. A research check has no diff. */
+/**
+ * The evidence check of submit_findings, on the notebook and the run store. A research check has no diff. The arrow
+ * functions keep the receiver of the methods, because a spread copy drops the methods of a class instance.
+ */
 function researchChecker(sources: ResearchSources): EvidenceCheck {
   return evidenceChecker({ read: (path) => sources.read(path), diff: '', artifact: (id) => sources.artifact(id) })
 }
@@ -208,7 +211,7 @@ export async function checkSurvey(input: unknown, sources: ResearchSources): Pro
   return survey as Survey
 }
 
-export async function checkHypotheses(input: unknown): Promise<{ hypotheses: Hypothesis[] }> {
+export function checkHypotheses(input: unknown): { hypotheses: Hypothesis[] } {
   const list = record(input).hypotheses
   if (!Array.isArray(list)) throw new Error('hypotheses must be an array')
   reject(list.flatMap((value, index) => prefixed(`hypotheses[${index}]`, missing(record(value), hypothesisFields))))
@@ -230,7 +233,8 @@ export function mergeHypotheses(lists: Hypothesis[][]): NumberedHypothesis[] {
     seen.add(key)
     return true
   })
-  return kept.map((hypothesis, index) => ({ id: numbered('hyp', index), ...hypothesis }))
+  // The host ID comes last, so that an id field that the agent submits cannot replace it.
+  return kept.map((hypothesis, index) => ({ ...hypothesis, id: numbered('hyp', index) }))
 }
 
 /** Enforces the evidence rule on objections, with a lens of the domain in place of a review track. */
@@ -258,9 +262,9 @@ export async function checkObjections(input: unknown, sources: ResearchSources, 
   return { objections: list as SubmittedObjection[] }
 }
 
-/** Gives each objection a stable ID, for example obj-003, from its position in the submitted list. */
+/** Gives each objection a stable ID, for example obj-003, from its position in the submitted list. The host ID replaces a submitted id field. */
 export function assignObjectionIds(objections: SubmittedObjection[]): Objection[] {
-  return objections.map((objection, index) => ({ id: numbered('obj', index), ...objection }))
+  return objections.map((objection, index) => ({ ...objection, id: numbered('obj', index) }))
 }
 
 /** The problems of a list of artifact IDs: it must not be empty, and each ID must be valid and in the run store. */

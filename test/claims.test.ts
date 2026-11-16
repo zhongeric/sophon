@@ -93,19 +93,17 @@ const hypothesis = {
   cost: 'Two hours of compute',
 }
 
-test('a list of hypotheses passes, and so does an empty list', async () => {
-  assert.deepEqual(await checkHypotheses({ hypotheses: [hypothesis] }), { hypotheses: [hypothesis] })
-  assert.deepEqual(await checkHypotheses({ hypotheses: [] }), { hypotheses: [] })
+test('a list of hypotheses passes, and so does an empty list', () => {
+  assert.deepEqual(checkHypotheses({ hypotheses: [hypothesis] }), { hypotheses: [hypothesis] })
+  assert.deepEqual(checkHypotheses({ hypotheses: [] }), { hypotheses: [] })
 })
 
-test('one hypotheses rejection lists every missing field of every item', async () => {
+test('one hypotheses rejection lists every missing field of every item', () => {
   const { why_missed: _why, ...noWhy } = hypothesis
-  assert.deepEqual(await problems(checkHypotheses({ hypotheses: [{}, { ...hypothesis, test: '  ' }, noWhy] })), [
-    'hypotheses[0]: missing title, statement, why_missed, data, test, kill_criterion, cost',
-    'hypotheses[1]: missing test',
-    'hypotheses[2]: missing why_missed',
-  ])
-  assert.deepEqual(await problems(checkHypotheses({})), ['hypotheses must be an array'])
+  assert.throws(() => checkHypotheses({ hypotheses: [{}, { ...hypothesis, test: '  ' }, noWhy] }), {
+    message: ['hypotheses[0]: missing title, statement, why_missed, data, test, kill_criterion, cost', 'hypotheses[1]: missing test', 'hypotheses[2]: missing why_missed'].join('\n'),
+  })
+  assert.throws(() => checkHypotheses({}), { message: 'hypotheses must be an array' })
 })
 
 test('the merge keeps the first hypothesis of each normalized data and test, and numbers the result without gaps', () => {
@@ -123,6 +121,12 @@ test('the merge keeps the first hypothesis of each normalized data and test, and
   )
   assert.deepEqual(merged[0], { id: 'hyp-001', ...hypothesis })
   assert.deepEqual(mergeHypotheses([[], []]), [])
+})
+
+test('the merge gives host IDs that replace an id field of the agent', () => {
+  const first = Object.assign({ ...hypothesis }, { id: 'hyp-009' })
+  const second = Object.assign({ ...hypothesis, data: 'Archive photometry' }, { id: 'hyp-001' })
+  assert.deepEqual(mergeHypotheses([[first, second]]).map(({ id }) => id), ['hyp-001', 'hyp-002'])
 })
 
 const lenses = ['systematics', 'contamination']
@@ -146,6 +150,12 @@ test('valid objections pass, and the host numbers them in the submitted order', 
     { id: 'obj-002', ...second },
   ])
   assert.deepEqual(await checkObjections({ objections: [] }, sources, lenses), { objections: [] })
+})
+
+test('the host IDs replace an id field that the skeptic submits', async () => {
+  const withId = { ...objection, id: 'obj-001' }
+  const checked = await checkObjections({ objections: [withId, withId] }, sources, lenses)
+  assert.deepEqual(assignObjectionIds(checked.objections).map(({ id }) => id), ['obj-001', 'obj-002'])
 })
 
 test('one objections rejection lists missing fields, unknown lenses, bad severities and bad quotes', async () => {
