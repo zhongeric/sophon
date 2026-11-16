@@ -77,6 +77,16 @@ export async function mockServices(
     number,
     title: pull.title,
   })
+  /** The entries of a directory at a ref, as the contents API lists them: the root, or the directory at `dir`. */
+  const entriesAt = (ref: string, dir?: string) =>
+    text(['ls-tree', ref, ...(dir ? ['--', `${dir}/`] : [])])
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        const [meta = '', path = ''] = line.split('\t')
+        const [mode, type] = meta.split(' ')
+        return { name: path.slice(path.lastIndexOf('/') + 1), path, type: type === 'tree' ? 'dir' : type === 'commit' ? 'submodule' : mode === '120000' ? 'symlink' : 'file' }
+      })
   const machineRoot = mkdtempSync(join(tmpdir(), 'factory-machine-'))
 
   const read = (request: IncomingMessage) =>
@@ -197,21 +207,15 @@ export async function mockServices(
       }
       if (route === `GET ${api}/contents`) {
         // The root listing: the profiles look for their markers and lockfiles here.
-        const entries = text(['ls-tree', url.searchParams.get('ref')!])
-          .split('\n')
-          .filter(Boolean)
-          .map((line) => {
-            const [meta = '', name = ''] = line.split('\t')
-            const [mode, type] = meta.split(' ')
-            return { name, path: name, type: type === 'tree' ? 'dir' : type === 'commit' ? 'submodule' : mode === '120000' ? 'symlink' : 'file' }
-          })
-        return json(response, 200, entries)
+        return json(response, 200, entriesAt(url.searchParams.get('ref')!))
       }
       if (route.startsWith(`GET ${api}/contents/`)) {
         const path = decodeURIComponent(url.pathname.slice(`${api}/contents/`.length))
         const ref = url.searchParams.get('ref')!
         const listing = text(['ls-tree', ref, '--', path])
         if (!listing) return json(response, 404, { message: 'Not Found' })
+        // A directory gives the array of its entries, as on GitHub.
+        if (request.headers.accept !== 'application/vnd.github.raw' && listing.split(/\s/)[1] === 'tree') return json(response, 200, entriesAt(ref, path))
         const content = git(['show', `${ref}:${path}`])
         if (request.headers.accept === 'application/vnd.github.raw') {
           response.writeHead(200, { 'content-type': 'application/octet-stream' })

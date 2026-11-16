@@ -10,6 +10,7 @@ import type { AgentStore, Files, Guides, PullRequests } from '../core/platform.t
 import { profileDefaults, type RootFiles } from '../core/profiles.ts'
 import type { Credentials } from '../core/providers.ts'
 import type { Channel } from '../core/questions.ts'
+import { loadResearchDomain, type ResearchConfig, type ResearchDomain, type ResearchFiles } from '../core/research.ts'
 import { StopError } from '../core/stop.ts'
 import { codeReviewLoop, type LoopDeps } from '../core/workflows/code-review-loop.ts'
 import type { DevelopDeps, DevelopInput } from '../core/workflows/develop.ts'
@@ -49,6 +50,35 @@ export async function loadRepoConfig(repo: string, path?: string): Promise<RepoC
   requireChecks(config, repo)
   const guides = Object.entries(config.guides ?? {}).map(([name, guide]) => [name, guide.replace(/^~(?=\/)/, homedir())])
   return { ...config, guides: Object.fromEntries(guides) }
+}
+
+/** The status of a path after symlinks, or null when the path or the target of a symlink is missing. */
+function statOf(path: string) {
+  try {
+    return statSync(path)
+  } catch {
+    return null
+  }
+}
+
+/** The files of a working copy at paths relative to its root. Reads and listings follow symlinks, as diskRoot does. */
+function diskFiles(repo: string): ResearchFiles {
+  return {
+    read: async (path) => (statOf(join(repo, path))?.isFile() ? readFileSync(join(repo, path), 'utf8') : null),
+    async list(dir) {
+      const path = join(repo, dir)
+      if (!statOf(path)?.isDirectory()) return null
+      return readdirSync(path).filter((name) => statOf(join(path, name))?.isFile() ?? false)
+    },
+  }
+}
+
+/**
+ * The research domain from the working copy. The paths of the research config are relative to the repository root,
+ * also when the config comes from a file in another directory.
+ */
+export async function loadResearch(repo: string, research: ResearchConfig): Promise<ResearchDomain> {
+  return loadResearchDomain(research, diskFiles(repo), `in ${repo}`)
 }
 
 /** Host guides from agents/, plus the repository's guides from its config. */
