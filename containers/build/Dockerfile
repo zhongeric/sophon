@@ -3,7 +3,7 @@
 FROM node:22-bookworm
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl git python3 xz-utils \
+  && apt-get install -y --no-install-recommends ca-certificates curl git python3 python3-pip python3-venv xz-utils \
   && rm -rf /var/lib/apt/lists/*
 
 # Foundry, for Solidity repositories.

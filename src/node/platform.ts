@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
@@ -26,6 +26,15 @@ function diskRoot(repo: string): RootFiles {
   return {
     exists: async (name) => existsSync(file(name)),
     read: async (name) => (existsSync(file(name)) ? readFileSync(file(name), 'utf8') : null),
+    // A symlink counts by its target, as exists() and read() follow it.
+    list: async () =>
+      readdirSync(repo).filter((name) => {
+        try {
+          return statSync(file(name)).isFile()
+        } catch {
+          return false
+        }
+      }),
   }
 }
 
