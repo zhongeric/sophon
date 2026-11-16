@@ -10,6 +10,7 @@ export async function rootAt(gh: GitHub, owner: string, repo: string, ref: strin
   const files = new Set(listing.filter((entry) => entry.type === 'file').map((entry) => entry.name))
   return {
     exists: async (name) => files.has(name),
+    list: async () => [...files],
     read: async (name) => (files.has(name) ? (await gh.raw(`${api}/${encodeURIComponent(name)}${query}`, 'application/vnd.github.raw')).text() : null),
   }
 }

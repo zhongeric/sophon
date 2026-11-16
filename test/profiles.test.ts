@@ -227,6 +227,33 @@ test('triage records the matched profiles and the guides of the profiles that go
   assert.equal(triageLine(many), 'TRIAGE path=full reason=not-docs-or-tests files=a.json,b.json,c.json,d.json,e.json,+2 profiles=docs')
 })
 
+test('the python profile applies with one of its markers, and Python tests take the light loop only at the root or by name', async () => {
+  const path = async (changed: string[], exists: (path: string) => Promise<boolean>) => {
+    const result = await triage(changed, exists, false)
+    return `${result.path} ${result.reason}${result.files.length ? ` ${result.files.join(',')}` : ''}`
+  }
+  const python = repo('requirements.txt')
+  assert.equal(await path(['tests/x.py', 'test/y.py', 'test_a.py', 'pkg/a_test.py', 'pkg/test_b.pyi', 'src/conftest.py', 'README.md'], python), 'light docs-or-tests-only')
+  assert.equal(await path(['src/pkg/tests/util.py', 'src/a.py', 'stubs/a.pyi', 'tests/x.py'], python), 'full not-docs-or-tests src/pkg/tests/util.py,src/a.py,stubs/a.pyi')
+  assert.equal(await path(['tests/x.py'], repo()), 'full not-docs-or-tests tests/x.py')
+
+  assert.deepEqual((await triage(['src/a.py'], python, false)).profiles, ['python', 'docs'])
+  assert.deepEqual((await triage(['src/a.py'], repo('pyproject.toml'), false)).guides, ['profiles/python.md'])
+  assert.deepEqual((await triage(['src/a.py'], repo('pyproject.toml', 'requirements.txt'), false)).profiles, ['python', 'docs'])
+  assert.deepEqual((await triage(['src/a.py'], repo(), false)).profiles, ['docs'])
+  assert.deepEqual((await triage(['src/a.ts'], repo('package.json'), false)).profiles, ['docs'])
+})
+
+test('a Python change must not add bytecode, caches, the venv or notebook checkpoints', () => {
+  const changed = ['pkg/__pycache__/a.cpython-312.pyc', 'a.pyc', '.venv/bin/python', 'nb/.ipynb_checkpoints/x-checkpoint.ipynb', 'src/a.py', 'venv.py']
+  const python = profiles.filter((profile) => profile.id === 'python')
+  assert.deepEqual(
+    staticFindings('', changed, python).map((finding) => `${finding.location} ${finding.severity}`),
+    ['pkg/__pycache__/a.cpython-312.pyc:1 medium', 'a.pyc:1 medium', '.venv/bin/python:1 medium', 'nb/.ipynb_checkpoints/x-checkpoint.ipynb:1 medium'],
+  )
+  assert.deepEqual(staticFindings('', changed, profiles.filter((profile) => profile.id === 'typescript')), [])
+})
+
 test('every guide file exists, and the Worker bundles it', () => {
   const bundle = readFileSync(new URL('../src/cloudflare/guides.ts', import.meta.url), 'utf8')
   for (const file of guideFiles) {

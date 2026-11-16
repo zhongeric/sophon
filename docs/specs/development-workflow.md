@@ -208,7 +208,8 @@ checks, tests, setup and protected paths of its stack. A repo can override field
 branch. The host reads both from the base branch, so a PR cannot change its own rules.
 
 The code has a part of this type now: `markers`, `files`, `light`, `guides`, `forbidden`, `rules` and `defaults` (the
-checks, tests, setup and protected paths of the stack). The review loop uses them for triage, guides, host findings
+checks, tests, setup and protected paths of the stack). A profile can apply when one of its markers exists
+(`markerMatch: 'any'`), for example `python` with `pyproject.toml` or `requirements.txt`. The review loop uses them for triage, guides, host findings
 and the repository config. Policy, checks, tests, protected paths, the machine and repo
 overrides come with phase 1.
 

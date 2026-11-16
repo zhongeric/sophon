@@ -57,9 +57,19 @@ export function requireChecks(config: RepoConfig, repository: string): RepoConfi
   return config
 }
 
+/**
+ * An entry without `*` matches an exact path or a directory prefix. In an entry with `*`, each `*` matches characters in
+ * one path segment. Such an entry matches the full path, or a directory prefix when it ends with `/`.
+ */
+function matchesProtectEntry(entry: string, relative: string): boolean {
+  if (!entry.includes('*')) return relative === entry || relative.startsWith(`${entry.replace(/\/$/, '')}/`)
+  const source = entry.split('*').map((part) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*')
+  return new RegExp(entry.endsWith('/') ? `^${source}` : `^${source}$`).test(relative)
+}
+
 export function isProtected(config: RepoConfig, path: string): boolean {
   const relative = path.replace(/^\/+/, '')
-  return [repoConfigFile, ...(config.protect ?? [])].some((entry) => relative === entry || relative.startsWith(`${entry.replace(/\/$/, '')}/`))
+  return [repoConfigFile, ...(config.protect ?? [])].some((entry) => matchesProtectEntry(entry, relative))
 }
 
 export type CheckResult = {

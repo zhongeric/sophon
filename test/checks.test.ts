@@ -71,3 +71,22 @@ test('the config file and its protect entries are protected', () => {
   assert.equal(isProtected(config, '/package.json'), true)
   assert.equal(isProtected(config, '/src/package.json'), false)
 })
+
+test('a star in a protect entry matches characters in one path segment', () => {
+  const config = { stack: 'Python', checks: { smoke: 'true' }, protect: ['requirements*.txt', 'pkg*/', 'a.b(c)+*'] }
+  assert.equal(isProtected(config, '/.agent-factory.json'), true)
+  assert.equal(isProtected(config, '/requirements.txt'), true)
+  assert.equal(isProtected(config, '/requirements-dev.txt'), true)
+  assert.equal(isProtected(config, '/sub/requirements.txt'), false)
+  assert.equal(isProtected(config, '/requirements/dev.txt'), false)
+  assert.equal(isProtected(config, '/requirementsXtxt'), false)
+  assert.equal(isProtected(config, '/pkg-a/x.py'), true)
+  assert.equal(isProtected(config, '/pkg/sub/x.py'), true)
+  assert.equal(isProtected(config, '/pkg-a'), false)
+  assert.equal(isProtected(config, '/src/pkg-a/x.py'), false)
+  assert.equal(isProtected(config, '/a.b(c)+d'), true)
+  assert.equal(isProtected(config, '/aXb(c)+d'), false)
+  const all = { stack: 'Python', checks: { smoke: 'true' }, protect: ['*'] }
+  assert.equal(isProtected(all, '/setup.py'), true)
+  assert.equal(isProtected(all, '/src/setup.py'), false)
+})

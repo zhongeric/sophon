@@ -9,6 +9,7 @@ import light from '../../agents/light.md'
 import minimize from '../../agents/minimize.md'
 import patch from '../../agents/patch.md'
 import planner from '../../agents/planner.md'
+import profiles_python from '../../agents/profiles/python.md'
 import profiles_solidity from '../../agents/profiles/solidity.md'
 import profiles_typescript from '../../agents/profiles/typescript.md'
 import questions from '../../agents/questions.md'
@@ -31,6 +32,7 @@ const texts: Record<string, string> = {
   'minimize.md': minimize,
   'patch.md': patch,
   'planner.md': planner,
+  'profiles/python.md': profiles_python,
   'profiles/solidity.md': profiles_solidity,
   'profiles/typescript.md': profiles_typescript,
   'questions.md': questions,

@@ -1,11 +1,14 @@
 import type { RepoConfig } from './checks.ts'
 import type { Finding, Severity } from './findings.ts'
+import { pythonSetup } from './python.ts'
 
 /** The files at the root of a repository tree, where markers, manifests and lockfiles are. */
 export type RootFiles = {
   exists(name: string): Promise<boolean>
   /** The text of a file, or null when it does not exist. */
   read(name: string): Promise<string | null>
+  /** The names of the files at the root, without the directories. */
+  list(): Promise<string[]>
 }
 
 /** A mechanical rule that the host checks on each line that a change adds, before any reviewer reads the change. */
@@ -24,6 +27,8 @@ export type Profile = {
   id: string
   /** Files at the repository root that must all exist for the profile to apply, for example foundry.toml. */
   markers: string[]
+  /** With 'any', the profile applies when one of its markers exists. The default is 'all'. */
+  markerMatch?: 'all' | 'any'
   /** The changed files that the profile governs. Its static rules check these files. */
   files: RegExp
   /** The governed files that may take the light loop because they cannot change behavior, or null for none. */
@@ -244,6 +249,40 @@ const typescript: Profile = {
   },
 }
 
+const pythonFiles = '\\.pyi?$'
+
+/** Compiles each file in memory, so that the check writes no bytecode into the tree. */
+const pythonCompile = `python3 -B -c "import sys; [compile(open(f, 'rb').read(), f, 'exec') for f in sys.argv[1:]]" {files}`
+
+const python: Profile = {
+  id: 'python',
+  markers: ['pyproject.toml', 'requirements.txt'],
+  markerMatch: 'any',
+  files: /\.pyi?$/,
+  /** Test directories only at the repository root, so that production code in a package directory named tests gets the full loop. */
+  light: /^tests?\/|(^|\/)(test_[^/]*\.pyi?|[^/]*_test\.pyi?|conftest\.py)$/,
+  guides: ['profiles/python.md'],
+  forbidden: [/(^|\/)__pycache__\//, /\.pyc$/, /(^|\/)\.venv\//, /(^|\/)\.ipynb_checkpoints\//],
+  rules: [],
+  planSections: [],
+  async defaults(root) {
+    const setup = await pythonSetup(root)
+    // The check is not named lint, so that it does not replace the eslint check of a TypeScript profile in the same repository.
+    const checks: RepoConfig['checks'] = setup.tools.includes('ruff')
+      ? { ruff: { command: '.venv/bin/ruff check --no-cache {files}', files: pythonFiles } }
+      : { compile: { command: pythonCompile, files: pythonFiles } }
+    return {
+      stack: 'Python',
+      checks,
+      ...(setup.tools.includes('pytest')
+        ? { tests: { pattern: '(^|/)(test_[^/]*|[^/]*_test)\\.py$', command: 'PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider {tests}' } }
+        : {}),
+      setup: setup.commands.join(' && '),
+      protect: ['pyproject.toml', 'requirements*.txt', 'uv.lock', 'poetry.lock'],
+    }
+  },
+}
+
 const docs: Profile = {
   id: 'docs',
   markers: [],
@@ -265,7 +304,7 @@ const docs: Profile = {
   ],
 }
 
-export const profiles: Profile[] = [solidity, soliditySupport, typescript, docs]
+export const profiles: Profile[] = [solidity, soliditySupport, typescript, python, docs]
 
 /** Scratch logs and environment files, in every repository. */
 const forbiddenEverywhere = [/\.log$/, /(^|\/)\.env(\.(?!(example|sample|template)$)[^/]+)?$/]
@@ -295,10 +334,13 @@ export async function profileDefaults(root: RootFiles): Promise<Partial<RepoConf
 
 export const profilesById = (ids: string[]) => profiles.filter((profile) => ids.includes(profile.id))
 
-/** The profiles whose marker files all exist in the repository. */
+/** The profiles whose marker files all exist in the repository, or one of them for a profile with markerMatch 'any'. */
 export async function presentProfiles(exists: (path: string) => Promise<boolean>): Promise<Profile[]> {
   const present: Profile[] = []
-  for (const profile of profiles) if ((await Promise.all(profile.markers.map(exists))).every(Boolean)) present.push(profile)
+  for (const profile of profiles) {
+    const found = await Promise.all(profile.markers.map(exists))
+    if (profile.markerMatch === 'any' ? found.some(Boolean) : found.every(Boolean)) present.push(profile)
+  }
   return present
 }
 

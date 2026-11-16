@@ -26,6 +26,7 @@ function diskRoot(repo: string): RootFiles {
   return {
     exists: async (name) => existsSync(file(name)),
     read: async (name) => (existsSync(file(name)) ? readFileSync(file(name), 'utf8') : null),
+    list: async () => readdirSync(repo, { withFileTypes: true }).flatMap((entry) => (entry.isFile() ? [entry.name] : [])),
   }
 }
 
