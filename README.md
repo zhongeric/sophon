@@ -9,7 +9,8 @@ It has two workflows:
   plan's tasks and the code review loop before the PR is ready.
 
 The design of the development workflow and of the profiles, with its decisions, is in
-[docs/specs/development-workflow.md](docs/specs/development-workflow.md).
+[docs/specs/development-workflow.md](docs/specs/development-workflow.md). The design of a third workflow, research runs
+on public data, is in [docs/specs/research-workflow.md](docs/specs/research-workflow.md). It is not built yet.
 
 The host owns the flow and the hard rules. Each agent gets one role: its guidelines (`agents/*.md`),
 its workspace, its tools, and a submit tool whose input the host checks. No agent sees another agent's
