@@ -7,7 +7,7 @@ import type { AgentStore, Checker, Files, Frozen, Guides, Repo } from '../platfo
 import { isLight, profilesById, staticFindings, triage, triageLine, type Triage } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
 import { asker, decisions, type Answer, type Channel } from '../questions.ts'
-import { roles, type ModelChoice } from '../roles.ts'
+import { reviewRoles, type ModelChoice } from '../roles.ts'
 import { askQuestions, intent, light, patch, review, splitReview, type LightLog, type PatchLog, type PatchOutcome, type Range, type RunContext, type Verdict } from '../steps.ts'
 import { StopError } from '../stop.ts'
 
@@ -232,7 +232,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     // The bugs review is the slowest track: on a large diff, the host splits it across reviewers.
     const step1 = await Promise.all(
       step1Roles.map((id) =>
-        step(ledger, `step1.${id}`, () => (id === 'bugs' ? splitReview : review)(context, `step1.${id}`, roles[id], input.models.step1[id], step1Range, '')),
+        step(ledger, `step1.${id}`, () => (id === 'bugs' ? splitReview : review)(context, `step1.${id}`, reviewRoles[id], input.models.step1[id], step1Range, '')),
       ),
     )
     const host1 = await hostCheck('step1.host', step1Range, 'host')
@@ -251,7 +251,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       const note = 'This is the step 2 pass. The diff is the patch that the step 1 patch agent applied, not the original change.'
       const late = await Promise.all(
         (['late-minimize', 'late-rules'] as const).map((id) =>
-          step(ledger, `step2.${id}`, () => review(context, `step2.${id}`, roles[id], input.models.step2[id], range, note)),
+          step(ledger, `step2.${id}`, () => review(context, `step2.${id}`, reviewRoles[id], input.models.step2[id], range, note)),
         ),
       )
       const host2 = await hostCheck('step2.host', range, 'late-host')
@@ -271,7 +271,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       const note =
         'This is the late bugs pass. The diff holds every fix that the patch agents applied after the review froze the change. Check that each fix is correct and breaks nothing around it.'
       const bugs = await step(ledger, 'step2.late-bugs', () =>
-        splitReview(context, 'step2.late-bugs', roles['late-bugs'], input.models.step2['late-bugs'], range, note),
+        splitReview(context, 'step2.late-bugs', reviewRoles['late-bugs'], input.models.step2['late-bugs'], range, note),
       )
       // The step 2 patch is the one commit that no host check saw yet.
       const host3 = patch2?.changed ? await hostCheck('step2.late-bugs-host', { from: patch2.before, to: patch2.after }, 'late-bugs-host') : []

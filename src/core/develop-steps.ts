@@ -1,12 +1,12 @@
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { runTurn, submitOnce, type AgentHost, type AgentSpec, type HostTools } from './agent.ts'
-import { callRunTests, isProtected, runTestsTool, targetedTests, type RepoConfig } from './checks.ts'
+import { callRunTests, isProtected, protectedEntries, runTestsTool, targetedTests, type RepoConfig } from './checks.ts'
 import { checkIntake, checkPlan, checkSpec, inScope, submitIntake, submitPlan, submitSpec, type Intake, type Plan, type Spec } from './plan.ts'
 import type { Branch, Checker, Guides } from './platform.ts'
 import { staticFindings, type Profile } from './profiles.ts'
 import { decisionsFile, decisionsLine } from './questions.ts'
-import { instructions, roles, type ModelChoice, type Role } from './roles.ts'
+import { developRoles, instructions, type ModelChoice, type Role } from './roles.ts'
 import { allowFiles, createWorkspace, guard, readOnly } from './workspace.ts'
 
 /** What every agent of one development run shares. */
@@ -42,7 +42,7 @@ export async function intake(context: DevelopContext, id: string, model: ModelCh
     '',
     'Call submit_intake one time.',
   ].join('\n')
-  return runTurn(context.host, agent(context, id, roles.intake, model, workspace, tools), prompt, 'submit_intake')
+  return runTurn(context.host, agent(context, id, developRoles.intake, model, workspace, tools), prompt, 'submit_intake')
 }
 
 /** A read-only agent that writes the spec of a larger change, and the decisions that the user can overrule. */
@@ -58,14 +58,14 @@ export async function writeSpec(context: DevelopContext, id: string, model: Mode
     '',
     'Call submit_spec one time.',
   ].join('\n')
-  return runTurn(context.host, agent(context, id, roles.spec, model, workspace, tools), prompt, 'submit_spec')
+  return runTurn(context.host, agent(context, id, developRoles.spec, model, workspace, tools), prompt, 'submit_spec')
 }
 
 /** The planner: one read-only agent that writes the four plan parts, the profile sections and the tasks (D7). */
 export async function plan(context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem, sections: string[], spec: string | null): Promise<Plan> {
   const review = { '/plan-sections.txt': sections.join('\n'), ...(spec ? { '/spec.md': spec } : {}) }
   const workspace = await readerWorkspace(context, tree, review)
-  const tools = submitOnce(context.host, `output:${id}`, submitPlan, async (input) => checkPlan(input, sections))
+  const tools = submitOnce(context.host, `output:${id}`, submitPlan, async (input) => checkPlan(input, sections, (path) => isProtected(context.config, path)))
   const prompt = [
     'Plan this confirmed ask.',
     '',
@@ -73,11 +73,12 @@ export async function plan(context: DevelopContext, id: string, model: ModelChoi
     '- Decisions of the user: /review/decisions.md',
     ...(spec ? ['- The spec: /review/spec.md'] : []),
     `- Required sections: /review/plan-sections.txt (${sections.length ? sections.join(', ') : 'none'})`,
+    `- Protected paths, which no task may write: ${protectedEntries(context.config).join(', ')}`,
     '- The repository: /repo, at the base commit',
     '',
     'Call submit_plan one time.',
   ].join('\n')
-  return runTurn(context.host, agent(context, id, roles.planner, model, workspace, tools), prompt, 'submit_plan')
+  return runTurn(context.host, agent(context, id, developRoles.planner, model, workspace, tools), prompt, 'submit_plan')
 }
 
 export type BuildLog = { summary: string; changes: { path: string; why: string }[]; tests: string[]; blocked: string }
@@ -214,5 +215,5 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
   const decided = decisionsFile(context.host.ledger)
   const workspace = await createWorkspace({ repo, review: { ...task.review, ...decided }, guides: context.guides.mounts })
   const prompt = [task.prompt, ...decisionsLine(decided)].join('\n')
-  return runTurn(context.host, agent(context, task.id, roles.builder, task.model, workspace, tools, true), prompt, 'submit_build_log', task.turn)
+  return runTurn(context.host, agent(context, task.id, developRoles.builder, task.model, workspace, tools, true), prompt, 'submit_build_log', task.turn)
 }

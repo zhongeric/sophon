@@ -9,3 +9,5 @@ Apply these rules in this order:
 3. When you are not sure that a word is approved and /guides/ste/asd-ste100-issue-9.txt exists, look it up: `grep -i -A4 "^myword " /guides/ste/asd-ste100-issue-9.txt`. Do not read the full dictionary.
 
 Prefer delete and inline over new layers. Prefer boring names and straight-line control flow.
+
+An STE fix must not make the text longer. When a sentence breaks a rule and adds no information, delete it.

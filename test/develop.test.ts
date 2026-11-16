@@ -8,9 +8,9 @@ import { PausedError } from '../src/core/questions.ts'
 import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
 import { fileLedger } from '../src/node/ledger.ts'
-import { developScript, developRepo, fakePulls, runDevelop, sources } from './support/develop.ts'
+import { developScript, developRepo, fakePulls, plan, runDevelop, sources } from './support/develop.ts'
 import { memoryChannel } from './support/fixture.ts'
-import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
+import { probeNetwork, scriptedDispatch, webSearch, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
 
@@ -19,7 +19,7 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   const turns: Turn[] = []
   const { channel, posted } = memoryChannel()
   const github = fakePulls([false, true])
-  const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(developScript(), turns), pulls: github.pulls, runId: 'dev' })
+  const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(probeNetwork(developScript(), 'builder'), turns), pulls: github.pulls, runId: 'dev' })
 
   assert.equal(result.status, 'ready', result.report)
   assert.equal(result.branch, 'factory/dev-add-sub-mul')
@@ -29,6 +29,12 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.deepEqual(posted[0]!.questions.map((question) => question.question.split('?')[0]), ['Is this the ask', 'Write a spec before the plan', 'How many review loop passes'])
   const first = (role: string) => turns.findIndex((turn) => turn.role === role)
   assert.ok(first('intake') < first('planner') && first('planner') < first('builder'))
+  // The development and review roles have no egress: the cell fetch and the shell of a builder fail, and no model request
+  // has the web search tool.
+  const probes = turns.filter((turn) => turn.role === 'builder' && turn.output).map((turn) => turn.output).join('\n')
+  assert.match(probes, /cell fetch: .*network access is off/)
+  assert.match(probes, /shell fetch: .*network access is off/)
+  assert.ok(!turns.some((turn) => webSearch.test(turn.request)))
 
   // sub and mul built in the same wave, the tests after both. Each builder could write only its own files.
   const builds = turns.filter((turn) => turn.role === 'builder' && turn.output === null).map((turn) => /Build task ([a-z]+)|Fix the CI failure/.exec(turn.request)?.[1] ?? 'ci-fix')
@@ -116,6 +122,39 @@ test('develop: a run without CI blocks, and the resumed run with CI posts its ne
   const third = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls: github.pulls, runId: 'no-ci' })
   assert.equal(third.report, second.report)
   assert.equal(github.state.comments.length, 2)
+})
+
+test('develop: the planner sees the protected paths, the host refuses a plan that writes them, and the corrected plan runs', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo({
+    stack: 'TypeScript',
+    checks: { smoke: 'node -e "process.exit(0)"' },
+    tests: { pattern: '\\.test\\.ts$', command: 'env -u NODE_TEST_CONTEXT node --test {tests}' },
+    protect: ['wrangler.jsonc'],
+  })
+  const turns: Turn[] = []
+  const script = developScript()
+  const protectedPlan = { ...plan, tasks: plan.tasks.map((task) => (task.id === 'sub' ? { ...task, files: [...task.files, 'wrangler.jsonc', '.agent-factory.json'] } : task)) }
+  const result = await runDevelop(repo, runsDir(), {
+    runId: 'protected-plan',
+    pulls: fakePulls([false, true]).pulls,
+    dispatch: scriptedDispatch((turn) => {
+      if (turn.role !== 'planner' || turn.output !== null) return script(turn)
+      return {
+        cell: [
+          `try { await tools.submit_plan(${JSON.stringify(protectedPlan)}); text('PROTECTED PLAN ACCEPTED') } catch (error) { text('plan refused: ' + error) }`,
+          `await tools.submit_plan(${JSON.stringify(plan)})`,
+        ].join('\n'),
+      }
+    }, turns),
+  })
+  assert.equal(result.status, 'ready', result.report)
+  const planner = turns.filter((turn) => turn.role === 'planner')
+  assert.ok(planner[0]!.request.includes('Protected paths, which no task may write: .agent-factory.json, wrangler.jsonc'))
+  const output = planner.map((turn) => turn.output ?? '').join('\n')
+  // The output is JSON, so the quotes in the refusal can be escaped.
+  assert.match(output, /plan refused:.*task \W*sub\W*: \W*wrangler\.jsonc\W* is a protected path/)
+  assert.match(output, /task \W*sub\W*: \W*\.agent-factory\.json\W* is a protected path/)
+  assert.doesNotMatch(output, /PROTECTED PLAN ACCEPTED/)
 })
 
 test('develop: a blocked builder stops the run with the reason, before any PR', { timeout: 120_000 }, async () => {

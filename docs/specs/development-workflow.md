@@ -80,6 +80,8 @@ Each stage below lists who does the work, what the host enforces, and where the 
   Done-looks-like is a list of acceptance checks. Each check is a command (a test, a typecheck, a CI job) or a
   statement that the intent reviewer verifies later.
 - **Rails:** the host refuses a plan without all four parts, or with a done-looks-like that has no checkable item.
+  The host also refuses a plan with a task whose files include a protected path, because the host refuses each write
+  to it.
   Profiles add plan sections. For example, a Solidity plan must list interfaces before implementations and the
   deployment sequence.
 - **One planner, not four in parallel (D7).** Each part sets limits on the other parts.
@@ -382,3 +384,16 @@ No rule covers these yet. Each default applies until the user replaces it.
 | 2 | The Auditor as a sub-workflow, PR-delta mode first. | A Solidity change with the review loop and the Auditor. |
 | 3 | The builder on Cloudflare, through a Container per run. Built: `DevelopmentRuns`, the build container, `/develop` on issues. | The phase 1 feature, run from `npm run remote`. |
 | 4 | The deploy workflow: dry run, the user's `/go` for an exact scope, broadcast in chunks with a progress file, live verify, record. | A testnet deploy. |
+
+## 11. Notes and limits
+
+- The late bugs pass runs when a patch changed code since the freeze, and reviews every fix since then. Thus step 1
+  fixes also get a bugs review.
+- Step 2 has no diff to review when the step 1 patch changed nothing. The run records that and goes on.
+- On Cloudflare, review agents cannot run tests: CI checks the result. Builders of development runs can, on the
+  build container.
+- On Cloudflare, in-process git reads a symlink as the content of its target. A PR that only changes the target of a
+  symlink shows no change to the reviewers. The fixes never change a symlink.
+- On Cloudflare, a PR with 3,000 or more files stops, files over the size limit of the tree are skipped, and the
+  freeze holds the whole tarball in memory, under the 128 MB limit.
+- Not built yet: the review bot loop after the PR is ready, and the Auditor workflow.

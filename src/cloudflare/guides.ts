@@ -13,6 +13,14 @@ import profiles_python from '../../agents/profiles/python.md'
 import profiles_solidity from '../../agents/profiles/solidity.md'
 import profiles_typescript from '../../agents/profiles/typescript.md'
 import questions from '../../agents/questions.md'
+import research_analyst from '../../agents/research/analyst.md'
+import research_generator from '../../agents/research/generator.md'
+import research_intake from '../../agents/research/intake.md'
+import research_late_skeptic from '../../agents/research/late-skeptic.md'
+import research_preregistrar from '../../agents/research/preregistrar.md'
+import research_skeptic from '../../agents/research/skeptic.md'
+import research_surveyor from '../../agents/research/surveyor.md'
+import research_writer from '../../agents/research/writer.md'
 import rules from '../../agents/rules.md'
 import shared_factory from '../../agents/shared/factory.md'
 import shared_reviewer from '../../agents/shared/reviewer.md'
@@ -36,6 +44,14 @@ const texts: Record<string, string> = {
   'profiles/solidity.md': profiles_solidity,
   'profiles/typescript.md': profiles_typescript,
   'questions.md': questions,
+  'research/analyst.md': research_analyst,
+  'research/generator.md': research_generator,
+  'research/intake.md': research_intake,
+  'research/late-skeptic.md': research_late_skeptic,
+  'research/preregistrar.md': research_preregistrar,
+  'research/skeptic.md': research_skeptic,
+  'research/surveyor.md': research_surveyor,
+  'research/writer.md': research_writer,
   'rules.md': rules,
   'shared/factory.md': shared_factory,
   'shared/reviewer.md': shared_reviewer,

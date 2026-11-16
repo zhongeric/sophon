@@ -50,7 +50,8 @@ export const sources = {
 const intake = { title: 'Add sub and mul', summary: 'Adds sub() and mul() next to add(), with tests.', slug: 'add-sub-mul', larger: false, passes: 1, reason: 'Two small functions.', questions: [] }
 
 const task = (id: string, files: string[], depends_on: string[] = []) => ({ id, title: `Add ${id}`, work: `Build ${id}.`, files, depends_on })
-const plan = {
+/** The plan that the scripted planner submits. */
+export const plan = {
   smallest_change: 'Two new modules and one test file.',
   goals: ['sub and mul return the right numbers'],
   non_goals: ['No division'],
