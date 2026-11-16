@@ -8,8 +8,9 @@ export const artifactSizeLimit = 32 * 1024 * 1024
 export const isArtifactId = (id: string): boolean => /^[0-9a-f]{64}$/.test(id)
 
 export async function artifactId(bytes: Uint8Array): Promise<string> {
-  // The copy gives a plain ArrayBuffer, which Web Crypto accepts on every platform.
-  const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(bytes))
+  // Web Crypto accepts only a plain ArrayBuffer on every platform. Copy the bytes only when the buffer is of a different type.
+  const plain = bytes.buffer instanceof ArrayBuffer ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength) : new Uint8Array(bytes)
+  const digest = await crypto.subtle.digest('SHA-256', plain)
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 

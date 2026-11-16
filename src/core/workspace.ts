@@ -90,8 +90,8 @@ export const repoMount = '/repo'
 
 /**
  * The workspace of one agent: a virtual shell over /repo, /review, /guides and, when the layout has a store,
- * /artifacts. The shell runs text tools
- * in-process, so an agent cannot start real processes or reach the network from it.
+ * /artifacts. The shell runs text tools in-process, so an agent cannot start real processes or reach the network
+ * from it.
  */
 export async function createWorkspace(layout: WorkspaceLayout): Promise<Contracts.WorkspaceHost> {
   const mounts: Record<string, FileSystem.FileSystem> = {

@@ -82,7 +82,7 @@ test('a read of an unknown or malformed name fails', async () => {
     assert.notEqual(result.stderr, '', name)
   }
   const fs = artifactsFileSystem(store)
-  await assert.rejects(fs.read('/0'.padEnd(65, '0')), { code: 'ENOENT' })
+  await assert.rejects(fs.read(`/${'0'.repeat(64)}`), { code: 'ENOENT' })
   await assert.rejects(fs.read('/../x'), { code: 'ENOENT' })
   await assert.rejects(fs.write(`/${id}`, text('x')), { code: 'EROFS' })
   assert.equal(await fs.stat('/unknown'), null)

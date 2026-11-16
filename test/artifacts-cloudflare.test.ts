@@ -71,6 +71,46 @@ test('chunk boundary sizes round trip byte for byte, in chunks no larger than th
   }
 })
 
+test('a Node Buffer round trips with only its own bytes, also in chunks', async () => {
+  const store = sqlArtifacts(fakeStorage(), 'run-1')
+  // A small Buffer is a view on a shared pool, and a large one spans more than one chunk.
+  for (const buffer of [Buffer.from('small text'), Buffer.from(pattern(artifactChunkSize + 1))]) {
+    const bytes = new Uint8Array(buffer)
+    const id = await store.put(buffer, fetched)
+    assert.equal(id, await artifactId(bytes))
+    assert.deepEqual(await store.get(id), bytes)
+    assert.equal((await store.meta(id))?.size, bytes.length)
+  }
+})
+
+test('a label with the key __proto__ round trips', async () => {
+  const store = sqlArtifacts(fakeStorage(), 'run-1')
+  const labels: Record<string, string> = JSON.parse('{"__proto__":"text","kind":"page"}')
+  const id = await store.put(pattern(10), { ...fetched, labels })
+  assert.deepEqual(Object.entries((await store.meta(id))?.labels ?? {}), [['__proto__', 'text'], ['kind', 'page']])
+  assert.deepEqual(Object.entries((await store.list())[0]?.meta.labels ?? {}), [['__proto__', 'text'], ['kind', 'page']])
+})
+
+test('metadata readers reject SQL columns with incorrect types', async () => {
+  for (const column of ['source', 'media_type', 'labels', 'size', 'created']) {
+    const storage = fakeStorage()
+    const store = sqlArtifacts(storage, 'run-1')
+    const id = await store.put(pattern(10), fetched)
+    storage.sql.exec(`update factory_artifacts set ${column} = ? where run = ? and id = ?`, new ArrayBuffer(1), 'run-1', id)
+    await assert.rejects(store.get(id), /invalid artifact meta row/)
+    await assert.rejects(store.meta(id), /invalid artifact meta row/)
+    await assert.rejects(store.list(), /invalid artifact meta row/)
+  }
+})
+
+test('list rejects a SQL ID with an incorrect type', async () => {
+  const storage = fakeStorage()
+  const store = sqlArtifacts(storage, 'run-1')
+  const id = await store.put(pattern(10), fetched)
+  storage.sql.exec('update factory_artifacts set id = ? where run = ? and id = ?', new ArrayBuffer(1), 'run-1', id)
+  await assert.rejects(store.list(), /invalid artifact ID row/)
+})
+
 test('a put that fails inside the transaction leaves no chunks and no meta', async () => {
   const storage = fakeStorage({ failOn: /^insert into factory_artifacts\b/ })
   const store = sqlArtifacts(storage, 'run-1')

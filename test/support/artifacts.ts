@@ -73,6 +73,15 @@ export function artifactContract(name: string, make: () => Promise<Artifacts>): 
     assert.ok(outputMeta.created >= before && outputMeta.created <= after)
   })
 
+  test(`${name}: a label with the key __proto__ round trips`, async () => {
+    const store = await make()
+    const labels = Object.fromEntries([['__proto__', 'text'], ['kind', 'page']])
+    const id = await store.put(text('label keys'), { ...fetched, labels })
+    const entries = [['__proto__', 'text'], ['kind', 'page']]
+    assert.deepEqual(Object.entries((await store.meta(id))?.labels ?? {}), entries)
+    assert.deepEqual(Object.entries((await store.list())[0]?.meta.labels ?? {}), entries)
+  })
+
   test(`${name}: empty bytes are an artifact`, async () => {
     const store = await make()
     const id = await store.put(new Uint8Array(), fetched)

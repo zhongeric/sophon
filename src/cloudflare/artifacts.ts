@@ -1,5 +1,5 @@
 import { artifactId, artifactMeta, checkArtifactSize, isArtifactId } from '../core/artifacts.ts'
-import type { ArtifactMeta, ArtifactSource, Artifacts } from '../core/platform.ts'
+import type { ArtifactMeta, Artifacts } from '../core/platform.ts'
 
 /** The size of one chunk row: 1 MiB, under the 2 MB row limit of Durable Object SQLite. */
 export const artifactChunkSize = 1024 * 1024
@@ -20,52 +20,21 @@ export function createArtifactTables(sql: ArtifactSql): void {
   sql.exec('create table if not exists factory_artifact_chunks (run text not null, id text not null, seq integer not null, data blob not null, primary key (run, id, seq))')
 }
 
-type Row = Record<string, SqlValue>
+type MetaRow = { source: string; media_type: string; labels: string; size: number; created: number }
 
-const text = (row: Row, key: string): string => {
-  const value = row[key]
-  if (typeof value !== 'string') throw new Error(`artifact row: ${key} is not text`)
-  return value
-}
-
-const integer = (row: Row, key: string): number => {
-  const value = row[key]
-  if (typeof value !== 'number') throw new Error(`artifact row: ${key} is not a number`)
-  return value
-}
-
-const blob = (row: Row, key: string): ArrayBuffer => {
-  const value = row[key]
-  if (!(value instanceof ArrayBuffer)) throw new Error(`artifact row: ${key} is not a blob`)
-  return value
-}
-
-function parseSource(json: string): ArtifactSource {
-  const value: unknown = JSON.parse(json)
-  if (typeof value === 'object' && value !== null) {
-    if ('command' in value && typeof value.command === 'string') return { command: value.command }
-    if ('url' in value && typeof value.url === 'string' && 'method' in value && typeof value.method === 'string') return { url: value.url, method: value.method }
+function checkMetaRow(row: Record<string, SqlValue>): asserts row is MetaRow {
+  if (typeof row.source !== 'string' || typeof row.media_type !== 'string' || typeof row.labels !== 'string' || typeof row.size !== 'number' || typeof row.created !== 'number') {
+    throw new Error('invalid artifact meta row')
   }
-  throw new Error('artifact row: source is malformed')
 }
 
-function parseLabels(json: string): Record<string, string> {
-  const value: unknown = JSON.parse(json)
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('artifact row: labels are malformed')
-  const labels: Record<string, string> = {}
-  for (const [key, label] of Object.entries(value)) {
-    if (typeof label !== 'string') throw new Error('artifact row: labels are malformed')
-    labels[key] = label
-  }
-  return labels
-}
-
-const readMeta = (row: Row): ArtifactMeta => ({
-  source: parseSource(text(row, 'source')),
-  media_type: text(row, 'media_type'),
-  labels: parseLabels(text(row, 'labels')),
-  size: integer(row, 'size'),
-  created: integer(row, 'created'),
+/** The meta of a row that this store wrote itself, from a checked ArtifactMeta. */
+const readMeta = (row: MetaRow): ArtifactMeta => ({
+  source: JSON.parse(row.source),
+  media_type: row.media_type,
+  labels: JSON.parse(row.labels),
+  size: row.size,
+  created: row.created,
 })
 
 /**
@@ -74,8 +43,12 @@ const readMeta = (row: Row): ArtifactMeta => ({
  */
 export function sqlArtifacts(storage: ArtifactStorage, run: string): Artifacts {
   const { sql } = storage
-  const metaRow = (id: string) =>
-    sql.exec('select source, media_type, labels, size, created from factory_artifacts where run = ? and id = ?', run, id).toArray()[0]
+  const metaRow = (id: string) => {
+    const row = sql.exec('select source, media_type, labels, size, created from factory_artifacts where run = ? and id = ?', run, id).toArray()[0]
+    if (!row) return undefined
+    checkMetaRow(row)
+    return row
+  }
   return {
     async put(bytes, input) {
       checkArtifactSize(bytes.length)
@@ -85,7 +58,8 @@ export function sqlArtifacts(storage: ArtifactStorage, run: string): Artifacts {
         // The first meta wins.
         if (metaRow(id)) return
         for (let seq = 0; seq * artifactChunkSize < bytes.length; seq++) {
-          const chunk = bytes.slice(seq * artifactChunkSize, (seq + 1) * artifactChunkSize)
+          // An explicit copy: the slice of a Buffer is a view, and its buffer is the full backing memory.
+          const chunk = new Uint8Array(bytes.subarray(seq * artifactChunkSize, (seq + 1) * artifactChunkSize))
           sql.exec('insert into factory_artifact_chunks (run, id, seq, data) values (?, ?, ?, ?)', run, id, seq, chunk.buffer)
         }
         sql.exec(
@@ -102,13 +76,14 @@ export function sqlArtifacts(storage: ArtifactStorage, run: string): Artifacts {
       return id
     },
     async get(id) {
-      if (!isArtifactId(id) || !metaRow(id)) return null
-      const chunks = sql.exec('select data from factory_artifact_chunks where run = ? and id = ? order by seq', run, id).toArray().map((row) => new Uint8Array(blob(row, 'data')))
-      const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0))
-      let offset = 0
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset)
-        offset += chunk.length
+      const row = isArtifactId(id) ? metaRow(id) : undefined
+      if (!row) return null
+      // Read one chunk row at a time, so that memory does not hold all chunks and the result.
+      const bytes = new Uint8Array(row.size)
+      for (let seq = 0; seq * artifactChunkSize < bytes.length; seq++) {
+        const data = sql.exec('select data from factory_artifact_chunks where run = ? and id = ? and seq = ?', run, id, seq).toArray()[0]?.data
+        if (!(data instanceof ArrayBuffer)) throw new Error(`artifact ${id}: chunk ${seq} is missing`)
+        bytes.set(new Uint8Array(data), seq * artifactChunkSize)
       }
       return bytes
     },
@@ -120,6 +95,11 @@ export function sqlArtifacts(storage: ArtifactStorage, run: string): Artifacts {
       sql
         .exec('select id, source, media_type, labels, size, created from factory_artifacts where run = ? order by created, id', run)
         .toArray()
-        .map((row) => ({ id: text(row, 'id'), meta: readMeta(row) })),
+        .map((row) => {
+          const id = row.id
+          if (typeof id !== 'string') throw new Error('invalid artifact ID row')
+          checkMetaRow(row)
+          return { id, meta: readMeta(row) }
+        }),
   }
 }
