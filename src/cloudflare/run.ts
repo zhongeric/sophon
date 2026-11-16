@@ -10,6 +10,7 @@ import { baseConfig } from './config.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubRepo, type PullRequest } from './repo.ts'
+import { githubSigning } from './signing.ts'
 import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
 import { sqlFiles, sqlLedger } from './storage.ts'
 
@@ -82,6 +83,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
       module,
       prices,
       repo,
+      signing: githubSigning(gh, request.owner, request.repo),
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
     return { passed: result.pass, summary: summary(run, result) }
@@ -102,6 +104,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
       allowedModels: allowedModelsFrom(this.env.ALLOWED_MODELS),
       ask: request.ask ?? `${view.title}\n\n${view.body ?? ''}`.trim(),
       config,
+      headRef: view.head.ref,
       models: mergeModels(overrides),
       pr: request.pr,
       runId: run,

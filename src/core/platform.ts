@@ -2,6 +2,7 @@ import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import type { CiJob } from './ci.ts'
 import type { CheckResult, MergeMethod } from './checks.ts'
+import type { SigningRecord } from './signing.ts'
 
 /** The frozen review target. `base` and `head` are commit IDs that `Repo.diff` accepts. */
 export type Frozen = { base: string; head: string; branch: string; location: string }
@@ -71,6 +72,14 @@ export type PullRequests = {
   ci(sha: string): Promise<CiJob[]>
   /** The end of the log of a failed job, for the agent that fixes it. */
   failureLog(job: CiJob): Promise<string>
+}
+
+/** Whether the commits of a run are signed. Each platform has its own. */
+export type Signing = {
+  /** Reads the signature rules of the branches that the run pushes and gives the commit mode. No GitHub call without a GitHub origin or without branches. */
+  check(branches: string[]): Promise<SigningRecord>
+  /** Prepares the commits of this process for the recorded answer, before the first commit. Throws StopError when the host cannot commit as the answer requires. */
+  apply(record: SigningRecord): Promise<void>
 }
 
 /** Runs the repository's checks. `tests` runs test files during agent turns, or is null where the platform cannot. */

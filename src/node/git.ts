@@ -18,6 +18,19 @@ export async function git(cwd: string, ...args: string[]): Promise<string> {
   return stdout
 }
 
+/** The hardened git for a command that can wait for the user, such as a signature: no terminal prompt, and a stop after `timeout` ms. */
+export async function gitUnattended(cwd: string, timeout: number, ...args: string[]): Promise<string> {
+  const env = { ...withoutHostSecrets(process.env), GIT_TERMINAL_PROMPT: '0' }
+  const { stdout } = await exec('git', [...hardened, ...args], { cwd, env, timeout, maxBuffer: maxOutputBytes })
+  return stdout
+}
+
+/** How the host commits. The signing check sets it before the first commit. */
+export type GitCommits = { unsigned: boolean }
+
+/** Unsigned mode turns off the signature of the user git config. Signed mode keeps that config. */
+const signature = (commits: GitCommits): string[] => (commits.unsigned ? ['-c', 'commit.gpgsign=false'] : [])
+
 /** Freezes the review target: a worktree of `head` on its own branch, and the merge base with `base`. */
 export async function freeze(repo: string, base: string, head: string, tree: string, branch: string): Promise<Frozen> {
   const headSha = (await git(repo, 'rev-parse', '--verify', `${head}^{commit}`)).trim()
@@ -49,10 +62,10 @@ export async function trackedFiles(tree: string): Promise<string[]> {
 }
 
 /** Commits every change in the worktree. Does nothing when nothing changed. */
-export async function commitAll(tree: string, message: string): Promise<void> {
+export async function commitAll(tree: string, message: string, commits: GitCommits = { unsigned: false }): Promise<void> {
   await git(tree, 'add', '-A')
   const staged = await git(tree, 'diff', '--cached', '--name-only')
-  if (staged.trim() !== '') await git(tree, 'commit', '--no-verify', '-m', message)
+  if (staged.trim() !== '') await git(tree, ...signature(commits), 'commit', '--no-verify', '-m', message)
 }
 
 export async function currentCommit(tree: string): Promise<string> {
@@ -62,7 +75,7 @@ export async function currentCommit(tree: string): Promise<string> {
 export type GitSource = { repo: string; base: string; head: string }
 
 /** A local git repository: the review runs in a worktree of its own, on branch `branch`. */
-export function gitRepo(source: GitSource, tree: string, branch: string): Repo {
+export function gitRepo(source: GitSource, tree: string, branch: string, commits: GitCommits = { unsigned: false }): Repo {
   return {
     tree: diskFileSystem(tree),
     freeze: () => freeze(source.repo, source.base, source.head, tree, branch),
@@ -70,7 +83,7 @@ export function gitRepo(source: GitSource, tree: string, branch: string): Repo {
     changedFiles: (from, to) => changedFiles(tree, from, to),
     touchedFiles: (from, to) => touchedFiles(tree, from, to),
     committedFiles: () => trackedFiles(tree),
-    commit: (message) => commitAll(tree, message),
+    commit: (message) => commitAll(tree, message, commits),
     head: () => currentCommit(tree),
     async ship({ pr, headRef }) {
       await git(tree, 'push', 'origin', `HEAD:refs/heads/${headRef}`)
@@ -103,7 +116,7 @@ async function remoteBranchExists(repo: string, name: string): Promise<boolean> 
   }
 }
 
-function gitBranch(tree: string, name: string): Branch {
+function gitBranch(tree: string, name: string, commits: GitCommits): Branch {
   return {
     name,
     tree: diskFileSystem(tree),
@@ -122,11 +135,11 @@ function gitBranch(tree: string, name: string): Branch {
         await git(tree, 'reset', '-q')
       }
     },
-    commit: (message) => commitAll(tree, message),
+    commit: (message) => commitAll(tree, message, commits),
     /** A fast-forward when it can, else a merge commit. A failed merge is aborted, so that a resume starts from a clean worktree. */
     async merge(ref, message) {
       try {
-        await git(tree, 'merge', '--ff', '--no-edit', '-m', message, ref)
+        await git(tree, ...signature(commits), 'merge', '--ff', '--no-edit', '-m', message, ref)
       } catch (error) {
         await git(tree, 'merge', '--abort').catch(() => undefined)
         throw error
@@ -136,7 +149,7 @@ function gitBranch(tree: string, name: string): Branch {
 }
 
 /** The branches of a development run, each in a worktree under `dir`. */
-export function gitBranches(repo: string, dir: string): Branches {
+export function gitBranches(repo: string, dir: string, commits: GitCommits = { unsigned: false }): Branches {
   return {
     async view(commit) {
       const tree = join(dir, `view-${commit.slice(0, 12)}`)
@@ -149,7 +162,7 @@ export function gitBranches(repo: string, dir: string): Branches {
         if (await branchExists(repo, name)) await git(repo, 'worktree', 'add', tree, name)
         else await git(repo, 'worktree', 'add', '-b', name, tree, from)
       }
-      return gitBranch(tree, name)
+      return gitBranch(tree, name, commits)
     },
     exists: async (name) => (await branchExists(repo, name)) || (await remoteBranchExists(repo, name)),
     async push(branch) {

@@ -111,6 +111,8 @@ npm run review -- --run <id>                     # resume a run, also with npm r
   from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`, `cached_input`, `cache_write`,
   `output`). Each report shows the usage of each step.
 - **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
+- **Commits:** the host commits unsigned, unless a GitHub rule requires signed commits on a branch that the run pushes.
+  Then signing must work without a prompt.
 
 ## Cloudflare
 

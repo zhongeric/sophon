@@ -215,7 +215,8 @@ test('on Cloudflare, a docs and tests only change takes the light loop, with hos
 
 test('on Cloudflare, deleted source files and the old paths of renamed source files require the full loop', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo({ light: true })
-  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' })
+  // The fixture has no usable key, so its own commits are unsigned.
+  const git = (...args: string[]) => execFileSync('git', ['-c', 'commit.gpgsign=false', ...args], { cwd: repo, stdio: 'pipe' })
   git('checkout', '-q', 'main')
   writeFileSync(join(repo, 'src/removed.ts'), 'export const removed = true\n')
   git('add', '-A')
