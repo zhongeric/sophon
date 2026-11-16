@@ -4,8 +4,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
+import { hostFetch, type AgentHost } from '../src/core/agent.ts'
+import { runLock } from '../src/core/egress.ts'
 import { createWorkspace, guard, readOnly } from '../src/core/workspace.ts'
 import { diskFileSystem } from '../src/node/disk.ts'
+import { fileLedger } from '../src/node/ledger.ts'
+import { sqliteStore } from '../src/node/platform.ts'
+import { memoryArtifacts } from './support/artifacts.ts'
+import { credentials, module } from './support/fixture.ts'
 
 function tree() {
   const root = mkdtempSync(join(tmpdir(), 'factory-ws-'))
@@ -95,4 +101,58 @@ test('a shell with a layout fetch sends curl through that fetch, and a shell wit
   assert.match(refused.stderr, /network access is off in this workspace/, JSON.stringify(refused))
   assert.notEqual(refused.exit_code, 0)
   assert.equal(fetched.length, 1)
+})
+
+test('an agent shell with hostFetch sends curl through the egress: it stores the artifact, and refuses a locked URL and an unlisted host', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'factory-ws-egress-'))
+  const fetched: string[] = []
+  const artifacts = memoryArtifacts()
+  const ledger = fileLedger(join(dir, 'state.json'))
+  const host: AgentHost = {
+    module,
+    store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
+    ledger,
+    credentials,
+    log: () => {},
+    egress: {
+      artifacts,
+      lock: runLock(ledger, ['https://archive.example.org/holdout/']),
+      secret: () => undefined,
+      fetch: async (input: string | URL | Request): Promise<Response> => {
+        fetched.push(input instanceof Request ? input.url : String(input))
+        return new Response('archive page', { headers: { 'content-type': 'text/plain' } })
+      },
+    },
+  }
+  const shellFetch = hostFetch('researcher', { hosts: ['archive.example.org'], web_search: false }, host)
+  const workspace = await createWorkspace({ repo: MemoryFileSystem.create(), review: {}, fetch: shellFetch })
+
+  const result = await run(workspace, 'curl -s https://archive.example.org/paper')
+  assert.equal(result.stdout, 'archive page', JSON.stringify(result))
+  assert.deepEqual(fetched, ['https://archive.example.org/paper'])
+  const listed = await artifacts.list()
+  assert.equal(listed.length, 2)
+  const body = listed.find(({ meta }) => 'url' in meta.source)
+  assert.ok(body)
+  assert.deepEqual(body.meta.source, { url: 'https://archive.example.org/paper', method: 'GET' })
+  assert.equal(body.meta.labels.status, '200')
+  assert.equal(new TextDecoder().decode((await artifacts.get(body.id)) ?? new Uint8Array()), 'archive page')
+  const provenance = listed.find(({ meta }) => 'command' in meta.source)
+  assert.ok(provenance)
+  assert.deepEqual(provenance.meta.source, { command: 'egress provenance' })
+  assert.equal(provenance.meta.labels.body, body.id)
+  const record = JSON.parse(new TextDecoder().decode((await artifacts.get(provenance.id)) ?? new Uint8Array()))
+  assert.equal(record.body, body.id)
+  assert.equal(record.url, 'https://archive.example.org/paper')
+  assert.equal(record.method, 'GET')
+
+  const locked = await run(workspace, 'curl https://archive.example.org/holdout/answers')
+  assert.match(locked.stderr, /egress refused: lock: .*holdout\/answers is locked/, JSON.stringify(locked))
+  assert.notEqual(locked.exit_code, 0)
+  const unlisted = await run(workspace, 'curl https://evil.example.net/x')
+  assert.match(unlisted.stderr, /egress refused: host evil\.example\.net is not in the list/, JSON.stringify(unlisted))
+  assert.notEqual(unlisted.exit_code, 0)
+  // The refused requests do not reach the network and store nothing.
+  assert.equal(fetched.length, 1)
+  assert.equal((await artifacts.list()).length, 2)
 })

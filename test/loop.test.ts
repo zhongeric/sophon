@@ -11,16 +11,14 @@ import { resumeInput } from '../src/node/cli.ts'
 import { changedFiles, diff, touchedFiles } from '../src/node/git.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { fixed, fixtureRepo, gitSource, lightFixed, loopInput, memoryChannel, runLoop, script, scriptFor } from './support/fixture.ts'
-import { scriptedDispatch, type Script, type Turn } from './support/scripted-model.ts'
+import { probeNetwork, scriptedDispatch, webSearch, type Script, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
-/** The web search tool in a model request: a nested Code Mode tool, or a provider tool. */
-const webSearch = /`WebSearch`|"type":"web_search/
 
 test('the loop reviews, gates, patches, swaps families, checks and passes', async () => {
   const repo = fixtureRepo()
   const turns: Turn[] = []
-  const result = await runLoop(repo, 'e2e', runsDir(), { dispatch: scriptedDispatch(script, turns) })
+  const result = await runLoop(repo, 'e2e', runsDir(), { dispatch: scriptedDispatch(probeNetwork(script, 'minimize'), turns) })
 
   assert.equal(result.pass, true, result.report)
   assert.equal(execFileSync('git', ['show', `${result.branch}:src/math.ts`], { cwd: repo }).toString(), fixed)
@@ -33,7 +31,9 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   assert.match(outputs('patch'), /"status\\":\\"pass/)
   // With a test runner, no agent hears that it has none.
   assert.ok(!turns.some((turn) => turn.request.includes('This run has no run_tests tool')))
-  // The review roles have no egress, so no model request has the web search tool.
+  // The review roles have no egress: the cell fetch and the shell fail, and no model request has the web search tool.
+  assert.match(outputs('minimize'), /cell fetch: .*network access is off/)
+  assert.match(outputs('minimize'), /shell fetch: .*network access is off/)
   assert.ok(!turns.some((turn) => webSearch.test(turn.request)))
 
   const providers = (role: string) => new Set(turns.filter((turn) => turn.role === role).map((turn) => turn.provider))

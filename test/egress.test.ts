@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { artifactSizeLimit } from '../src/core/artifacts.ts'
-import { checkEgress, defaultResponseLimit, egressFetch, runLock, type Egress, type EgressHost, type RunLock } from '../src/core/egress.ts'
+import { checkEgress, egressFetch, runLock, type Egress, type EgressHost, type RunLock } from '../src/core/egress.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { memoryArtifacts } from './support/artifacts.ts'
 
@@ -18,7 +18,7 @@ const base: Egress = { hosts: ['api.example.com', 'files.example.com'], web_sear
 const ledgerPath = () => join(mkdtempSync(join(tmpdir(), 'factory-egress-')), 'state.json')
 
 /** An egress over a scripted fetch that records each call. The default answer is 200 with the text "ok". */
-function setup(options: { egress?: Partial<Egress>; answer?: (call: Call, index: number) => Response; lock?: RunLock } = {}) {
+function setup(options: { egress?: Partial<Egress>; answer?: (call: Call, index: number) => Response; lock?: RunLock; secret?: string } = {}) {
   const calls: Call[] = []
   const lines: string[] = []
   const artifacts = memoryArtifacts()
@@ -31,7 +31,7 @@ function setup(options: { egress?: Partial<Egress>; answer?: (call: Call, index:
   }
   const host: EgressHost = {
     artifacts,
-    secret: (name) => (name === 'ARCHIVE_KEY' ? secretValue : undefined),
+    secret: (name) => (name === 'ARCHIVE_KEY' ? (options.secret ?? secretValue) : undefined),
     fetch: scripted,
     ...(options.lock ? { lock: options.lock } : {}),
   }
@@ -70,16 +70,17 @@ test('an allowed GET goes out with manual redirects, and the agent gets the body
   assert.equal(run.calls[0]?.redirect, 'manual')
   const id = response.headers.get('x-artifact-id')
   assert.equal(id, sha256('ok'))
+  const provenance = response.headers.get('x-provenance-id')
+  assert.ok(provenance)
+  assert.notEqual(provenance, id)
   const listed = await run.artifacts.list()
-  assert.deepEqual(listed.map((entry) => entry.id), [id])
-  assert.deepEqual(listed[0]?.meta.source, { url: 'https://api.example.com/papers?q=vault', method: 'GET' })
-  assert.equal(listed[0]?.meta.media_type, 'text/plain')
-  assert.deepEqual(listed[0]?.meta.labels, { body_sha256: emptySha, status: '200' })
-  assert.deepEqual(run.lines, [`researcher: egress GET https://api.example.com/papers?q=vault 200 artifact ${id}`])
-})
-
-test('the default cap is 8 MiB', () => {
-  assert.equal(defaultResponseLimit, 8 * 1024 * 1024)
+  assert.deepEqual(new Set(listed.map((entry) => entry.id)), new Set([id, provenance]))
+  const meta = await run.artifacts.meta(id ?? '')
+  assert.deepEqual(meta?.source, { url: 'https://api.example.com/papers?q=vault', method: 'GET' })
+  assert.equal(meta?.media_type, 'text/plain')
+  assert.deepEqual(meta?.labels, { body_sha256: emptySha, status: '200' })
+  assert.deepEqual((await run.artifacts.meta(provenance))?.source, { command: 'egress provenance' })
+  assert.deepEqual(run.lines, [`researcher: egress GET https://api.example.com/papers?q=vault 200 artifact ${id} provenance ${provenance}`])
 })
 
 test('a host that is not in the list is refused', async () => {
@@ -166,8 +167,10 @@ test('five redirects are followed, and a sixth is refused', async () => {
   assert.equal(five.calls.length, 6)
   // The bodies of the redirects are not stored.
   const listed = await five.artifacts.list()
-  assert.equal(listed.length, 1)
-  assert.deepEqual(listed[0]?.meta.source, { url: 'https://api.example.com/hop/5', method: 'GET' })
+  assert.equal(listed.length, 2)
+  const meta = await five.artifacts.meta(response.headers.get('x-artifact-id') ?? '')
+  assert.deepEqual(meta?.source, { url: 'https://api.example.com/hop/5', method: 'GET' })
+  assert.deepEqual(new Set(listed.map((entry) => entry.id)), new Set([response.headers.get('x-artifact-id'), response.headers.get('x-provenance-id')]))
 
   const six = setup({ answer: chain(6) })
   await refuses(six.egress('https://api.example.com/hop/0'), /redirect: more than 5 hops/)
@@ -199,10 +202,22 @@ test('303, and 301 or 302 for a POST, continue as GET without a body. 307 and 30
 test('methods other than GET and POST, and a GET with a body, are refused', async () => {
   const run = setup()
   for (const method of ['PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']) await refuses(run.egress('https://api.example.com/a', { method }), /method/)
-  await refuses(run.egress('https://api.example.com/a', { method: 'GET', body: 'x' }), /method GET with a body/)
-  await refuses(run.egress('https://api.example.com/a', { body: 'x' }), /method GET with a body/)
+  await refuses(run.egress('https://api.example.com/a', { method: 'GET', body: 'x' }), /egress refused: the request is not valid/)
+  await refuses(run.egress('https://api.example.com/a', { body: 'x' }), /egress refused: the request is not valid/)
   assert.equal(run.calls.length, 0)
   assert.deepEqual(await run.artifacts.list(), [])
+})
+
+test('the host header and the method-override headers of the agent do not reach the server', async () => {
+  const run = setup()
+  const headers = { host: 'files.example.com', 'x-http-method-override': 'DELETE', 'x-http-method': 'DELETE', 'x-method-override': 'DELETE', accept: 'text/plain' }
+  await run.egress('https://api.example.com/a', { headers })
+  await run.egress('https://api.example.com/b', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: '{}' })
+  assert.equal(run.calls.length, 2)
+  for (const call of run.calls) {
+    for (const name of ['host', 'x-http-method-override', 'x-http-method', 'x-method-override']) assert.equal(call.headers.get(name), null, name)
+    assert.equal(call.headers.get('accept'), 'text/plain')
+  }
 })
 
 test('a POST body other than form or JSON is refused', async () => {
@@ -222,11 +237,60 @@ test('a POST with a form or a JSON body goes out, and the label has the hash of 
   const json = await run.egress('https://api.example.com/b', { method: 'post', headers: { 'Content-Type': 'application/json; charset=utf-8' }, body: '{}' })
   assert.deepEqual(run.calls.map((call) => call.method), ['POST', 'POST'])
   assert.deepEqual(run.calls[0]?.body, new TextEncoder().encode('q=vault'))
-  // Both bodies are "ok", so the store keeps the first meta for the one artifact.
-  assert.equal(form.headers.get('x-artifact-id'), json.headers.get('x-artifact-id'))
-  const meta = await run.artifacts.meta(form.headers.get('x-artifact-id') ?? '')
+  // Both bodies are "ok", so the store keeps the first meta for the one body artifact.
+  const id = form.headers.get('x-artifact-id') ?? ''
+  assert.equal(json.headers.get('x-artifact-id'), id)
+  assert.notEqual(form.headers.get('x-provenance-id'), id)
+  const meta = await run.artifacts.meta(id)
   assert.deepEqual(meta?.labels, { body_sha256: sha256('q=vault'), status: '200' })
   assert.deepEqual(meta?.source, { url: 'https://api.example.com/a', method: 'POST' })
+  // The second request gets a provenance record of its own.
+  const record = json.headers.get('x-provenance-id') ?? ''
+  assert.notEqual(record, id)
+  const recordMeta = await run.artifacts.meta(record)
+  assert.deepEqual(recordMeta?.source, { command: 'egress provenance' })
+  assert.deepEqual(recordMeta?.labels, { body_sha256: sha256('{}'), status: '200', body: id })
+  assert.equal(recordMeta?.media_type, 'application/json')
+  const { nonce, ...fields } = JSON.parse(new TextDecoder().decode((await run.artifacts.get(record)) ?? new Uint8Array()))
+  assert.match(nonce, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.equal(typeof recordMeta?.created, 'number')
+  assert.deepEqual(fields, { body: id, url: 'https://api.example.com/b', method: 'POST', body_sha256: sha256('{}'), status: '200' })
+  assert.equal(run.lines[1], `researcher: egress POST https://api.example.com/b 200 artifact ${id} provenance ${record}`)
+})
+
+test('concurrent identical responses get unique provenance records, also with an existing body and a fixed clock', async (t) => {
+  const now = 1_700_000_000_000
+  t.mock.method(Date, 'now', () => now)
+  const run = setup()
+  const url = 'https://api.example.com/a'
+  const first = await Promise.all([run.egress(url), run.egress(url)])
+  const repeated = await Promise.all([run.egress(url), run.egress(url)])
+  const responses = [...first, ...repeated]
+  const records = responses.map((response) => response.headers.get('x-provenance-id'))
+  assert.equal(new Set(records).size, 4)
+  const nonces = new Set<string>()
+  for (const response of responses) {
+    const id = response.headers.get('x-artifact-id')
+    assert.equal(id, sha256('ok'))
+    assert.equal(await response.text(), 'ok')
+    const provenance = response.headers.get('x-provenance-id')
+    assert.ok(provenance)
+    assert.notEqual(provenance, id)
+    const bytes = await run.artifacts.get(provenance)
+    assert.ok(bytes)
+    const { nonce, ...fields } = JSON.parse(new TextDecoder().decode(bytes))
+    assert.equal(typeof nonce, 'string')
+    nonces.add(nonce)
+    assert.deepEqual(fields, { body: id, url, method: 'GET', body_sha256: emptySha, status: '200' })
+    const meta = await run.artifacts.meta(provenance)
+    assert.deepEqual(meta?.source, { command: 'egress provenance' })
+    assert.equal(meta?.media_type, 'application/json')
+    assert.equal(meta?.created, now)
+    assert.deepEqual(meta?.labels, { body_sha256: emptySha, status: '200', body: id })
+  }
+  assert.equal(nonces.size, 4)
+  assert.equal((await run.artifacts.list()).length, 5)
+  assert.equal(run.lines.length, 4)
 })
 
 test('a Content-Length over the cap is refused before the read', async () => {
@@ -273,6 +337,27 @@ test('a body of exactly the cap is accepted', async () => {
   assert.equal(response.headers.get('x-artifact-id'), sha256(bytes))
 })
 
+test('without max_bytes, the cap is 8 MiB: a body of 8 MiB is accepted, and a stream of one more byte is refused', async () => {
+  const cap = 8 * 1024 * 1024
+  const full = setup({ answer: () => new Response(new Uint8Array(cap)) })
+  const response = await full.egress('https://api.example.com/a')
+  assert.equal((await response.arrayBuffer()).byteLength, cap)
+  assert.equal((await full.artifacts.list()).length, 2)
+
+  // The stream has no content-length, so the egress counts the bytes.
+  const chunks = [new Uint8Array(cap), new Uint8Array(1)]
+  const over = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      const chunk = chunks.shift()
+      if (chunk) controller.enqueue(chunk)
+      else controller.close()
+    },
+  })
+  const run = setup({ answer: () => new Response(over) })
+  await refuses(run.egress('https://api.example.com/a'), /size: the body is over the cap of 8388608 bytes/)
+  assert.deepEqual(await run.artifacts.list(), [])
+})
+
 test('the run lock refuses a matching first URL', async () => {
   const lock = runLock(fileLedger(ledgerPath()), ['https://api.example.com/holdout'])
   const run = setup({ lock })
@@ -289,6 +374,28 @@ test('the run lock refuses a matching redirect hop', async () => {
   await refuses(run.egress('https://api.example.com/a'), /redirect to https:\/\/files\.example\.com\/holdout\/a: lock/)
   assert.equal(run.calls.length, 1)
   assert.deepEqual(await run.artifacts.list(), [])
+})
+
+test('the run lock refuses a trailing dot on the host and escaped letters in the path and query, on the first URL and on a redirect hop', async () => {
+  const lock = runLock(fileLedger(ledgerPath()), ['https://api.example.com/holdout', 'https://api.example.com/papers?range=holdout'])
+  const spellings = [
+    'https://api.example.com./holdout/x',
+    'https://api.example.com/%68oldout/x',
+    'https://api.example.com/%68%6F%6cdout/x',
+    'https://api.example.com/papers?range=%68oldout',
+  ]
+  for (const spelling of spellings) assert.ok(lock.locked(spelling), spelling)
+  const run = setup({ lock })
+  for (const spelling of spellings) await refuses(run.egress(spelling), /lock: .* is locked/)
+  assert.equal(run.calls.length, 0)
+  for (const spelling of spellings) {
+    const hop = setup({ lock, answer: () => redirect(302, spelling) })
+    await refuses(hop.egress('https://files.example.com/a'), /redirect to .*: lock: .* is locked/)
+    assert.equal(hop.calls.length, 1)
+    assert.deepEqual(await hop.artifacts.list(), [])
+  }
+  // An escape of a reserved character is not decoded, so the URL does not match.
+  assert.ok(!lock.locked('https://api.example.com/hold%2Fout/x'))
 })
 
 test('an unlock opens the pattern, and a new lock over the same ledger keeps it', async () => {
@@ -338,6 +445,44 @@ test('the credential follows a same-origin redirect, not a cross-origin one, and
   }
 })
 
+test('a redirect from a host without a credential to a host with one gets the credential of the hop host', async () => {
+  const run = setup({ egress: keyed, answer: (_call, index) => (index === 0 ? redirect(302, 'https://api.example.com/b') : new Response('end')) })
+  await run.egress('https://files.example.com/a', { headers: { 'x-api-key': 'from-agent' } })
+  assert.deepEqual(run.calls.map((call) => call.headers.get('x-api-key')), ['from-agent', secretValue])
+  for (const line of run.lines) assert.ok(!line.includes(secretValue), line)
+})
+
+test('a secret that is not a valid header value is refused, and the value is not in the error or the log', async () => {
+  const bad = 'line-one\nline-two'
+  const run = setup({ egress: keyed, secret: bad })
+  await refuses(run.egress('https://api.example.com/a'), /the secret ARCHIVE_KEY for api\.example\.com is not a valid header value/)
+  await assert.rejects(run.egress('https://api.example.com/a'), (error: Error) => !error.message.includes('line-one') && !error.message.includes('line-two'))
+  assert.equal(run.calls.length, 0)
+  assert.equal(run.lines.length, 2)
+  for (const line of run.lines) assert.ok(!line.includes('line-one') && !line.includes('line-two'), line)
+})
+
+test('a URL or a method with a newline gives one log line', async () => {
+  const run = setup()
+  await refuses(run.egress('https://evil.example.net/\nnote: egress GET https://api.example.com/x 200 artifact ' + '0'.repeat(64)), /host evil\.example\.net is not in the list/)
+  await refuses(run.egress('https://api.example.com/a', { method: 'GET\nnote: egress GET https://api.example.com/x' }), /the request is not valid/)
+  assert.equal(run.calls.length, 0)
+  assert.equal(run.lines.length, 2)
+  for (const line of run.lines) {
+    assert.ok(!/[\r\n]/.test(line), line)
+    assert.match(line, /^researcher: egress .*\\u000a/)
+  }
+})
+
+test('an invalid long URL reaches the log without an intermediate length limit', async () => {
+  const run = setup()
+  const url = 'not-a-url/' + 'x'.repeat(3000)
+  await refuses(run.egress(url), /the URL is not valid/)
+  assert.deepEqual(run.lines, [`researcher: egress GET ${url} egress refused: the URL is not valid`])
+  assert.equal(run.calls.length, 0)
+  assert.deepEqual(await run.artifacts.list(), [])
+})
+
 test('each final response is an artifact: a 404, an empty body and a null-body status', async () => {
   const answers = [
     new Response('missing', { status: 404, statusText: 'Not Found', headers: { 'content-type': 'text/html; charset=utf-8' } }),
@@ -366,8 +511,18 @@ test('each final response is an artifact: a 404, an empty body and a null-body s
   assert.equal(none.body, null)
   assert.equal(none.headers.get('x-artifact-id'), emptySha)
   assert.equal(none.headers.get('etag'), '"x"')
+  // Each response gets a separate record, even when two responses have the same empty body.
+  assert.notEqual(missing.headers.get('x-provenance-id'), missing.headers.get('x-artifact-id'))
+  assert.notEqual(empty.headers.get('x-provenance-id'), emptySha)
+  assert.notEqual(none.headers.get('x-provenance-id'), empty.headers.get('x-provenance-id'))
+  const noneMeta = await run.artifacts.meta(none.headers.get('x-provenance-id') ?? '')
+  assert.deepEqual(noneMeta?.source, { command: 'egress provenance' })
+  assert.deepEqual(noneMeta?.labels, { body_sha256: emptySha, status: '204', body: emptySha })
+  const record = JSON.parse(new TextDecoder().decode((await run.artifacts.get(none.headers.get('x-provenance-id') ?? '')) ?? new Uint8Array()))
+  assert.equal(record.url, 'https://api.example.com/none')
+  assert.equal(record.method, 'GET')
   assert.equal(run.lines.length, 3)
-  assert.match(run.lines[0] ?? '', /^researcher: egress GET https:\/\/api\.example\.com\/missing 404 artifact [0-9a-f]{64}$/)
+  assert.match(run.lines[0] ?? '', /^researcher: egress GET https:\/\/api\.example\.com\/missing 404 artifact [0-9a-f]{64} provenance [0-9a-f]{64}$/)
 })
 
 test('the media type falls back to octet-stream, and content-encoding and content-length are dropped', async () => {
@@ -408,6 +563,17 @@ test('checkEgress refuses a credential for an unlisted host, a bad header, a hos
   assert.throws(() => checkEgress(credential('api.example.com', 'x api key', 'ARCHIVE_KEY'), checkHost()), /not a valid HTTP token/)
   assert.throws(() => checkEgress(credential('api.example.com', 'x-api-key', 'GITHUB_TOKEN'), checkHost()), /host secret GITHUB_TOKEN/)
   assert.throws(() => checkEgress(credential('api.example.com', 'x-api-key', 'MISSING_KEY'), checkHost()), /secret MISSING_KEY for api\.example\.com is not set/)
+})
+
+test('checkEgress refuses a secret that is not a valid header value, and the message does not have the value', () => {
+  for (const value of ['line-one\nline-two', 'line-one\rline-two', 'line-one\0line-two', 'line-one\u0100line-two']) {
+    const host: EgressHost = { artifacts: memoryArtifacts(), secret: () => value }
+    assert.throws(
+      () => checkEgress({ ...base, ...keyed }, host),
+      (error: Error) => /secret ARCHIVE_KEY for api\.example\.com is not a valid header value/.test(error.message) && !error.message.includes('line-one'),
+      JSON.stringify(value),
+    )
+  }
 })
 
 test('checkEgress refuses web_search while the lock has a pending pattern', () => {

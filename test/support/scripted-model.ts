@@ -14,6 +14,23 @@ export type Turn = {
 
 export type Script = (turn: Turn) => Reply
 
+/** The web search tool in a model request: a nested Code Mode tool, or a provider tool. */
+export const webSearch = /`WebSearch`|"type":"web_search/
+
+/** A cell that tries the network through the cell fetch and through the shell, and shows each result. */
+const networkProbe = [
+  `try { await fetch('https://example.org/'); text('CELL FETCH ALLOWED') } catch (error) { text('cell fetch: ' + error) }`,
+  `try { text('shell fetch: ' + JSON.stringify(await tools.Bash({ command: 'curl https://example.org/' }))) } catch (error) { text('shell fetch: ' + error) }`,
+].join('\n')
+
+/** The script, with the network probe before the first cell of each turn of `role`. */
+export function probeNetwork(script: Script, role: string): Script {
+  return (turn) => {
+    const reply = script(turn)
+    return turn.role === role && turn.output === null && 'cell' in reply ? { cell: `${networkProbe}\n${reply.cell}` } : reply
+  }
+}
+
 const sse = (events: [string | null, unknown][]) =>
   new Response(events.map(([event, data]) => (event ? `event: ${event}\n` : '') + `data: ${JSON.stringify(data)}\n\n`).join(''), {
     headers: { 'content-type': 'text/event-stream' },

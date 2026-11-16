@@ -13,7 +13,7 @@ import { fileLedger } from '../src/node/ledger.ts'
 import { sqliteStore } from '../src/node/platform.ts'
 import { memoryArtifacts } from './support/artifacts.ts'
 import { credentials, module } from './support/fixture.ts'
-import { scriptedDispatch, type Script, type Turn } from './support/scripted-model.ts'
+import { scriptedDispatch, webSearch, type Script, type Turn } from './support/scripted-model.ts'
 
 const submitNote: Contracts.HostTool = {
   name: 'submit_note',
@@ -63,8 +63,6 @@ test('a turn that failed on a model error asks again under a new request ID when
   assert.equal(second.ledger.get('retries:note:task'), 1)
 })
 
-/** The web search tool in a model request: a nested Code Mode tool, or a provider tool. */
-const webSearch = /`WebSearch`|"type":"web_search/
 const archive: Egress = { hosts: ['archive.example.org'], web_search: true }
 const page = 'archive page'
 

@@ -10,7 +10,7 @@ export type EgressCredential = { header: string; secret: string }
 export type Egress = { hosts: string[]; web_search: boolean; max_bytes?: number; credentials?: Record<string, EgressCredential> }
 
 /** The default cap of a response body: 8 MiB. */
-export const defaultResponseLimit = 8 * 1024 * 1024
+const defaultResponseLimit = 8 * 1024 * 1024
 
 /** URL prefixes that the egress refuses until the host unlocks them. Only the host can unlock. */
 export type RunLock = { locked(url: string): boolean; pending(): string[]; unlock(pattern: string): void }
@@ -26,10 +26,25 @@ const postTypes = new Set(['application/x-www-form-urlencoded', 'application/jso
 const httpToken = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
 const hostLabel = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/
 
-/** The href of a URL without its fragment, so that two forms of one URL compare equal. */
+/** An escape of an unreserved character decodes to that character. The hex digits of other escapes become upper case. */
+const decodeUnreserved = (text: string) =>
+  text.replace(/%[0-9a-fA-F]{2}/g, (escape) => {
+    const char = String.fromCharCode(parseInt(escape.slice(1), 16))
+    return /^[A-Za-z0-9\-._~]$/.test(char) ? char : escape.toUpperCase()
+  })
+
+/**
+ * The href of a URL in one form, so that two forms of one URL compare equal. The form has no fragment and no trailing
+ * dot on the host. It has no escapes of unreserved characters in the path and the query. The lock compares only this form.
+ */
 const normalizeUrl = (url: string) => {
   const parsed = new URL(url)
   parsed.hash = ''
+  if (parsed.hostname.endsWith('.')) parsed.hostname = parsed.hostname.slice(0, -1)
+  const path = decodeUnreserved(parsed.pathname)
+  if (path !== parsed.pathname) parsed.pathname = path
+  const query = decodeUnreserved(parsed.search)
+  if (query !== parsed.search) parsed.search = query
   return parsed.href
 }
 
@@ -64,6 +79,9 @@ export function runLock(ledger: Ledger, patterns: string[]): RunLock {
   }
 }
 
+/** The Headers API refuses CR, LF, NUL and characters over U+00FF, with an error that contains the value. */
+const validHeaderValue = (value: string) => !/[\0\r\n]|[^\u0000-\u00ff]/.test(value)
+
 /** Refuses a spec that the host must not run. The messages name secrets, never their values. */
 export function checkEgress(egress: Egress, host: EgressHost): void {
   const max = egress.max_bytes
@@ -75,13 +93,22 @@ export function checkEgress(egress: Egress, host: EgressHost): void {
     if (!hosts.has(hostName(name))) throw new Error(`egress: the credential host ${name} is not in hosts`)
     if (!httpToken.test(credential.header)) throw new Error(`egress: the credential header ${JSON.stringify(credential.header)} of ${name} is not a valid HTTP token`)
     if (hostSecrets.includes(credential.secret)) throw new Error(`egress: the credential of ${name} cannot use the host secret ${credential.secret}`)
-    if (!host.secret(credential.secret)) throw new Error(`egress: the secret ${credential.secret} for ${name} is not set`)
+    const value = host.secret(credential.secret)
+    if (!value) throw new Error(`egress: the secret ${credential.secret} for ${name} is not set`)
+    if (!validHeaderValue(value)) throw new Error(`egress: the secret ${credential.secret} for ${name} is not a valid header value`)
   }
   const pending = host.lock?.pending() ?? []
   if (egress.web_search && pending.length > 0) throw new Error(`egress: web_search is not possible while ${pending.join(', ')} is locked`)
 }
 
 const refused = (reason: string) => new Error(`egress refused: ${reason}`)
+
+/** Control characters become escapes, so that one request gives one log line. */
+const logText = (text: string) =>
+  text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`)
+
+/** The egress removes these request headers of the agent. A server can use them to change the approved host or method. */
+const removedHeaders = ['host', 'x-http-method-override', 'x-http-method', 'x-method-override']
 
 const refusedIpv4 = (octets: number[]) => {
   const [a = 0, b = 0] = octets
@@ -162,9 +189,13 @@ async function readCapped(response: Response, cap: number): Promise<Uint8Array<A
 
 /**
  * The fetch of an agent with an egress. Each request and each redirect hop must pass the rules, else the fetch
- * rejects and stores nothing. The host adds the credential header only on the origin of the first request, as
+ * rejects and stores nothing. On each hop, the host adds the credential header of the host of that hop, as
  * `dispatcher` in providers.ts does. Each final body goes into the artifact store, and the response gets its ID in
  * the x-artifact-id header.
+ *
+ * The store keeps the first meta of a body. Each response also gets a JSON provenance record
+ * with a unique nonce. The x-provenance-id header has the ID of this record. The record contains the body ID and the
+ * request data. Its meta contains the time.
  */
 export function egressFetch(agent: string, egress: Egress, host: EgressHost, log: (line: string) => void): typeof fetch {
   const hosts = new Set(egress.hosts.map(hostName))
@@ -180,6 +211,7 @@ export function egressFetch(agent: string, egress: Egress, host: EgressHost, log
     const name = hostName(url.hostname)
     if (refusedAddress(name)) return `address ${name} is private or local`
     if (!hosts.has(name)) return `host ${name} is not in the list`
+    // The lock compares the normalized form, so a trailing dot or an escape does not change the result.
     if (host.lock?.locked(url.href)) return `lock: ${url.href} is locked`
     return null
   }
@@ -198,8 +230,6 @@ export function egressFetch(agent: string, egress: Egress, host: EgressHost, log
       first.hash = ''
       const reason = refusal(first)
       if (reason) throw refused(reason)
-      // The Request API refuses a GET with a body with an error of its own. This check gives the egress reason.
-      if (init?.body != null && /^(get|head)$/i.test(given)) throw refused(`method ${given} with a body`)
       let request: Request
       try {
         request = new Request(input, init)
@@ -210,6 +240,7 @@ export function egressFetch(agent: string, egress: Egress, host: EgressHost, log
       let method = request.method
       if (method !== 'GET' && method !== 'POST') throw refused(`method ${method} is not GET or POST`)
       const headers = new Headers(request.headers)
+      for (const name of removedHeaders) headers.delete(name)
       let body: Uint8Array<ArrayBuffer> | undefined
       if (method === 'POST') {
         const type = (headers.get('content-type') ?? '').split(';')[0]?.trim().toLowerCase() ?? ''
@@ -217,17 +248,17 @@ export function egressFetch(agent: string, egress: Egress, host: EgressHost, log
         body = new Uint8Array(await request.arrayBuffer())
       }
 
-      const credential = credentials.get(hostName(first.hostname))
       const hopHeaders = (url: URL) => {
         const sent = new Headers(headers)
+        // A value of the agent for a credential header does not go to a different origin.
+        if (url.origin !== first.origin) for (const { header } of credentials.values()) sent.delete(header)
+        const name = hostName(url.hostname)
+        const credential = credentials.get(name)
         if (!credential) return sent
-        // The credential goes only to the first origin. The value of the agent does not go to a different origin.
-        if (url.origin !== first.origin) {
-          sent.delete(credential.header)
-          return sent
-        }
         const secret = host.secret(credential.secret)
-        if (!secret) throw refused(`the secret ${credential.secret} for ${hostName(first.hostname)} is not set`)
+        if (!secret) throw refused(`the secret ${credential.secret} for ${name} is not set`)
+        // The error of Headers.set contains the value, so the egress gives its own error without the value.
+        if (!validHeaderValue(secret)) throw refused(`the secret ${credential.secret} for ${name} is not a valid header value`)
         sent.set(credential.header, secret)
         return sent
       }
@@ -259,20 +290,25 @@ export function egressFetch(agent: string, egress: Egress, host: EgressHost, log
       }
 
       const bytes = await readCapped(response, cap)
-      const id = await host.artifacts.put(bytes, {
-        source: { url: url.href, method },
-        media_type: response.headers.get('content-type') ?? 'application/octet-stream',
-        labels: { body_sha256: await artifactId(body ?? new Uint8Array()), status: String(response.status) },
+      const source = { url: url.href, method }
+      const labels = { body_sha256: await artifactId(body ?? new Uint8Array()), status: String(response.status) }
+      const id = await host.artifacts.put(bytes, { source, media_type: response.headers.get('content-type') ?? 'application/octet-stream', labels })
+      const record = { body: id, url: url.href, method, ...labels, nonce: crypto.randomUUID() }
+      const provenance = await host.artifacts.put(new TextEncoder().encode(JSON.stringify(record)), {
+        source: { command: 'egress provenance' },
+        media_type: 'application/json',
+        labels: { ...labels, body: id },
       })
       const answered = new Headers(response.headers)
       answered.delete('content-encoding')
       answered.delete('content-length')
       answered.set('x-artifact-id', id)
+      answered.set('x-provenance-id', provenance)
       const final = url.href === first.href ? '' : ` from ${method} ${url.href}`
-      log(`${line} ${response.status}${final} artifact ${id}`)
+      log(logText(`${line} ${response.status}${final} artifact ${id} provenance ${provenance}`))
       return new Response(nullBodyStatuses.has(response.status) ? null : bytes, { status: response.status, statusText: response.statusText, headers: answered })
     } catch (error) {
-      log(`${line} ${error instanceof Error ? error.message : String(error)}`)
+      log(logText(`${line} ${error instanceof Error ? error.message : String(error)}`))
       throw error
     }
   }
