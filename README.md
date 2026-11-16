@@ -29,7 +29,7 @@ The same workflow runs on two platforms:
 ```
 freeze ─▶ triage: light or full
 
-full:  step 1: minimize │ rules │ bugs ×1-4 │ anti-slop   (Opus 5.5, Sol, Fable 5.2: read-only, parallel)
+full:  step 1: minimize │ rules │ bugs ×1-4 │ anti-slop   (Opus 5.5, Sol: read-only, parallel)
        + host findings ─▶ gate ─▶ patch ×1-4 by file (Opus 5.5) ─▶ commit
        ─▶ step 2: late-minimize │ late-rules on the new diff   (each role on the other family)
        + host findings ─▶ gate ─▶ patch ×1-4 by file (Sol) ─▶ commit

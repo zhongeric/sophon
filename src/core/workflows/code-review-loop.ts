@@ -18,7 +18,10 @@ export type LoopModels = {
   light: ModelChoice
 }
 
-/** The models that a run accepts when the host sets no ALLOWED_MODELS: Fable, Opus 5.5 and Sol. The default models use only these. */
+/**
+ * The models that a run accepts when the host sets no ALLOWED_MODELS: Fable, Opus 5.5 and Sol. The default models use
+ * only Opus 5.5 and Sol. Fable costs more for each token, thus it gets a role only from a models file or MODELS.
+ */
 export const defaultAllowedModels = ['claude-fable-5-2', 'claude-opus-5-5', 'gpt-6.1-sol']
 
 /** The ALLOWED_MODELS setting: model IDs, comma-separated. When it is empty, the default list applies. */
@@ -30,23 +33,22 @@ export function allowedModelsFrom(setting: string | undefined): string[] {
   return models.length > 0 ? models : defaultAllowedModels
 }
 
-const fable: ModelChoice = { provider: 'claude', model: 'claude-fable-5-2' }
 const opus: ModelChoice = { provider: 'claude', model: 'claude-opus-5-5' }
 const sol: ModelChoice = { provider: 'codex', model: 'gpt-6.1-sol' }
 
-/** Step 1 spreads the tracks over the three models for variance. Each step 2 role swaps the family of its step 1 counterpart. */
+/** Step 1 spreads the tracks over the two families for variance. Each step 2 role swaps the family of its step 1 counterpart. */
 export const defaultModels: LoopModels = {
   step1: {
     minimize: opus,
     rules: sol,
-    bugs: { ...fable, thinking: 'high' },
+    bugs: { ...opus, thinking: 'high' },
     'anti-slop': opus,
     patch: { ...opus, thinking: 'high' },
     questions: opus,
   },
   step2: {
     'late-minimize': sol,
-    'late-rules': fable,
+    'late-rules': opus,
     'late-bugs': { ...sol, thinking: 'high' },
     patch: { ...sol, thinking: 'high' },
     intent: opus,
