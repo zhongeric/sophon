@@ -33,6 +33,8 @@ export type AgentHost = {
   credentials: Credentials
   /** Replaces the credentialed dispatch, for scripted models in tests. */
   dispatch?: Contracts.RuntimeOptions['dispatch']
+  /** Replaces the runtime factory, for tests that change what the runtime answers. */
+  instantiate?: typeof AgentRuntime.instantiate
   /** Runs before the host opens an agent turn, for example to compare the spend with the budget. A rejection stops the turn. */
   beforeTurn?: () => Promise<void>
   /** The artifacts, the lock and the secrets of the egress. Only an agent with an egress uses it. */
@@ -85,7 +87,7 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
   const dispatch = host.dispatch ?? dispatcher(host.credentials, spec.provider)
 
   const connect = async () => {
-    const runtime = await AgentRuntime.instantiate(host.module, host.store.sql, {
+    const runtime = await (host.instantiate ?? AgentRuntime.instantiate)(host.module, host.store.sql, {
       published(events) {
         host.store.record(spec.id, events)
         recordUsage(host.ledger, spec.id, spec.model, events)

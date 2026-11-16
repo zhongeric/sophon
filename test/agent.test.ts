@@ -159,13 +159,14 @@ test('a resumed ask with a changed prompt still fails when the journal has no tu
   await firstAgent.close()
 
   // The submit of the resumed runtime gets a conflict from the journal, but its turn view is empty.
-  const instantiate = AgentRuntime.instantiate.bind(AgentRuntime)
-  t.mock.method(AgentRuntime, 'instantiate', async (...args: Parameters<typeof instantiate>) => {
-    const runtime = await instantiate(...args)
-    t.mock.method(runtime, 'turn', async () => null)
-    return runtime
-  })
-  const second = run.host(dispatch)
+  const second: AgentHost = {
+    ...run.host(dispatch),
+    async instantiate(...args) {
+      const runtime = await AgentRuntime.instantiate(...args)
+      t.mock.method(runtime, 'turn', async () => null)
+      return runtime
+    },
+  }
   const agent = await openAgent(await run.spec(second), second)
   try {
     await assert.rejects(agent.ask('task', 'Write note B.'), /note: turn task exists with another prompt/)
