@@ -17,12 +17,13 @@
     { "new_sqlite_classes": ["DevelopmentRuns"], "tag": "v2" },
     { "new_sqlite_classes": ["ResearchRuns"], "tag": "v3" }
   ],
-  // One build container for each development run, and one for each research run (the domain commands). Setup, checks,
-  // tests and commands run there, never beside a secret. standard-4 is 4 vCPU and 12 GiB: the setup and the tests use
-  // all cores, and the parallel builders of a run share it.
+  // One build container for each development run, each research run (the domain commands) and each review run whose
+  // config has tests. Setup, checks, tests and commands run there, never beside a secret. standard-4 is 4 vCPU and
+  // 12 GiB: the setup and the tests use all cores, and the parallel builders of a run share it.
   "containers": [
     { "class_name": "DevelopmentRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 10 },
-    { "class_name": "ResearchRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 5 }
+    { "class_name": "ResearchRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 5 },
+    { "class_name": "PullRequestRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 10 }
   ],
   "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
   // The STE dictionary is optional: when agents/guides/ste holds it, it is a module of its own (src/cloudflare/guides.ts).
