@@ -4,16 +4,19 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import type { Contracts } from 'nanocode-ts'
+import { callBudget, PlannedStop } from '../src/core/planned-stop.ts'
 import type { Repo } from '../src/core/platform.ts'
 import { profiles, staticFindings, triage } from '../src/core/profiles.ts'
 import type { Signing } from '../src/core/platform.ts'
 import { PausedError, type Channel } from '../src/core/questions.ts'
 import { StopError } from '../src/core/stop.ts'
-import { allowedModelsFrom, defaultAllowedModels, defaultModels, type LoopInput } from '../src/core/workflows/code-review-loop.ts'
+import { allowedModelsFrom, codeReviewLoop, defaultAllowedModels, defaultModels, type LoopInput } from '../src/core/workflows/code-review-loop.ts'
 import { branchLine, resumeInput } from '../src/node/cli.ts'
 import { changedFiles, diff, touchedFiles } from '../src/node/git.ts'
 import { fileLedger } from '../src/node/ledger.ts'
-import { fixed, fixtureRepo, gitSource, lightFixed, loopInput, memoryChannel, runLoop, script, scriptFor, withoutKey } from './support/fixture.ts'
+import { nodeRun } from '../src/node/platform.ts'
+import { credentials, fixed, fixtureRepo, gitSource, lightFixed, loopInput, memoryChannel, module, runLoop, script, scriptFor, withoutKey } from './support/fixture.ts'
 import { probeNetwork, scriptedDispatch, webSearch, type Script, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
@@ -238,6 +241,26 @@ test('a resumed run does not repeat finished steps', async () => {
   assert.equal(result.pass, true)
   for (const role of ['minimize', 'rules', 'bugs', 'anti-slop']) assert.ok(!second.some((turn) => turn.role === role), `${role} ran again`)
   assert.ok(second.some((turn) => turn.role === 'patch'))
+})
+
+test('a planned stop in step 1 ends the call only after the questions agent settled', async () => {
+  const repo = fixtureRepo()
+  const input = await loopInput(repo, 'stop')
+  const run = await nodeRun({ config: input.config, runId: 'stop', runsDir: runsDir(), source: gitSource(repo) })
+  const reviewed = () => ['minimize', 'rules', 'bugs', 'anti-slop'].every((id) => run.ledger.get(`step:step1.${id}`) !== undefined)
+  // The budget is spent when the step 1 reviewers finished, so the step 1 host check stops the run.
+  const ledger = callBudget(run.ledger, { budgetMs: 1000, startedAt: 0, now: () => (reviewed() ? 5000 : 0) })
+  const scripted = scriptedDispatch(scriptFor({ tests: false }), [])
+  // The questions agent answers only after the reviewers finished.
+  const dispatch: Contracts.RuntimeOptions['dispatch'] = async (request, signal, timing) => {
+    if (/Agent role: questions/.test(new TextDecoder().decode(request.body))) while (!reviewed()) await new Promise((resolve) => setTimeout(resolve, 10))
+    return scripted(request, signal, timing)
+  }
+  await assert.rejects(
+    codeReviewLoop(input, { ...run, ledger, channel: memoryChannel().channel, credentials, dispatch, log: () => {}, module }),
+    (error: unknown) => error instanceof PlannedStop && run.ledger.get('step:step1.questions') !== undefined,
+  )
+  assert.equal(run.ledger.get('step:step1.host'), undefined)
 })
 
 test('a signing check that stops ends the run before the freeze and before any model call', async () => {

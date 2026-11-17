@@ -183,22 +183,33 @@ export async function runTurn<T>(
 ): Promise<T> {
   const recorded = host.ledger.get<T>(turn.key)
   if (recorded !== undefined) return recorded
+  host.ledger.safePoint?.()
   await host.beforeTurn?.()
   const retriesKey = `retries:${spec.id}:${turn.request}`
   const retries = host.ledger.get<number>(retriesKey) ?? 0
   const request = retries === 0 ? turn.request : `${turn.request}-retry-${retries}`
   const agent = await openAgent(spec, host)
+  const ask = async (id: string, text: string) => {
+    const started = Date.now()
+    try {
+      return await agent.ask(id, text)
+    } finally {
+      const used = Date.now() - started
+      if (used > longTurnMs) host.log(`${spec.id}: warning: turn ${id} took ${Math.round(used / 1000)} s, more than ${longTurnMs / 60_000} minutes`)
+    }
+  }
   let failed = false
   try {
-    const report = await agent.ask(request, retries === 0 ? prompt : `${retryNote}\n\n${prompt}`)
+    const report = await ask(request, retries === 0 ? prompt : `${retryNote}\n\n${prompt}`)
     failed = report.status === 'failed'
     if (host.ledger.get(turn.key) === undefined) {
       if (report.status !== 'completed') throw new Error(`${spec.id}: turn ${report.status}: ${JSON.stringify(report.error ?? null)}`)
       // The first turn keeps the nudge request ID of earlier runs, so that their journals resume.
       const nudge = request === 'task' ? 'nudge' : `${request}-nudge`
-      // The nudge is a new agent turn, so the budget check applies to it too.
+      // The nudge is a new agent turn, so the safe point and the budget check apply to it too.
+      host.ledger.safePoint?.()
       await host.beforeTurn?.()
-      failed = (await agent.ask(nudge, `You ended the turn without calling ${tool}. Call tools.${tool} now.`)).status === 'failed'
+      failed = (await ask(nudge, `You ended the turn without calling ${tool}. Call tools.${tool} now.`)).status === 'failed'
     }
   } finally {
     if (failed && host.ledger.get(turn.key) === undefined) host.ledger.put(retriesKey, retries + 1)
@@ -208,6 +219,9 @@ export async function runTurn<T>(
   if (output === undefined) throw new Error(`${spec.id} did not call ${tool}`)
   return output
 }
+
+/** A turn that takes longer than this can pass the wall-time limit of a Cloudflare alarm call, so the host logs a warning. */
+const longTurnMs = 7 * 60_000
 
 /** The start of the prompt that asks again after a failed turn. The failed turn can have stopped before any work. */
 const retryNote = 'Your last turn stopped with an error before it finished. Here is the task again. Keep the work that you already did in this session.'

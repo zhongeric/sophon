@@ -3,6 +3,7 @@ import type { CiJob } from '../ci.ts'
 import type { MergeMethod, RepoConfig } from '../checks.ts'
 import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
+import { alarmLines, settleAll } from '../planned-stop.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
 import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeResult, PullRequests, Signing } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
@@ -226,7 +227,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
           () => note,
           (error: unknown) => `${note} The host did not remove the worktrees of the run: ${reasonOf(error)}.`,
         )
-    const report = renderReport(state, status, criteria, shown, decisions(ledger), usage, pruned ? branchesSection(pruned) : [])
+    const report = renderReport(state, status, criteria, shown, decisions(ledger), usage, pruned ? branchesSection(pruned) : [], alarmLines(ledger))
     deps.files.write('report.md', report)
     // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
     if (state.pr && ledger.get('commented') !== report) {
@@ -299,11 +300,8 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         })
       }),
     )
-    const logs = await Promise.all(builds).catch(async (error: unknown) => {
-      // All tasks must end before finish checks or deletes their branches.
-      await Promise.allSettled(builds)
-      throw error
-    })
+    // All tasks must end before finish checks or deletes their branches.
+    const logs = await settleAll(builds)
     state.built.push(...wave.map((task, position) => ({ task, log: logs[position]! })))
     const blocked = state.built.filter((entry) => entry.log.blocked.trim())
     if (blocked.length > 0) return finish('blocked', [], blocked.map((entry) => `Task ${entry.task.id} is blocked: ${entry.log.blocked}`).join('\n'))
@@ -622,7 +620,7 @@ function reviewRow(review: Review, index: number): UsageRow {
   return { step: `review.${index + 1}`, model: 'review loop', tokens: usage.tokens, usd: usage.usd, unpriced: usage.unpriced }
 }
 
-function renderReport(state: ReportState, status: DevelopStatus, criteria: Criterion[], note: string, answers: Answer[], usage: string[], branches: string[]): string {
+function renderReport(state: ReportState, status: DevelopStatus, criteria: Criterion[], note: string, answers: Answer[], usage: string[], branches: string[], alarms: string[]): string {
   const triage = (report: string) => /^- Triage: (.*)$/m.exec(report)?.[1] ?? ''
   const failed = criteria.filter((criterion) => !criterion.ok)
   const criterionLine = (criterion: Criterion) => `- [${criterion.ok ? 'x' : ' '}] ${criterion.name}: ${criterion.detail}`
@@ -641,6 +639,7 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
     ...(state.route ? [`- Route: ${state.route.spec ? 'spec, then plan' : 'plan'}, ${state.route.passes} review loop ${state.route.passes === 1 ? 'pass' : 'passes'}. ${state.intake?.reason ?? ''}`] : []),
     ...(state.branch ? [`- Branch: ${state.branch}${state.head ? ` at ${state.head.slice(0, 12)}` : ''}`] : []),
     ...(state.signing ? [`- ${signingLine(state.signing)}`] : []),
+    ...alarms,
     '',
     ...(criteria.length > 0 ? ['## Criteria', '', ...criteria.map(criterionLine), ''] : []),
     ...(state.plan ? ['## Plan', '', state.plan.smallest_change, ''] : []),

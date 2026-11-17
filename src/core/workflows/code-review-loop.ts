@@ -3,6 +3,7 @@ import type { CheckResult, RepoConfig } from '../checks.ts'
 import { assignIds, type Finding } from '../findings.ts'
 import { acceptRejection, findingQuestion, gate, rejectionQuestion, settle, type GateResult } from '../gate.ts'
 import { step, type Ledger } from '../ledger.ts'
+import { alarmLines, settleAll } from '../planned-stop.ts'
 import type { AgentStore, Checker, Files, Frozen, Guides, Repo, Signing } from '../platform.ts'
 import { branchesSection, pruneBranches, reasonOf, type PruneResult, type PullState } from '../prune.ts'
 import { isLight, profilesById, staticFindings, triage, triageLine, type Triage } from '../profiles.ts'
@@ -264,13 +265,16 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       questions.post('ask', list),
     )
     // The bugs review is the slowest track: on a large diff, the host splits it across reviewers.
-    const step1 = await Promise.all(
+    const reviewed = settleAll(
       step1Roles.map((id) =>
         step(ledger, `step1.${id}`, () => (id === 'bugs' ? splitReview : review)(context, `step1.${id}`, reviewRoles[id], input.models.step1[id], step1Range, '')),
       ),
     )
-    const host1 = await hostCheck('step1.host', step1Range, 'host')
-    await asked
+    const checked = reviewed.then(() => hostCheck('step1.host', step1Range, 'host'))
+    // The questions agent also runs in step 1: it settles before a failure ends the call.
+    await settleAll<unknown>([checked, asked])
+    const step1 = await reviewed
+    const host1 = await checked
     await questions.wait('ask')
     const gate1 = await runGate('step1.gate', familyHeader('Step 1', input.models.step1), [...host1, ...step1.flat()])
     const patch1 = await runPatch('step1.patch', gate1, () =>
@@ -283,7 +287,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     if (patch1.changed) {
       const range = { from: frozen.head, to: patch1.after }
       const note = 'This is the step 2 pass. The diff is the patch that the step 1 patch agent applied, not the original change.'
-      const late = await Promise.all(
+      const late = await settleAll(
         (['late-minimize', 'late-rules'] as const).map((id) =>
           step(ledger, `step2.${id}`, () => review(context, `step2.${id}`, reviewRoles[id], input.models.step2[id], range, note)),
         ),
@@ -383,7 +387,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     const steps = ['- The run stopped at the cost budget before the steps finished.']
     // A resume with a higher budget goes on, so this prune step must not be the prune step of its end.
     const { pruned, lines } = await prune('prune.stopped', false)
-    const report = renderReport({ input, frozen, current, pass: false, criteria, triage: triaged, signing, steps, checks: null, verdict: null, decisions: decisions(ledger), usage: usageReport.lines, note, branches: lines })
+    const report = renderReport({ input, frozen, current, pass: false, criteria, triage: triaged, signing, steps, checks: null, verdict: null, decisions: decisions(ledger), usage: usageReport.lines, alarms: alarmLines(ledger), note, branches: lines })
     deps.files.write('report.md', report)
     ledger.put('result', { pass: false, criteria, final: current, usage: usageReport.run, stopped: true })
     return end({ pass: false, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: true, pruned })
@@ -400,7 +404,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   const { pruned, lines } = await prune('prune', pass && input.ship !== undefined)
 
   const usageReport = usage()
-  const report = renderReport({ input, frozen, current, pass, criteria, triage: triaged, signing, steps, checks, verdict, decisions: decisions(ledger), usage: usageReport.lines, note: null, branches: lines })
+  const report = renderReport({ input, frozen, current, pass, criteria, triage: triaged, signing, steps, checks, verdict, decisions: decisions(ledger), usage: usageReport.lines, alarms: alarmLines(ledger), note: null, branches: lines })
   deps.files.write('report.md', report)
   ledger.put('result', { pass, criteria, final: current, usage: usageReport.run, stopped: false })
   return end({ pass, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: false, pruned })
@@ -486,6 +490,8 @@ type ReportInput = {
   verdict: Verdict | null
   decisions: Answer[]
   usage: string[]
+  /** The counters of the alarm calls, or no line on the local platform. */
+  alarms: string[]
   note: string | null
   /** The Branches section, or no lines when the prune deleted nothing and nothing failed. */
   branches: string[]
@@ -501,6 +507,7 @@ function renderReport(run: ReportInput): string {
     `- Fixes: branch ${run.frozen.branch} at ${short(run.current)} (${run.frozen.location})`,
     `- Triage: \`${triageLine(run.triage)}\``,
     `- ${signingLine(run.signing)}`,
+    ...run.alarms,
     '',
     ...(run.note ? [run.note, ''] : []),
     '## Criteria',

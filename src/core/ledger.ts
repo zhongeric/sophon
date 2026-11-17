@@ -2,6 +2,8 @@
 export type Ledger = {
   get<T>(key: string): T | undefined
   put(key: string, value: unknown): void
+  /** A point between steps and agent turns where the journal holds all finished work. The host can stop the run here (it throws) and continue it in a new call. */
+  safePoint?(): void
 }
 
 /** Runs `run` once per ledger. A resumed run returns the recorded result instead of running the step again. */
@@ -9,6 +11,7 @@ export async function step<T>(ledger: Ledger, name: string, run: () => Promise<T
   const key = `step:${name}`
   const done = ledger.get<{ result: T }>(key)
   if (done) return done.result
+  ledger.safePoint?.()
   const result = await run()
   ledger.put(key, { result })
   return result

@@ -3,6 +3,7 @@ import { runTurn, submitOnce, type AgentHost, type AgentSpec, type HostTools } f
 import { callRunTests, isProtected, runTestsTool, type RepoConfig } from './checks.ts'
 import { assignIds, checkFindings, parseLocation, submitFindings, type Finding } from './findings.ts'
 import { step } from './ledger.ts'
+import { settleAll } from './planned-stop.ts'
 import type { Checker, Frozen, Guides, Repo } from './platform.ts'
 import { checkQuestions, decisionsFile, decisionsLine, submitQuestions, type Question } from './questions.ts'
 import { instructions, reviewRoles, type ModelChoice, type Role } from './roles.ts'
@@ -120,7 +121,7 @@ export async function splitReview(context: RunContext, id: string, role: Role, m
   if (shares.length === 1) return review(context, id, role, model, range, note)
   const of = diffFiles(diff).length
   context.host.log(`${id}: ${shares.length} reviewers at the same time, with ${shares.map((files) => files.length).join(', ')} files`)
-  const found = await Promise.all(
+  const found = await settleAll(
     shares.map((files, index) => step(context.host.ledger, `${id}.${index + 1}`, () => review(context, `${id}.${index + 1}`, role, model, range, note, { files, of }))),
   )
   const { track, prefix } = role.findings
@@ -223,7 +224,7 @@ export async function patch(context: RunContext, id: string, model: ModelChoice,
   const { ledger } = context.host
   const owners = fileOwners(groups, { ...ledger.get<Record<string, number>>(`claims:${id}`) }, (claims) => ledger.put(`claims:${id}`, claims))
   context.host.log(`${id}: ${groups.length} patch agents at the same time, with ${groups.map((group) => group.findings.length).join(', ')} findings`)
-  const logs = await Promise.all(
+  const logs = await settleAll(
     groups.map((group, index) =>
       patchTurn<GroupLog>(context, `${id}.${index + 1}`, model, group.findings, gateLog, before, {
         kind: 'share',

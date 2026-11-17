@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { PlannedStop } from '../src/core/planned-stop.ts'
 import { pool } from '../src/core/pool.ts'
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -82,4 +83,14 @@ test('an error starts no new items, waits for the items in progress, and rejects
   assert.deepEqual(settled, [1, 2, 0])
   await sleep(40)
   assert.deepEqual(started, [0, 1, 2])
+})
+
+test('a real error replaces a PlannedStop as the failure, and the first real error still wins', async () => {
+  const run = async ([ms, error]: [number, unknown]) => {
+    await sleep(ms)
+    throw error
+  }
+  const real = new Error('real')
+  await assert.rejects(pool<[number, unknown], never>([[0, new PlannedStop('stop')], [10, real], [20, new Error('later')]], 3, run), real)
+  await assert.rejects(pool<[number, unknown], never>([[0, new PlannedStop('one')], [10, new PlannedStop('two')]], 2, run), { message: 'one' })
 })
