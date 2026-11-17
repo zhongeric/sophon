@@ -1,6 +1,6 @@
 {
-  // One Durable Object per PR holds its review runs, and one per issue holds its development runs: the ledger,
-  // the repository trees and every agent session.
+  // One Durable Object per PR holds its review runs, one per issue its development runs, and one per program issue its
+  // research runs: the ledger, the repository trees and every agent session.
   "name": "agent-factory",
   "main": "src/cloudflare/worker.ts",
   "compatibility_date": "2026-10-01",
@@ -8,16 +8,22 @@
   "durable_objects": {
     "bindings": [
       { "class_name": "PullRequestRuns", "name": "PULL_REQUESTS" },
-      { "class_name": "DevelopmentRuns", "name": "DEVELOPMENT_RUNS" }
+      { "class_name": "DevelopmentRuns", "name": "DEVELOPMENT_RUNS" },
+      { "class_name": "ResearchRuns", "name": "RESEARCH_RUNS" }
     ]
   },
   "migrations": [
     { "new_sqlite_classes": ["PullRequestRuns"], "tag": "v1" },
-    { "new_sqlite_classes": ["DevelopmentRuns"], "tag": "v2" }
+    { "new_sqlite_classes": ["DevelopmentRuns"], "tag": "v2" },
+    { "new_sqlite_classes": ["ResearchRuns"], "tag": "v3" }
   ],
-  // One build container for each development run. Builders' setup, checks and tests run there, never beside a secret.
-  // standard-4 is 4 vCPU and 12 GiB: the setup and the tests use all cores, and the parallel builders of a run share it.
-  "containers": [{ "class_name": "DevelopmentRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 10 }],
+  // One build container for each development run, and one for each research run (the domain commands). Setup, checks,
+  // tests and commands run there, never beside a secret. standard-4 is 4 vCPU and 12 GiB: the setup and the tests use
+  // all cores, and the parallel builders of a run share it.
+  "containers": [
+    { "class_name": "DevelopmentRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 10 },
+    { "class_name": "ResearchRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 5 }
+  ],
   "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
   // The STE dictionary is optional: when agents/guides/ste holds it, it is a module of its own (src/cloudflare/guides.ts).
   "base_dir": "agents/guides",
