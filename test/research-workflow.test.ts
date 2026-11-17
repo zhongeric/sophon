@@ -10,6 +10,7 @@ import { StopError } from '../src/core/stop.ts'
 import { defaultResearchModels, research } from '../src/core/workflows/research.ts'
 import { worktreePath } from '../src/node/git.ts'
 import { nodeResearch } from '../src/node/platform.ts'
+import { fakePulls } from './support/develop.ts'
 import { credentials, memoryChannel, module } from './support/fixture.ts'
 import { archive, earlierPrereg, holdoutPrefix, notebook, prices, researchConfig, researchInput, researchScript, runResearch } from './support/research.ts'
 import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
@@ -17,6 +18,8 @@ import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-research-runs-'))
 const gitIn = (repo: string, ...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' }).toString()
 const stops = (pattern: RegExp) => (error: unknown) => error instanceof StopError && pattern.test(error.message)
+// The builder submits a blocked log, so these runs end at stage 5 before any push.
+const blocked = researchScript({ blockBuilder: true })
 
 test('research: intake with a cap, surveys through the egress, two generators, the pick, an approval with a rejection, and the freeze', { timeout: 120_000 }, async () => {
   const { repo, origin, base } = notebook()
@@ -29,9 +32,9 @@ test('research: intake with a cap, surveys through the egress, two generators, t
     'approve.1': '/answer\nQ1: a\nQ2: The decision rules need a trials factor.',
   })
   const input = researchInput(base, 'r1')
-  const { result, deps } = await runResearch(repo, runs, input, { channel, dispatch: scriptedDispatch(researchScript(), turns), fetch: web.fetch })
+  const { result, deps } = await runResearch(repo, runs, input, { channel, dispatch: scriptedDispatch(blocked, turns), fetch: web.fetch })
 
-  assert.equal(result.status, 'frozen', result.report)
+  assert.equal(result.status, 'blocked', result.report)
   assert.equal(result.branch, 'factory/research-r1')
   assert.deepEqual(
     posted.map((batch) => batch.batch),
@@ -92,23 +95,24 @@ test('research: intake with a cap, surveys through the egress, two generators, t
   assert.equal(gitIn(repo, 'rev-parse', 'HEAD'), `${base}\n`)
   assert.equal(gitIn(repo, 'status', '--porcelain'), ' M research/holdout.json\n')
 
-  // No stage 5: no turn of a role after the preregistrar.
-  assert.deepEqual([...new Set(turns.map((turn) => turn.role))].sort(), ['generator', 'intake', 'preregistrar', 'surveyor'])
-  assert.equal(turns.at(-1)!.role, 'preregistrar')
-  assert.match(result.report, /did not push the branch, and stopped before stage 5/)
+  // The blocked builder of hyp-001 ends the run at stage 5.
+  assert.deepEqual([...new Set(turns.map((turn) => turn.role))].sort(), ['builder', 'generator', 'intake', 'preregistrar', 'surveyor'])
+  assert.equal(turns.at(-1)!.role, 'builder')
+  assert.match(result.report, /The analysis of hyp-001 is blocked: the analysis needs a catalog/)
+  assert.match(result.report, /factory\/research-r1 \(local, not pushed\)/)
   assert.match(result.report, /prereg\/hyp-001-v2\.md: SHA-256 [0-9a-f]{64}/)
   assert.equal(readFileSync(join(deps.dir, 'report.md'), 'utf8'), result.report)
 
   // The same run ID resumes from the ledger and makes no model call.
   const again: Turn[] = []
-  const second = await runResearch(repo, runs, input, { channel, dispatch: scriptedDispatch(researchScript(), again), fetch: web.fetch })
+  const second = await runResearch(repo, runs, input, { channel, dispatch: scriptedDispatch(blocked, again), fetch: web.fetch })
   assert.equal(again.length, 0)
   assert.deepEqual(second.result.frozen, result.frozen)
 
   // A frozen file that changed after the freeze stops the next resume before any turn.
   writeFileSync(join(worktreePath(join(deps.dir, 'branches'), 'factory/research-r1'), 'prereg/hyp-003-v1.md'), 'changed\n')
   await assert.rejects(
-    runResearch(repo, runs, input, { channel, dispatch: scriptedDispatch(researchScript(), again), fetch: web.fetch }),
+    runResearch(repo, runs, input, { channel, dispatch: scriptedDispatch(blocked, again), fetch: web.fetch }),
     stops(/the frozen prereg prereg\/hyp-003-v1\.md on factory\/research-r1 changed after the freeze/),
   )
   assert.equal(again.length, 0)
@@ -118,9 +122,9 @@ test('research: a Drop answer at the approval removes the hypothesis without a f
   const { repo, base } = notebook()
   const turns: Turn[] = []
   const { channel, posted } = memoryChannel({ pick: '/answer\nQ1: a, c', 'approve.1': '/answer\nQ1: a\nQ2: c' })
-  const { result } = await runResearch(repo, runsDir(), researchInput(base, 'drop'), { channel, dispatch: scriptedDispatch(researchScript(), turns) })
+  const { result } = await runResearch(repo, runsDir(), researchInput(base, 'drop'), { channel, dispatch: scriptedDispatch(blocked, turns) })
 
-  assert.equal(result.status, 'frozen', result.report)
+  assert.equal(result.status, 'blocked', result.report)
   assert.deepEqual(
     posted.map((batch) => batch.batch),
     ['intake', 'pick', 'approve.1'],
@@ -130,7 +134,7 @@ test('research: a Drop answer at the approval removes the hypothesis without a f
     ['prereg/hyp-001-v2.md'],
   )
   assert.equal(turns.filter((turn) => turn.role === 'preregistrar' && turn.output === null).length, 2)
-  assert.match(result.report, /dropped hyp-003/)
+  assert.match(result.report, /Dropped at the approval: hyp-003/)
 })
 
 test('research: a fresh run creates the next version when the base has an identical prereg', { timeout: 120_000 }, async () => {
@@ -147,10 +151,10 @@ test('research: a fresh run creates the next version when the base has an identi
   const { channel } = memoryChannel({ pick: '/answer\nQ1: a' })
   const { result, deps } = await runResearch(repo, runsDir(), researchInput(base, 'identical-base'), {
     channel,
-    dispatch: scriptedDispatch(researchScript(), []),
+    dispatch: scriptedDispatch(blocked, []),
   })
 
-  assert.equal(result.status, 'frozen', result.report)
+  assert.equal(result.status, 'blocked', result.report)
   assert.equal(result.frozen.length, 1)
   const frozen = result.frozen[0]
   assert.ok(frozen)
@@ -173,14 +177,16 @@ test('research: a resume commits a prereg left in the worktree before it records
   const deps = await nodeResearch({
     channel,
     credentials,
-    dispatch: scriptedDispatch(researchScript(), []),
+    dispatch: scriptedDispatch(blocked, []),
     env: { ARCHIVE_TOKEN: 'token-1' },
     fetch: archive().fetch,
     input,
     log: () => {},
     module,
     prices,
+    pulls: fakePulls().pulls,
     repo,
+    reviewChannel: async () => memoryChannel().channel,
     runsDir: runs,
   })
   await assert.rejects(
@@ -205,9 +211,10 @@ test('research: a resume commits a prereg left in the worktree before it records
   assert.equal(deps.ledger.get('frozen'), undefined)
 
   const again: Turn[] = []
-  const { result } = await runResearch(repo, runs, input, { channel, dispatch: scriptedDispatch(researchScript(), again) })
-  assert.equal(result.status, 'frozen', result.report)
-  assert.equal(again.length, 0)
+  const { result } = await runResearch(repo, runs, input, { channel, dispatch: scriptedDispatch(blocked, again) })
+  assert.equal(result.status, 'blocked', result.report)
+  // The resume makes no model call before the builder of stage 5.
+  assert.deepEqual([...new Set(again.map((turn) => turn.role))], ['builder'])
   assert.equal(result.frozen.length, 1)
   const frozen = result.frozen[0]
   assert.ok(frozen)
@@ -230,7 +237,7 @@ test('research: the user stops the run at intake, so no surveyor runs and no bra
   const { repo, base } = notebook()
   const turns: Turn[] = []
   const { channel } = memoryChannel({ intake: '/answer\nQ1: b' })
-  const { result } = await runResearch(repo, runsDir(), researchInput(base, 'r2'), { channel, dispatch: scriptedDispatch(researchScript(), turns) })
+  const { result } = await runResearch(repo, runsDir(), researchInput(base, 'r2'), { channel, dispatch: scriptedDispatch(blocked, turns) })
   assert.equal(result.status, 'stopped')
   assert.equal(result.branch, null)
   assert.deepEqual([...new Set(turns.map((turn) => turn.role))], ['intake'])
@@ -242,7 +249,7 @@ test('research: a missing egress secret and two generators of one family stop th
   const { repo, base } = notebook()
   const turns: Turn[] = []
   const { channel } = memoryChannel()
-  const dispatch = scriptedDispatch(researchScript(), turns)
+  const dispatch = scriptedDispatch(blocked, turns)
   await assert.rejects(
     runResearch(repo, runsDir(), researchInput(base, 'r3'), { channel, dispatch, env: {} }),
     stops(/^egress: the secret ARCHIVE_TOKEN for archive\.example\.org is not set$/),
@@ -258,7 +265,7 @@ test('research: the run reads the config and the holdout from the base commit, n
   const moved = notebook({ config: { checks: { smoke: 'true' }, research: { ...researchConfig, holdout: 'research/new-holdout.json' } }, uncommitted })
   const { channel } = memoryChannel()
   const turns: Turn[] = []
-  const dispatch = scriptedDispatch(researchScript(), turns)
+  const dispatch = scriptedDispatch(blocked, turns)
   await assert.rejects(runResearch(moved.repo, runsDir(), researchInput(moved.base, 'r5'), { channel, dispatch }), stops(/^research\/new-holdout\.json at main: the file does not exist$/))
   const plain = notebook({ config: { checks: { smoke: 'true' } }, uncommitted: { '.agent-factory.json': JSON.stringify({ research: researchConfig }) } })
   await assert.rejects(runResearch(plain.repo, runsDir(), researchInput(plain.base, 'r6'), { channel, dispatch }), stops(/^\.agent-factory\.json at main has no research field$/))
@@ -297,8 +304,8 @@ test('research: the intake cap replaces --budget, and an unreadable cap or pick 
     pick: '/answer\nQ1: I pick a and c',
     'pick.2': '/answer\nQ1: a',
   })
-  const { result, deps } = await runResearch(repo, runsDir(), researchInput(base, 'r10', { budgetOverride: 100 }), { channel, dispatch: scriptedDispatch(researchScript(), []) })
-  assert.equal(result.status, 'frozen', result.report)
+  const { result, deps } = await runResearch(repo, runsDir(), researchInput(base, 'r10', { budgetOverride: 100 }), { channel, dispatch: scriptedDispatch(blocked, []) })
+  assert.equal(result.status, 'blocked', result.report)
   assert.deepEqual(
     posted.map((batch) => batch.batch),
     ['intake', 'cap.2', 'pick', 'pick.2', 'approve.1'],
@@ -313,7 +320,7 @@ test('research: the intake cap replaces --budget, and an unreadable cap or pick 
   )
 
   const uncapped = memoryChannel({ intake: '/answer\nQ2: No cap', pick: '/answer\nQ1: None' })
-  const second = await runResearch(repo, runsDir(), researchInput(base, 'r11', { budgetOverride: 100 }), { channel: uncapped.channel, dispatch: scriptedDispatch(researchScript(), []) })
+  const second = await runResearch(repo, runsDir(), researchInput(base, 'r11', { budgetOverride: 100 }), { channel: uncapped.channel, dispatch: scriptedDispatch(blocked, []) })
   assert.equal(second.result.status, 'stopped')
   assert.equal(second.deps.ledger.get<{ limit?: number }>('budget')?.limit, undefined)
 })
@@ -322,7 +329,7 @@ test('research: with no pick, or with no hypothesis, the run stops before any pr
   const { repo, base } = notebook()
   const turns: Turn[] = []
   const none = memoryChannel({ pick: '/answer\nQ1: None' })
-  const picked = await runResearch(repo, runsDir(), researchInput(base, 'r8'), { channel: none.channel, dispatch: scriptedDispatch(researchScript(), turns) })
+  const picked = await runResearch(repo, runsDir(), researchInput(base, 'r8'), { channel: none.channel, dispatch: scriptedDispatch(blocked, turns) })
   assert.equal(picked.result.status, 'stopped')
   assert.match(picked.result.report, /You picked no hypothesis, so the run stopped after stage 3\./)
   const empty = memoryChannel()

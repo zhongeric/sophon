@@ -7,10 +7,11 @@ import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { commandChecker, parseRepoConfig, readRepoConfig, repoConfigFile, requireChecks, resolveRepoConfig, type RepoConfig } from '../core/checks.ts'
 import { runLock } from '../core/egress.ts'
-import type { AgentStore, Files, Guides, PullRequests } from '../core/platform.ts'
+import type { AgentStore, Branch, Files, Guides, PullRequests } from '../core/platform.ts'
 import { profileDefaults, type RootFiles } from '../core/profiles.ts'
 import type { Credentials } from '../core/providers.ts'
 import type { Channel } from '../core/questions.ts'
+import { analysisConfig } from '../core/research-steps.ts'
 import { loadResearchDomain, type ResearchConfig, type ResearchDomain, type ResearchFiles } from '../core/research.ts'
 import { StopError } from '../core/stop.ts'
 import type { Prices } from '../core/usage.ts'
@@ -19,7 +20,7 @@ import type { DevelopDeps, DevelopInput } from '../core/workflows/develop.ts'
 import type { ResearchDeps, ResearchInput } from '../core/workflows/research.ts'
 import { nodeArtifacts } from './artifacts.ts'
 import { diskFileSystem, guideFileSystem } from './disk.ts'
-import { gitBranches, gitRepo, gitTree, worktreePath, type GitSource } from './git.ts'
+import { git, gitBranches, gitRepo, gitTree, worktreePath, type GitSource } from './git.ts'
 import { fileLedger } from './ledger.ts'
 import { localMachine } from './machine.ts'
 
@@ -226,7 +227,10 @@ export type NodeResearchOptions = {
   /** The notebook working copy. The run reads its base commit and commits the frozen preregs on a branch of its own. */
   repo: string
   input: ResearchInput
+  /** Where the questions of the run go, and where the review questions go once the PR exists. */
   channel: Channel
+  reviewChannel(pr: number): Promise<Channel>
+  pulls: PullRequests
   credentials: Credentials
   module: WebAssembly.Module
   dispatch?: Contracts.RuntimeOptions['dispatch']
@@ -240,8 +244,9 @@ export type NodeResearchOptions = {
 
 /**
  * The platform of one research run on this machine: runs/<id>/ holds the ledger, the journals, the artifacts, the
- * report and the branch worktrees. The config, the holdout, the checklist and the guides come from the base commit,
- * never from the working copy, so an uncommitted change cannot move the holdout.
+ * report, the branch worktrees and the clean checkouts of the reproduction. The config, the holdout, the checklist and
+ * the guides come from the base commit, never from the working copy, so an uncommitted change cannot move the holdout.
+ * The review loop pass is a run of its own, runs/<id>-review-1/.
  */
 export async function nodeResearch(options: NodeResearchOptions): Promise<ResearchDeps & { dir: string }> {
   const { input } = options
@@ -255,18 +260,48 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
   const domain = await loadResearchDomain(config.research, base.files, source)
   const ledger = fileLedger(join(dir, 'state.json'))
   const env = options.env ?? process.env
+  const host = { credentials: options.credentials, dispatch: options.dispatch, log: options.log, module: options.module, prices: options.prices }
+  const machine = (branch: Branch) => localMachine(worktreePath(branchesDir, branch.name))
   return {
+    ...host,
     dir,
-    module: options.module,
     ledger,
     files: dirFiles(dir),
     store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
     guides: await nodeGuides(withHomeGuides(config)),
-    credentials: options.credentials,
-    dispatch: options.dispatch,
-    prices: options.prices,
     channel: options.channel,
     branches: gitBranches(options.repo, branchesDir),
+    config,
+    pulls: options.pulls,
+    checker: (branch) => commandChecker(branch, config, machine(branch)),
+    machine,
+    // A new checkout each time, so that no file of an earlier command or of the branch worktree is in it.
+    async cleanBox(commit) {
+      const tree = join(dir, `clean-${commit.slice(0, 12)}`)
+      if (existsSync(tree)) await git(options.repo, 'worktree', 'remove', '--force', tree)
+      await git(options.repo, 'worktree', 'add', '--detach', tree, commit)
+      return localMachine(tree)
+    },
+    async review({ runId, ask, head, full, pr, budget }) {
+      const reviewSource = { repo: options.repo, base: input.base, head }
+      const reviewConfig = analysisConfig(config)
+      const run = await nodeRun({ config: reviewConfig, runId, runsDir: options.runsDir, source: reviewSource })
+      run.ledger.put('git', reviewSource)
+      const loopInput = {
+        allowedModels: input.allowedModels,
+        ask,
+        config: reviewConfig,
+        models: input.models.review,
+        pr,
+        runId,
+        source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`,
+        ...(full ? { full } : {}),
+        ...(budget !== undefined ? { budgetOverride: budget } : {}),
+        stopAtBudget: true,
+      }
+      // As in nodeDevelop: at the budget, the pass stops without a question, and the research run asks with the run totals.
+      return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr) })
+    },
     domain,
     egress: {
       artifacts: nodeArtifacts(dir),
@@ -274,6 +309,5 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
       secret: (name) => env[name],
       ...(options.fetch ? { fetch: options.fetch } : {}),
     },
-    log: options.log,
   }
 }

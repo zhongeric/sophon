@@ -100,8 +100,8 @@ export type Machine = {
 }
 
 /** The environment of check commands: these variables, plus the config's `env` list, never the host's secrets. */
-const checkEnv = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'TZ']
-const defaultTimeoutMs = 30 * 60_000
+export const checkEnv = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'TZ']
+export const defaultTimeoutMs = 30 * 60_000
 const toolOutputTailChars = 8_000
 
 const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`

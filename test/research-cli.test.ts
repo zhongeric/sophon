@@ -37,6 +37,8 @@ test('research CLI: a bad --models file or a bad --wait stops with status 2 and 
 test('research CLI: researchModels refuses a models file with another shape', () => {
   const sol = { provider: 'codex' as const, model: 'gpt-6.1-sol' }
   assert.deepEqual(researchModels(JSON.stringify({ surveyor: sol }), 'm.json'), { ...defaultResearchModels, surveyor: sol })
+  const stages = { builder: sol, skeptic: sol, lateSkeptic: defaultResearchModels.intake, analyst: sol, writer: sol }
+  assert.deepEqual(researchModels(JSON.stringify(stages), 'm.json'), { ...defaultResearchModels, ...stages })
   const refused: [string, RegExp][] = [
     ['{"generators":null}', /generators must be a list of two models/],
     ['{"generators":[{"provider":"codex","model":"m"}]}', /generators must be a list of two models/],
@@ -50,7 +52,8 @@ test('research CLI: researchModels refuses a models file with another shape', ()
     ['{"surveyor":{"provider":"codex","model":"m","thinking":{}}}', /surveyor must be/],
     ['{"surveyor":{"provider":"codex","model":"m","thinking":[]}}', /surveyor must be/],
     ['{"surveyor":{"provider":"codex","model":"m","thinking":"high","extra":true}}', /surveyor must be/],
-    ['{"builder":{"provider":"codex","model":"m"}}', /builder is not a research role/],
+    ['{"reviewer":{"provider":"codex","model":"m"}}', /reviewer is not a research role \(generators, intake, surveyor, preregistrar, builder, skeptic, lateSkeptic, analyst, writer\)/],
+    ['{"builder":{"provider":"codex","model":"m","thinking":"max"}}', /builder must be/],
     ['[]', /must be a JSON object of roles/],
     ['{', /is not valid JSON/],
   ]
@@ -65,10 +68,15 @@ test('research CLI: a --models file retains valid thinking settings', async () =
     surveyor: { provider: 'codex', model: 'm', thinking: 'high' },
     generators: [{ provider: 'codex', model: 'm', thinking: 'medium' }, { provider: 'claude', model: 'm', thinking: 'high' }],
     preregistrar: { provider: 'claude', model: 'm', thinking: 'high' },
+    builder: { provider: 'claude', model: 'm', thinking: 'medium' },
+    skeptic: { provider: 'claude', model: 'm', thinking: 'high' },
+    lateSkeptic: { provider: 'codex', model: 'm', thinking: 'low' },
+    analyst: { provider: 'codex', model: 'm', thinking: 'high' },
+    writer: { provider: 'claude', model: 'm', thinking: 'low' },
   }
   writeFileSync(models, JSON.stringify(choices))
   const { input } = await newInput({ repo, program: 'p', models })
-  assert.deepEqual(input.models, choices)
+  assert.deepEqual(input.models, { ...defaultResearchModels, ...choices })
 })
 
 test('research CLI: parseWait refuses a wait that is not a number of 0 or more minutes', () => {
