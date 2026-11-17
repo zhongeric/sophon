@@ -159,7 +159,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   if (resolveBudget(deps.ledger, input.budget, input.budgetOverride) !== undefined) checkPriced(loopModelIds(input.models), prices)
 
   const { ledger, repo } = deps
-  const budget = budgetGate({ channel: deps.channel, ledger, log: deps.log, prices, runId: input.runId, stopAtLimit: input.stopAtBudget === true })
+  const budget = budgetGate({ channel: deps.channel, ledger, log: deps.log, prices, runId: input.runId, stopAtBudget: input.stopAtBudget === true })
   // A resume without --budget must not apply the override again, so the recorded input does not keep it.
   const { budgetOverride, ...recorded } = input
   ledger.put('input', recorded)

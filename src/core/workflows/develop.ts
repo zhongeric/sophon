@@ -326,8 +326,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         if (!loop.stopped) return result
         ledger.put(stoppedKey, result)
         state.stoppedReview = result
-        // Below twice the run budget, the gate does not pause, so no raise can let the pass go on, for example when the
-        // user stopped the pass itself.
+        // Below twice the run budget, the gate does not pause, so the pass cannot continue after a raise.
         if (limit === undefined || belowBudget(budget.spent(), 2 * limit)) throw new BudgetStop(`stopped at the cost budget in review loop pass ${pass}`)
       }
     })

@@ -170,7 +170,7 @@ function spentTen(options: { notice?: boolean } = {}) {
   const prices: Prices = { m1: { input: 1e6, cached_input: 0, cache_write: 0, output: 0 } }
   const { channel, posted, replies, notices, events } = scriptedChannel({}, options.notice ?? true)
   const logs: string[] = []
-  const gate = (more: { extraRows?: () => UsageRow[]; recommend?: boolean; stopAtLimit?: boolean } = {}, on: Ledger = ledger) =>
+  const gate = (more: { extraRows?: () => UsageRow[]; recommend?: boolean; stopAtBudget?: boolean } = {}, on: Ledger = ledger) =>
     budgetGate({ ledger: on, channel, runId: 'run-1', prices, log: (line) => void logs.push(line), ...more })
   return { ledger, posted, replies, notices, events, logs, gate }
 }
@@ -369,6 +369,15 @@ test('a hotfix run raises the budget to twice the spend at twice the budget, wit
   await gate({ recommend: true }).check()
   assert.equal(notices.length, 1)
   assert.deepEqual(decisions(ledger), [])
+
+  // Below twice the budget, the notice of a hotfix run tells that the host raises the budget there.
+  resolveBudget(ledger, 10)
+  await gate({ recommend: true }).check()
+  assert.equal(
+    notices[1],
+    'The run spent about $10.00 of its budget of $10.00. The run continues. At $20.00, twice the budget, the host raises the budget to twice the spend, and the run continues. The most expensive steps: a $10.00.',
+  )
+  assert.equal(posted.length, 0)
 })
 
 test('a channel without notice continues at the budget, and the notice goes only to the log', async () => {
@@ -380,12 +389,31 @@ test('a channel without notice continues at the budget, and the notice goes only
   assert.match(logs[0] ?? '', /^budget notice: The run spent about \$10\.00 of its budget of \$10\.00\./)
 })
 
-test('the stop-at-limit option stops at the budget without a notice or a question', async () => {
+test('a notice post that fails does not stop the run at the budget', async () => {
+  const { ledger, posted, logs, gate } = spentTen()
+  const failing: Channel = {
+    ...scriptedChannel().channel,
+    async notice() {
+      throw new Error('comment API down')
+    },
+  }
+  resolveBudget(ledger, 10)
+  const prices: Prices = { m1: { input: 1e6, cached_input: 0, cache_write: 0, output: 0 } }
+  await budgetGate({ ledger, channel: failing, runId: 'run-1', prices, log: (line) => void logs.push(line) }).check()
+  assert.equal(posted.length, 0)
+  assert.match(logs[0] ?? '', /^budget notice: The run spent about \$10\.00 of its budget of \$10\.00\./)
+  assert.equal(logs[1], 'budget notice failed: comment API down')
+  // The ledger records the notice of the round, so the next check does not post it again.
+  await gate().check()
+  assert.equal(logs.length, 2)
+})
+
+test('the stop-at-budget option stops at the budget without a notice or a question', async () => {
   const { ledger, posted, notices, gate } = spentTen()
   resolveBudget(ledger, 20)
-  await gate({ stopAtLimit: true }).check()
+  await gate({ stopAtBudget: true }).check()
   resolveBudget(ledger, 10)
-  await assert.rejects(gate({ stopAtLimit: true }).check(), (error) => error instanceof BudgetStop && error.message === 'stopped at the cost budget: spent $10.00 of $10.00')
+  await assert.rejects(gate({ stopAtBudget: true }).check(), (error) => error instanceof BudgetStop && error.message === 'stopped at the cost budget: spent $10.00 of $10.00')
   assert.equal(posted.length, 0)
   assert.equal(notices.length, 0)
 })

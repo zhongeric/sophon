@@ -239,7 +239,7 @@ export function budgetGate(options: {
   /** At twice the budget, raise the budget to twice the spend without a question, as in a hotfix run. */
   recommend?: boolean
   /** Stop at the budget without a notice or a question, as in a nested review pass. */
-  stopAtLimit?: boolean
+  stopAtBudget?: boolean
 }) {
   const { ledger, prices } = options
   const ask = asker(ledger, options.channel, options.runId, options.log, { decisions: false })
@@ -250,18 +250,23 @@ export function budgetGate(options: {
 
   /** The three most expensive steps by USD. Rows without a price do not show. */
   const costliest = () => {
-    const priced = usageOf(ledger).agents.flatMap((row) => {
+    const rows = [...usageOf(ledger).agents, ...extra()].flatMap((row) => {
       const price = prices[row.model]
-      return price ? [{ step: row.step, usd: costOf(row.tokens, price) }] : []
+      const usd = row.usd ?? (price ? costOf(row.tokens, price) : undefined)
+      return usd === undefined ? [] : [{ step: row.step, usd }]
     })
-    const rows = [...priced, ...extra().flatMap((row) => (row.usd === undefined ? [] : [{ step: row.step, usd: row.usd }]))]
     const top = rows.sort((a, b) => b.usd - a.usd).slice(0, 3)
     return top.length > 0 ? ` The most expensive steps: ${top.map((row) => `${row.step} ${formatUsd(row.usd)}`).join(', ')}.` : ''
   }
   const notify = async (text: string) => {
     const notice = `${text}${costliest()}`
     options.log(`budget notice: ${notice}`)
-    await options.channel.notice?.(options.runId, notice)
+    // The notice only informs, and the run log has it, so a failed post does not stop the run.
+    try {
+      await options.channel.notice?.(options.runId, notice)
+    } catch (error) {
+      options.log(`budget notice failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
   const raise = (state: BudgetState, value: number) => {
     ledger.put(budgetKey, { ...state, limit: value, round: state.round + 1 } satisfies BudgetState)
@@ -273,8 +278,8 @@ export function budgetGate(options: {
       const state = budgetState(ledger)
       const now = spent()
       if (state.limit === undefined || belowBudget(now, state.limit)) return
-      const spentText = `spent ${formatUsd(now)} of ${formatUsd(state.limit)}`
-      if (options.stopAtLimit) throw new BudgetStop(`stopped at the cost budget: ${spentText}`)
+      const stop = new BudgetStop(`stopped at the cost budget: spent ${formatUsd(now)} of ${formatUsd(state.limit)}`)
+      if (options.stopAtBudget) throw stop
       const pause = !belowBudget(now, 2 * state.limit)
       const target = doubled(now)
       if (pause && options.recommend) {
@@ -284,9 +289,10 @@ export function budgetGate(options: {
         return
       }
       if (!ledger.get(noticeKey(state.round))) {
-        await notify(
-          `The run spent about ${formatUsd(now)} of its budget of ${formatUsd(state.limit)}. The run continues. At ${formatUsd(2 * state.limit)}, twice the budget, the host pauses and asks you to raise the budget or to stop the run.`,
-        )
+        const next = options.recommend
+          ? 'the host raises the budget to twice the spend, and the run continues'
+          : 'the host pauses and asks you to raise the budget or to stop the run'
+        await notify(`The run spent about ${formatUsd(now)} of its budget of ${formatUsd(state.limit)}. The run continues. At ${formatUsd(2 * state.limit)}, twice the budget, ${next}.`)
         ledger.put(noticeKey(state.round), true)
       }
       if (!pause) return
@@ -306,7 +312,7 @@ export function budgetGate(options: {
       ]
       await ask.post(batch, questions)
       const text = ((await ask.wait(batch))[0]?.answer ?? stopOption).trim()
-      if (text === stopOption || /^stop\b/i.test(text)) throw new BudgetStop(`stopped at the cost budget: ${spentText}`)
+      if (text === stopOption || /^stop\b/i.test(text)) throw stop
       // The recorded option gives the value, so that a resume raises to the value of the question.
       const raised = raiseTo.exec(text) ?? /^\$?\s*(\d+(?:\.\d+)?)$/.exec(text)
       const value = raised ? Number(raised[1]) : Number.NaN
