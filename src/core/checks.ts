@@ -104,7 +104,33 @@ const checkEnv = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 
 const defaultTimeoutMs = 30 * 60_000
 const toolOutputTailChars = 8_000
 
-const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
+export const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
+
+/** The options of each command that the host runs from the config: the check environment and the config timeout. */
+export function commandOptions(config: RepoConfig): { env: string[]; timeoutMs: number } {
+  return { env: [...checkEnv, ...(config.env ?? [])].filter((name) => !hostSecrets.includes(name)), timeoutMs: config.timeout_ms ?? defaultTimeoutMs }
+}
+
+/**
+ * A function that runs the setup of the config one time. A failed setup runs again at the next call.
+ * The function gives the failed result, or null when the setup passed or the config has no setup.
+ */
+export function setupOnce<T extends { exit_code: number | null }>(config: RepoConfig, run: (command: string) => Promise<T>): () => Promise<T | null> {
+  let ready: Promise<T | null> | null = null
+  return async () => {
+    if (!config.setup) return null
+    ready ??= run(config.setup).then((result) => (result.exit_code === 0 ? null : result))
+    try {
+      const failed = await ready
+      if (failed) ready = null
+      return failed
+    } catch (error) {
+      ready = null
+      throw error
+    }
+  }
+}
+
 const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes)
 
 /** The parts of a repository that the checks read. */
@@ -172,20 +198,13 @@ export async function targetedTests(repo: Tree, config: RepoConfig, changed: str
 
 /** Checks that run the configured commands on a machine. Commands come from the config only. */
 export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine): Checker {
-  const env = [...checkEnv, ...(config.env ?? [])].filter((name) => !hostSecrets.includes(name))
+  const options = commandOptions(config)
   const run = async (name: string, command: string): Promise<CheckResult> => {
-    const result = await machine.run(command, { env, timeoutMs: config.timeout_ms ?? defaultTimeoutMs })
+    const result = await machine.run(command, options)
     return { name, command, status: result.exit_code === 0 ? 'pass' : 'fail', ...result }
   }
-  // The setup runs one time for each checker, which is one worktree. A failed setup runs again at the next check.
-  let ready: Promise<CheckResult | null> | null = null
-  const setup = async (): Promise<CheckResult | null> => {
-    if (!config.setup) return null
-    ready ??= run('setup', config.setup).then((result) => (result.status === 'pass' ? null : result))
-    const failed = await ready
-    if (failed) ready = null
-    return failed
-  }
+  // The setup runs one time for each checker, which is one worktree.
+  const setup = setupOnce(config, (command) => run('setup', command))
   const runTests = async (tests: string[]): Promise<CheckResult[]> => {
     if (!config.tests || tests.length === 0) return []
     const failed = await setup()

@@ -1,31 +1,86 @@
 import type { Contracts } from 'nanocode-ts'
 import { artifactId } from '../artifacts.ts'
-import { mergeHypotheses, type NumberedHypothesis } from '../claims.ts'
+import type { Machine, RepoConfig } from '../checks.ts'
+import { mergeHypotheses, type Dossier, type NumberedHypothesis, type Objection } from '../claims.ts'
+import type { BuildLog } from '../develop-steps.ts'
 import { checkEgress, type EgressHost } from '../egress.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { route, routeQuestions } from '../plan.ts'
-import type { AgentStore, Branch, Branches, Files, Guides } from '../platform.ts'
+import type { AgentStore, Branch, Branches, Checker, Files, Guides, PullRequests } from '../platform.ts'
 import { pool } from '../pool.ts'
 import { freezePrereg, type Prereg } from '../prereg.ts'
+import { presentProfiles, profilesById, type Profile } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
-import { asker, decisions, type Answer, type Channel, type Question } from '../questions.ts'
-import { generate, preregister, researchEgress, researchIntake, survey, type LensSurvey, type ResearchContext, type ResearchIntake } from '../research-steps.ts'
+import { asker, decisionLists, decisions, type Answer, type Channel, type Question } from '../questions.ts'
+import { calibrationVerdict, compareReproduction, preregThreshold, runDomainCommand, type DomainOutputs, type DomainRun, type HashMismatch } from '../research-commands.ts'
+import {
+  analyst,
+  buildAnalysis,
+  conceded,
+  generate,
+  lateSkeptic,
+  numberObjections,
+  preregister,
+  renderDossier,
+  researchEgress,
+  researchIntake,
+  responseLine,
+  skeptic,
+  survey,
+  writeDossier,
+  type CalibrationFailure,
+  type CalibrationSummary,
+  type HeldAnswer,
+  type LensSurvey,
+  type ResearchContext,
+  type ResearchIntake,
+  type VetRound,
+} from '../research-steps.ts'
 import type { ResearchDomain } from '../research.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
-import { BudgetStop, budgetGate, checkPriced, clearBudget, parseBudget, resolveBudget, usageOf, usageSection, type Prices } from '../usage.ts'
-import { decisionSections, defaultAllowedModels } from './code-review-loop.ts'
+import { BudgetStop, belowBudget, budgetGate, checkPriced, clearBudget, parseBudget, resolveBudget, usageOf, usageSection, type Prices, type RunUsage, type UsageRow } from '../usage.ts'
+import {
+  checkAllowedModels,
+  checkFamilySwap,
+  decisionSections,
+  defaultAllowedModels,
+  defaultModels,
+  loopModelIds,
+  providersOf,
+  type LoopModels,
+  type LoopResult,
+} from './code-review-loop.ts'
+import { cutReport, type ReviewRequest } from './develop.ts'
 
-/** The two generators run on two model families. */
-export type ResearchModels = { intake: ModelChoice; surveyor: ModelChoice; generators: [ModelChoice, ModelChoice]; preregistrar: ModelChoice }
+/** The two generators run on two model families, and so do the skeptic and the late skeptic. `review` is the code review loop of the analysis. */
+export type ResearchModels = {
+  intake: ModelChoice
+  surveyor: ModelChoice
+  generators: [ModelChoice, ModelChoice]
+  preregistrar: ModelChoice
+  builder: ModelChoice
+  skeptic: ModelChoice
+  lateSkeptic: ModelChoice
+  analyst: ModelChoice
+  writer: ModelChoice
+  review: LoopModels
+}
 
 const opus: ModelChoice = { provider: 'claude', model: 'claude-opus-5-5' }
+const sol: ModelChoice = { provider: 'codex', model: 'gpt-6.1-sol' }
 
 export const defaultResearchModels: ResearchModels = {
   intake: opus,
   surveyor: opus,
-  generators: [opus, { provider: 'codex', model: 'gpt-6.1-sol' }],
+  generators: [opus, sol],
   preregistrar: opus,
+  builder: opus,
+  skeptic: opus,
+  lateSkeptic: sol,
+  analyst: opus,
+  writer: opus,
+  review: defaultModels,
 }
 
 export type ResearchInput = {
@@ -60,18 +115,30 @@ export type ResearchDeps = {
   /** USD per million tokens of each model, from MODEL_PRICES. Default: no prices. */
   prices?: Prices
   channel: Channel
-  /** The branches of the notebook. The run commits the frozen preregs on a branch of its own, and never pushes. */
+  /** The branches of the notebook. The run commits on a branch of its own, and pushes it only after the reproduction. */
   branches: Branches
+  /** The notebook config at the base commit. */
+  config: RepoConfig
+  pulls: PullRequests
+  /** The checks and tests of a branch, run in its worktree. */
+  checker(branch: Branch): Checker
+  /** A machine on a new checkout of a commit, outside every branch worktree, for the calibration and the reproduction. */
+  cleanBox(commit: string): Promise<ResearchBox>
+  /** Runs the code review loop on a commit of the run branch. */
+  review(request: ReviewRequest): Promise<LoopResult>
   domain: ResearchDomain
   egress: EgressHost
   log(line: string): void
 }
 
+/** A clean checkout with read access to the output files of its commands. */
+type ResearchBox = Machine & { read(path: string): Promise<Uint8Array> }
+
 /** A frozen prereg as the ledger records it. */
 export type Freeze = { hypothesis: string; version: number; path: string; sha256: string; commit: string }
 
-export type ResearchStatus = 'frozen' | 'stopped'
-export type ResearchResult = { status: ResearchStatus; branch: string | null; frozen: Freeze[]; report: string }
+export type ResearchStatus = 'ready' | 'blocked' | 'failed' | 'stopped'
+export type ResearchResult = { status: ResearchStatus; branch: string | null; frozen: Freeze[]; pr: { number: number; url: string } | null; report: string }
 
 const defaultParallel = 3
 /** The cap that the intake question recommends when the run has no budget. */
@@ -79,29 +146,49 @@ const defaultCap = 25
 const noCap = 'No cap'
 const noneOption = 'None'
 const approveOptions = ['Approve and freeze', 'Reject (write the reason)', 'Drop the hypothesis']
+const heldOptions = ['Accept and continue', 'Stop the run']
+const lockLines = ['- The lock binds the agents only, not the commands of a box (RG1).', '- The lock does not bind web search, because web search runs at the provider (RG10).']
 const frozenKey = 'frozen'
 /** The cap of the intake answer, after the host applied it. Null is no cap. */
 const capKey = 'cap'
 type Cap = { usd: number | null }
 type Parsed<T> = { value: T } | { error: string }
 
-const choices = (models: ResearchModels) => [models.intake, models.surveyor, ...models.generators, models.preregistrar]
+const choices = (models: ResearchModels) => [
+  models.intake,
+  models.surveyor,
+  ...models.generators,
+  models.preregistrar,
+  models.builder,
+  models.skeptic,
+  models.lateSkeptic,
+  models.analyst,
+  models.writer,
+]
 
-const researchModelIds = (models: ResearchModels): string[] => choices(models).map((choice) => choice.model)
+/** Every model of the run, also of the review loop roles that do not run, because a budget needs a price for each. */
+const researchModelIds = (models: ResearchModels): string[] => [...choices(models).map((choice) => choice.model), ...loopModelIds(models.review)]
 
-export const researchProviders = (models: ResearchModels): Set<Provider> => new Set(choices(models).map((choice) => choice.provider))
+export const researchProviders = (models: ResearchModels): Set<Provider> =>
+  new Set([...choices(models).map((choice) => choice.provider), ...providersOf(models.review)])
 
 function checkResearchModels(models: ResearchModels, allowed = defaultAllowedModels): void {
-  const refused = [...new Set(researchModelIds(models))].filter((model) => !allowed.includes(model))
+  const refused = [...new Set(choices(models).map((choice) => choice.model))].filter((model) => !allowed.includes(model))
   if (refused.length > 0) throw new StopError(`models outside the allowed list (${allowed.join(', ')}): ${refused.join(', ')}`)
   // A models file can give another count, so the host also checks the count at run time.
   const generators: ModelChoice[] = models.generators
   if (generators.length !== 2) throw new StopError(`the research run needs exactly two generators, not ${generators.length}`)
   if (generators[0]!.provider === generators[1]!.provider) throw new StopError(`the two generators must use two model families, but both use ${generators[0]!.provider}`)
+  if (models.skeptic.provider === models.lateSkeptic.provider)
+    throw new StopError(`the skeptic and the late skeptic must use two model families, but both use ${models.skeptic.provider}`)
+  checkAllowedModels(models.review, allowed)
+  checkFamilySwap(models.review)
 }
 
 /**
- * The host freezes and commits a prereg only after the user approves it. The run stops before stage 5. Every step is
+ * The host freezes and commits a prereg only after the user approves it. Then each frozen prereg goes through the
+ * analysis, the calibration and the vet by itself (stages 5 to 9). Stage 11 writes the dossiers, reproduces the outputs
+ * on a clean checkout, and only then pushes the branch and opens the dossier PR with one review loop pass. Every step is
  * in the ledger, so the same run ID resumes without repeating finished steps.
  */
 export async function research(input: ResearchInput, deps: ResearchDeps): Promise<ResearchResult> {
@@ -109,7 +196,7 @@ export async function research(input: ResearchInput, deps: ResearchDeps): Promis
   try {
     return await researchSteps(input, deps, stop)
   } catch (error) {
-    if (error instanceof BudgetStop && stop.finish) return stop.finish('stopped', `The run ${error.message}. Reason: cost budget.`)
+    if (error instanceof BudgetStop && stop.finish) return stop.finish('stopped', `The run ${error.message}. Reason: cost budget. A PR of the run stays draft.`)
     throw error
   }
 }
@@ -126,7 +213,45 @@ type ReportState = {
   frozen: Freeze[]
   /** The picked hypotheses that the user dropped at the approval. They get no freeze. */
   dropped: string[]
+  analyses: Analysis[]
+  /** The head that the run pushed last, or null before the push. */
+  pushed: string | null
+  pr: { number: number; url: string } | null
+  reviews: Review[]
+  /** The review pass that stopped at its budget. Its spend counts until the pass runs again and finishes. */
+  stoppedReview: Review | null
 }
+
+/** One calibration round on a clean checkout. `known` and `inject` hold artifact IDs for command output and declared files. */
+type CalibrationRound = {
+  round: number
+  head: string
+  recall: number | null
+  threshold: number
+  known: string[]
+  inject: string[]
+  outputs: DomainOutputs
+  pass: boolean
+  reason: string
+  tail: string
+}
+
+/** One reproduce run of one prereg on a clean checkout of `head`. `artifact` is the artifact ID of its output. */
+type Reproduction = { head: string; pass: boolean; mismatches: HashMismatch[]; missing: string[]; reason: string; artifact: string }
+
+/** What the stages after the freeze record of one frozen prereg, for the next stages and the report. */
+type Analysis = {
+  freeze: Freeze
+  builds: BuildLog[]
+  calibrations: CalibrationRound[]
+  rounds: VetRound[]
+  answers: HeldAnswer[]
+  dossier: Dossier | null
+  reproductions: Reproduction[]
+}
+
+/** A review pass. Its usage counts as extra spend of the run. */
+type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage: RunUsage }
 
 type Pending = { hypothesis: NumberedHypothesis; revision?: { round: number; reason: string } }
 
@@ -146,12 +271,34 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   const capped = ledger.get<Cap>(capKey)
   const recordedBudget = capped ? (capped.usd ?? undefined) : input.budget
   if (resolveBudget(ledger, recordedBudget, input.budgetOverride) !== undefined) checkPriced(researchModelIds(models), prices)
-  const budget = budgetGate({ channel: deps.channel, ledger, log: deps.log, prices, runId: input.runId })
+  const state: ReportState = {
+    input,
+    intake: null,
+    surveys: [],
+    hypotheses: [],
+    picked: null,
+    branch: null,
+    frozen: [],
+    dropped: [],
+    analyses: [],
+    pushed: null,
+    pr: null,
+    reviews: [],
+    stoppedReview: null,
+  }
+  const spentPasses = () => [...state.reviews, ...(state.stoppedReview ? [state.stoppedReview] : [])]
+  // The review pass keeps its usage in its own ledger, so its spend counts here as extra spend.
+  const budget = budgetGate({
+    channel: deps.channel,
+    extraSpend: () => spentPasses().reduce((sum, review) => sum + review.usage.usd, 0),
+    ledger,
+    log: deps.log,
+    prices,
+    runId: input.runId,
+  })
   // A resume without --budget must not apply the override again, so the recorded input does not keep it.
   const { budgetOverride, ...recorded } = input
   ledger.put('input', recorded)
-
-  const state: ReportState = { input, intake: null, surveys: [], hypotheses: [], picked: null, branch: null, frozen: [], dropped: [] }
   const context: ResearchContext = {
     host: {
       module: deps.module,
@@ -185,11 +332,16 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   }
   const finish: Finish = async (status, note) => {
     const limit = budget.limit()
-    const usage = usageSection(usageOf(ledger).agents, prices, limit === undefined ? undefined : { limit, spent: budget.spent() })
+    const usage = usageSection([...usageOf(ledger).agents, ...spentPasses().map(reviewRow)], prices, limit === undefined ? undefined : { limit, spent: budget.spent() })
     const report = renderReport(state, status, note, decisions(ledger), usage)
     deps.files.write('report.md', report)
-    ledger.put('result', { status, branch: state.branch, frozen: state.frozen })
-    return { status, branch: state.branch, frozen: state.frozen, report }
+    // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
+    if (state.pr && ledger.get('commented') !== report) {
+      await deps.pulls.comment(state.pr.number, cutReport(report, `(cut: see report.md of run ${input.runId})`))
+      ledger.put('commented', report)
+    }
+    ledger.put('result', { status, branch: state.branch, frozen: state.frozen, pr: state.pr })
+    return { status, branch: state.branch, frozen: state.frozen, pr: state.pr, report }
   }
   stop.finish = finish
 
@@ -270,8 +422,346 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     pending = rejected
   }
   if (state.frozen.length === 0) return finish('stopped', 'You dropped each picked hypothesis, so the run froze no prereg.')
-  const dropped = state.dropped.length > 0 ? `, dropped ${state.dropped.join(', ')}` : ''
-  return finish('frozen', `The run froze ${state.frozen.length} preregs on ${branchName}${dropped}, did not push the branch, and stopped before stage 5.`)
+
+  // 5 to 9: each frozen prereg by itself, in freeze order (decision 1).
+  const active = profilesById(await step(ledger, 'profiles', async () => (await presentProfiles(async (path) => (await context.tree.stat(`/${path}`)) !== null)).map((profile) => profile.id)))
+  const stages: Stages = { input, deps, context, branch, active, parallel, ask, askUntil }
+  for (const freeze of state.frozen) {
+    const analysis: Analysis = { freeze, builds: [], calibrations: [], rounds: [], answers: [], dossier: null, reproductions: [] }
+    state.analyses.push(analysis)
+    const end = await analyze(stages, analysis)
+    if (end) return finish(end.status, end.note)
+  }
+
+  // 11. The dossiers. The frozen preregs must not change before a dossier cites them.
+  await checkFrozen(branch, state.frozen)
+  for (const analysis of state.analyses) {
+    const { hypothesis } = analysis.freeze
+    const task = { branch, prereg: analysis.freeze, calibration: summary(finalCalibration(analysis)), rounds: analysis.rounds, answers: analysis.answers }
+    const dossier = await step(ledger, `writer.${hypothesis}`, () => writeDossier(context, models.writer, task))
+    analysis.dossier = dossier
+    try {
+      await step(ledger, `dossier.${hypothesis}`, async () => {
+        const outside = await outsidePaths(branch, (path) => path === `dossier/${hypothesis}.md`)
+        if (outside.length > 0) throw new AnalysisScopeError(`Before the dossier of ${hypothesis}, the run branch has uncommitted changes: ${outside.join(', ')}. ${notPushed}`)
+        await branch.tree.mkdir('/dossier')
+        await branch.tree.write(`/dossier/${hypothesis}.md`, new TextEncoder().encode(renderDossier(hypothesis, dossier, analysis.rounds, analysis.answers)))
+        await branch.commit(`agent-factory: dossier ${hypothesis} (${input.runId})`)
+        return branch.head()
+      })
+    } catch (error) {
+      if (error instanceof AnalysisScopeError) return finish('blocked', error.message)
+      throw error
+    }
+  }
+  const head = await branch.head()
+  if (!(await reproduce(stages, state.analyses, head))) return finish('blocked', `The reproduction on a clean checkout of ${head.slice(0, 12)} failed, so the run did not push the branch and opened no PR.`)
+
+  // The push, the draft PR and one review loop pass on the analysis code.
+  const publish = async () => {
+    const local = await branch.head()
+    state.pushed = await step(ledger, `push.${local}`, () => deps.branches.push(branch))
+    return state.pushed
+  }
+  const at = await publish()
+  state.pr = await step(ledger, 'pr', () => deps.pulls.open({ head: branchName, title: intook.title, body: prBody(input, state.analyses, decisions(ledger)) }))
+  const pr = state.pr.number
+  // A pass that stops at its budget is not a finished step: the budget gate of this run asks with the run totals.
+  // After a raise, or on a resume with a higher budget, the same pass runs again with the new remaining budget.
+  const stoppedKey = 'review-stopped.1'
+  const review = await step(ledger, 'review.1', async (): Promise<Review> => {
+    state.stoppedReview = ledger.get<Review>(stoppedKey) ?? null
+    for (;;) {
+      await budget.check()
+      // After the check, the spend is below the limit, so the remaining budget is positive. The ledger of the pass
+      // already counts the spend of its stopped attempt, so that spend is not taken from the remaining budget.
+      const limit = budget.limit()
+      const remaining = limit === undefined ? {} : { budget: limit - budget.spent() + (state.stoppedReview?.usage.usd ?? 0) }
+      const loop = await deps.review({ runId: `${input.runId}-review-1`, ask: reviewAsk(input, state.analyses), head: at, branch: branchName, full: false, pr, ...remaining })
+      const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage }
+      if (!loop.stopped) return result
+      ledger.put(stoppedKey, result)
+      state.stoppedReview = result
+      // Below the run budget, no raise can let the pass go on, for example when the user stopped the pass itself.
+      if (limit === undefined || belowBudget(budget.spent(), limit)) throw new BudgetStop('stopped at the cost budget in the review loop pass')
+    }
+  })
+  state.stoppedReview = null
+  state.reviews.push(review)
+  if (review.final !== review.head) {
+    // The review can fix only the analysis code. prereg/ and dossier/ are host files, and the notebook outside analysis/ is the user's.
+    const outside = (await branch.changedFiles(review.head, review.final)).filter((path) => !path.startsWith('analysis/'))
+    if (outside.length > 0)
+      return finish('failed', `The review loop changed paths outside analysis/: ${outside.join(', ')}. The run did not merge its fixes, and the PR stays draft.`)
+    await step(ledger, 'merge.review.1', async () => {
+      await branch.merge(review.final, `agent-factory: review loop fixes (${input.runId})`)
+      return branch.head()
+    })
+    const final = await publish()
+    for (const analysis of state.analyses) {
+      const { hypothesis } = analysis.freeze
+      const cited = finalCalibration(analysis)
+      const calibration = await calibrate(stages, analysis)
+      if (!calibration.pass) return finish('failed', `${calibrationLine(hypothesis, calibration)} after the review fixes. The PR stays draft.`)
+      // The dossier cites the calibration before the review, and the host does not write the dossier again.
+      if (calibration.recall !== cited.recall || !sameOutputs(calibration.outputs, cited.outputs))
+        return finish('failed', `After the review fixes, the calibration of ${hypothesis} gives another known recall or other output hashes than dossier/${hypothesis}.md cites. The PR stays draft.`)
+    }
+    if (!(await reproduce(stages, state.analyses, final))) return finish('failed', `The reproduction on a clean checkout of ${final.slice(0, 12)} failed after the review fixes. The PR stays draft.`)
+  }
+  if (!review.pass) return finish('failed', 'The review loop did not pass. The PR stays draft.')
+  await step(ledger, 'ready', async () => (await deps.pulls.ready(pr), true))
+  return finish('ready', 'The dossiers are ready for your review. You merge.')
+}
+
+/** What the stages after the freeze share. */
+type Stages = {
+  input: ResearchInput
+  deps: ResearchDeps
+  context: ResearchContext
+  branch: Branch
+  active: Profile[]
+  parallel: number
+  ask(batch: string, list: Question[]): Promise<Answer[]>
+  /** Asks the question again in a new batch until the answer parses. */
+  askUntil<T>(batch: string, question: Question, answer: string, parse: (text: string) => Parsed<T>): Promise<T>
+}
+
+/** How the stages of one prereg end the run, or null when the prereg goes on to the dossier. */
+type End = { status: ResearchStatus; note: string } | null
+
+class AnalysisScopeError extends Error {}
+
+/** Stages 5 to 9 of one frozen prereg: the build, the calibration with one fix round, and two vet rounds. */
+async function analyze(stages: Stages, analysis: Analysis): Promise<End> {
+  const { input, deps, context, branch } = stages
+  const { ledger } = deps
+  const { hypothesis } = analysis.freeze
+  const start = await step(ledger, `start.${hypothesis}`, () => branch.head())
+  const build = async (key: string, failure?: CalibrationFailure): Promise<End> => {
+    const log = await step(ledger, key, () =>
+      buildAnalysis(context, {
+        model: input.models.builder,
+        branch,
+        prereg: analysis.freeze,
+        config: deps.config,
+        active: stages.active,
+        checker: deps.checker(branch),
+        base: start,
+        ...(failure ? { failure } : {}),
+      }),
+    )
+    analysis.builds.push(log)
+    return log.blocked.trim() ? { status: 'blocked', note: `The analysis of ${hypothesis} is blocked: ${log.blocked.trim()}` } : null
+  }
+  // 5 and 6. A failed first calibration goes back to the builder with the end of the output. A second failure ends the run.
+  const built = await build(`build.${hypothesis}`)
+  if (built) return built
+  let calibration = await calibrate(stages, analysis)
+  if (!calibration.pass) {
+    const fixed = await build(`build.${hypothesis}.fix-1`, { round: calibration.round, reason: calibration.reason, tail: calibration.tail })
+    if (fixed) return fixed
+    calibration = await calibrate(stages, analysis)
+    if (!calibration.pass) return { status: 'blocked', note: `${calibrationLine(hypothesis, calibration)}. ${notPushed}` }
+  }
+
+  // 9. The skeptics, then the late skeptics. The analyst answers each round that has objections.
+  for (const round of [1, 2] as const) {
+    const vetted = await step(ledger, `vet.${hypothesis}.${round}`, () => vet(stages, analysis, round))
+    analysis.rounds.push(vetted.round)
+    if (vetted.changed) {
+      try {
+        await step(ledger, `commit.${hypothesis}.${round}`, async () => {
+          const outside = await outsidePaths(branch, (path) => path.startsWith(`analysis/${hypothesis}/`))
+          if (outside.length > 0) throw new AnalysisScopeError(`After the analyst round ${round} of ${hypothesis}, changes outside analysis/${hypothesis}/ are uncommitted: ${outside.join(', ')}. ${notPushed}`)
+          await branch.commit(`agent-factory: analyst changes to ${hypothesis}, round ${round} (${input.runId})`)
+          return branch.head()
+        })
+      } catch (error) {
+        if (error instanceof AnalysisScopeError) return { status: 'blocked', note: error.message }
+        throw error
+      }
+      calibration = await calibrate(stages, analysis)
+      if (!calibration.pass) return { status: 'blocked', note: `${calibrationLine(hypothesis, calibration)} after the analyst changes. ${notPushed}` }
+    }
+    const held = await hold(stages, analysis, round)
+    if (held) return held
+  }
+  return null
+}
+
+/** One vet round: one skeptic for each skeptic lens, then the analyst when there are objections. */
+async function vet(stages: Stages, analysis: Analysis, round: 1 | 2): Promise<{ round: VetRound; changed: boolean }> {
+  const { input, deps, context, branch } = stages
+  const { hypothesis } = analysis.freeze
+  const task = { branch, prereg: analysis.freeze, calibration: summary(finalCalibration(analysis)) }
+  const lists = await pool(deps.domain.config.lenses.skeptic, stages.parallel, (lens, index) => {
+    const id = `${round === 1 ? 'skeptic' : 'late-skeptic'}.${hypothesis}.${index + 1}`
+    return step(deps.ledger, id, async () => {
+      const submitted =
+        round === 1
+          ? await skeptic(context, id, input.models.skeptic, { ...task, lens })
+          : await lateSkeptic(context, id, input.models.lateSkeptic, { ...task, lens, first: analysis.rounds[0]! })
+      return submitted.objections
+    })
+  })
+  const objections = numberObjections(lists, round)
+  if (objections.length === 0) return { round: { objections, responses: null }, changed: false }
+  const answered = await step(deps.ledger, `analyst.${hypothesis}.${round}`, () => analyst(context, input.models.analyst, { ...task, config: deps.config, round, objections }))
+  return { round: { objections, responses: answered.responses }, changed: answered.changed }
+}
+
+const severe = (objection: Objection) => objection.severity === 'critical' || objection.severity === 'high'
+const accepts = (answer: string) => answer === heldOptions[0] || /^\s*accept\b/i.test(answer)
+const stopsRun = (answer: string) => answer === heldOptions[1] || /^\s*stop\b/i.test(answer)
+const parseHeld = (answer: string): Parsed<string> =>
+  accepts(answer) || stopsRun(answer) ? { value: answer } : { error: `the answer chooses neither "${heldOptions[0]}" nor "${heldOptions[1]}"` }
+
+/** Asks the user about each conceded critical or high objection of the round, in one batch. One stop ends the run. */
+async function hold(stages: Stages, analysis: Analysis, round: 1 | 2): Promise<End> {
+  const { hypothesis } = analysis.freeze
+  const vetted = analysis.rounds[round - 1]!
+  const held = conceded([vetted]).filter((entry) => severe(entry.objection))
+  if (held.length === 0) return null
+  const batch = `held.${hypothesis}.${round}`
+  const answers = await step(stages.deps.ledger, batch, async (): Promise<HeldAnswer[]> => {
+    const questions = held.map((entry, index) => heldQuestion(hypothesis, entry.objection, entry.reason, index))
+    const replies = await stages.ask(batch, questions)
+    const received = held.map((entry, index) => ({ objection: entry.objection.id, answer: replies[index]?.answer ?? '' }))
+    if (received.some((reply) => stopsRun(reply.answer))) return received.filter((reply) => 'value' in parseHeld(reply.answer))
+    const checked: HeldAnswer[] = []
+    for (const [index, entry] of held.entries()) {
+      const answer = await stages.askUntil(`${batch}.${entry.objection.id}`, questions[index]!, replies[index]?.answer ?? '', parseHeld)
+      checked.push({ objection: entry.objection.id, answer })
+      if (stopsRun(answer)) return checked
+    }
+    return checked
+  })
+  analysis.answers.push(...answers)
+  const stopped = answers.filter((answer) => stopsRun(answer.answer)).map((answer) => answer.objection)
+  return stopped.length > 0 ? { status: 'stopped', note: `You stopped the run at the conceded objections ${stopped.join(', ')} of ${hypothesis}, before the dossier.` } : null
+}
+
+function heldQuestion(hypothesis: string, objection: Objection, reason: string, index: number): Question {
+  return {
+    id: `Q${index + 1}`,
+    question: `The analyst conceded ${objection.id} (${objection.severity}) on ${hypothesis}: ${objection.title}. Accept the concession and continue to the dossier, or stop the run?`,
+    why: [
+      `Location: ${objection.location}`,
+      `Evidence: ${objection.evidence}`,
+      `Impact: ${objection.impact}`,
+      `Reason of the analyst: ${reason.trim()}`,
+      'The dossier shows the concession with your answer.',
+    ].join('\n'),
+    options: heldOptions,
+    recommendation: heldOptions[0]!,
+    level: 'user',
+    rule: 'decision',
+  }
+}
+
+const summary = (calibration: CalibrationRound): CalibrationSummary => ({
+  round: calibration.round,
+  recall: calibration.recall ?? 0,
+  threshold: calibration.threshold,
+  known: calibration.known,
+  inject: calibration.inject,
+  outputs: calibration.outputs,
+})
+
+/** The last calibration round. The stages give it to an agent only after it passed. */
+const finalCalibration = (analysis: Analysis): CalibrationRound => analysis.calibrations.at(-1)!
+
+const oneLine = (text: string) => text.trim().replace(/\s*\n\s*/g, '; ')
+
+const notPushed = 'The run did not push the branch and opened no PR.'
+
+const sameOutputs = (a: DomainOutputs, b: DomainOutputs) => Object.keys(a).length === Object.keys(b).length && Object.entries(a).every(([path, sha]) => b[path] === sha)
+
+/** The uncommitted paths that `allowed` rejects. A host commit takes all uncommitted changes. */
+async function outsidePaths(branch: Branch, allowed: (path: string) => boolean): Promise<string[]> {
+  const pending = await branch.pending()
+  return [...pending.changed, ...pending.removed].filter((path) => !allowed(path))
+}
+
+const calibrationLine = (hypothesis: string, calibration: CalibrationRound) =>
+  `Calibration round ${calibration.round} of ${hypothesis} failed (known recall ${calibration.recall ?? 'none'}, threshold ${calibration.threshold}): ${oneLine(calibration.reason)}`
+
+/** Keeps the output of a domain command in the run store. */
+function keep(deps: ResearchDeps, run: DomainRun, hypothesis: string, round: number): Promise<string> {
+  const labels = { hypothesis, command: run.name, round: String(round) }
+  return deps.egress.artifacts.put(new TextEncoder().encode(run.output), { source: { command: run.command }, media_type: 'text/plain', labels })
+}
+
+/** Keeps each declared output before another command can replace or remove it. */
+async function keepOutputs(deps: ResearchDeps, box: ResearchBox, run: DomainRun, hypothesis: string, round: number): Promise<{ run: DomainRun; artifacts: string[] }> {
+  const artifacts = [await keep(deps, run, hypothesis, round)]
+  for (const [path, hash] of Object.entries(run.json?.outputs ?? {})) {
+    try {
+      const bytes = await box.read(path)
+      if ((await artifactId(bytes)) !== hash) throw new Error(`the file does not match SHA-256 ${hash}`)
+      artifacts.push(await deps.egress.artifacts.put(bytes, {
+        source: { command: run.command },
+        media_type: 'application/octet-stream',
+        labels: { hypothesis, command: run.name, round: String(round), path },
+      }))
+    } catch (error) {
+      return { run: { ...run, json: null, problem: `${run.name} output ${path}: ${error instanceof Error ? error.message : String(error)}` }, artifacts }
+    }
+  }
+  return { run, artifacts }
+}
+
+/**
+ * Stage 6: known and inject on a clean checkout of the run branch head, gated on the threshold of the frozen prereg
+ * (decision 2). The output files of the commands stay out of the run branch, so no host commit and no builder takes them.
+ */
+async function calibrate(stages: Stages, analysis: Analysis): Promise<CalibrationRound> {
+  const { deps, branch } = stages
+  const { hypothesis, path } = analysis.freeze
+  const round = analysis.calibrations.length + 1
+  const calibration = await step(deps.ledger, `calibrate.${hypothesis}.${round}`, async (): Promise<CalibrationRound> => {
+    const threshold = preregThreshold(new TextDecoder().decode(await branch.tree.read(`/${path}`)))
+    const head = await branch.head()
+    const box = await deps.cleanBox(head)
+    const known = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'known', path), hypothesis, round)
+    const inject = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'inject', path), hypothesis, round)
+    const verdict = calibrationVerdict(known.run, inject.run, threshold)
+    return {
+      round,
+      head,
+      recall: verdict.recall,
+      threshold,
+      known: known.artifacts,
+      inject: inject.artifacts,
+      outputs: verdict.outputs,
+      ...(verdict.pass ? { pass: true, reason: '', tail: '' } : { pass: false, reason: verdict.reason, tail: verdict.tail }),
+    }
+  })
+  analysis.calibrations.push(calibration)
+  return calibration
+}
+
+/**
+ * Stage 11: reproduce of each prereg on one clean checkout of `head`, against the outputs of its last calibration.
+ * True when each output hash matches.
+ */
+async function reproduce(stages: Stages, analyses: Analysis[], head: string): Promise<boolean> {
+  const { deps } = stages
+  let box: Promise<Machine> | undefined
+  for (const analysis of analyses) {
+    const { hypothesis, path } = analysis.freeze
+    const calibration = finalCalibration(analysis)
+    const result = await step(deps.ledger, `reproduce.${hypothesis}.${head}`, async (): Promise<Reproduction> => {
+      box ??= deps.cleanBox(head)
+      const run = await runDomainCommand(deps.config, await box, 'reproduce', path)
+      const verdict = compareReproduction(calibration.outputs, run)
+      const artifact = await keep(deps, run, hypothesis, calibration.round)
+      return { head, pass: verdict.pass, mismatches: verdict.mismatches, missing: verdict.missing, reason: verdict.pass ? '' : verdict.reason, artifact }
+    })
+    analysis.reproductions.push(result)
+  }
+  return analyses.every((analysis) => analysis.reproductions.at(-1)?.pass === true)
 }
 
 /** Stops the run when a frozen file on the run branch is missing, or has another hash than the ledger records. */
@@ -412,14 +902,99 @@ function approveQuestion(draft: Prereg, index: number): Question {
 const approves = (answer: string) => answer === approveOptions[0] || /^\s*(yes|approve)\b/i.test(answer)
 const drops = (answer: string) => answer === approveOptions[2] || /^\s*drop\b/i.test(answer)
 
+/** One row of the Usage section for a review pass, with the tokens and USD of all its agents. */
+function reviewRow(review: Review, index: number): UsageRow {
+  const { tokens, usd, unpriced } = review.usage
+  return { step: `review.${index + 1}`, model: 'review loop', tokens, usd, unpriced }
+}
+
+/** The frozen package of the review pass: the program, and what the change is. */
+function reviewAsk(input: ResearchInput, analyses: Analysis[]): string {
+  return [
+    input.program.trim(),
+    '',
+    `The change is the analysis of the frozen preregs ${analyses.map((analysis) => analysis.freeze.path).join(', ')} in analysis/<id>/.`,
+    'The host wrote prereg/ and dossier/. A fix can change only analysis/.',
+  ].join('\n')
+}
+
+/**
+ * The PR description, written by the host (G7). Only the dossiers are visible. The run, the program, the decisions and
+ * the holdout lock are in one collapsed block.
+ */
+function prBody(input: ResearchInput, analyses: Analysis[], answers: Answer[]): string {
+  return [
+    ...analyses.map((analysis) => `- dossier/${analysis.freeze.hypothesis}.md: outcome ${analysis.dossier?.outcome ?? 'none'}, prereg ${analysis.freeze.path}`),
+    '',
+    '<details><summary>Run, program, decisions and holdout lock</summary>',
+    '',
+    `agent-factory run \`${input.runId}\` (${input.source}) opened this draft PR. It stays draft until the review loop passes.`,
+    '',
+    '# Program',
+    '',
+    ...input.program.trim().split('\n').map((line) => `> ${line}`),
+    '',
+    ...decisionLists(answers, { user: '# Decisions of the user', run: '# Decisions the run made' }),
+    '# Holdout lock',
+    '',
+    ...lockLines,
+    '',
+    '</details>',
+  ].join('\n')
+}
+
+function objectionLines(rounds: VetRound[], answers: HeldAnswer[]): string[] {
+  return rounds.flatMap((round, index) => {
+    if (round.objections.length === 0) return [`- Vet round ${index + 1}: no objections`]
+    return round.objections.map((objection) => {
+      const response = responseLine(objection.id, round.responses)
+      const user = answers.find((entry) => entry.objection === objection.id)
+      return [
+        `- Vet round ${index + 1}, ${objection.id} (${objection.severity}, lens ${objection.lens}): ${objection.title} (${objection.location}).`,
+        response ? ` Analyst: ${oneLine(response)}` : '',
+        user ? ` User: ${user.answer}` : '',
+      ].join('')
+    })
+  })
+}
+
+function reproductionLines(reproduction: Reproduction): string[] {
+  const at = `- Reproduction at ${reproduction.head.slice(0, 12)} (output artifact ${reproduction.artifact}):`
+  if (reproduction.pass) return [`${at} PASS, each hash matches`]
+  const listed = [
+    ...reproduction.mismatches.map((entry) => `  - ${entry.path}: expected ${entry.expected}, reproduce gave ${entry.actual}`),
+    ...reproduction.missing.map((path) => `  - ${path}: reproduce gave no hash`),
+  ]
+  return [`${at} FAIL${listed.length > 0 ? '' : `: ${oneLine(reproduction.reason)}`}`, ...listed]
+}
+
+function analysisLines(analysis: Analysis): string[] {
+  const { hypothesis } = analysis.freeze
+  return [
+    `## Analysis of ${hypothesis}`,
+    '',
+    ...analysis.builds.map((log, index) => `- Build${index > 0 ? ` fix ${index}` : ''}: ${log.blocked.trim() ? `blocked: ${log.blocked.trim()}` : oneLine(log.summary)}`),
+    ...analysis.calibrations.map(
+      (calibration) =>
+        `- Calibration round ${calibration.round} at ${calibration.head.slice(0, 12)}: ${calibration.pass ? 'PASS' : 'FAIL'}, known recall ${calibration.recall ?? 'none'}, threshold ${calibration.threshold}, known output ${calibration.known.join(', ')}, inject output ${calibration.inject.join(', ')}${calibration.pass ? '' : `. ${oneLine(calibration.reason)}`}`,
+    ),
+    ...objectionLines(analysis.rounds, analysis.answers),
+    ...(analysis.dossier ? [`- Dossier: dossier/${hypothesis}.md, outcome ${analysis.dossier.outcome}`] : []),
+    ...analysis.reproductions.flatMap(reproductionLines),
+    '',
+  ]
+}
+
 function renderReport(state: ReportState, status: ResearchStatus, note: string, answers: Answer[], usage: string[]): string {
+  const triage = (report: string) => /^- Triage: (.*)$/m.exec(report)?.[1] ?? ''
   return [
     `# Research run: ${status.toUpperCase()}`,
     '',
+    ...(state.pr ? [`PR: ${state.pr.url}`, ''] : []),
     `- Run: ${state.input.runId}`,
     `- Source: ${state.input.source}`,
     ...(state.intake ? [`- Program: ${state.intake.title}`] : []),
-    ...(state.branch ? [`- Branch: ${state.branch} (local, not pushed)`] : []),
+    ...(state.branch ? [`- Branch: ${state.branch} ${state.pushed ? `(pushed at ${state.pushed.slice(0, 12)})` : '(local, not pushed)'}`] : []),
     '',
     note,
     '',
@@ -428,13 +1003,30 @@ function renderReport(state: ReportState, status: ResearchStatus, note: string, 
       : []),
     ...(state.hypotheses.length > 0 ? ['## Hypotheses', '', ...state.hypotheses.map((hypothesis) => `- ${pickOption(hypothesis)}`), ''] : []),
     ...(state.picked ? ['## Picks', '', state.picked.length > 0 ? state.picked.map((id) => `- ${id}`).join('\n') : '- none', ''] : []),
-    ...(state.frozen.length > 0
-      ? ['## Frozen preregs', '', ...state.frozen.map((entry) => `- ${entry.path}: SHA-256 ${entry.sha256}, commit ${entry.commit.slice(0, 12)}`), '']
+    ...(state.frozen.length > 0 || state.dropped.length > 0
+      ? [
+          '## Frozen preregs',
+          '',
+          ...state.frozen.map((entry) => `- ${entry.path}: SHA-256 ${entry.sha256}, commit ${entry.commit.slice(0, 12)}`),
+          ...(state.dropped.length > 0 ? [`- Dropped at the approval: ${state.dropped.join(', ')}`] : []),
+          '',
+        ]
+      : []),
+    ...state.analyses.flatMap(analysisLines),
+    ...(state.reviews.length > 0
+      ? [
+          '## Review loop',
+          '',
+          ...state.reviews.map(
+            (review, index) =>
+              `- Pass ${index + 1}: ${review.pass ? 'PASS' : 'FAIL'}, ${triage(review.report)}, ${review.final === review.head ? 'no fixes' : `fixes from ${review.branch}`}`,
+          ),
+          '',
+        ]
       : []),
     '## Holdout lock',
     '',
-    '- The lock binds the agents only, not the commands of a box (RG1).',
-    '- The lock does not bind web search, because web search runs at the provider (RG10).',
+    ...lockLines,
     '',
     ...usage,
     '',

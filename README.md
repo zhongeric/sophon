@@ -83,8 +83,8 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
   runs one command for each test file.
 - `protect` lists paths that agents cannot write. A `*` matches inside one path segment.
 - `env` lists extra environment variables for the checks. `guides` mounts reference material at `/guides/<name>`.
-- `answerers` limits who can answer questions. `research` configures a research notebook
-  ([spec, section 6.3](docs/specs/research-workflow.md)).
+- `answerers` limits who can answer questions. `research` configures a research notebook. Its `known`, `inject` and
+  `reproduce` commands print a JSON last line ([spec, section 6.3](docs/specs/research-workflow.md#63-the-domain-in-the-notebook)).
 - Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
   file that no test imports gets the test files that have its base name as a word. A builder's `run_checks` runs
   only the checks. The targeted tests run one time, when the builder submits its build log.
@@ -99,7 +99,7 @@ The STE dictionary is optional: see [agents/guides/ste/README.md](agents/guides/
 npm run review -- --repo ~/src/app --pr 123     # review a PR, add --ship to push the fixes and mark it ready on PASS
 npm run review -- --repo ~/src/app --base main --ask-file ask.md
 npm run develop -- --repo ~/src/app --ask "Add a fee switch, off by default"
-node --disable-warning=ExperimentalWarning src/node/research.ts --repo ~/src/notebook --program-file program.md
+node --disable-warning=ExperimentalWarning src/node/research.ts --repo ~/src/notebook --program-file program.md  # ends in a dossier PR, needs gh auth login
 npm run review -- --run <id>                     # resume a run, also with npm run develop
 ```
 

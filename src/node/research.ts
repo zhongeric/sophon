@@ -6,15 +6,16 @@ import { parseArgs } from 'node:util'
 import { repoConfigFile } from '../core/checks.ts'
 import { parseParallel } from '../core/plan.ts'
 import { defaultEndpoints, type Credentials } from '../core/providers.ts'
-import { PausedError, type Channel } from '../core/questions.ts'
+import { commentChannel, PausedError, type Channel } from '../core/questions.ts'
 import type { ModelChoice } from '../core/roles.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget, parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom } from '../core/workflows/code-review-loop.ts'
 import { defaultResearchModels, research, researchProviders, type ResearchInput, type ResearchModels } from '../core/workflows/research.ts'
-import { fileChannel, terminalChannel } from './channels.ts'
+import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
 import { credential } from './credentials.ts'
 import { git } from './git.ts'
+import { ghPullRequests } from './github.ts'
 import { fileLedger } from './ledger.ts'
 import { nodeResearch } from './platform.ts'
 
@@ -25,9 +26,11 @@ const command = 'node --disable-warning=ExperimentalWarning src/node/research.ts
 
 const usage = `Usage: ${command} --program <text> [options]
 
-Runs stages 0 to 4 of the research workflow on a notebook: intake and your confirmation, the surveys, two
-generators on two model families, your pick, and one prereg for each pick. You approve each prereg before the
-host freezes it on the branch factory/research-<run>. The run never pushes and stops before stage 5.
+Runs the research workflow on a notebook: intake and your confirmation, the surveys, two generators on two model
+families, your pick, and one prereg for each pick. You approve each prereg before the host freezes it on the branch
+factory/research-<run>. Then each prereg gets an analysis, a calibration, skeptics and an analyst, and a dossier.
+After the reproduction on a clean checkout, the run pushes factory/research-<run> and opens a dossier PR with one
+review loop pass. Stage 11 needs the gh CLI login (gh auth login).
 
 Options:
   --repo <path>          The notebook (default: current directory). Its ${repoConfigFile} at the base needs a
@@ -38,14 +41,14 @@ Options:
   --run <id>             Resume a run; the other options come from its ledger
   --runs-dir <path>      Where runs live (default: <agent-factory>/runs)
   --parallel <n>         At most n surveyors or preregistrars at the same time (default 3)
-  --models <path>        JSON that overrides models: { "surveyor": ..., "generators": [..., ...] }
+  --models <path>        JSON that overrides models: { "surveyor": ..., "generators": [..., ...], "skeptic": ... }
   --claude-plan          Sign Claude requests with the nc Claude login instead of ANTHROPIC_API_KEY
   --wait <minutes>       How long to wait for answers before the run pauses (default 60)
   --budget <usd>         Cost budget in USD. The cap that you give at intake replaces it. With --run, it replaces
                          the recorded budget.
 
-Questions go to the terminal when it is interactive, else to a file in the run directory. A paused run exits
-with status 3; resume it with --run <id>.
+Questions go to the terminal when it is interactive, else to a file in the run directory, and the review questions
+go to the PR. A paused run exits with status 3; resume it with --run <id>.
 
 Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, the secrets that the research config names, ALLOWED_MODELS (model
 IDs, comma-separated), MODEL_PRICES (JSON: USD per million tokens of each model ID, see README.md).`
@@ -83,21 +86,30 @@ async function main(): Promise<number> {
   const credentials: Credentials = {}
   for (const provider of researchProviders(input.models)) credentials[provider] = credential(provider, { claudePlan: values['claude-plan'] })
   const dir = resolve(runsDir, input.runId)
+  const interactive = process.stdin.isTTY === true
+  const terminal = terminalChannel(process.stdin, process.stderr)
+  const run = gh(repo)
   const deps = await nodeResearch({
-    channel: process.stdin.isTTY === true ? terminalChannel(process.stdin, process.stderr) : waiting(fileChannel(dir), waitMs),
+    channel: interactive ? terminal : waiting(fileChannel(dir), waitMs),
     credentials,
     input,
     log: (line) => console.error(`[${new Date().toTimeString().slice(0, 8)}] ${line}`),
     module: await WebAssembly.compile(readFileSync(fileURLToPath(import.meta.resolve('nanocode-ts/nanocode_wasm.wasm')))),
     prices,
+    pulls: ghPullRequests(repo, input.baseRef),
     repo,
+    async reviewChannel(pr) {
+      if (interactive) return terminal
+      const answerers = deps.config.answerers ?? [(await run(['api', 'user', '--jq', '.login'])).trim()]
+      return commentChannel({ answerers, comments: ghComments(run, pr), pollMs, waitMs })
+    },
     runsDir,
   })
   deps.ledger.put('repo', repo)
   try {
     const result = await research(input, deps)
-    console.log(`${result.status.toUpperCase()}: ${join(deps.dir, 'report.md')}${result.branch ? `\nbranch: ${result.branch}` : ''}`)
-    return result.status === 'frozen' ? 0 : 1
+    console.log(`${result.status.toUpperCase()}: ${join(deps.dir, 'report.md')}${result.branch ? `\nbranch: ${result.branch}` : ''}${result.pr ? `\n${result.pr.url}` : ''}`)
+    return result.status === 'ready' ? 0 : 1
   } catch (error) {
     if (!(error instanceof PausedError)) throw error
     console.log(`paused: ${error.message}`)
@@ -128,14 +140,15 @@ function waiting(channel: Channel, waitMs: number): Channel {
   }
 }
 
-function resumeInput(runsDir: string, runId: string): { input: ResearchInput; repo: string } {
+/** The recorded input of a run. A run of part 1 recorded fewer roles, so the new roles get the default models. */
+export function resumeInput(runsDir: string, runId: string): { input: ResearchInput; repo: string } {
   const path = join(runsDir, runId, 'state.json')
   if (!existsSync(path)) throw new StopError(`no run ${runId} in ${runsDir}`)
   const ledger = fileLedger(path)
   const input = ledger.get<ResearchInput>('input')
   const repo = ledger.get<string>('repo')
   if (!input || !repo) throw new StopError(`run ${runId} has no recorded input`)
-  return { input, repo }
+  return { input: { ...input, models: { ...defaultResearchModels, ...input.models } }, repo }
 }
 
 type Values = Record<string, string | boolean | undefined>
@@ -153,6 +166,10 @@ function modelChoice(value: unknown, where: string): ModelChoice {
   return { provider: provider as ModelChoice['provider'], model, ...(thinking !== undefined ? { thinking } : {}) }
 }
 
+/** The roles of a models file with one model each. The review loop keeps its default models. */
+const singleRoles = ['intake', 'surveyor', 'preregistrar', 'builder', 'skeptic', 'lateSkeptic', 'analyst', 'writer'] as const
+const isSingleRole = (role: string): role is (typeof singleRoles)[number] => (singleRoles as readonly string[]).includes(role)
+
 /** The models of a --models file over the defaults. A file with another shape stops the run before any work. */
 export function researchModels(text: string, source: string): ResearchModels {
   let parsed: unknown
@@ -167,8 +184,8 @@ export function researchModels(text: string, source: string): ResearchModels {
     if (role === 'generators') {
       if (!Array.isArray(value) || value.length !== 2) throw new StopError(`--models ${source}: generators must be a list of two models`)
       models.generators = [modelChoice(value[0], `--models ${source}: generators[0]`), modelChoice(value[1], `--models ${source}: generators[1]`)]
-    } else if (role === 'intake' || role === 'surveyor' || role === 'preregistrar') models[role] = modelChoice(value, `--models ${source}: ${role}`)
-    else throw new StopError(`--models ${source}: ${role} is not a research role (intake, surveyor, generators, preregistrar)`)
+    } else if (isSingleRole(role)) models[role] = modelChoice(value, `--models ${source}: ${role}`)
+    else throw new StopError(`--models ${source}: ${role} is not a research role (${['generators', ...singleRoles].join(', ')})`)
   }
   return models
 }
@@ -180,7 +197,7 @@ export async function newInput(values: Values, budget?: number): Promise<{ input
   if (!program?.trim()) throw new StopError('give the program with --program or --program-file')
   const parallel = values.parallel !== undefined ? parseParallel(String(values.parallel)) : undefined
   const baseRef = String(values.base ?? 'main')
-  // The local branch, not origin: the run commits on a branch of this working copy and never pushes.
+  // The local branch, not origin: the run commits on a branch of this working copy, and pushes only at stage 11.
   const base = (await git(repo, 'rev-parse', '--verify', `${baseRef}^{commit}`)).trim()
   const models = values.models ? researchModels(readFileSync(String(values.models), 'utf8'), String(values.models)) : defaultResearchModels
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
