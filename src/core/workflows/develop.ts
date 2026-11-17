@@ -3,12 +3,15 @@ import type { CiJob } from '../ci.ts'
 import type { MergeMethod, RepoConfig } from '../checks.ts'
 import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
+import { alarmLines, settleAll } from '../planned-stop.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
-import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeResult, PullRequests } from '../platform.ts'
+import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeResult, PullRequests, Signing } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
+import { branchesSection, pruneBranches, reasonOf, type BranchFacts, type BranchRun, type PruneResult } from '../prune.ts'
 import type { Credentials, Provider } from '../providers.ts'
 import { asker, commentLimit, decisionLists, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
 import type { ModelChoice } from '../roles.ts'
+import { signingLine, type SigningRecord } from '../signing.ts'
 import { StopError } from '../stop.ts'
 import { BudgetStop, belowBudget, budgetGate, checkPriced, resolveBudget, usageOf, usageSection, zeroTokens, type Prices, type RunUsage, type UsageRow } from '../usage.ts'
 import { checkAllowedModels, checkFamilySwap, decisionSections, defaultAllowedModels, loopModelIds, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
@@ -47,8 +50,8 @@ export type DevelopInput = {
   issue?: number
 }
 
-/** `budget` is what remains up to twice the development budget, so that the review loop stops where the development gate pauses. */
-export type ReviewRequest = { runId: string; ask: string; head: string; full: boolean; pr: number; budget?: number }
+/** `budget` is what remains up to twice the development budget, so that the review loop stops where the development gate pauses. `branch` is the PR head branch. */
+export type ReviewRequest = { runId: string; ask: string; head: string; branch: string; full: boolean; pr: number; budget?: number }
 
 /** What the platform supplies. */
 export type DevelopDeps = {
@@ -65,6 +68,7 @@ export type DevelopDeps = {
   channel: Channel
   branches: Branches
   pulls: PullRequests
+  signing: Signing
   /** The checks and tests of a branch, run in its worktree. */
   checker(branch: Branch): Checker
   /** Runs the code review loop on a commit of the run's branch. */
@@ -95,8 +99,6 @@ const ciGraceMs = 3 * 60_000
 /** The most that GitHub's clock and the host's clock can differ. */
 const clockSkewMs = 30_000
 const defaultParallel = 3
-/** The longest reason of a refused merge or a failed branch delete in the report. */
-const reasonChars = 300
 
 type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failures: string }
 /** A review pass. Records of older runs have no usage: it counts as zero. */
@@ -146,7 +148,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const { ledger, branches, pulls } = deps
   const models = input.models.develop
   // What the report shows. Each stage fills its part.
-  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [], stoppedReview: null }
+  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, signing: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [], stoppedReview: null }
   const spentPasses = () => [...state.reviews, ...(state.stoppedReview ? [state.stoppedReview] : [])]
   // The review passes keep their usage in their own ledgers, so their rows count here as extra spend.
   const budget = budgetGate({
@@ -161,6 +163,9 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   // A resume without --budget must not apply the override again, so the recorded input does not keep it.
   const { budgetOverride, ...recorded } = input
   ledger.put('input', recorded)
+  // A run that deleted its development branch cannot go on: a resume starts the branch again from the base.
+  const ended = ledger.get<DevelopResult>('ended')
+  if (ended) return ended
   const view = await branches.view(input.base)
   const active = profilesById(await step(ledger, 'profiles', async () => (await presentProfiles(async (path) => (await view.stat(`/${path}`)) !== null)).map((profile) => profile.id)))
   const context: DevelopContext = {
@@ -177,10 +182,52 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     return questions.wait(batch)
   }
 
+  // The tasks whose merge step ran, and the result of the delete-branch step after a host merge.
+  const mergedTasks = new Set<string>()
+  let remoteDeleted: boolean | null = null
+  const taskBranch = (task: PlanTask) => `factory/task-${input.runId}-${task.id}`
+  const prune = async (merged: boolean): Promise<PruneResult> => {
+    const pr = merged ? 'merged' : state.pr ? 'open' : null
+    const own = (name: string, kind: BranchRun['kind'], applied: boolean, of: BranchFacts['pr']): BranchFacts => ({ name, run: { kind, finished: true, ship: false }, pr: of, applied, inDefault: false })
+    // A stop in a wave leaves the task branches of that wave out of state.built, but they can exist.
+    const built = new Set(state.built.map((entry) => entry.task.id))
+    const unbuilt = (state.plan?.tasks ?? []).filter((task) => !built.has(task.id))
+    const present = await Promise.all(unbuilt.map((task) => branches.exists(taskBranch(task)).catch(() => false)))
+    const tasks = [...state.built.map((entry) => entry.task), ...unbuilt.filter((_, index) => present[index])]
+    // A failed delete-branch step is already in the note, so the prune leaves that branch alone.
+    const facts = [
+      ...(state.branch && remoteDeleted !== false ? [own(state.branch, 'develop', false, pr)] : []),
+      ...tasks.map((task) => own(taskBranch(task), 'task', mergedTasks.has(task.id), null)),
+      // The run merged the fixes of each finished pass, or the pass had none.
+      ...[...new Set(state.reviews.map((review) => review.branch))].map((name) => own(name, 'review', true, pr)),
+    ]
+    // A resumed run can end again. Only the branches that are not deleted yet go through the rules again.
+    const earlier = ledger.get<PruneResult>('prune')
+    const gone = new Set(earlier?.deleted.map((branch) => branch.name))
+    const result = await pruneBranches(
+      facts.filter((branch) => !gone.has(branch.name)),
+      async (name) => {
+        if (!(name === state.branch && remoteDeleted)) await branches.deleteRemote(name)
+        await branches.deleteLocal(name)
+      },
+    )
+    const all = { ...result, deleted: [...(earlier?.deleted ?? []), ...result.deleted] }
+    ledger.put('prune', all)
+    return all
+  }
+
   const finish: Finish = async (status, criteria, note, resumable = false, merge = null) => {
     const limit = budget.limit()
     const usage = usageSection([...usageOf(ledger).agents, ...spentPasses().map(reviewRow)], prices, limit === undefined ? undefined : { limit, spent: budget.spent() })
-    const report = renderReport(state, status, criteria, note, decisions(ledger), usage)
+    // A resumable run is not finished, so its branches and worktrees stay.
+    const pruned = resumable ? null : await prune(merge !== null)
+    const shown = resumable
+      ? note
+      : await branches.release().then(
+          () => note,
+          (error: unknown) => `${note} The host did not remove the worktrees of the run: ${reasonOf(error)}.`,
+        )
+    const report = renderReport(state, status, criteria, shown, decisions(ledger), usage, pruned ? branchesSection(pruned) : [], alarmLines(ledger))
     deps.files.write('report.md', report)
     // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
     if (state.pr && ledger.get('commented') !== report) {
@@ -188,7 +235,9 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
       ledger.put('commented', report)
     }
     ledger.put('result', { status, pr: state.pr, branch: state.branch, merge })
-    return { status, pr: state.pr, branch: state.branch, report, resume: resumable ? note : null, merge }
+    const result = { status, pr: state.pr, branch: state.branch, report, resume: resumable ? note : null, merge }
+    if (pruned?.deleted.some((branch) => branch.name === state.branch)) ledger.put('ended', result)
+    return result
   }
   stop.finish = finish
 
@@ -225,39 +274,46 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     }
   })
   state.branch = branchName
+  // Before the first commit. The branch name comes from the intake slug, so the check cannot run before intake.
+  const signing = await step(ledger, 'signing', () => deps.signing.check([branchName]))
+  state.signing = signing
+  await deps.signing.apply(signing)
   const dev = await branches.branch(branchName, input.base)
-  const taskBranch = (task: PlanTask) => `factory/task-${input.runId}-${task.id}`
   const scheduled = waves(planned.tasks, input.parallel ?? defaultParallel)
   for (const [index, wave] of scheduled.entries()) {
     const from = await step(ledger, `wave.${index}`, () => dev.head())
-    const logs = await Promise.all(
-      wave.map((task) =>
-        step(ledger, `build.${task.id}`, async () => {
-          const branch = await branches.branch(taskBranch(task), from)
-          return build(context, {
-            id: `build.${task.id}`,
-            turn: { request: 'task', key: `output:build.${task.id}` },
-            model: models.builder,
-            branch,
-            scope: task.files,
-            active,
-            checker: deps.checker(branch),
-            base: input.base,
-            review: { '/ask.md': input.ask, '/plan.md': planText, '/task.md': renderTask(task, state.built) },
-            prompt: buildPrompt(task),
-            label: `agent-factory: ${task.id}`,
-          })
-        }),
-      ),
+    const builds = wave.map((task) =>
+      step(ledger, `build.${task.id}`, async () => {
+        const branch = await branches.branch(taskBranch(task), from)
+        return build(context, {
+          id: `build.${task.id}`,
+          turn: { request: 'task', key: `output:build.${task.id}` },
+          model: models.builder,
+          branch,
+          scope: task.files,
+          active,
+          checker: deps.checker(branch),
+          base: input.base,
+          review: { '/ask.md': input.ask, '/plan.md': planText, '/task.md': renderTask(task, state.built) },
+          prompt: buildPrompt(task),
+          label: `agent-factory: ${task.id}`,
+        })
+      }),
     )
+    // All tasks must end before finish checks or deletes their branches.
+    const logs = await settleAll(builds)
     state.built.push(...wave.map((task, position) => ({ task, log: logs[position]! })))
     const blocked = state.built.filter((entry) => entry.log.blocked.trim())
     if (blocked.length > 0) return finish('blocked', [], blocked.map((entry) => `Task ${entry.task.id} is blocked: ${entry.log.blocked}`).join('\n'))
-    for (const task of wave)
+    for (const task of wave) {
       await step(ledger, `merge.${task.id}`, async () => {
         await dev.merge(taskBranch(task), `agent-factory: merge task ${task.id} (${input.runId})`)
         return dev.head()
       })
+      mergedTasks.add(task.id)
+      // A delete is safe to repeat on a resume. When it fails, the prune at the end tries again and reports it.
+      await branches.deleteLocal(taskBranch(task)).catch((error: unknown) => deps.log(`task branch ${taskBranch(task)} not deleted: ${reasonOf(error)}`))
+    }
   }
 
   // Draft PR and CI. A red CI goes back to a builder, inside the budget (G6). CI and the review loop see the pushed commit.
@@ -321,7 +377,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         // already counts the spend of its stopped attempt, so that spend is not taken from the remaining budget.
         const limit = budget.limit()
         const remaining = limit === undefined ? {} : { budget: 2 * limit - budget.spent() + (state.stoppedReview?.usage?.usd ?? 0) }
-        const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, full: input.full === true, pr: state.pr!.number, ...remaining })
+        const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, branch: branchName, full: input.full === true, pr: state.pr!.number, ...remaining })
         const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage }
         if (!loop.stopped) return result
         ledger.put(stoppedKey, result)
@@ -403,6 +459,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
       return { deleted: false, reason: reasonOf(error) }
     }
   })
+  remoteDeleted = deleted.deleted
   const note = [
     `Merged by the host (${method}): ${merged.sha}.`,
     ...(deleted.deleted ? [] : [`The host did not delete the branch ${branchName}: ${deleted.reason}.`]),
@@ -442,9 +499,6 @@ async function watchCi(ledger: Ledger, pulls: PullRequests, timing: DevelopDeps[
     await new Promise((resolve) => setTimeout(resolve, timing.pollMs))
   }
 }
-
-/** An error as one line for the finish note of the report. */
-const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().slice(0, reasonChars)
 
 const noCi = (sha: string) => `No CI ran on ${sha.slice(0, 12)}. Add CI that runs on pull requests, push again, and resume the run.`
 
@@ -550,6 +604,7 @@ type ReportState = {
   route: Route | null
   plan: Plan | null
   branch: string | null
+  signing: SigningRecord | null
   head: string | null
   pr: { number: number; url: string } | null
   built: { task: PlanTask; log: BuildLog }[]
@@ -566,7 +621,7 @@ function reviewRow(review: Review, index: number): UsageRow {
   return { step: `review.${index + 1}`, model: 'review loop', tokens: usage.tokens, usd: usage.usd, unpriced: usage.unpriced }
 }
 
-function renderReport(state: ReportState, status: DevelopStatus, criteria: Criterion[], note: string, answers: Answer[], usage: string[]): string {
+function renderReport(state: ReportState, status: DevelopStatus, criteria: Criterion[], note: string, answers: Answer[], usage: string[], branches: string[], alarms: string[]): string {
   const triage = (report: string) => /^- Triage: (.*)$/m.exec(report)?.[1] ?? ''
   const failed = criteria.filter((criterion) => !criterion.ok)
   const criterionLine = (criterion: Criterion) => `- [${criterion.ok ? 'x' : ' '}] ${criterion.name}: ${criterion.detail}`
@@ -584,6 +639,8 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
     ...(state.intake ? [`- Title: ${state.intake.title}`] : []),
     ...(state.route ? [`- Route: ${state.route.spec ? 'spec, then plan' : 'plan'}, ${state.route.passes} review loop ${state.route.passes === 1 ? 'pass' : 'passes'}. ${state.intake?.reason ?? ''}`] : []),
     ...(state.branch ? [`- Branch: ${state.branch}${state.head ? ` at ${state.head.slice(0, 12)}` : ''}`] : []),
+    ...(state.signing ? [`- ${signingLine(state.signing)}`] : []),
+    ...alarms,
     '',
     ...(criteria.length > 0 ? ['## Criteria', '', ...criteria.map(criterionLine), ''] : []),
     ...(state.plan ? ['## Plan', '', state.plan.smallest_change, ''] : []),
@@ -610,6 +667,7 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
           '',
         ]
       : []),
+    ...branches,
     ...usage,
     '',
     ...decisionSections(answers),

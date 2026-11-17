@@ -83,8 +83,8 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
   runs one command for each test file.
 - `protect` lists paths that agents cannot write. A `*` matches inside one path segment.
 - `env` lists extra environment variables for the checks. `guides` mounts reference material at `/guides/<name>`.
-- `answerers` limits who can answer questions. `research` configures a research notebook
-  ([spec, section 6.3](docs/specs/research-workflow.md)).
+- `answerers` limits who can answer questions. `research` configures a research notebook. Its `known`, `inject` and
+  `reproduce` commands print a JSON last line ([spec, section 6.3](docs/specs/research-workflow.md#63-the-domain-in-the-notebook)).
 - Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
   file that no test imports gets the test files that have its base name as a word. A builder's `run_checks` runs
   only the checks. The targeted tests run one time, when the builder submits its build log.
@@ -99,20 +99,22 @@ The STE dictionary is optional: see [agents/guides/ste/README.md](agents/guides/
 npm run review -- --repo ~/src/app --pr 123     # review a PR, add --ship to push the fixes and mark it ready on PASS
 npm run review -- --repo ~/src/app --base main --ask-file ask.md
 npm run develop -- --repo ~/src/app --ask "Add a fee switch, off by default"
-node --disable-warning=ExperimentalWarning src/node/research.ts --repo ~/src/notebook --program-file program.md
+node --disable-warning=ExperimentalWarning src/node/research.ts --repo ~/src/notebook --program-file program.md  # ends in a dossier PR, needs gh auth login
 npm run review -- --run <id>                     # resume a run, also with npm run develop
 ```
 
 - **Questions** that need you (D11) go to the PR, the terminal, or `runs/<run>/questions-<batch>.md`. Answer with `/answer` and one
   line for each question (`Q1: b`, or your own words), or with `/answer recommended`.
 - **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
-  fixes are on the local branch `factory/<run>`.
+  fixes stay on `factory/<run>`. The run deletes it at its end after `--ship` or a closed PR.
 - **Models:** `--models file.json` sets the model of each role.
 - **Budget:** `--budget <usd>` sets a soft limit on the spend of a run. At the budget, the run posts a notice and
   continues. At two times the budget, it asks you to raise the budget or stop, and `/answer recommended` raises it to
   two times the spend. Prices come from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`,
   `cached_input`, `cache_write`, `output`). Each report shows the usage of each step.
 - **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
+- **Commits:** the host commits unsigned, unless a GitHub rule requires signed commits on a branch that the run pushes.
+  Then signing must work without a prompt.
 
 ## Cloudflare
 
@@ -141,6 +143,7 @@ npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full,
 npm run remote -- develop acme/app#45    # a development run on an issue (--base, --hotfix, --full, --parallel, --budget)
 npm run remote -- resume acme/app#45     # wake a paused run after you answer
 npm run remote -- status acme/app#45     # or report
+npm run remote -- prune acme/app         # delete the merged, applied and stranded factory/* branches
 npm run metrics                          # CPU, memory and network of each build container
 ```
 

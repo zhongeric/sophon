@@ -1,12 +1,14 @@
+import { keepFailure } from './planned-stop.ts'
+
 /**
  * Runs `run` on each item, with at most `limit` calls in progress at the same time, and gives the results in the order of the items.
- * When one call fails, the pool starts no new items, waits until the calls in progress settle, and then rejects with the first error.
+ * When one call fails, the pool starts no new items, waits until the calls in progress settle, and then rejects with the first
+ * error. A real error replaces a PlannedStop as the failure.
  */
 export async function pool<T, R>(items: readonly T[], limit: number, run: (item: T, index: number) => Promise<R>): Promise<R[]> {
   if (!Number.isInteger(limit) || limit < 1) throw new Error(`the pool limit must be an integer of 1 or more, not ${limit}`)
   const results = new Array<R>(items.length)
   let next = 0
-  // An object, so that a thrown undefined still counts as the first error.
   let failure: { error: unknown } | undefined
   const worker = async () => {
     while (!failure && next < items.length) {
@@ -14,7 +16,7 @@ export async function pool<T, R>(items: readonly T[], limit: number, run: (item:
       try {
         results[index] = await run(items[index]!, index)
       } catch (error) {
-        failure ??= { error }
+        failure = keepFailure(failure, error)
       }
     }
   }

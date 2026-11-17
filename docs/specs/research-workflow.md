@@ -1,6 +1,7 @@
 # Spec: the research workflow
 
-Status: part 1 of R1, stages 0 to 4 on the local platform, is built. Section 11 is the build plan.
+Status: part 1 (stages 0 to 4) and part 2 (stages 5, 6, 9 and 11) of R1 are built on the local platform. Cloudflare
+comes later. Section 11 is the build plan.
 
 This spec defines a third workflow of agent-factory: the **research workflow**. A swarm of agents reads large public
 data, makes hypotheses, tests them, and reports a candidate or a calibrated null. The design is domain-neutral. A
@@ -161,8 +162,21 @@ The `holdout` file names the targets and the query ranges that the egress refuse
 The egress refuses the holdout to agents from the start of the run, before a prereg exists.
 The prereg section "Holdout" refers to this file and does not define the holdout.
 
-The host takes the command strings from the base branch. `{prereg}` is the path of the frozen prereg, and
-`{partition}` identifies the current data partition. `feeds` are the sources of scout (section 3).
+The host takes the command strings from the base branch. It replaces `{prereg}` with the quoted path of the frozen
+prereg. `{partition}` identifies the current data partition. `feeds` are the sources of scout (section 3).
+
+The last line of a command output that is not empty is a JSON object:
+
+| Command | Last line |
+| --- | --- |
+| `known` | `{"recall": <number 0..1>, "outputs": {"<path>": "<sha256 hex>"}}` |
+| `inject`, `reproduce` | `{"outputs": {"<path>": "<sha256 hex>"}}` |
+
+- The calibration passes only when the `known` recall is equal to or more than the `known_recall` of the prereg. The
+  `inject` outputs are the artifacts for completeness and false positives.
+- A non-zero exit, a timeout, or a last line that is not a JSON object of this shape is a failed round. The failure
+  text gives the end of the output.
+- `reproduce` on a clean checkout must give the same hashes as the calibration.
 
 agent-factory holds the roles and their generic guides (`agents/research/*.md`). The domain's guides add to them,
 as profile guides do today.
@@ -235,7 +249,7 @@ as profile guides do today.
 | Phase | Scope | Exit |
 | --- | --- | --- |
 | R0 | The core changes of section 6.2, with the holdout lock for agents. | Each rail has tests. A scripted run fetches through the egress and cites an artifact. |
-| R1 | The research workflow on Cloudflare: stages 0 to 6, 9 and 11, per-target analysis, no sweep and no holdout test. Part 1 builds stages 0 to 4 locally, with the CLI `src/node/research.ts`. | A notebook run recovers a known set blind, with a completeness curve, in a dossier PR. |
+| R1 | The research workflow on Cloudflare: stages 0 to 6, 9 and 11, per-target analysis, no sweep and no holdout test. Part 1 builds stages 0 to 4 locally, with the CLI `src/node/research.ts`. Part 2 builds stages 5, 6, 9 and 11 locally: the build, the calibration in two rounds at most, the vet, the dossier, `reproduce` on a clean checkout, and the dossier PR with one pass of the code review loop. | A notebook run recovers a known set blind, with a completeness curve, in a dossier PR. |
 | R2 | The sweep, the screeners, the holdout test (stage 10) and the trial count. | A program over thousands of targets ends in a vetted top few or a calibrated null. |
 | R3 | Submission with a `/go`. | One submission that the user approved. |
 | R4 | Scout: the domain's feeds, the weekly digest and proposal issues. | Four weekly digests, and one proposal that the user takes. |

@@ -14,6 +14,7 @@ import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubPulls } from './pulls.ts'
+import { githubSigning } from './signing.ts'
 import { baseConfig } from './config.ts'
 import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
 import { sqlFiles } from './storage.ts'
@@ -82,6 +83,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       prices,
       pulls: githubPulls(gh, owner, repo, input.baseRef),
       review: (review) => this.review(request, ledger, review),
+      signing: githubSigning(gh, owner, repo),
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
     // A run that waits for the user, for example for CI, stops on an error, so that the admin resume starts it again from its ledger.
