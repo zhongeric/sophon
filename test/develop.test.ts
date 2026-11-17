@@ -404,9 +404,13 @@ const budgetPrices = {
 type ScriptedPass = { usd: number; stopped: boolean }
 
 /** Runs the development workflow with a budget, and with review passes that the test gives in place of the review loop. */
-async function runBudget(repo: string, runsDir: string, options: { runId: string; budget: number; channel: Channel; passes: ScriptedPass[]; requests: ReviewRequest[]; prices?: Prices }) {
+async function runBudget(
+  repo: string,
+  runsDir: string,
+  options: { runId: string; budget: number; channel: Channel; passes: ScriptedPass[]; requests: ReviewRequest[]; prices?: Prices; hotfix?: boolean },
+) {
   const github = fakePulls([true])
-  const input = { ...(await developInput(repo, options.runId)), budget: options.budget }
+  const input = { ...(await developInput(repo, options.runId)), budget: options.budget, ...(options.hotfix ? { hotfix: true } : {}) }
   const deps = await nodeDevelop({
     channel: options.channel,
     ci: { pollMs: 10, startMs: 1_000, waitMs: 5_000 },
@@ -432,15 +436,19 @@ async function runBudget(repo: string, runsDir: string, options: { runId: string
   return { ...(await develop(input, { ...deps, review })), github }
 }
 
-test('develop: at the budget, the run asks with the run totals and a stop ends it before the PR', { timeout: 120_000 }, async () => {
+test('develop: at twice the budget, the run posts the notice, asks with the run totals, and a stop ends it before the PR', { timeout: 120_000 }, async () => {
   const { repo } = developRepo()
-  const { channel, posted } = memoryChannel()
+  const { channel, posted, notices, events } = memoryChannel({ 'budget.1': '/answer\nQ1: stop' })
   const requests: ReviewRequest[] = []
   const result = await runBudget(repo, runsDir(), { runId: 'budget-stop', budget: 0.001, channel, passes: [], requests })
   assert.equal(result.status, 'stopped', result.report)
   const asked = posted.find((entry) => entry.batch.startsWith('budget.'))
   assert.ok(asked, JSON.stringify(posted.map((entry) => entry.batch)))
-  assert.match(asked.questions[0]!.question, /of its budget of \$0\.0010\./)
+  assert.match(asked.questions[0]!.question, /of its budget of \$0\.0010\. Raise the budget or stop the run\?/)
+  assert.match(asked.questions[0]!.recommendation, /^Raise the budget to \$0\.\d{2}$/)
+  // The first agent turn spent more than twice the budget: the notice comes first, then one question.
+  assert.deepEqual(events, ['notice', `post ${asked.batch}`])
+  assert.match(notices[0] ?? '', /of its budget of \$0\.0010\. The run continues\./)
   assert.match(result.report, /Reason: cost budget\./)
   assert.match(result.report, /^Budget: \$0\.0010\. Spent: \$0\.\d{4}\.$/m)
   assert.equal(result.github.state.opened.length, 0)
@@ -450,30 +458,51 @@ test('develop: at the budget, the run asks with the run totals and a stop ends i
 test('develop: a review pass that stops at its budget is not recorded, and a resume with a higher budget runs it again', { timeout: 120_000 }, async () => {
   const { repo } = developRepo()
   const dir = runsDir()
-  const { channel, posted } = memoryChannel()
+  const { channel, posted, notices } = memoryChannel({ 'budget.1': '/answer\nQ1: stop' })
   const requests: ReviewRequest[] = []
-  // The pass spends $150 of the remaining budget of about $100. The development gate then asks with the run totals.
-  const first = await runBudget(repo, dir, { runId: 'budget-review', budget: 100, channel, passes: [{ usd: 150, stopped: true }], requests })
+  // The pass spends $250 of the remaining budget of about $200, up to twice the run budget. The development gate then
+  // posts the notice and asks with the run totals.
+  const first = await runBudget(repo, dir, { runId: 'budget-review', budget: 100, channel, passes: [{ usd: 250, stopped: true }], requests })
   assert.equal(first.status, 'stopped', first.report)
-  assert.match(first.report, /^The run stopped at the cost budget: spent \$15\d\.\d{2} of \$100\.00\. Reason: cost budget\./m)
-  assert.match(first.report, /^\| review\.1 \| review loop \| 0 \| 0 \| 0 \| 0 \| \$150\.00 \|$/m)
+  assert.match(first.report, /^The run stopped at the cost budget: spent \$25\d\.\d{2} of \$100\.00\. Reason: cost budget\./m)
+  assert.match(first.report, /^\| review\.1 \| review loop \| 0 \| 0 \| 0 \| 0 \| \$250\.00 \|$/m)
   const asked = posted.filter((entry) => entry.batch.startsWith('budget.'))
   assert.equal(asked.length, 1)
-  assert.match(asked[0]!.questions[0]!.question, /^The run spent about \$15\d\.\d{2} of its budget of \$100\.00\./)
-  // The review loop got what remains of the run budget after the development agents.
+  assert.match(asked[0]!.questions[0]!.question, /^The run spent about \$25\d\.\d{2} of its budget of \$100\.00\./)
+  assert.equal(notices.length, 1)
+  assert.match(notices[0] ?? '', /The most expensive steps: review\.1 \$250\.00, /)
+  // The review loop got what remains up to twice the run budget after the development agents.
   const firstBudget = requests[0]!.budget!
-  assert.ok(firstBudget > 99 && firstBudget < 100, String(firstBudget))
+  assert.ok(firstBudget > 199 && firstBudget < 200, String(firstBudget))
   assert.equal(fileLedger(join(dir, 'budget-review', 'state.json')).get('step:review.1'), undefined)
 
   // The resumed run gets a higher budget. The same pass runs again, and its stopped attempt does not count two times.
-  const second = await runBudget(repo, dir, { runId: 'budget-review', budget: 1000, channel, passes: [{ usd: 160, stopped: false }], requests })
+  const second = await runBudget(repo, dir, { runId: 'budget-review', budget: 1000, channel, passes: [{ usd: 260, stopped: false }], requests })
   assert.equal(second.status, 'ready', second.report)
   assert.equal(requests.length, 2)
   assert.equal(requests[1]!.runId, requests[0]!.runId)
-  assert.ok(Math.abs(requests[1]!.budget! - firstBudget - 900) < 1e-6, String(requests[1]!.budget))
-  assert.match(second.report, /^\| review\.1 \| review loop \| 0 \| 0 \| 0 \| 0 \| \$160\.00 \|$/m)
-  assert.match(second.report, /^Budget: \$1000\.00\. Spent: \$16\d\.\d{2}\.$/m)
+  assert.ok(Math.abs(requests[1]!.budget! - firstBudget - 1800) < 1e-6, String(requests[1]!.budget))
+  assert.match(second.report, /^\| review\.1 \| review loop \| 0 \| 0 \| 0 \| 0 \| \$260\.00 \|$/m)
+  assert.match(second.report, /^Budget: \$1000\.00\. Spent: \$26\d\.\d{2}\.$/m)
   assert.equal(posted.filter((entry) => entry.batch.startsWith('budget.')).length, 1)
+  assert.equal(notices.length, 1)
+})
+
+test('develop: a hotfix run raises the budget at twice the budget with a notice, runs a stopped pass again, and ends ready', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const { channel, posted, notices } = memoryChannel()
+  const requests: ReviewRequest[] = []
+  const passes = [{ usd: 100, stopped: true }, { usd: 150, stopped: false }]
+  const result = await runBudget(repo, runsDir(), { runId: 'budget-hotfix', budget: 0.01, channel, passes, requests, hotfix: true })
+  assert.equal(result.status, 'ready', result.report)
+  assert.equal(posted.filter((entry) => entry.batch.startsWith('budget.')).length, 0)
+  // The development agents passed twice the first budget, and the stopped pass passed twice the raised budget.
+  assert.match(notices.find((text) => /hotfix run/.test(text)) ?? '', /^The run spent about \$0\.0\d{3} of its budget of \$0\.0100\. This is a hotfix run, so the host raised the budget to \$0\.0\d{3}, and the run continues\./)
+  assert.match(notices.at(-1) ?? '', /^The run spent about \$10\d\.\d{2} of its budget of \$[\d.]+\. This is a hotfix run, so the host raised the budget to \$20\d\.\d{2}, and the run continues\. The most expensive steps: review\.1 \$100\.00, /)
+  assert.equal(requests.length, 2)
+  assert.equal(requests[1]!.runId, requests[0]!.runId)
+  assert.ok(requests[1]!.budget! > 300, String(requests[1]!.budget))
+  assert.match(result.report, /^Budget: \$20\d\.\d{2}\. Spent: \$15\d\.\d{2}\.$/m)
 })
 
 test('develop: a budget with a configured model without a price stops the run before any work', { timeout: 120_000 }, async () => {
@@ -486,7 +515,7 @@ test('develop: a budget with a configured model without a price stops the run be
   assert.equal(requests.length, 0)
 })
 
-test('develop: $0.20 of development and $0.70 of review pause at a $0.90 budget, then resume after a raise', { timeout: 120_000 }, async () => {
+test('develop: $0.20 of development and $0.70 of review post the notice and pause at a $0.45 budget, then resume after a raise', { timeout: 120_000 }, async () => {
   const { repo } = developRepo()
   const dir = runsDir()
   const runId = 'budget-round-off'
@@ -500,15 +529,19 @@ test('develop: $0.20 of development and $0.70 of review pause at a $0.90 budget,
     created_at: 0,
     event: { source: 'agent', event: { request_id: 'prior', seq: 1, type: 'model.call.completed', payload: { usage: { input_tokens: 1 } } } },
   }])
-  const { channel, posted, replies } = memoryChannel({ 'budget.1': null })
+  const { channel, posted, replies, notices, events } = memoryChannel({ 'budget.1': null })
   const requests: ReviewRequest[] = []
-  const options = { runId, budget: 0.9, channel, requests, prices }
+  const options = { runId, budget: 0.45, channel, requests, prices }
   await assert.rejects(runBudget(repo, dir, { ...options, passes: [{ usd: 0.7, stopped: true }] }), PausedError)
   const asked = posted.filter((entry) => entry.batch.startsWith('budget.'))
   assert.equal(asked.length, 1)
   const question = asked[0]
   assert.ok(question)
-  assert.match(question.questions[0]?.question ?? '', /spent about \$0\.9000 of its budget of \$0\.9000\./)
+  assert.match(question.questions[0]?.question ?? '', /spent about \$0\.9000 of its budget of \$0\.4500\./)
+  assert.equal(question.questions[0]?.recommendation, 'Raise the budget to $1.80')
+  // The round-off of $0.20 + $0.70 passes both thresholds in one step: one notice, then one question.
+  assert.deepEqual(events, ['notice', `post ${question.batch}`])
+  assert.match(notices[0] ?? '', /The most expensive steps: review\.1 \$0\.7000, prior \$0\.2000, /)
   assert.equal(requests.length, 1)
   assert.equal(requests[0]?.budget, 0.7)
   assert.equal(fileLedger(path).get('step:review.1'), undefined)
@@ -520,9 +553,10 @@ test('develop: $0.20 of development and $0.70 of review pause at a $0.90 budget,
   assert.equal(requests.length, 2)
   const resumed = requests[1]
   assert.ok(resumed && resumed.budget !== undefined)
-  assert.ok(Math.abs(resumed.budget - 1) < 1e-12)
+  assert.ok(Math.abs(resumed.budget - 2.2) < 1e-12)
   assert.match(result.report, /^Budget: \$1\.20\. Spent: \$0\.9000\.$/m)
   assert.equal(posted.filter((entry) => entry.batch.startsWith('budget.')).length, 1)
+  assert.equal(notices.length, 1)
 })
 
 test('Node branches: an origin error is not an absent branch', async () => {

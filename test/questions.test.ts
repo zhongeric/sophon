@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -275,4 +275,25 @@ test('the file channel writes the questions and reads the reply file', async () 
   assert.equal(await channel.answers(posted, questions), null)
   writeFileSync(join(dir, 'answers-ask.md'), '/answer\nQ1: up')
   assert.equal((await channel.answers(posted, questions))?.[0]?.answer, 'up')
+})
+
+test('the PR channel posts a notice as one comment, without the questions marker and without mentions', async () => {
+  const bodies: string[] = []
+  const comments = {
+    async post(body: string) {
+      bodies.push(body)
+      return { url: 'https://github.com/o/r/pull/7#issuecomment-2', at: '2026-11-13T10:00:00Z' }
+    },
+    list: async () => [],
+  }
+  await commentChannel({ answerers: ['maintainer'], comments, pollMs: 1, waitMs: 0 }).notice?.('run-1', 'The run spent about $10.00 of its budget of $10.00.')
+  assert.deepEqual(bodies, ['The run spent about $10.00 of its budget of $10.00.'])
+})
+
+test('the file channel writes each notice to notices.md in the run directory', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'factory-questions-'))
+  const channel = fileChannel(dir)
+  await channel.notice?.('run-1', 'first notice')
+  await channel.notice?.('run-1', 'second notice')
+  assert.equal(readFileSync(join(dir, 'notices.md'), 'utf8'), 'first notice\n\nsecond notice\n\n')
 })

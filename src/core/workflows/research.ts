@@ -323,7 +323,7 @@ function hostQuestions(intake: ResearchIntake, cap: number | undefined): [Questi
       id: capId(intake),
       question: 'What is the cost cap of this run?',
       why: [
-        'At the cap, the host asks you to raise it or to stop the run before it opens the next agent turn. Write a USD number for another cap.',
+        'At the cap, the host posts a notice, and the run continues. At twice the cap, the host asks you to raise the cap or to stop the run. Write a USD number for another cap.',
         ...(cap === undefined ? ['MODEL_PRICES has no price for some models of this run, and a cap needs a price for each model.'] : []),
       ].join(' '),
       options: cap === undefined ? [noCap] : [recommended, noCap],

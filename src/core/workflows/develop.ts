@@ -47,7 +47,7 @@ export type DevelopInput = {
   issue?: number
 }
 
-/** `budget` is what remains of the development budget, so that the review loop stays inside it. */
+/** `budget` is what remains up to twice the development budget, so that the review loop stops where the development gate pauses. */
 export type ReviewRequest = { runId: string; ask: string; head: string; full: boolean; pr: number; budget?: number }
 
 /** What the platform supplies. */
@@ -148,10 +148,10 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   // What the report shows. Each stage fills its part.
   const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [], stoppedReview: null }
   const spentPasses = () => [...state.reviews, ...(state.stoppedReview ? [state.stoppedReview] : [])]
-  // The review passes keep their usage in their own ledgers, so their spend counts here as extra spend.
+  // The review passes keep their usage in their own ledgers, so their rows count here as extra spend.
   const budget = budgetGate({
     channel: deps.channel,
-    extraSpend: () => spentPasses().reduce((sum, review) => sum + (review.usage?.usd ?? 0), 0),
+    extraRows: () => spentPasses().map(reviewRow),
     ledger,
     log: deps.log,
     prices,
@@ -306,7 +306,8 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   if (ci.state === 'fail') return finish('blocked', [], `CI is still red on ${ci.sha.slice(0, 12)} after ${ciFixRounds} fix rounds.`)
 
   // 4 and 5. Freeze and the review loop, once or twice. The frozen package is the ask, the decisions and the plan.
-  // A pass that stops at its budget is not a finished step: the budget gate of this run asks with the run totals.
+  // A pass gets the budget up to twice the run budget and stops there without a question. That stop is not a finished
+  // step: the budget gate of this run then asks with the run totals, or raises the budget in a hotfix run.
   // After a raise, or on a resume with a higher budget, the same pass runs again with the new remaining budget.
   let head = ci.sha
   for (let pass = 1; pass <= routed.passes; pass++) {
@@ -316,17 +317,18 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
       state.stoppedReview = ledger.get<Review>(stoppedKey) ?? null
       for (;;) {
         await budget.check()
-        // After the check, the spend is below the limit, so the remaining budget is positive. The ledger of the pass
+        // After the check, the spend is below twice the limit, so the remaining budget is positive. The ledger of the pass
         // already counts the spend of its stopped attempt, so that spend is not taken from the remaining budget.
         const limit = budget.limit()
-        const remaining = limit === undefined ? {} : { budget: limit - budget.spent() + (state.stoppedReview?.usage?.usd ?? 0) }
+        const remaining = limit === undefined ? {} : { budget: 2 * limit - budget.spent() + (state.stoppedReview?.usage?.usd ?? 0) }
         const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, full: input.full === true, pr: state.pr!.number, ...remaining })
         const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage }
         if (!loop.stopped) return result
         ledger.put(stoppedKey, result)
         state.stoppedReview = result
-        // Below the run budget, no raise can let the pass go on, for example when the user stopped the pass itself.
-        if (limit === undefined || belowBudget(budget.spent(), limit)) throw new BudgetStop(`stopped at the cost budget in review loop pass ${pass}`)
+        // Below twice the run budget, the gate does not pause, so no raise can let the pass go on, for example when the
+        // user stopped the pass itself.
+        if (limit === undefined || belowBudget(budget.spent(), 2 * limit)) throw new BudgetStop(`stopped at the cost budget in review loop pass ${pass}`)
       }
     })
     state.stoppedReview = null

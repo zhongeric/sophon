@@ -162,12 +162,18 @@ export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBu
   }
 }
 
-/** A channel that answers each batch with a scripted reply: `/answer recommended` unless `replies` says otherwise, null to not answer yet. */
+/**
+ * A channel that answers each batch with a scripted reply: `/answer recommended` unless `replies` says otherwise, null to
+ * not answer yet. It records the notices, and `events` keeps the order of the notices and the posts.
+ */
 export function memoryChannel(replies: Record<string, string | null> = {}) {
   const posted: { batch: string; questions: Question[] }[] = []
+  const notices: string[] = []
+  const events: string[] = []
   const channel: Channel = {
     async post(_runId, batch, questions) {
       posted.push({ batch, questions })
+      events.push(`post ${batch}`)
       return { batch, ref: `memory:${batch}`, at: new Date().toISOString() }
     },
     async answers(where, questions) {
@@ -175,8 +181,12 @@ export function memoryChannel(replies: Record<string, string | null> = {}) {
       return reply === null || reply === undefined ? null : parseAnswers(reply, questions)
     },
     where: (where) => where.ref,
+    async notice(_runId, text) {
+      notices.push(text)
+      events.push('notice')
+    },
   }
-  return { channel, posted, replies }
+  return { channel, posted, replies, notices, events }
 }
 
 export const gitSource = (repo: string): GitSource => ({ base: 'main', head: 'feature', repo })

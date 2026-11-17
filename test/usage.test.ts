@@ -20,7 +20,9 @@ import {
   spendOf,
   usageOf,
   usageSection,
+  zeroTokens,
   type Prices,
+  type UsageRow,
 } from '../src/core/usage.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 
@@ -29,12 +31,18 @@ function memoryLedger(): Ledger {
   return { get: <T>(key: string) => state.get(key) as T | undefined, put: (key, value) => void state.set(key, structuredClone(value)) }
 }
 
-/** A channel that answers each batch from `replies`. A batch without a reply has no answer yet. */
-function scriptedChannel(replies: Record<string, string> = {}) {
+/**
+ * A channel that answers each batch from `replies`. A batch without a reply has no answer yet. `events` keeps the order
+ * of the notices and the posts. Without `notice`, the channel has no notice method.
+ */
+function scriptedChannel(replies: Record<string, string> = {}, notice = true) {
   const posted: { batch: string; questions: Question[] }[] = []
+  const notices: string[] = []
+  const events: string[] = []
   const channel: Channel = {
     async post(_runId, batch, questions) {
       posted.push({ batch, questions })
+      events.push(`post ${batch}`)
       return { batch, ref: `memory:${batch}`, at: new Date().toISOString() }
     },
     async answers(where, questions) {
@@ -42,8 +50,16 @@ function scriptedChannel(replies: Record<string, string> = {}) {
       return reply === undefined ? null : parseAnswers(reply, questions)
     },
     where: (where) => where.ref,
+    ...(notice
+      ? {
+          async notice(_runId: string, text: string) {
+            notices.push(text)
+            events.push('notice')
+          },
+        }
+      : {}),
   }
-  return { channel, posted, replies }
+  return { channel, posted, replies, notices, events }
 }
 
 /** A model.call.completed event as the SDK publishes it: the usage sits in the payload of the inner event. */
@@ -148,30 +164,34 @@ test('the Usage section shows each step, no price, a precomputed row, the total 
 })
 
 /** A ledger with a spend of $10: one agent with 10 input tokens at $1 each. */
-function spentTen() {
+function spentTen(options: { notice?: boolean } = {}) {
   const ledger = memoryLedger()
   recordUsage(ledger, 'a', 'm1', [call('r1', 1, { input_tokens: 10 })])
   const prices: Prices = { m1: { input: 1e6, cached_input: 0, cache_write: 0, output: 0 } }
-  const { channel, posted, replies } = scriptedChannel()
-  const gate = (options: { extraSpend?: () => number; recommend?: boolean } = {}) =>
-    budgetGate({ ledger, channel, runId: 'run-1', prices, log: () => {}, ...options })
-  return { ledger, posted, replies, gate }
+  const { channel, posted, replies, notices, events } = scriptedChannel({}, options.notice ?? true)
+  const logs: string[] = []
+  const gate = (more: { extraRows?: () => UsageRow[]; recommend?: boolean; stopAtLimit?: boolean } = {}, on: Ledger = ledger) =>
+    budgetGate({ ledger: on, channel, runId: 'run-1', prices, log: (line) => void logs.push(line), ...more })
+  return { ledger, posted, replies, notices, events, logs, gate }
 }
 
+const row = (step: string, usd: number | undefined): UsageRow => ({ step, model: 'review loop', tokens: zeroTokens(), ...(usd === undefined ? {} : { usd }) })
+
 test('without a budget or under it, the gate asks nothing', async () => {
-  const { ledger, posted, gate } = spentTen()
+  const { ledger, posted, notices, gate } = spentTen()
   await gate().check()
   assert.equal(gate().limit(), undefined)
   assert.equal(resolveBudget(ledger, 20), 20)
   await gate().check()
   assert.equal(gate().spent(), 10)
   assert.equal(posted.length, 0)
+  assert.equal(notices.length, 0)
 })
 
 test('clearBudget removes the limit without removing usage or reusing budget answers', async () => {
   const { ledger, posted, replies, gate } = spentTen()
   clearBudget(ledger)
-  assert.equal(resolveBudget(ledger, 10), 10)
+  assert.equal(resolveBudget(ledger, 5), 5)
   await assert.rejects(gate().check(), PausedError)
   const first = posted[0]
   assert.ok(first)
@@ -185,69 +205,133 @@ test('clearBudget removes the limit without removing usage or reusing budget ans
   await gate().check()
   assert.equal(posted.length, 1)
 
-  assert.equal(resolveBudget(ledger, 10), 10)
+  assert.equal(resolveBudget(ledger, 5), 5)
   await assert.rejects(gate().check(), PausedError)
   assert.equal(posted.length, 2)
   assert.notEqual(posted[1]?.batch, first.batch)
 })
 
-test('at the budget, concurrent checks post one question and pause; a higher number raises the budget', async () => {
-  const { ledger, posted, replies, gate } = spentTen()
+test('at the budget, concurrent checks post one notice for the round, and the run continues without a question', async () => {
+  const { ledger, posted, notices, logs, gate } = spentTen()
   resolveBudget(ledger, 10)
+  const one = gate()
+  const checks = [one.check(), one.check(), one.check()]
+  assert.equal(checks[0], checks[1])
+  await Promise.all(checks)
+  await gate().check()
+  assert.equal(posted.length, 0)
+  assert.deepEqual(notices, [
+    'The run spent about $10.00 of its budget of $10.00. The run continues. At $20.00, twice the budget, the host pauses and asks you to raise the budget or to stop the run. The most expensive steps: a $10.00.',
+  ])
+  assert.deepEqual(logs, [`budget notice: ${notices[0]}`])
+
+  // A resumed run reads the notice of the round from the ledger, and does not post it again.
+  const round = ledger.get<{ round: number }>('budget')?.round
+  await gate({}, fileLedgerCopy(ledger, ['budget', 'usage', `budget-notice.${round}`])).check()
+  assert.equal(notices.length, 1)
+
+  // A new budget is a new round, with its own notice.
+  resolveBudget(ledger, 9)
+  await gate().check()
+  assert.equal(notices.length, 2)
+  assert.match(notices[1] ?? '', /of its budget of \$9\.00\./)
+  assert.equal(posted.length, 0)
+  assert.deepEqual(decisions(ledger), [])
+})
+
+test('at twice the budget, concurrent checks post the notice, then one question, and pause; a higher number raises the budget', async () => {
+  const { ledger, posted, replies, notices, events, logs, gate } = spentTen()
+  resolveBudget(ledger, 5)
   const one = gate()
   const checks = [one.check(), one.check(), one.check()]
   assert.equal(checks[0], checks[1])
   const results = await Promise.allSettled(checks)
   assert.ok(results.every((result) => result.status === 'rejected' && result.reason instanceof PausedError))
-  assert.equal(posted.length, 1)
+  assert.deepEqual(events, ['notice', 'post budget.1'])
+  assert.equal(notices.length, 1)
   const [question] = posted[0]!.questions
-  assert.match(posted[0]!.batch, /^budget\./)
-  assert.deepEqual(question?.options, ['Raise the budget (write the new USD number)', 'Stop the run'])
-  assert.equal(question?.recommendation, 'Stop the run')
-  assert.match(question?.question ?? '', /\$10\.00 of its budget of \$10\.00/)
+  assert.deepEqual(question?.options, ['Raise the budget to $20.00', 'Raise the budget (write the new USD number)', 'Stop the run'])
+  assert.equal(question?.recommendation, 'Raise the budget to $20.00')
+  assert.deepEqual([question?.level, question?.rule], ['user', 'spend'])
+  assert.match(question?.question ?? '', /\$10\.00 of its budget of \$5\.00\. Raise the budget or stop the run\?/)
+
+  // A resume asks nothing new while the question waits.
+  await assert.rejects(gate().check(), PausedError)
+  assert.deepEqual(events, ['notice', 'post budget.1'])
 
   replies[posted[0]!.batch] = '/answer\nQ1: 12'
   await gate().check()
   assert.equal(gate().limit(), 12)
+  assert.ok(logs.includes('budget raised to $12.00'))
   await gate().check()
   assert.equal(posted.length, 1)
+  assert.equal(notices.length, 1)
   assert.deepEqual(decisions(ledger), [])
 })
 
-test('an answer that is not a number above the spend asks again in a new batch', async () => {
-  const { ledger, posted, replies, gate } = spentTen()
-  resolveBudget(ledger, 10)
+test('/answer recommended and its option letter raise the budget to twice the spend, rounded up to the cent', async () => {
+  for (const reply of ['/answer recommended', '/answer\nQ1: a']) {
+    const { ledger, posted, replies, gate } = spentTen()
+    const extraRows = () => [row('review.1', 0.123)]
+    resolveBudget(ledger, 5)
+    await assert.rejects(gate({ extraRows }).check(), PausedError)
+    assert.equal(posted[0]?.questions[0]?.recommendation, 'Raise the budget to $20.25')
+    replies[posted[0]!.batch] = reply
+    // A new gate reads the value from the recorded option, as a resumed run does.
+    await gate({ extraRows }).check()
+    assert.equal(gate().limit(), 20.25)
+    assert.equal(posted.length, 1)
+    assert.deepEqual(decisions(ledger), [])
+  }
+})
+
+test('an answer that is not a number above the spend asks again in a new batch, without a new notice', async () => {
+  const { ledger, posted, replies, notices, gate } = spentTen()
+  resolveBudget(ledger, 5)
   await assert.rejects(gate().check(), PausedError)
   replies[posted[0]!.batch] = '/answer\nQ1: 5'
   await assert.rejects(gate().check(), PausedError)
-  replies[posted[1]!.batch] = '/answer\nQ1: a'
+  replies[posted[1]!.batch] = '/answer\nQ1: 10'
   await assert.rejects(gate().check(), PausedError)
-  replies[posted[2]!.batch] = '/answer\nQ1: more please'
+  replies[posted[2]!.batch] = '/answer\nQ1: b'
   await assert.rejects(gate().check(), PausedError)
-  assert.equal(posted.length, 4)
-  assert.equal(new Set(posted.map((post) => post.batch)).size, 4)
-  replies[posted[3]!.batch] = '/answer\nQ1: $15.5'
+  replies[posted[3]!.batch] = '/answer\nQ1: more please'
+  await assert.rejects(gate().check(), PausedError)
+  assert.equal(posted.length, 5)
+  assert.equal(new Set(posted.map((post) => post.batch)).size, 5)
+  assert.equal(notices.length, 1)
+  replies[posted[4]!.batch] = '/answer\nQ1: $15.5'
   await gate().check()
   assert.equal(gate().limit(), 15.5)
   assert.deepEqual(decisions(ledger), [])
 })
 
-test('round-off at the budget asks a question and requires a higher budget', async () => {
+test('round-off at the budget posts the notice, and round-off at twice the budget asks and requires a higher budget', async () => {
   const ledger = memoryLedger()
   const prices = { m1: { input: 100_000, cached_input: 0, cache_write: 0, output: 0 } }
   recordUsage(ledger, 'a', 'm1', [call('r1', 1, { input_tokens: 2 })])
-  const { channel, posted, replies } = scriptedChannel()
-  const gate = budgetGate({ ledger, prices, channel, runId: 'round-off', extraSpend: () => 0.7, log: () => {} })
+  const { channel, posted, replies, notices } = scriptedChannel()
+  const gate = budgetGate({ ledger, prices, channel, runId: 'round-off', extraRows: () => [row('review.1', 0.7)], log: () => {} })
   assert.equal(gate.spent(), 0.2 + 0.7)
   resolveBudget(ledger, 0.900001)
   await gate.check()
-  assert.equal(posted.length, 0)
+  assert.equal(notices.length, 0)
 
   resolveBudget(ledger, 0.9)
+  await gate.check()
+  assert.equal(notices.length, 1)
+
+  resolveBudget(ledger, 0.4500001)
+  await gate.check()
+  assert.equal(notices.length, 2)
+  assert.equal(posted.length, 0)
+
+  resolveBudget(ledger, 0.45)
   await assert.rejects(gate.check(), PausedError)
   assert.equal(posted.length, 1)
   const first = posted[0]
   assert.ok(first)
+  assert.equal(first.questions[0]?.recommendation, 'Raise the budget to $1.80')
   replies[first.batch] = '/answer\nQ1: 0.9'
   await assert.rejects(gate.check(), PausedError)
   assert.equal(posted.length, 2)
@@ -260,49 +344,83 @@ test('round-off at the budget asks a question and requires a higher budget', asy
   assert.equal(posted.length, 2)
 })
 
-test('stop, the stop option and /answer recommended stop the run at the budget', async () => {
-  for (const reply of ['/answer\nQ1: stop', '/answer\nQ1: b', '/answer recommended']) {
+test('stop, the letter of the stop option and the stop option stop the run at twice the budget', async () => {
+  for (const reply of ['/answer\nQ1: stop', '/answer\nQ1: c', '/answer\nQ1: Stop the run']) {
     const { ledger, posted, replies, gate } = spentTen()
-    resolveBudget(ledger, 10)
+    resolveBudget(ledger, 5)
     await assert.rejects(gate().check(), PausedError)
     replies[posted[0]!.batch] = reply
-    await assert.rejects(gate().check(), BudgetStop)
+    await assert.rejects(gate().check(), (error) => error instanceof BudgetStop && error.message === 'stopped at the cost budget: spent $10.00 of $5.00')
     assert.deepEqual(decisions(ledger), [])
   }
 })
 
-test('a hotfix run takes the recommendation without a question', async () => {
-  const { ledger, posted, gate } = spentTen()
-  resolveBudget(ledger, 10)
-  await assert.rejects(gate({ recommend: true }).check(), BudgetStop)
+test('a hotfix run raises the budget to twice the spend at twice the budget, with a notice and without a question', async () => {
+  const { ledger, posted, notices, logs, gate } = spentTen()
+  resolveBudget(ledger, 5)
+  await gate({ recommend: true }).check()
+  assert.equal(gate().limit(), 20)
   assert.equal(posted.length, 0)
+  assert.deepEqual(notices, [
+    'The run spent about $10.00 of its budget of $5.00. This is a hotfix run, so the host raised the budget to $20.00, and the run continues. The most expensive steps: a $10.00.',
+  ])
+  assert.ok(logs.includes('budget raised to $20.00'))
+  assert.ok(logs.includes(`budget notice: ${notices[0]}`))
+  await gate({ recommend: true }).check()
+  assert.equal(notices.length, 1)
   assert.deepEqual(decisions(ledger), [])
 })
 
-test('the gate adds the extra spend', async () => {
-  const { ledger, posted, gate } = spentTen()
-  resolveBudget(ledger, 14)
+test('a channel without notice continues at the budget, and the notice goes only to the log', async () => {
+  const { ledger, posted, logs, gate } = spentTen({ notice: false })
+  resolveBudget(ledger, 10)
   await gate().check()
-  assert.equal(gate({ extraSpend: () => 5 }).spent(), 15)
-  await assert.rejects(gate({ extraSpend: () => 5 }).check(), PausedError)
-  assert.equal(posted.length, 1)
+  assert.equal(posted.length, 0)
+  assert.equal(logs.length, 1)
+  assert.match(logs[0] ?? '', /^budget notice: The run spent about \$10\.00 of its budget of \$10\.00\./)
+})
+
+test('the stop-at-limit option stops at the budget without a notice or a question', async () => {
+  const { ledger, posted, notices, gate } = spentTen()
+  resolveBudget(ledger, 20)
+  await gate({ stopAtLimit: true }).check()
+  resolveBudget(ledger, 10)
+  await assert.rejects(gate({ stopAtLimit: true }).check(), (error) => error instanceof BudgetStop && error.message === 'stopped at the cost budget: spent $10.00 of $10.00')
+  assert.equal(posted.length, 0)
+  assert.equal(notices.length, 0)
+})
+
+test('the gate adds the extra rows to the spend, and the notice lists the three most expensive priced steps', async () => {
+  const { ledger, posted, notices, gate } = spentTen()
+  recordUsage(ledger, 'b', 'm2', [call('r2', 1, { input_tokens: 1000 })])
+  const extraRows = () => [row('review.1', 5), row('review.2', undefined), row('review.3', 0.5), row('review.4', 1)]
+  resolveBudget(ledger, 17)
+  await gate().check()
+  assert.equal(gate({ extraRows }).spent(), 16.5)
+  await gate({ extraRows }).check()
+  assert.equal(notices.length, 0)
+  resolveBudget(ledger, 16)
+  await gate({ extraRows }).check()
+  assert.equal(posted.length, 0)
+  assert.equal(notices.length, 1)
+  assert.match(notices[0] ?? '', /^The run spent about \$16\.50 of its budget of \$16\.00\..* The most expensive steps: a \$10\.00, review\.1 \$5\.00, review\.4 \$1\.00\.$/)
 })
 
 test('a new given budget replaces the recorded one; the same value keeps a raise', async () => {
   const { ledger, posted, replies, gate } = spentTen()
   assert.equal(resolveBudget(ledger, undefined), undefined)
-  assert.equal(resolveBudget(ledger, 10), 10)
+  assert.equal(resolveBudget(ledger, 5), 5)
   await assert.rejects(gate().check(), PausedError)
   replies[posted[0]!.batch] = '/answer\nQ1: 12'
   await gate().check()
-  assert.equal(resolveBudget(ledger, 10), 12)
+  assert.equal(resolveBudget(ledger, 5), 12)
   assert.equal(resolveBudget(ledger, undefined), 12)
   assert.equal(resolveBudget(ledger, 30), 30)
   assert.equal(resolveBudget(fileLedgerCopy(ledger), undefined), 30)
 
   // A new budget above the spend lets a paused run go on without an answer.
   const paused = spentTen()
-  resolveBudget(paused.ledger, 10)
+  resolveBudget(paused.ledger, 5)
   await assert.rejects(paused.gate().check(), PausedError)
   resolveBudget(paused.ledger, 11)
   await paused.gate().check()
@@ -324,9 +442,9 @@ test('a budget of the current invocation applies also when it is the same as the
 })
 
 /** The same state in a new ledger object, as a resumed run reads it. */
-function fileLedgerCopy(ledger: Ledger): Ledger {
+function fileLedgerCopy(ledger: Ledger, keys = ['budget']): Ledger {
   const path = join(mkdtempSync(join(tmpdir(), 'factory-usage-')), 'state.json')
   const copy = fileLedger(path)
-  copy.put('budget', ledger.get('budget'))
+  for (const key of keys) copy.put(key, ledger.get(key))
   return fileLedger(path)
 }

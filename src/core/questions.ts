@@ -62,6 +62,8 @@ export type Channel = {
   answers(posted: Posted, questions: Question[]): Promise<Answer[] | null>
   /** Where the user answers, for the pause message. */
   where(posted: Posted): string
+  /** Gives the user information that needs no answer, for example the notice at the cost budget. */
+  notice?(runId: string, text: string): Promise<void>
 }
 
 /** The run waits for the user. Resume it with the same run ID after the user answers. */
@@ -292,5 +294,9 @@ export function commentChannel(options: { comments: Comments; answerers: string[
       }
     },
     where: (posted) => posted.ref,
+    // A notice needs no answer, so it has no questions marker and no mentions.
+    async notice(_runId, text) {
+      await options.comments.post(text)
+    },
   }
 }
