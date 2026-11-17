@@ -250,13 +250,16 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       questions.post('ask', list),
     )
     // The bugs review is the slowest track: on a large diff, the host splits it across reviewers.
-    const step1 = await settleAll(
+    const reviewed = settleAll(
       step1Roles.map((id) =>
         step(ledger, `step1.${id}`, () => (id === 'bugs' ? splitReview : review)(context, `step1.${id}`, reviewRoles[id], input.models.step1[id], step1Range, '')),
       ),
     )
-    const host1 = await hostCheck('step1.host', step1Range, 'host')
-    await asked
+    const checked = reviewed.then(() => hostCheck('step1.host', step1Range, 'host'))
+    // The questions agent also runs in step 1: it settles before a failure ends the call.
+    await settleAll<unknown>([checked, asked])
+    const step1 = await reviewed
+    const host1 = await checked
     await questions.wait('ask')
     const gate1 = await runGate('step1.gate', familyHeader('Step 1', input.models.step1), [...host1, ...step1.flat()])
     const patch1 = await runPatch('step1.patch', gate1, () =>

@@ -65,7 +65,7 @@ function callSetup() {
 test('a spent budget stops the run before the nudge, and a new call continues without a request for the finished turn', async () => {
   const run = callSetup()
   const first = run.call()
-  // The budget is spent at the start, but the first turn runs: the call has no new work yet (decision 7).
+  // The budget is spent at the start, but the first turn runs: the call has no new work yet (D12).
   await assert.rejects(runTurn(first, await run.spec(first, 'note'), 'Write a note.', 'submit_note'), PlannedStop)
   assert.equal(run.turns.length, 1)
   assert.doesNotMatch(run.turns[0]!.request, nudgeText)

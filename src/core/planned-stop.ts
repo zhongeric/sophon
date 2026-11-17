@@ -6,7 +6,7 @@ export class PlannedStop extends Error {
 }
 
 /** The ledger keys of new work: a finished step (`step()`), a submitted output and a finished agent turn (`runTurn`, `ask`). */
-export const progressPrefixes = ['step:', 'output:', 'report:'] as const
+const progressPrefixes = ['step:', 'output:', 'report:'] as const
 
 /**
  * The ledger of one host call with a time budget. Its safe point stops the run with a PlannedStop when the budget is
@@ -40,7 +40,7 @@ export function keepFailure(failure: { error: unknown } | undefined, error: unkn
 
 /**
  * Waits until each promise settles, so that no agent works after the call ends. Then gives the results in order, or
- * throws the failure that `keepFailure` keeps: a real error before a PlannedStop, and the first real error before later ones.
+ * throws the failure that `keepFailure` keeps.
  */
 export async function settleAll<T>(promises: readonly Promise<T>[]): Promise<T[]> {
   const results = new Array<T>(promises.length)
