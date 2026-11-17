@@ -64,7 +64,8 @@ test('disk lstat reads the final link but refuses hidden paths and parents outsi
     assert.equal(await fs.lstat?.(path), null, path)
   }
   await assert.rejects(fs.read('/escape/secret'), /EACCES/)
-  await assert.rejects(fs.read('/gitlink/config'), /ENOENT/)
+  // The message of a file system error names the cause in words, so the check reads its code.
+  await assert.rejects(fs.read('/gitlink/config'), (error: unknown) => (error as { code?: string }).code === 'ENOENT')
 })
 
 test('writes never go through symlinks, so links cannot reach protected paths, .git, or outside the tree', async () => {
@@ -171,12 +172,14 @@ test('an edit record keeps concurrent first hashes without another file read, al
   await open().write('/src/a.ts', new TextEncoder().encode('y'))
   await open().write('/src/new.ts', new TextEncoder().encode('new'))
   await open().write('/src/new.ts', new TextEncoder().encode('changed'))
+  // A file system removes one empty directory at a time, so the files go first, as `rm -r` removes them.
+  for (const file of ['/src/a.ts', '/src/b.ts', '/src/new.ts']) await open().remove(file)
   await open().remove('/src')
   assert.deepEqual(reads.sort(), ['/src/a.ts', '/src/b.ts'])
   assert.deepEqual(ledger.get('originals:patch'), { 'src/a.ts': a, 'src/new.ts': null, 'src/b.ts': b })
 })
 
-test('an edit record removes a directory without following parent or external symlinks', async () => {
+test('an edit record follows no parent or external symlink, and records nothing for a refused removal', async () => {
   const fs = MemoryFileSystem.create({ files: { '/src/a.ts': 'a', '/outside/secret': 'secret' } })
   await fs.symlink('..', '/src/parent')
   await fs.symlink('/outside', '/src/external')
@@ -190,10 +193,12 @@ test('an edit record removes a directory without following parent or external sy
   }
   const ledger = fileLedger(join(mkdtempSync(join(tmpdir(), 'factory-edits-')), 'state.json'))
   const repo = recordEdits(guard(counted), ledger, 'edits:patch', 'originals:patch')
-  await repo.remove('/src')
+  // As `rm -r` does: each entry first. The guard refuses to remove a link, so the agent cannot remove the directory.
+  await repo.remove('/src/a.ts')
+  await assert.rejects(repo.remove('/src/parent'), /EACCES/)
+  await assert.rejects(repo.remove('/src/external'), /EACCES/)
   assert.deepEqual(reads, ['/src/a.ts'])
-  assert.deepEqual([...(ledger.get<string[]>('edits:patch') ?? [])].sort(), ['src/a.ts', 'src/external', 'src/parent'])
-  assert.equal(await fs.stat('/src'), null)
+  assert.deepEqual(ledger.get<string[]>('edits:patch'), ['src/a.ts'])
   assert.equal(new TextDecoder().decode(await fs.read('/outside/secret')), 'secret')
 })
 
