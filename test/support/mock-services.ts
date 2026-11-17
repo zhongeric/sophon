@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -127,6 +127,8 @@ export async function mockServices(
     return items.slice((number - 1) * size, number * size)
   }
 
+  /** The running commands of the machine, with their time limits, so that close() can kill them. */
+  const machines = new Map<ChildProcess, NodeJS.Timeout>()
   /** Runs one command of the machine: argv in a directory under the machine's root, with stdin and a time limit. */
   const exec = (body: { argv: string[]; cwd: string; env: Record<string, string>; stdin: string | null; timeoutMs: number }) =>
     new Promise<{ exit_code: number | null; output: string }>((resolve) => {
@@ -138,8 +140,10 @@ export async function mockServices(
       child.stdout.on('data', (chunk: Buffer) => (output += chunk.toString()))
       child.stderr.on('data', (chunk: Buffer) => (output += chunk.toString()))
       const timer = setTimeout(() => child.kill('SIGKILL'), body.timeoutMs)
+      machines.set(child, timer)
       child.on('close', (code) => {
         clearTimeout(timer)
+        machines.delete(child)
         resolve({ exit_code: code, output: output.slice(-20_000) })
       })
       child.stdin.end(body.stdin ? Buffer.from(body.stdin, 'base64') : undefined)
@@ -380,5 +384,22 @@ export async function mockServices(
     if (merged) pull.merged = shaOf(pull.head)!
     else pull.closed = true
   }
-  return { close: () => server.close(), closePull, comment, fileAt, headSha: shaOf('feature'), machineRoot, state, url }
+  /**
+   * Kills the running commands of the machine and closes the server with all its connections, also the keep-alive
+   * connections of workerd. Resolves when the server closed. A second call gives the same promise.
+   */
+  let closing: Promise<void> | undefined
+  const close = () =>
+    (closing ??= new Promise<void>((resolve, reject) => {
+      for (const [child, timer] of machines) {
+        clearTimeout(timer)
+        child.kill('SIGKILL')
+        // A grandchild can hold the pipes after the child exits.
+        for (const pipe of [child.stdin, child.stdout, child.stderr]) pipe?.destroy()
+      }
+      machines.clear()
+      server.close((error) => (error ? reject(error) : resolve()))
+      server.closeAllConnections()
+    }))
+  return { close, closePull, comment, fileAt, headSha: shaOf('feature'), machineRoot, state, url }
 }

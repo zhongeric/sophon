@@ -34,7 +34,7 @@ async function withMock(app: { slug: string; installed: boolean; expiresInSecond
   try {
     await run(mock)
   } finally {
-    mock.close()
+    await mock.close()
     rmSync(repo, { force: true, recursive: true })
   }
 }
