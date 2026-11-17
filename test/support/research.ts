@@ -6,7 +6,7 @@ import type { Contracts } from 'nanocode-ts'
 import { coreSections } from '../../src/core/prereg.ts'
 import type { Channel } from '../../src/core/questions.ts'
 import type { Prices } from '../../src/core/usage.ts'
-import { defaultResearchModels, research, type ResearchInput } from '../../src/core/workflows/research.ts'
+import { defaultResearchModels, research, type ResearchDeps, type ResearchInput } from '../../src/core/workflows/research.ts'
 import { nodeResearch } from '../../src/node/platform.ts'
 import { fakePulls } from './develop.ts'
 import { credentials, memoryChannel, module } from './fixture.ts'
@@ -33,23 +33,28 @@ export const researchConfig = {
 }
 
 /**
- * The domain commands of the notebook. It finds analysis/<id>/ from the prereg file name, and prints its working
- * directory, then the last-line JSON with the SHA-256 of the rows of analysis/<id>/analyze.mjs.
+ * The domain commands of the notebook. It finds analysis/<id>/ from the prereg file name, writes the rows of
+ * analysis/<id>/analyze.mjs to out/<id>/, and prints its working directory, then the last-line JSON with their SHA-256.
  */
 export const runScript = `import { createHash } from 'node:crypto'
-import { resolve } from 'node:path'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const [command, prereg] = process.argv.slice(2)
 const id = /(hyp-\\d+)-v\\d+\\.md$/.exec(prereg)[1]
 const analysis = await import(pathToFileURL(resolve('analysis', id, 'analyze.mjs')).href)
 const sha = (text) => createHash('sha256').update(text).digest('hex')
-const known = { ['out/' + id + '/known.txt']: sha(analysis.rows('known')) }
-const inject = { ['out/' + id + '/inject.txt']: sha(analysis.rows('inject')) }
+const output = (name) => {
+  const path = 'out/' + id + '/' + name + '.txt'
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, analysis.rows(name))
+  return { [path]: sha(analysis.rows(name)) }
+}
 console.log(command + ' of ' + id + ' in ' + process.cwd())
-if (command === 'known') console.log(JSON.stringify({ recall: analysis.recall, outputs: known }))
-else if (command === 'inject') console.log(JSON.stringify({ outputs: inject }))
-else console.log(JSON.stringify({ outputs: { ...known, ...inject } }))
+if (command === 'known') console.log(JSON.stringify({ recall: analysis.recall, outputs: output('known') }))
+else if (command === 'inject') console.log(JSON.stringify({ outputs: output('inject') }))
+else console.log(JSON.stringify({ outputs: { ...output('known'), ...output('inject') } }))
 `
 
 export const prices: Prices = {
@@ -171,20 +176,25 @@ function builderCell(id: string, fix: boolean, options: ResearchScriptOptions): 
 }
 
 /** The analyst: it tries the domain commands, writes a note in its scope, and concedes the objection of the skeptic. */
-const analystCell = (id: string) =>
+const analystCell = (id: string, twoObjections: boolean) =>
   [
     `await tools.Read({ file_path: '/repo/research/run.mjs' })`,
     `try { await tools.Write({ file_path: '/repo/research/run.mjs', content: 'x' }); text('ANALYST WRITE ALLOWED') } catch (error) { text('analyst write refused: ' + error) }`,
     `await tools.Write({ file_path: '/repo/analysis/${id}/notes.md', content: 'The recall comes from the known set only.\\n' })`,
-    submit('submit_responses', { addressed: [], conceded: [{ id: 'obj-001', reason: 'The known set is small.' }] }),
+    submit('submit_responses', { addressed: [], conceded: (twoObjections ? ['obj-001', 'obj-002'] : ['obj-001']).map((id) => ({ id, reason: 'The known set is small.' })) }),
   ].join('\n')
 
-/** The writer: it cites the first inject output artifact of /review/calibration.md. */
+const readMeasurement = [
+  `const calibration = JSON.stringify(await tools.Read({ file_path: '/review/calibration.md' }))`,
+  `const inject = /Output file [^:]+inject.txt: artifact:([0-9a-f]{64})/.exec(calibration)[1]`,
+  `text(await tools.Read({ file_path: '/artifacts/' + inject }))`,
+].join('\n')
+
+/** The writer cites the measurement file of the inject command. */
 const writerCell = () =>
   [
-    `const calibration = JSON.stringify(await tools.Read({ file_path: '/review/calibration.md' }))`,
-    `const inject = /Inject output artifacts: ([0-9a-f]{64})/.exec(calibration)[1]`,
-    `await tools.submit_dossier({ outcome: 'null', summary: 'No quiet dwarf galaxies over the calibrated null.', claims: [], checklist: [{ item: 'Check the known set', status: 'not_tested' }, { item: 'Check the holdout', status: 'not_tested' }], completeness: [inject], false_positives: [inject], coverage: 'The deep fields only.', trials: 1, reproduce: 'node research/run.mjs reproduce' })`,
+    readMeasurement,
+    `await tools.submit_dossier({ outcome: 'null', summary: 'No quiet dwarf galaxies over the calibrated null.', claims: [{ statement: 'The inject command produced measurement rows.', location: 'artifact:' + inject, evidence: 'inject rows' }], checklist: [{ item: 'Check the known set', status: 'not_tested' }, { item: 'Check the holdout', status: 'not_tested' }], completeness: [inject], false_positives: [inject], coverage: 'The deep fields only.', trials: 1, reproduce: 'node research/run.mjs reproduce' })`,
     `text('submitted')`,
   ].join('\n')
 
@@ -209,6 +219,7 @@ export type ResearchScriptOptions = {
   lowRecall?: boolean
   /** The rows of the analysis include the working directory. */
   unstable?: boolean
+  twoObjections?: boolean
 }
 
 const badQuote = 'a quote that the page does not have'
@@ -241,9 +252,14 @@ export function researchScript(options: ResearchScriptOptions = {}): Script {
     }
     const id = /(?:analysis|round \d+) of (hyp-\d+)/.exec(turn.request)?.[1] ?? 'unknown'
     if (turn.role === 'builder') return { cell: builderCell(id, turn.request.includes('Calibration round 1 of'), options) }
-    if (turn.role === 'skeptic') return { cell: submit('submit_objections', { objections: [objection(id)] }) }
+    if (turn.role === 'skeptic') return {
+      cell: [
+        readMeasurement,
+        `await tools.submit_objections({ objections: ${JSON.stringify(options.twoObjections ? [objection(id), { ...objection(id), title: 'Check the measurement rows' }] : [objection(id)])}.map(objection => ({ ...objection, location: 'artifact:' + inject, evidence: 'inject rows' })) })`,
+      ].join('\n'),
+    }
     if (turn.role === 'late-skeptic') return { cell: submit('submit_objections', { objections: [] }) }
-    if (turn.role === 'analyst') return { cell: analystCell(id) }
+    if (turn.role === 'analyst') return { cell: analystCell(id, options.twoObjections ?? false) }
     if (turn.role === 'writer') return { cell: writerCell() }
     if (turn.role === 'questions') return { cell: submit('submit_questions', { questions: [] }) }
     if (turn.role === 'intent') return { cell: submit('submit_verdict', { satisfied: true, gaps: [], summary: 'The dossier answers the program.' }) }
@@ -270,6 +286,8 @@ export async function runResearch(
     fetch?: typeof fetch
     env?: Record<string, string>
     pulls?: ReturnType<typeof fakePulls>
+    /** Replaces the code review loop of the dossier PR. */
+    review?: ResearchDeps['review']
   },
 ) {
   const pulls = options.pulls ?? fakePulls()
@@ -288,5 +306,6 @@ export async function runResearch(
     reviewChannel: async () => memoryChannel().channel,
     runsDir,
   })
+  if (options.review) deps.review = options.review
   return { deps, pulls: pulls.state, result: await research(input, deps) }
 }

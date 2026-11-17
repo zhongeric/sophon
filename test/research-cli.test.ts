@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { StopError } from '../src/core/stop.ts'
 import { defaultResearchModels } from '../src/core/workflows/research.ts'
-import { newInput, parseWait, researchModels } from '../src/node/research.ts'
+import { newInput, parseWait, researchModels, resumeInput } from '../src/node/research.ts'
 import { memoryChannel } from './support/fixture.ts'
 import { notebook, researchScript, runResearch } from './support/research.ts'
 import { scriptedDispatch } from './support/scripted-model.ts'
@@ -83,6 +83,18 @@ test('research CLI: parseWait refuses a wait that is not a number of 0 or more m
   assert.equal(parseWait('1.5'), 90_000)
   assert.equal(parseWait('0'), 0)
   for (const text of ['1h', 'abc', '', '-1', 'Infinity']) assert.throws(() => parseWait(text), stops(/^--wait must be a number of minutes of 0 or more/))
+})
+
+test('research CLI: a resume of a part 1 run fills in the new roles with the default models', () => {
+  const dir = runsDir()
+  const sol = { provider: 'codex' as const, model: 'gpt-6.1-sol' }
+  const { intake, generators, preregistrar } = defaultResearchModels
+  const models = { intake, surveyor: sol, generators, preregistrar }
+  mkdirSync(join(dir, 'r1'))
+  writeFileSync(join(dir, 'r1', 'state.json'), JSON.stringify({ input: { runId: 'r1', program: 'p', base: 'b', baseRef: 'main', source: 's', models }, repo: '/notebook' }))
+  const { input, repo } = resumeInput(dir, 'r1')
+  assert.equal(repo, '/notebook')
+  assert.deepEqual(input.models, { ...defaultResearchModels, surveyor: sol })
 })
 
 test('research CLI: a new run keeps --budget as the budget before the intake, so the intake recommends it and its cap replaces it', async () => {

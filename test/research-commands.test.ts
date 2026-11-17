@@ -82,6 +82,13 @@ test('a known recall below the threshold fails with the recall, the threshold an
   assert.match(verdict.tail, /missed object M31/)
 })
 
+test('a calibration without outputs fails, so that the reproduction compares at least one hash', async () => {
+  const verdict = await calibrate(ok({ recall: 1, outputs: {} }), ok({ outputs: {} }), 0.5)
+  assert.equal(verdict.pass, false)
+  if (verdict.pass) return
+  assert.match(verdict.reason, /known and inject give no outputs/)
+})
+
 test('a non-zero exit, a timeout and an output without a JSON last line each fail with the tail', async () => {
   const known = ok({ recall: 1, outputs: {} })
   const cases: [Reply, Reply, RegExp][] = [

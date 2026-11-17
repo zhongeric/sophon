@@ -286,7 +286,7 @@ export async function preregister(
 export type FrozenRef = { hypothesis: string; path: string }
 
 /** The calibration that the host gives the vet agents: the gate numbers and the artifact IDs of the command outputs. */
-export type CalibrationSummary = { round: number; recall: number; threshold: number; known: string[]; inject: string[] }
+export type CalibrationSummary = { round: number; recall: number; threshold: number; known: string[]; inject: string[]; outputs: Record<string, string> }
 
 /** A failed calibration round, for the fix turn of the builder. `tail` is the end of the command output. */
 export type CalibrationFailure = { round: number; reason: string; tail: string }
@@ -318,12 +318,13 @@ function renderCalibration(hypothesis: string, calibration: CalibrationSummary):
     `- Known recall: ${calibration.recall} (threshold ${calibration.threshold})`,
     `- Known output artifacts: ${calibration.known.join(', ') || 'none'}`,
     `- Inject output artifacts: ${calibration.inject.join(', ') || 'none'}`,
+    ...Object.entries(calibration.outputs).map(([path, id]) => `- Output file ${path}: artifact:${id}`),
     '',
   ].join('\n')
 }
 
 /** The line of the analyst response to one objection, or null when the analyst did not answer yet. */
-function responseLine(id: string, responses: Responses | null): string | null {
+export function responseLine(id: string, responses: Responses | null): string | null {
   const addressed = responses?.addressed.find((entry) => entry.id === id)
   if (addressed) return `Addressed: ${addressed.change.trim()} (artifacts: ${addressed.artifacts.join(', ')})`
   const conceded = responses?.conceded.find((entry) => entry.id === id)
@@ -544,7 +545,7 @@ export async function writeDossier(context: ResearchContext, model: ModelChoice,
 }
 
 /** The conceded objections of all rounds, in round order, with the reason of the analyst. */
-function conceded(rounds: VetRound[]): { objection: Objection; reason: string }[] {
+export function conceded(rounds: VetRound[]): { objection: Objection; reason: string }[] {
   return rounds.flatMap((round) =>
     round.objections.flatMap((objection) => {
       const entry = round.responses?.conceded.find((item) => item.id === objection.id)

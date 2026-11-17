@@ -140,14 +140,15 @@ function waiting(channel: Channel, waitMs: number): Channel {
   }
 }
 
-function resumeInput(runsDir: string, runId: string): { input: ResearchInput; repo: string } {
+/** The recorded input of a run. A run of part 1 recorded fewer roles, so the new roles get the default models. */
+export function resumeInput(runsDir: string, runId: string): { input: ResearchInput; repo: string } {
   const path = join(runsDir, runId, 'state.json')
   if (!existsSync(path)) throw new StopError(`no run ${runId} in ${runsDir}`)
   const ledger = fileLedger(path)
   const input = ledger.get<ResearchInput>('input')
   const repo = ledger.get<string>('repo')
   if (!input || !repo) throw new StopError(`run ${runId} has no recorded input`)
-  return { input, repo }
+  return { input: { ...input, models: { ...defaultResearchModels, ...input.models } }, repo }
 }
 
 type Values = Record<string, string | boolean | undefined>

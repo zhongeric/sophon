@@ -1,5 +1,4 @@
-import { checkEnv, defaultTimeoutMs, type Machine, type RepoConfig } from './checks.ts'
-import { hostSecrets } from './secrets.ts'
+import { commandOptions, quote, setupOnce, type Machine, type RepoConfig } from './checks.ts'
 
 /** The domain commands of stages 6 and 11 (section 6.3 of docs/specs/research-workflow.md). */
 export type DomainCommand = 'known' | 'inject' | 'reproduce'
@@ -26,34 +25,20 @@ export type HashMismatch = { path: string; expected: string; actual: string }
 export type Reproduction = { mismatches: HashMismatch[]; missing: string[] } & ({ pass: true } | { pass: false; reason: string; tail: string })
 
 /** The output tail that a failure gives to the builder and to the report. */
-export const failureTailChars = 4_000
+const failureTailChars = 4_000
 
-const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
 const sha256Hex = /^[0-9a-f]{64}$/
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 
-/** The setup result of each machine. A failed setup runs again before the next command, as in commandChecker. */
-const setups = new WeakMap<Machine, Promise<{ exit_code: number | null; output: string }>>()
-
-function setup(config: RepoConfig, machine: Machine, env: string[], timeoutMs: number): Promise<{ exit_code: number | null; output: string }> | null {
-  if (!config.setup) return null
-  const known = setups.get(machine)
-  if (known) return known
-  const started = machine.run(config.setup, { env, timeoutMs })
-  setups.set(machine, started)
-  void started.then(
-    (result) => result.exit_code === 0 || setups.delete(machine),
-    () => setups.delete(machine),
-  )
-  return started
-}
+/** The setup of each machine, as in commandChecker. */
+const setups = new WeakMap<Machine, () => Promise<{ exit_code: number | null; output: string } | null>>()
 
 const exitProblem = (what: string, exitCode: number | null) =>
   exitCode === null ? `${what} did not finish: it timed out or the host stopped it` : `${what} exited with code ${exitCode}`
 
 /** Parses the last non-empty line of the output by the contract of the command, or gives the problem. */
-export function parseDomainOutput(name: DomainCommand, output: string): { json: DomainJson; problem: null } | { json: null; problem: string } {
+function parseDomainOutput(name: DomainCommand, output: string): { json: DomainJson; problem: null } | { json: null; problem: string } {
   const line = output.split('\n').map((item) => item.trim()).filter((item) => item !== '').at(-1)
   if (line === undefined) return { json: null, problem: `${name} printed nothing, but its last line must be a JSON object` }
   let value: unknown
@@ -88,12 +73,15 @@ export function parseDomainOutput(name: DomainCommand, output: string): { json: 
 export async function runDomainCommand(config: RepoConfig, machine: Machine, name: DomainCommand, preregPath: string): Promise<DomainRun> {
   if (!config.research) throw new Error('the notebook has no research config')
   const command = config.research.commands[name].replaceAll('{prereg}', quote(preregPath))
-  const env = [...checkEnv, ...(config.env ?? [])].filter((item) => !hostSecrets.includes(item))
-  const timeoutMs = config.timeout_ms ?? defaultTimeoutMs
-  const prepared = await setup(config, machine, env, timeoutMs)
-  if (prepared && prepared.exit_code !== 0)
-    return { name, command, exit_code: prepared.exit_code, output: prepared.output, json: null, problem: exitProblem(`the setup ${config.setup}`, prepared.exit_code) }
-  const { exit_code, output } = await machine.run(command, { env, timeoutMs })
+  const options = commandOptions(config)
+  let setup = setups.get(machine)
+  if (!setup) {
+    setup = setupOnce(config, (setupCommand) => machine.run(setupCommand, options))
+    setups.set(machine, setup)
+  }
+  const failed = await setup()
+  if (failed) return { name, command, exit_code: failed.exit_code, output: failed.output, json: null, problem: exitProblem(`the setup ${config.setup}`, failed.exit_code) }
+  const { exit_code, output } = await machine.run(command, options)
   if (exit_code !== 0) return { name, command, exit_code, output, json: null, problem: exitProblem(name, exit_code) }
   return { name, command, exit_code, output, ...parseDomainOutput(name, output) }
 }
@@ -118,6 +106,9 @@ export function calibrationVerdict(known: DomainRun, inject: DomainRun, threshol
   }
   const failed = [known, inject].filter((run) => run.problem !== null)
   if (failed.length > 0) return { pass: false, recall, threshold, outputs, reason: failed.map((run) => run.problem).join('\n'), tail: tails(failed) }
+  // With no outputs, the reproduction compares no hash and always passes.
+  if (Object.keys(outputs).length === 0)
+    return { pass: false, recall, threshold, outputs, reason: 'known and inject give no outputs, but the reproduction needs at least one path to SHA-256 hex', tail: tails([known, inject]) }
   if (conflicts.length > 0)
     return { pass: false, recall, threshold, outputs, reason: `known and inject give different hashes for ${conflicts.join(', ')}`, tail: tails([known, inject]) }
   if (recall === null || recall < threshold)

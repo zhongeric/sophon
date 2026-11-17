@@ -244,7 +244,7 @@ export type NodeResearchOptions = {
 
 /**
  * The platform of one research run on this machine: runs/<id>/ holds the ledger, the journals, the artifacts, the
- * report, the branch worktrees and the clean checkouts of the reproduction. The config, the holdout, the checklist and
+ * report, the branch worktrees and one clean checkout. The config, the holdout, the checklist and
  * the guides come from the base commit, never from the working copy, so an uncommitted change cannot move the holdout.
  * The review loop pass is a run of its own, runs/<id>-review-1/.
  */
@@ -255,7 +255,7 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
   mkdirSync(branchesDir, { recursive: true })
   const source = `at ${input.baseRef}`
   const base = gitTree(options.repo, input.base)
-  const config = await readRepoConfig(base.root, source)
+  const config = withHomeGuides(await readRepoConfig(base.root, source))
   if (!config.research) throw new StopError(`${repoConfigFile} ${source} has no research field`)
   const domain = await loadResearchDomain(config.research, base.files, source)
   const ledger = fileLedger(join(dir, 'state.json'))
@@ -268,19 +268,18 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
     ledger,
     files: dirFiles(dir),
     store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
-    guides: await nodeGuides(withHomeGuides(config)),
+    guides: await nodeGuides(config),
     channel: options.channel,
     branches: gitBranches(options.repo, branchesDir),
     config,
     pulls: options.pulls,
     checker: (branch) => commandChecker(branch, config, machine(branch)),
-    machine,
     // A new checkout each time, so that no file of an earlier command or of the branch worktree is in it.
     async cleanBox(commit) {
-      const tree = join(dir, `clean-${commit.slice(0, 12)}`)
+      const tree = join(dir, 'clean')
       if (existsSync(tree)) await git(options.repo, 'worktree', 'remove', '--force', tree)
       await git(options.repo, 'worktree', 'add', '--detach', tree, commit)
-      return localMachine(tree)
+      return { ...localMachine(tree), read: diskFileSystem(tree).read }
     },
     async review({ runId, ask, head, full, pr, budget }) {
       const reviewSource = { repo: options.repo, base: input.base, head }

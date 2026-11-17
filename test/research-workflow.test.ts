@@ -21,6 +21,45 @@ const stops = (pattern: RegExp) => (error: unknown) => error instanceof StopErro
 // The builder submits a blocked log, so these runs end at stage 5 before any push.
 const blocked = researchScript({ blockBuilder: true })
 
+test('research: clean boxes reuse one worktree across commits and remove command outputs', async () => {
+  const { repo, base } = notebook()
+  gitIn(repo, 'commit', '--allow-empty', '-m', 'next head')
+  const head = gitIn(repo, 'rev-parse', 'HEAD').trim()
+  const { channel } = memoryChannel()
+  const deps = await nodeResearch({
+    channel,
+    credentials,
+    input: researchInput(base, 'clean-box'),
+    log: () => {},
+    module,
+    pulls: fakePulls().pulls,
+    repo,
+    reviewChannel: async () => channel,
+    runsDir: runsDir(),
+  })
+  const first = await deps.cleanBox(base)
+  const location = await first.run('pwd', { env: [], timeoutMs: 10_000 })
+  assert.equal(location.exit_code, 0)
+  const tree = location.output.trim()
+
+  for (const commit of [base, head, head]) {
+    writeFileSync(join(tree, 'research/checklist.md'), 'changed\n')
+    writeFileSync(join(tree, '.gitignore'), 'ignored\n')
+    writeFileSync(join(tree, 'ignored'), 'output\n')
+    writeFileSync(join(tree, 'untracked'), 'output\n')
+    const box = await deps.cleanBox(commit)
+    const next = await box.run('pwd', { env: [], timeoutMs: 10_000 })
+    assert.equal(next.exit_code, 0)
+    assert.equal(next.output.trim(), tree)
+    assert.equal(gitIn(tree, 'rev-parse', 'HEAD').trim(), commit)
+    assert.equal(gitIn(tree, 'status', '--porcelain', '--ignored'), '')
+    assert.deepEqual(
+      gitIn(repo, 'worktree', 'list', '--porcelain').split('\n').filter((line) => line.startsWith('worktree ')).sort(),
+      [`worktree ${repo}`, `worktree ${tree}`].sort(),
+    )
+  }
+})
+
 test('research: intake with a cap, surveys through the egress, two generators, the pick, an approval with a rejection, and the freeze', { timeout: 120_000 }, async () => {
   const { repo, origin, base } = notebook()
   const runs = runsDir()
