@@ -2,7 +2,8 @@ import { DevelopmentRuns, type DevelopRequest } from './develop.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
 import { sameSecret, verifySignature } from './github.ts'
-import { appBotLogin, type BotLogins } from './github-app.ts'
+import { appBotLogin, githubAccess, type BotLogins, type InstallationTokens } from './github-app.ts'
+import { sweepBranches } from './prune.ts'
 import { allowedUsers, PullRequestRuns, type Env } from './run.ts'
 
 export { DevelopmentRuns, PullRequestRuns }
@@ -11,6 +12,21 @@ const key = (owner: string, repo: string, number: number) => `${owner}/${repo}#$
 const pullRequest = (env: Env, owner: string, repo: string, pr: number) => env.PULL_REQUESTS.get(env.PULL_REQUESTS.idFromName(key(owner, repo, pr)))
 const issue = (env: Env, owner: string, repo: string, number: number) => env.DEVELOPMENT_RUNS.get(env.DEVELOPMENT_RUNS.idFromName(key(owner, repo, number)))
 const accepted = (body: unknown) => Response.json(body, { status: 202 })
+/** The installation tokens of the sweeps in this isolate. The runs keep their own. */
+const tokens: InstallationTokens = new Map()
+
+/** Prunes the factory/* branches of owner/repo, or with `only` the branches that it selects. */
+async function prune(env: Env, owner: string, repo: string, only?: (name: string) => boolean) {
+  const { gh } = await githubAccess(env, owner, repo, tokens)
+  return sweepBranches({
+    gh,
+    lookup: (kind, number, run) => (kind === 'review' ? pullRequest(env, owner, repo, number) : issue(env, owner, repo, number)).runState(run),
+    owner,
+    repo,
+    ...(only ? { only } : {}),
+  })
+}
+
 const botLogins: BotLogins = new Map()
 
 /** The review runs of a PR, or the development runs of an issue. GitHub numbers both in one sequence, so a number is one or the other. */
@@ -55,8 +71,14 @@ export default {
     const url = new URL(request.url)
     if (request.method === 'POST' && url.pathname === '/github/webhook') return webhook(request, env)
     const route = /^\/(runs|develop)\/([^/]+)\/([^/]+)\/(\d+)(?:\/(report|resume))?$/.exec(url.pathname)
-    if (!route) return new Response('agent-factory', { status: url.pathname === '/' ? 200 : 404 })
+    const pruneRoute = /^\/prune\/([^/]+)\/([^/]+)$/.exec(url.pathname)
+    if (!route && !pruneRoute) return new Response('agent-factory', { status: url.pathname === '/' ? 200 : 404 })
     if (!env.ADMIN_TOKEN || !sameSecret(request.headers.get('authorization') ?? '', `Bearer ${env.ADMIN_TOKEN}`)) return new Response('unauthorized', { status: 401 })
+    if (pruneRoute) {
+      if (request.method !== 'POST') return new Response('method not allowed', { status: 405 })
+      return Response.json(await prune(env, pruneRoute[1]!, pruneRoute[2]!))
+    }
+    if (!route) return new Response('agent-factory', { status: 404 })
     const [, kind, owner = '', repo = '', number, action] = route
     const by = allowedUsers(env)[0] ?? owner
     if (kind === 'develop') {
@@ -89,7 +111,7 @@ type Payload = {
   sender?: { login: string }
   issue?: { number: number; pull_request?: unknown }
   comment?: { body: string; user: { login: string } }
-  pull_request?: { number: number }
+  pull_request?: { number: number; head?: { ref: string } }
   label?: { name: string }
   check_suite?: { head_branch: string | null; pull_requests: { number: number }[] }
   check_run?: { check_suite: { head_branch: string | null; pull_requests: { number: number }[] } }
@@ -99,8 +121,9 @@ type Payload = {
 
 /**
  * GitHub webhooks: `/review` and the agent-review label start a review run on a PR, `/develop` and the agent-develop
- * label start a development run on an issue, and `/answer` and CI results (workflow runs, statuses) wake a paused run.
- * Comment, issue and PR events of the App bot do nothing, so that the posts of a run do not start or wake runs.
+ * label start a development run on an issue, and `/answer` and CI results (workflow runs, statuses) wake a paused run. A
+ * closed PR prunes its factory/* head branch and its review fix branches. Other comment, issue and PR events of the App
+ * bot do nothing, so that the posts of a run do not start or wake runs.
  */
 async function webhook(request: Request, env: Env): Promise<Response> {
   const body = await request.text()
@@ -112,7 +135,9 @@ async function webhook(request: Request, env: Env): Promise<Response> {
   const allowed = (login: string | undefined) => allowedUsers(env).some((user) => user.toLowerCase() === login?.toLowerCase())
   // Only a sender that ends with [bot] makes the GET /app request, so human and CI deliveries cost no request.
   const sender = payload.sender?.login.toLowerCase() ?? ''
-  if ((event === 'issue_comment' || event === 'issues' || event === 'pull_request') && sender.endsWith('[bot]') && sender === (await appBotLogin(env, botLogins))?.toLowerCase())
+  // A closed PR still prunes its branches, also when the App merged it: the prune starts and wakes no run.
+  const closedPr = event === 'pull_request' && payload.action === 'closed'
+  if ((event === 'issue_comment' || event === 'issues' || event === 'pull_request') && !closedPr && sender.endsWith('[bot]') && sender === (await appBotLogin(env, botLogins))?.toLowerCase())
     return accepted({ ignored: 'the App bot' })
 
   if (event === 'issue_comment' && payload.action === 'created' && payload.issue && payload.comment) {
@@ -133,6 +158,11 @@ async function webhook(request: Request, env: Env): Promise<Response> {
   }
   if (event === 'pull_request' && payload.action === 'labeled' && payload.label?.name === 'agent-review' && payload.pull_request && allowed(payload.sender?.login))
     return accepted(await pullRequest(env, owner, repo, payload.pull_request.number).start({ by: payload.sender!.login, owner, pr: payload.pull_request.number, repo, ship: false }))
+  if (event === 'pull_request' && payload.action === 'closed' && payload.pull_request) {
+    const { number, head } = payload.pull_request
+    const own = head?.ref.startsWith('factory/') ? head.ref : null
+    return accepted(await prune(env, owner, repo, (name) => name === own || name.startsWith(`factory/pr-${number}-`)))
+  }
   if (event === 'issues' && payload.action === 'labeled' && payload.label?.name === 'agent-develop' && payload.issue && !payload.issue.pull_request && allowed(payload.sender?.login))
     return accepted(await issue(env, owner, repo, payload.issue.number).start({ by: payload.sender!.login, issue: payload.issue.number, owner, repo }))
   if (event === 'workflow_run' || event === 'check_suite' || event === 'check_run' || event === 'status') {

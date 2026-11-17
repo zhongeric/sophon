@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -21,7 +21,7 @@ const stops = (pattern: RegExp) => (error: unknown) => error instanceof StopErro
 // The builder submits a blocked log, so these runs end at stage 5 before any push.
 const blocked = researchScript({ blockBuilder: true })
 
-test('research: clean boxes reuse one worktree across commits and remove command outputs', async () => {
+test('research: each clean box is a new checkout at a new path, and only the last one stays', async () => {
   const { repo, base } = notebook()
   gitIn(repo, 'commit', '--allow-empty', '-m', 'next head')
   const head = gitIn(repo, 'rev-parse', 'HEAD').trim()
@@ -40,7 +40,7 @@ test('research: clean boxes reuse one worktree across commits and remove command
   const first = await deps.cleanBox(base)
   const location = await first.run('pwd', { env: [], timeoutMs: 10_000 })
   assert.equal(location.exit_code, 0)
-  const tree = location.output.trim()
+  let tree = location.output.trim()
 
   for (const commit of [base, head, head]) {
     writeFileSync(join(tree, 'research/checklist.md'), 'changed\n')
@@ -50,13 +50,15 @@ test('research: clean boxes reuse one worktree across commits and remove command
     const box = await deps.cleanBox(commit)
     const next = await box.run('pwd', { env: [], timeoutMs: 10_000 })
     assert.equal(next.exit_code, 0)
-    assert.equal(next.output.trim(), tree)
+    // A new path, so that an output that depends on the path does not reproduce. The earlier checkout is gone.
+    assert.notEqual(next.output.trim(), tree)
+    assert.equal(existsSync(tree), false)
+    tree = next.output.trim()
     assert.equal(gitIn(tree, 'rev-parse', 'HEAD').trim(), commit)
     assert.equal(gitIn(tree, 'status', '--porcelain', '--ignored'), '')
-    assert.deepEqual(
-      gitIn(repo, 'worktree', 'list', '--porcelain').split('\n').filter((line) => line.startsWith('worktree ')).sort(),
-      [`worktree ${repo}`, `worktree ${tree}`].sort(),
-    )
+    // Real paths, because a temporary directory can be behind a symlink, as /var is on macOS.
+    const worktrees = gitIn(repo, 'worktree', 'list', '--porcelain').split('\n').filter((line) => line.startsWith('worktree '))
+    assert.deepEqual(worktrees.map((line) => realpathSync(line.slice('worktree '.length))).sort(), [realpathSync(repo), realpathSync(tree)].sort())
   }
 })
 

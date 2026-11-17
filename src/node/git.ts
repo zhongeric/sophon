@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, realpathSync } from 'node:fs'
+import { join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import type { Branch, Branches, Frozen, Repo } from '../core/platform.ts'
 import type { RootFiles } from '../core/profiles.ts'
@@ -19,6 +19,19 @@ export async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await exec('git', [...hardened, ...args], { cwd, env: withoutHostSecrets(process.env), maxBuffer: maxOutputBytes })
   return stdout
 }
+
+/** The hardened git for a command that can wait for the user, such as a signature: no terminal prompt, and a stop after `timeout` ms. */
+export async function gitUnattended(cwd: string, timeout: number, ...args: string[]): Promise<string> {
+  const env = { ...withoutHostSecrets(process.env), GIT_TERMINAL_PROMPT: '0' }
+  const { stdout } = await exec('git', [...hardened, ...args], { cwd, env, timeout, maxBuffer: maxOutputBytes })
+  return stdout
+}
+
+/** How the host commits. The signing check sets it before the first commit. */
+export type GitCommits = { unsigned: boolean }
+
+/** Unsigned mode turns off the signature of the user git config. Signed mode keeps that config. */
+const signature = (commits: GitCommits): string[] => (commits.unsigned ? ['-c', 'commit.gpgsign=false'] : [])
 
 /** Freezes the review target: a worktree of `head` on its own branch, and the merge base with `base`. */
 export async function freeze(repo: string, base: string, head: string, tree: string, branch: string): Promise<Frozen> {
@@ -51,10 +64,10 @@ export async function trackedFiles(tree: string): Promise<string[]> {
 }
 
 /** Commits every change in the worktree. Does nothing when nothing changed. */
-export async function commitAll(tree: string, message: string): Promise<void> {
+export async function commitAll(tree: string, message: string, commits: GitCommits): Promise<void> {
   await git(tree, 'add', '-A')
   const staged = await git(tree, 'diff', '--cached', '--name-only')
-  if (staged.trim() !== '') await git(tree, 'commit', '--no-verify', '-m', message)
+  if (staged.trim() !== '') await git(tree, ...signature(commits), 'commit', '--no-verify', '-m', message)
 }
 
 export async function currentCommit(tree: string): Promise<string> {
@@ -63,23 +76,82 @@ export async function currentCommit(tree: string): Promise<string> {
 
 export type GitSource = { repo: string; base: string; head: string }
 
-/** A local git repository: the review runs in a worktree of its own, on branch `branch`. */
-export function gitRepo(source: GitSource, tree: string, branch: string): Repo {
+/**
+ * A local git repository: the review runs in a worktree of its own, on branch `branch`. A resumed run after a release
+ * has no worktree. Each git method recreates it from the branch, and the loop calls one before an agent reads the tree.
+ */
+export function gitRepo(source: GitSource, tree: string, branch: string, commits: GitCommits = { unsigned: false }): Repo {
+  const ensure = async () => {
+    if (existsSync(tree) || !(await branchExists(source.repo, branch))) return
+    await git(source.repo, 'worktree', 'prune')
+    await git(source.repo, 'worktree', 'add', tree, branch)
+  }
+  const inTree =
+    <A extends unknown[], T>(run: (...args: A) => Promise<T>) =>
+    async (...args: A) => {
+      await ensure()
+      return run(...args)
+    }
   return {
     tree: diskFileSystem(tree),
     freeze: () => freeze(source.repo, source.base, source.head, tree, branch),
-    diff: (from, to) => diff(tree, from, to),
-    changedFiles: (from, to) => changedFiles(tree, from, to),
-    touchedFiles: (from, to) => touchedFiles(tree, from, to),
-    committedFiles: () => trackedFiles(tree),
-    commit: (message) => commitAll(tree, message),
-    head: () => currentCommit(tree),
-    async ship({ pr, headRef }) {
+    diff: inTree((from: string, to: string) => diff(tree, from, to)),
+    changedFiles: inTree((from: string, to: string) => changedFiles(tree, from, to)),
+    touchedFiles: inTree((from: string, to: string) => touchedFiles(tree, from, to)),
+    committedFiles: inTree(() => trackedFiles(tree)),
+    commit: inTree((message: string) => commitAll(tree, message, commits)),
+    head: inTree(() => currentCommit(tree)),
+    ship: inTree(async ({ pr, headRef }: { pr: number; headRef: string }) => {
       await git(tree, 'push', 'origin', `HEAD:refs/heads/${headRef}`)
       const run = gh(tree)
       if ((JSON.parse(await run(['pr', 'view', String(pr), '--json', 'isDraft'])) as { isDraft: boolean }).isDraft) await run(['pr', 'ready', String(pr)])
+    }),
+    async pullState(pr) {
+      const { state } = JSON.parse(await gh(source.repo)(['pr', 'view', String(pr), '--json', 'state'])) as { state: string }
+      return state === 'MERGED' ? 'merged' : state === 'CLOSED' ? 'closed' : 'open'
     },
+    async deleteBranch() {
+      // A local --base run can have no origin.
+      const remotes = (await git(source.repo, 'remote')).split('\n')
+      if (remotes.includes('origin') && (await remoteBranchExists(source.repo, branch))) await git(source.repo, 'push', 'origin', '--delete', `refs/heads/${branch}`)
+      await deleteLocalBranch(source.repo, branch)
+    },
+    release: () => removeWorktrees(source.repo, (path) => isUnder(path, tree)),
   }
+}
+
+/** The worktrees of the repository, with the branch of each, or null for a detached worktree. */
+async function worktrees(repo: string): Promise<{ path: string; branch: string | null }[]> {
+  // A worktree whose directory is gone stays registered until a prune, and blocks a new worktree of its branch.
+  await git(repo, 'worktree', 'prune')
+  return (await git(repo, 'worktree', 'list', '--porcelain'))
+    .split('\n\n')
+    .filter(Boolean)
+    .map((block) => {
+      const lines = block.split('\n')
+      const path = lines.find((line) => line.startsWith('worktree '))?.slice('worktree '.length) ?? ''
+      const ref = lines.find((line) => line.startsWith('branch '))?.slice('branch '.length)
+      return { path, branch: ref?.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : null }
+    })
+}
+
+/** True when `path` is `dir` or inside it. git gives real paths, so a symlinked temp directory compares by its real path too. */
+function isUnder(path: string, dir: string): boolean {
+  const roots = [resolve(dir), ...(existsSync(dir) ? [realpathSync(dir)] : [])]
+  return roots.some((root) => path === root || path.startsWith(root + sep))
+}
+
+/** Removes the worktrees that `match` selects, never the main worktree. Their branches stay. */
+async function removeWorktrees(repo: string, match: (path: string, branch: string | null) => boolean): Promise<void> {
+  const [, ...linked] = await worktrees(repo)
+  for (const entry of linked) if (match(entry.path, entry.branch)) await git(repo, 'worktree', 'remove', '--force', entry.path)
+}
+
+/** Removes the worktree of the branch, wherever it is, then deletes the branch. An absent branch counts as deleted. */
+async function deleteLocalBranch(repo: string, name: string): Promise<void> {
+  await removeWorktrees(repo, (_path, branch) => branch === name)
+  // -D: a squash merge or a merge on GitHub leaves the branch unmerged in the local history.
+  if (await branchExists(repo, name)) await git(repo, 'branch', '-D', name)
 }
 
 /** Where the worktree of a branch lives, under the run's directory. */
@@ -105,7 +177,7 @@ async function remoteBranchExists(repo: string, name: string): Promise<boolean> 
   }
 }
 
-function gitBranch(tree: string, name: string): Branch {
+function gitBranch(tree: string, name: string, commits: GitCommits): Branch {
   return {
     name,
     tree: diskFileSystem(tree),
@@ -124,11 +196,11 @@ function gitBranch(tree: string, name: string): Branch {
         await git(tree, 'reset', '-q')
       }
     },
-    commit: (message) => commitAll(tree, message),
+    commit: (message) => commitAll(tree, message, commits),
     /** A fast-forward when it can, else a merge commit. A failed merge is aborted, so that a resume starts from a clean worktree. */
     async merge(ref, message) {
       try {
-        await git(tree, 'merge', '--ff', '--no-edit', '-m', message, ref)
+        await git(tree, ...signature(commits), 'merge', '--ff', '--no-edit', '-m', message, ref)
       } catch (error) {
         await git(tree, 'merge', '--abort').catch(() => undefined)
         throw error
@@ -138,7 +210,7 @@ function gitBranch(tree: string, name: string): Branch {
 }
 
 /** The branches of a development run, each in a worktree under `dir`. */
-export function gitBranches(repo: string, dir: string): Branches {
+export function gitBranches(repo: string, dir: string, commits: GitCommits = { unsigned: false }): Branches {
   return {
     async view(commit) {
       const tree = join(dir, `view-${commit.slice(0, 12)}`)
@@ -151,7 +223,7 @@ export function gitBranches(repo: string, dir: string): Branches {
         if (await branchExists(repo, name)) await git(repo, 'worktree', 'add', tree, name)
         else await git(repo, 'worktree', 'add', '-b', name, tree, from)
       }
-      return gitBranch(tree, name)
+      return gitBranch(tree, name, commits)
     },
     exists: async (name) => (await branchExists(repo, name)) || (await remoteBranchExists(repo, name)),
     async push(branch) {
@@ -161,6 +233,8 @@ export function gitBranches(repo: string, dir: string): Branches {
     async deleteRemote(name) {
       if (await remoteBranchExists(repo, name)) await git(repo, 'push', 'origin', '--delete', `refs/heads/${name}`)
     },
+    deleteLocal: (name) => deleteLocalBranch(repo, name),
+    release: () => removeWorktrees(repo, (path) => isUnder(path, dir)),
   }
 }
 

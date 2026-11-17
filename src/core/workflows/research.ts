@@ -477,7 +477,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
       // already counts the spend of its stopped attempt, so that spend is not taken from the remaining budget.
       const limit = budget.limit()
       const remaining = limit === undefined ? {} : { budget: limit - budget.spent() + (state.stoppedReview?.usage.usd ?? 0) }
-      const loop = await deps.review({ runId: `${input.runId}-review-1`, ask: reviewAsk(input, state.analyses), head: at, full: false, pr, ...remaining })
+      const loop = await deps.review({ runId: `${input.runId}-review-1`, ask: reviewAsk(input, state.analyses), head: at, branch: branchName, full: false, pr, ...remaining })
       const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage }
       if (!loop.stopped) return result
       ledger.put(stoppedKey, result)

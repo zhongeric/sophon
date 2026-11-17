@@ -269,7 +269,7 @@ for (const change of ['remove', 'replace'] as const) {
     assert.equal(result.status, 'blocked', result.report)
     assert.match(result.report, /Calibration round 2 of hyp-001 failed/)
     assert.match(result.report, /inject output out\/hyp-001\/inject\.txt:/)
-    assert.match(result.report, change === 'remove' ? /ENOENT/ : /the file does not match SHA-256/)
+    assert.match(result.report, change === 'remove' ? /No such file or directory/ : /the file does not match SHA-256/)
     assert.deepEqual(pulls.opened, [])
     assert.equal(refs(origin), 'refs/heads/main\n')
   })
