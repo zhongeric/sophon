@@ -1,6 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import { Bash, FileSystem, MemoryFileSystem, Mount } from 'nanocode-ts/bash'
-import { artifactsFileSystem } from './artifacts.ts'
+import { artifactId, artifactsFileSystem } from './artifacts.ts'
+import type { Ledger } from './ledger.ts'
 import type { Artifacts } from './platform.ts'
 
 /** Names that agents never see in a repository tree. */
@@ -72,6 +73,77 @@ export function allowFiles(fs: FileSystem.FileSystem, allow: (path: string) => b
     write: async (path, data, append) => (check(path), fs.write(path, data, append)),
     remove: async (path) => (check(path), fs.remove(path)),
     rename: async (from, to) => (check(from), check(to), fs.rename(from, to)),
+  }
+}
+
+/** The SHA-256 of file contents or symlink text, or null for a directory or an absent path. */
+export async function fileHash(fs: FileSystem.FileSystem, path: string): Promise<string | null> {
+  const stat = fs.lstat ? await fs.lstat(path) : await fs.stat(path)
+  if (stat === null || stat.kind === 'directory') return null
+  if (stat.kind === 'symlink') return artifactId(new TextEncoder().encode((await fs.readlink?.(path)) ?? ''))
+  return artifactId(await fs.read(path))
+}
+
+/**
+ * Records in the ledger, under `key`, each path that a write, removal or rename changed: both paths of a rename. A change
+ * to a directory records each file in it, because the gate selects tests by file. A refused change records nothing. The
+ * list stays in the ledger, so a resumed turn keeps the edits of the turn before. With `originalsKey`, the record also
+ * keeps each first hash, so the gate ignores reverted edits.
+ */
+export function recordEdits(fs: FileSystem.FileSystem, ledger: Ledger, key: string, originalsKey?: string): FileSystem.FileSystem {
+  const keep = async (...paths: string[]) => {
+    if (!originalsKey) return
+    const kept = { ...ledger.get<Record<string, string | null>>(originalsKey) }
+    let changed = false
+    for (const path of paths) {
+      const file = FileSystem.normalize(path).replace(/^\/+/, '')
+      if (Object.hasOwn(kept, file)) continue
+      kept[file] = await fileHash(fs, path)
+      changed = true
+    }
+    if (changed) ledger.put(originalsKey, { ...kept, ...ledger.get<Record<string, string | null>>(originalsKey) })
+  }
+  const record = (...paths: string[]) => {
+    const edits = new Set(ledger.get<string[]>(key) ?? [])
+    const count = edits.size
+    for (const path of paths) edits.add(FileSystem.normalize(path).replace(/^\/+/, ''))
+    if (edits.size > count) ledger.put(key, [...edits])
+  }
+  /** The paths of the files under `path`, relative to it: [''] when `path` is not a directory. */
+  const filesUnder = async (path: string, prefix = ''): Promise<string[]> => {
+    const stat = fs.lstat ? await fs.lstat(`${path}${prefix}`) : await fs.stat(`${path}${prefix}`)
+    if (stat?.kind !== 'directory') return [prefix]
+    const files: string[] = []
+    for (const name of await fs.list(`${path}${prefix}`)) files.push(...(await filesUnder(path, `${prefix}/${name}`)))
+    return files
+  }
+  return {
+    stat: (path) => fs.stat(path),
+    lstat: fs.lstat && ((path) => fs.lstat!(path)),
+    readlink: fs.readlink && ((path) => fs.readlink!(path)),
+    read: (path) => fs.read(path),
+    list: (path) => fs.list(path),
+    mkdir: (path) => fs.mkdir(path),
+    write: async (path, data, append) => {
+      await keep(path)
+      const result = await fs.write(path, data, append)
+      record(path)
+      return result
+    },
+    remove: async (path) => {
+      const files = (await filesUnder(path)).map((file) => path + file)
+      await keep(...files)
+      const result = await fs.remove(path)
+      record(...files)
+      return result
+    },
+    rename: async (from, to) => {
+      const files = (await filesUnder(from)).flatMap((file) => [from + file, to + file])
+      await keep(...files)
+      const result = await fs.rename(from, to)
+      record(...files)
+      return result
+    },
   }
 }
 

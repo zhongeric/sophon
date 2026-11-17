@@ -320,7 +320,7 @@ decision that the run made (D11).
 
 ## 7. Platforms
 
-The builder needs a real toolchain: `forge`, `node`, package installs. The review loop does not.
+The builder needs a real toolchain: `forge`, `node`, package installs. The review loop needs one only for tests.
 
 - **Local (Node):** the builder uses a git worktree and runs commands on this machine, with the trust limits in the
   README.
@@ -332,6 +332,8 @@ The builder needs a real toolchain: `forge`, `node`, package installs. The revie
   - The container only runs commands: `setup`, checks and tests on a copy of a branch that the object syncs in.
     It gets no secret and no git remote. One image (Node 22, git, Foundry) serves every profile for now.
   - Pushes go through the Git Data API. The review loop runs as a review run of the new PR, in its own object.
+  - Each review run whose config has tests has a container of its own for `setup`, tests and the checks of agents.
+    The final checks stay CI.
   - Entry: `npm run remote -- develop owner/repo#<issue>`, a `/develop` comment, or the `agent-develop` label. The
     issue is the ask, verbatim, and its comments carry the intake and spec questions and the report.
 
@@ -415,8 +417,7 @@ No rule covers these yet. Each default applies until the user replaces it.
 - The late bugs pass runs when a patch changed code since the freeze, and reviews every fix since then. Thus step 1
   fixes also get a bugs review.
 - Step 2 has no diff to review when the step 1 patch changed nothing. The run records that and goes on.
-- On Cloudflare, review agents cannot run tests: CI checks the result. Builders of development runs can, on the
-  build container.
+- On Cloudflare, a review run without tests in its config has no test runner: CI checks the result.
 - On Cloudflare, in-process git reads a symlink as the content of its target. A PR that only changes the target of a
   symlink shows no change to the reviewers. The fixes never change a symlink.
 - On Cloudflare, a PR with 3,000 or more files stops, files over the size limit of the tree are skipped, and the

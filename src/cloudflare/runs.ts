@@ -3,7 +3,9 @@ import type { Ledger } from '../core/ledger.ts'
 import { callBudget, PlannedStop } from '../core/planned-stop.ts'
 import { apiKeyCredential, type Credentials, type Provider } from '../core/providers.ts'
 import type { Comments } from '../core/questions.ts'
+import { StopError } from '../core/stop.ts'
 import { afterError, alarmBudgetMs, countRestart, initCounters, progressLedger } from './alarm.ts'
+import { containerBox, httpBox, type Box, type SyncStore } from './box.ts'
 import { githubComments } from './comments.ts'
 import type { DevelopmentRuns } from './develop.ts'
 import { GitHubError, type GitHub } from './github.ts'
@@ -47,7 +49,7 @@ export type Env = {
   GITHUB_API_URL?: string
   ANTHROPIC_URL?: string
   OPENAI_URL?: string
-  /** A machine endpoint that replaces the development run's container, for local tests. */
+  /** A machine endpoint that replaces the build container of the runs, for local tests. */
   MACHINE_URL?: string
 }
 
@@ -71,6 +73,12 @@ const heartbeatMs = 60_000
 const heartbeatEveryMs = 20_000
 /** How long CI can take, when CI_TIMEOUT_MINUTES does not say. */
 export const defaultCiTimeoutMinutes = 30
+/**
+ * The container stops after this long without a command. A stopped container comes back empty. Its start clears
+ * the sync state in SQL, so the next sync copies the trees again.
+ */
+const containerIdleMs = 30 * 60_000
+export const setupTimeoutMs = 20 * 60_000
 
 export function allowedUsers(env: Env): string[] {
   return (env.ALLOWED_USERS ?? '')
@@ -112,6 +120,13 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
   protected abstract announcement(run: string, request: Request): string
   /** Runs the work, or resumes it from the ledger. Returns whether it passed, and the comment for the end of the run. */
   protected abstract execute(run: string, request: Request, ledger: Ledger, gh: GitHub, comments: Comments): Promise<{ passed: boolean; summary: string }>
+
+  /** The build machine of this object: MACHINE_URL in local tests, else the object's Cloudflare Container. */
+  protected box(syncs: SyncStore): Box {
+    if (this.env.MACHINE_URL) return httpBox(this.env.MACHINE_URL)
+    if (!this.ctx.container) throw new StopError('this Worker has no container for builds: add the containers section of wrangler.jsonc and deploy again')
+    return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => syncs.clear() })
+  }
 
   async start(request: Request): Promise<{ run: string; started: boolean }> {
     const active = this.active()

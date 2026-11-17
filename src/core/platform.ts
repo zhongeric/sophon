@@ -100,6 +100,11 @@ export type Checker = {
    */
   checks(changed: string[], options?: { tests?: boolean }): Promise<CheckResult[]>
   tests: ((tests: string[]) => Promise<CheckResult[]>) | null
+  /**
+   * The configured checks without tests, on a real machine, for the run_checks tool of an agent. Absent where the
+   * platform has no machine for agents. An agent tool never calls `checks`, because on Cloudflare it is the CI.
+   */
+  agentChecks?: (changed: string[]) => Promise<CheckResult[]>
 }
 
 /** The output files of the run, such as report.md and gate-log.txt. */

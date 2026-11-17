@@ -7,8 +7,11 @@ import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import type { SqlValue } from '../src/cloudflare/artifacts.ts'
-import { boxMachine, containerBox, syncTree, syncWithSetup, type Box } from '../src/cloudflare/box.ts'
+import { boxMachine, containerBox, SetupError, syncTree, syncWithSetup, type Box } from '../src/cloudflare/box.ts'
+import { reviewChecker } from '../src/cloudflare/checker.ts'
 import { createSyncTables, sqlSyncs, type SyncSql } from '../src/cloudflare/syncs.ts'
+import { commandChecker } from '../src/core/checks.ts'
+import type { Checker } from '../src/core/platform.ts'
 
 /** Durable Object SQL over node:sqlite. A new store over the same database is a new object after a restart. */
 function fakeSql(): SyncSql {
@@ -139,6 +142,7 @@ function syncFixture() {
   const pending = new Map<string, Promise<void>>()
   const fixture = {
     failTar: false,
+    box,
     commands,
     lines,
     pending,
@@ -215,7 +219,7 @@ test('a missing or a different marker gives a full copy and the setup', async ()
 test('a failed setup leaves no valid state, so the next sync is full and runs the setup again', async () => {
   const fixture = syncFixture()
   writeFileSync(join(fixture.root, 'fail'), '')
-  await assert.rejects(fixture.sync(), /the setup command failed/)
+  await assert.rejects(fixture.sync(), (error) => error instanceof SetupError && /the setup command failed/.test(error.message) && error.result.exit_code === 1)
   assert.equal(fixture.store.read('work/x'), null)
   assert.equal(existsSync(fixture.marker), false)
   assert.match(fixture.lines.at(-1) ?? '', /^setup work\/x: fail, 2 files in \d+ ms$/)
@@ -225,6 +229,23 @@ test('a failed setup leaves no valid state, so the next sync is full and runs th
   await fixture.sync()
   assert.equal(fixture.full(), true)
   assert.equal(fixture.setupRuns(), 1)
+})
+
+test('the checker of a review run keeps CI as its checks, and gives a failed setup on the machine as a failed result named setup', async () => {
+  const fixture = syncFixture()
+  writeFileSync(join(fixture.root, 'fail'), '')
+  const config = { stack: 'TypeScript', checks: { smoke: 'true' }, tests: { pattern: '\\.test\\.ts$', command: 'node --test {tests}' } }
+  const ci: Checker = { checks: async () => [], tests: null }
+  const checker = reviewChecker(ci, commandChecker({ committedFiles: async () => [], tree: fixture.tree }, config, boxMachine(fixture.box, 'work/x', fixture.sync)))
+  assert.equal(checker.checks, ci.checks)
+  const failed = { command: 'test ! -f ../../fail && echo run >> setup.log', exit_code: 1, name: 'setup', output: '', status: 'fail' }
+  assert.deepEqual(await checker.tests!(['test/a.test.ts']), [failed])
+  assert.deepEqual(await checker.agentChecks!([]), [failed])
+
+  // Other errors of the sync still stop the call.
+  rmSync(join(fixture.root, 'fail'))
+  fixture.failTar = true
+  await assert.rejects(checker.tests!(['test/a.test.ts']), /syncing work\/x failed/)
 })
 
 test('a sync with changes removes the marker before its first write, so a failed copy leaves no valid state', async () => {
