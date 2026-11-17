@@ -301,13 +301,17 @@ export async function cleanBox(
         if (depth < 0) break
       }
       if (path.startsWith('/') || depth < 0) throw new Error(`read ${path}: the path is not relative to ${dir}`)
-      const size = Number((await readFile(path, 'wc -c < "$file"', [])).trim())
-      if (!Number.isSafeInteger(size)) throw new Error(`read ${path}: no size for the file`)
+      // The output can hold other lines, for example warnings on stderr, so each value comes after a marker.
+      const sized = await readFile(path, 'printf "size=%s\\n" "$(wc -c < "$file")"', [])
+      const size = Number(/^size=\s*(\d+)\s*$/m.exec(sized)?.[1])
+      if (!Number.isSafeInteger(size)) throw new Error(`read ${path}: no size for the file in the output ${JSON.stringify(sized.slice(-300))}`)
       if (size > artifactSizeLimit) throw new Error(`read ${path}: the file has ${size} bytes, over the limit of ${artifactSizeLimit} bytes`)
       const bytes = new Uint8Array(size)
       for (let offset = 0; offset < size; offset += readChunkBytes) {
-        const text = await readFile(path, 'tail -c "+$2" -- "$file" | head -c "$3" | base64 | tr -d "\\n"', [String(offset + 1), String(readChunkBytes)])
-        const chunk = Uint8Array.from(atob(text.trim()), (char) => char.charCodeAt(0))
+        const output = await readFile(path, 'printf "base64=%s\\n" "$(tail -c "+$2" -- "$file" | head -c "$3" | base64 | tr -d "\\n")"', [String(offset + 1), String(readChunkBytes)])
+        const text = /^base64=([A-Za-z0-9+/=]*)$/m.exec(output)?.[1]
+        if (text === undefined) throw new Error(`read ${path}: no bytes in the output ${JSON.stringify(output.slice(-300))}`)
+        const chunk = Uint8Array.from(atob(text), (char) => char.charCodeAt(0))
         if (chunk.length !== Math.min(readChunkBytes, size - offset)) throw new Error(`read ${path}: the file changed while the host read it`)
         bytes.set(chunk, offset)
       }
