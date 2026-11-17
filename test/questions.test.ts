@@ -232,7 +232,7 @@ test('the PR channel posts one comment and reads only later, unedited /answer re
     waitMs: 0,
   })
   const posted = await channel.post('run-1', 'ask', questions)
-  assert.deepEqual(bodies, [render('run-1', 'ask', questions)])
+  assert.deepEqual(bodies, [`@maintainer\n\n${render('run-1', 'ask', questions)}`])
   assert.equal(channel.where(posted), 'https://github.com/o/r/pull/7#issuecomment-1')
 
   const later = '2026-11-13T10:05:00Z'
@@ -247,6 +247,25 @@ test('the PR channel posts one comment and reads only later, unedited /answer re
   assert.equal(await channel.answers(posted, questions), null)
   comments.push({ author: 'Maintainer', body: '/answer\nQ2: no', createdAt: later })
   assert.deepEqual((await channel.answers(posted, questions))?.map((answer) => answer.answer), ['down', 'no'])
+})
+
+test('the PR channel mentions each answerer one time, without bots, before the questions', async () => {
+  const post = async (answerers: string[]) => {
+    const bodies: string[] = []
+    const comments = {
+      async post(body: string) {
+        bodies.push(body)
+        return { url: 'https://github.com/o/r/pull/7#issuecomment-1', at: '2026-11-13T10:00:00Z' }
+      },
+      list: async () => [],
+    }
+    await commentChannel({ answerers, comments, pollMs: 1, waitMs: 0 }).post('run-1', 'ask', questions)
+    return bodies
+  }
+  const text = render('run-1', 'ask', questions)
+  assert.deepEqual(await post(['maintainer', 'sophon-factory[bot]', 'Other', 'MAINTAINER']), [`@maintainer @Other\n\n${text}`])
+  assert.deepEqual(await post([]), [text])
+  assert.deepEqual(await post(['sophon-factory[bot]', 'Dependabot[BOT]']), [text])
 })
 
 test('the file channel writes the questions and reads the reply file', async () => {

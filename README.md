@@ -99,6 +99,7 @@ The STE dictionary is optional: see [agents/guides/ste/README.md](agents/guides/
 npm run review -- --repo ~/src/app --pr 123     # review a PR, add --ship to push the fixes and mark it ready on PASS
 npm run review -- --repo ~/src/app --base main --ask-file ask.md
 npm run develop -- --repo ~/src/app --ask "Add a fee switch, off by default"
+node --disable-warning=ExperimentalWarning src/node/research.ts --repo ~/src/notebook --program-file program.md
 npm run review -- --run <id>                     # resume a run, also with npm run develop
 ```
 
@@ -145,8 +146,11 @@ npm run metrics                          # CPU, memory and network of each build
 ```
 
 The webhook is optional. With it, a `/review` or `/develop` comment, or the `agent-review` or `agent-develop`
-label, starts a run, and answers take effect at once. Without it, runs poll for answers and CI. Point it at
-`https://<worker>/github/webhook`, with the events Issue comments, Issues, Pull requests, Workflow runs and Statuses.
+label, starts a run, and answers take effect at once. Without it, runs poll for answers and CI. One App webhook
+replaces the webhook of each repository: point it at `https://<worker>/github/webhook` and set its secret as
+`GITHUB_APP_WEBHOOK_SECRET`. Without that secret, the Worker checks the webhook of each repository with
+`GITHUB_WEBHOOK_SECRET`. Use the events Issue comments, Issues, Pull requests, Workflow runs and Statuses. The Worker
+ignores the comment, issue and PR events of its own bot.
 
 A Durable Object holds the ledger, the repository tree and the agent sessions of each run. Alarms drive the run and
 resume it after a crash. Development runs run their checks in a Cloudflare Container that has no secrets. Commits

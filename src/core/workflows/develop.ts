@@ -186,7 +186,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     deps.files.write('report.md', report)
     // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
     if (state.pr && ledger.get('commented') !== report) {
-      await pulls.comment(state.pr.number, report.length > commentLimit ? `${report.slice(0, commentLimit)}\n\n(cut: see report.md of run ${input.runId})` : report)
+      await pulls.comment(state.pr.number, cutReport(report, `(cut: see report.md of run ${input.runId})`))
       ledger.put('commented', report)
     }
     ledger.put('result', { status, pr: state.pr, branch: state.branch, merge })
@@ -284,7 +284,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     return result
   }
   const pushed = await publish()
-  state.pr = await step(ledger, 'pr', () => pulls.open({ head: branchName, title: intook.title, body: prBody(input, decisions(ledger), planText) }))
+  state.pr = await step(ledger, 'pr', () => pulls.open({ head: branchName, title: intook.title, body: prBody(input, decisions(ledger), planText, planned.smallest_change) }))
   let ci = await waitCi('ci.build.0', pushed)
   const fixer = planned.tasks.length === 1 ? `build.${planned.tasks[0]!.id}` : 'ci-fix'
   for (let round = 1; ci.state === 'fail' && round <= ciFixRounds; round++) {
@@ -493,19 +493,60 @@ function renderTask(task: PlanTask, built: { task: PlanTask; log: BuildLog }[]):
   ].join('\n')
 }
 
-/** The PR description: the frozen package, written by the host (G7). */
-function prBody(input: DevelopInput, answers: Answer[], planText: string): string {
+/** The PR description shows at most this many words of the smallest change, so that it stays short for any plan. */
+const prWords = 140
+
+function closeFence(markdown: string): string {
+  let fence = ''
+  for (const line of markdown.split('\n')) {
+    if (fence) {
+      const close = /^ {0,3}(`+|~+)[ \t]*$/.exec(line)?.[1]
+      if (close && close[0] === fence[0] && close.length >= fence.length) fence = ''
+    } else {
+      fence = /^ {0,3}(`{3,}(?!.*`)|~{3,})/.exec(line)?.[1] ?? ''
+    }
+  }
+  return fence ? `${markdown}\n${fence}` : markdown
+}
+
+/**
+ * The PR description, written by the host (G7). Only `Closes #<issue>` and the smallest change are visible. The frozen
+ * package (the run, the ask, the decisions and the plan) is in one collapsed block.
+ */
+export function prBody(input: DevelopInput, answers: Answer[], planText: string, smallestChange: string): string {
+  const trimmed = smallestChange.trim()
+  // Cut at the start of the first word over the limit, so that the line breaks of the shown words stay.
+  const over = [...trimmed.matchAll(/\S+/g)][prWords]
+  const shown = over ? `${trimmed.slice(0, over.index).trimEnd()} …` : trimmed
   return [
+    ...(input.issue ? [`Closes #${input.issue}`, ''] : []),
+    // Close an open code fence so that GitHub does not show the details block as code.
+    closeFence(shown),
+    '',
+    '<details><summary>Run, ask, decisions and plan</summary>',
+    '',
     `agent-factory run \`${input.runId}\` (${input.source}) opened this draft PR. It stays draft until the review loop passes and CI is green.`,
     '',
-    ...(input.issue ? [`Closes #${input.issue}`, ''] : []),
     '# Ask',
     '',
     ...input.ask.trim().split('\n').map((line) => `> ${line}`),
     '',
     ...decisionLists(answers, { user: '# Decisions of the user', run: '# Decisions the run made' }),
     planText,
+    '',
+    '</details>',
   ].join('\n')
+}
+
+/**
+ * Cuts a report to the comment limit. The cut can remove the closing `</details>` tag, so this function closes the block
+ * before the note. Thus the note stays visible.
+ */
+export function cutReport(report: string, note: string): string {
+  if (report.length <= commentLimit) return report
+  const head = report.slice(0, commentLimit)
+  const open = head.lastIndexOf('<details>') > head.lastIndexOf('</details>')
+  return `${head}${open ? '\n\n</details>' : ''}\n\n${note}`
 }
 
 type ReportState = {
@@ -533,8 +574,16 @@ function reviewRow(review: Review, index: number): UsageRow {
 
 function renderReport(state: ReportState, status: DevelopStatus, criteria: Criterion[], note: string, answers: Answer[], usage: string[]): string {
   const triage = (report: string) => /^- Triage: (.*)$/m.exec(report)?.[1] ?? ''
+  const failed = criteria.filter((criterion) => !criterion.ok)
+  const criterionLine = (criterion: Criterion) => `- [${criterion.ok ? 'x' : ' '}] ${criterion.name}: ${criterion.detail}`
   return [
     `# Development run: ${status.toUpperCase()}`,
+    '',
+    ...(state.pr ? [`PR: ${state.pr.url}`, ''] : []),
+    note,
+    '',
+    ...(failed.length > 0 ? [...failed.map(criterionLine), ''] : []),
+    '<details><summary>Run details</summary>',
     '',
     `- Run: ${state.input.runId}`,
     `- Source: ${state.input.source}`,
@@ -542,11 +591,8 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
     ...(state.route ? [`- Route: ${state.route.spec ? 'spec, then plan' : 'plan'}, ${state.route.passes} review loop ${state.route.passes === 1 ? 'pass' : 'passes'}. ${state.intake?.reason ?? ''}`] : []),
     ...(state.branch ? [`- Branch: ${state.branch}${state.head ? ` at ${state.head.slice(0, 12)}` : ''}`] : []),
     ...(state.signing ? [`- ${signingLine(state.signing)}`] : []),
-    ...(state.pr ? [`- PR: ${state.pr.url}`] : []),
     '',
-    note,
-    '',
-    ...(criteria.length > 0 ? ['## Criteria', '', ...criteria.map((criterion) => `- [${criterion.ok ? 'x' : ' '}] ${criterion.name}: ${criterion.detail}`), ''] : []),
+    ...(criteria.length > 0 ? ['## Criteria', '', ...criteria.map(criterionLine), ''] : []),
     ...(state.plan ? ['## Plan', '', state.plan.smallest_change, ''] : []),
     ...(state.built.length > 0
       ? ['## Tasks', '', ...state.built.map((entry) => `- ${entry.task.id}: ${entry.log.blocked.trim() ? `blocked: ${entry.log.blocked}` : entry.log.summary}`), '']
@@ -574,5 +620,7 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
     ...usage,
     '',
     ...decisionSections(answers),
+    '',
+    '</details>',
   ].join('\n')
 }

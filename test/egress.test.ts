@@ -358,6 +358,56 @@ test('without max_bytes, the cap is 8 MiB: a body of 8 MiB is accepted, and a st
   assert.deepEqual(await run.artifacts.list(), [])
 })
 
+// The URL https://api.example.com/a has 25 bytes, and content-type: application/json has 12 + 16 bytes.
+const json = (body: string) => ({ method: 'POST', headers: { 'content-type': 'application/json' }, body })
+
+test('a request of exactly max_request_bytes goes out, and one more byte in the URL, a header or the body is refused', async () => {
+  const exact = setup({ egress: { max_request_bytes: 100 } })
+  // The fragment does not go to the server, so it does not count.
+  await exact.egress(`https://api.example.com/${'x'.repeat(76)}#fragment`)
+  await exact.egress('https://api.example.com/a', { headers: { 'x-note': 'n'.repeat(69) } })
+  await exact.egress('https://api.example.com/a', json('b'.repeat(47)))
+  assert.equal(exact.calls.length, 3)
+
+  const over = setup({ egress: { max_request_bytes: 100 } })
+  const size = /size: the request of 101 bytes is over the cap of 100 bytes/
+  await refuses(over.egress(`https://api.example.com/${'x'.repeat(77)}`), size)
+  await refuses(over.egress('https://api.example.com/a', { headers: { 'x-note': 'n'.repeat(70) } }), size)
+  await refuses(over.egress('https://api.example.com/a', json('b'.repeat(48))), size)
+  assert.equal(over.calls.length, 0)
+  assert.deepEqual(await over.artifacts.list(), [])
+  assert.equal(over.lines.length, 3)
+  assert.match(over.lines[0] ?? '', /^researcher: egress GET https:\/\/api\.example\.com\/x+ egress refused: size: the request of 101 bytes/)
+  assert.match(over.lines[1] ?? '', /^researcher: egress GET https:\/\/api\.example\.com\/a egress refused: size: /)
+  assert.match(over.lines[2] ?? '', /^researcher: egress POST https:\/\/api\.example\.com\/a egress refused: size: /)
+})
+
+test('without max_request_bytes, the cap is 8 KiB: a request of 8 KiB goes out, and one of 8 KiB + 1 is refused', async () => {
+  const run = setup()
+  // The URL prefix https://api.example.com/ has 24 bytes.
+  assert.equal((await run.egress(`https://api.example.com/${'x'.repeat(8 * 1024 - 24)}`)).status, 200)
+  await refuses(run.egress(`https://api.example.com/${'x'.repeat(8 * 1024 - 23)}`), /size: the request of 8193 bytes is over the cap of 8192 bytes/)
+  assert.equal(run.calls.length, 1)
+  assert.equal((await run.artifacts.list()).length, 2)
+})
+
+test('a credential header that the host adds does not count toward the request size', async () => {
+  const secret = 'k'.repeat(10_000)
+  const credentials = { 'api.example.com': { header: 'x-api-key', secret: 'ARCHIVE_KEY' } }
+  const run = setup({ egress: { credentials, max_request_bytes: 100 }, secret })
+  await run.egress(`https://api.example.com/${'x'.repeat(76)}`)
+  assert.equal(run.calls.length, 1)
+  assert.equal(run.calls[0]?.headers.get('x-api-key'), secret)
+})
+
+test('a redirect hop over max_request_bytes is refused, and nothing is stored', async () => {
+  // The URL https://files.example.com/ has 26 bytes.
+  const run = setup({ egress: { max_request_bytes: 100 }, answer: () => redirect(302, `https://files.example.com/${'x'.repeat(75)}`) })
+  await refuses(run.egress('https://api.example.com/a'), /size: the request of 101 bytes is over the cap of 100 bytes/)
+  assert.equal(run.calls.length, 1)
+  assert.deepEqual(await run.artifacts.list(), [])
+})
+
 test('the run lock refuses a matching first URL', async () => {
   const lock = runLock(fileLedger(ledgerPath()), ['https://api.example.com/holdout'])
   const run = setup({ lock })
@@ -550,6 +600,13 @@ test('checkEgress accepts a valid spec', () => {
 
 test('checkEgress refuses a cap that is not an integer from 1 to 32 MiB', () => {
   for (const max_bytes of [0, -1, 1.5, artifactSizeLimit + 1, Number.NaN]) assert.throws(() => checkEgress({ ...base, max_bytes }, checkHost()), /max_bytes/)
+})
+
+test('checkEgress refuses a request cap that is not an integer from 1 to 32 MiB', () => {
+  checkEgress({ ...base, max_request_bytes: 1 }, checkHost())
+  checkEgress({ ...base, max_request_bytes: artifactSizeLimit }, checkHost())
+  for (const max_request_bytes of [0, -1, 1.5, artifactSizeLimit + 1, Number.NaN])
+    assert.throws(() => checkEgress({ ...base, max_request_bytes }, checkHost()), new RegExp(`egress: max_request_bytes .* is not an integer from 1 to ${artifactSizeLimit}`))
 })
 
 test('checkEgress refuses a host entry that is not a plain host name', () => {

@@ -10,6 +10,8 @@ export type Turn = {
   output: string | null
   /** The whole request body, as JSON, for scripts that answer by prompt. */
   request: string
+  /** The subagent that sends the request, or null for the root agent. */
+  subagent: Contracts.Subagent | null
 }
 
 export type Script = (turn: Turn) => Reply
@@ -44,7 +46,7 @@ export function scriptedDispatch(script: Script, turns: Turn[]): Contracts.Runti
     const provider = request.provider ?? (body.messages ? 'claude' : 'codex')
     const text = JSON.stringify(body)
     const role = /Agent role: ([a-z-]+)/.exec(text)?.[1] ?? 'unknown'
-    const turn: Turn = { provider, role, output: provider === 'claude' ? claudeOutput(body) : codexOutput(body), request: text }
+    const turn: Turn = { provider, role, output: provider === 'claude' ? claudeOutput(body) : codexOutput(body), request: text, subagent: request.subagent }
     turns.push(turn)
     const reply = script(turn)
     const call = calls++

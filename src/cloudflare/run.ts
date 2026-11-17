@@ -5,6 +5,7 @@ import { commentChannel, commentLimit, type Comments } from '../core/questions.t
 import { StopError } from '../core/stop.ts'
 import { parsePrices, zeroTokens, type RunUsage } from '../core/usage.ts'
 import { allowedModelsFrom, codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
+import { reviewAnnouncement } from './announcements.ts'
 import { ciChecker } from './checker.ts'
 import { baseConfig } from './config.ts'
 import type { GitHub } from './github.ts'
@@ -37,7 +38,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
   }
 
   protected announcement(run: string, request: StartRequest) {
-    return `agent-factory started review run \`${run}\` for @${request.by}. Questions for you will appear here; answer them with a \`/answer\` comment.`
+    return reviewAnnouncement(run, request.by)
   }
 
   /** The result of a review run, with its fixes as a commit on GitHub, or what the run waits for. */

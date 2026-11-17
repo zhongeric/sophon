@@ -75,17 +75,7 @@ export const letter = (index: number) => String.fromCharCode(97 + index)
 export function render(runId: string, batch: string, questions: Question[]): string {
   return [
     marker(runId, batch),
-    `### agent-factory needs your input (run \`${runId}\`)`,
-    '',
-    'Reply with a comment that starts with `/answer`. Give one line for each question that you answer. A question that you leave out takes the recommendation.',
-    '',
-    '```',
-    '/answer',
-    `${questions[0]?.id ?? 'Q1'}: b`,
-    `${questions[1]?.id ?? 'Q2'}: your own words also work`,
-    '```',
-    '',
-    'Reply `/answer recommended` to take every recommendation.',
+    'Reply with a `/answer` comment and one `Q<n>: <letter or your own words>` line for each question. A question that you leave out takes the recommendation. `/answer recommended` takes all recommendations.',
     '',
     ...questions.flatMap((question) => [
       `**${question.id}.** ${question.question}`,
@@ -267,6 +257,7 @@ export type Comments = {
 /**
  * Questions as a PR comment. Only later, unedited replies from `answerers` count, because answers reach
  * the patch agents and the gate. `waitMs` keeps polling before the run pauses.
+ * The first line mentions each answerer that is not a bot, so that GitHub notifies them.
  */
 export function commentChannel(options: { comments: Comments; answerers: string[]; waitMs: number; pollMs: number }): Channel {
   const answerers = new Set(options.answerers.map((login) => login.toLowerCase()))
@@ -278,9 +269,18 @@ export function commentChannel(options: { comments: Comments; answerers: string[
     const last = replies.at(-1)
     return last ? parseAnswers(last.body, questions) : null
   }
+  const mentioned = new Set<string>()
+  const mentions = options.answerers.filter((login) => {
+    const key = login.toLowerCase()
+    if (key.endsWith('[bot]') || mentioned.has(key)) return false
+    mentioned.add(key)
+    return true
+  })
+  const mentionLine = mentions.map((login) => `@${login}`).join(' ')
   return {
     async post(runId, batch, questions) {
-      const { url, at } = await options.comments.post(render(runId, batch, questions))
+      const text = render(runId, batch, questions)
+      const { url, at } = await options.comments.post(mentionLine ? `${mentionLine}\n\n${text}` : text)
       return { batch, ref: url, at }
     },
     async answers(posted, questions) {
