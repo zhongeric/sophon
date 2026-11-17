@@ -99,6 +99,8 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
     assert.match(done.body, /CI \(push\): pass/)
     assert.match(done.body, /May sub return a negative number\? \*\*No, throw an error\*\*/)
     assert.equal(mock.fileAt(`refs/heads/factory/${started.run}`, 'src/math.ts'), fixed)
+    // The signing check also reads the rules of the publish branch.
+    assert.ok(mock.state.requests.includes(`GET /repos/acme/app/rules/branches/${encodeURIComponent(`factory/${started.run}`)}`))
 
     const status = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: { state: string }[] }
     assert.equal(status.runs[0]?.state, 'passed')
@@ -265,7 +267,8 @@ test('on Cloudflare, a docs and tests only change takes the light loop, with hos
 
 test('on Cloudflare, deleted source files and the old paths of renamed source files require the full loop', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo({ light: true })
-  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' })
+  // The fixture has no usable key, so its own commits are unsigned.
+  const git = (...args: string[]) => execFileSync('git', ['-c', 'commit.gpgsign=false', ...args], { cwd: repo, stdio: 'pipe' })
   git('checkout', '-q', 'main')
   writeFileSync(join(repo, 'src/removed.ts'), 'export const removed = true\n')
   git('add', '-A')

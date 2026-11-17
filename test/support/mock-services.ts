@@ -190,6 +190,8 @@ export async function mockServices(
         return json(response, 200, { data: {} })
       }
       if (route === `GET ${api}`) return json(response, 200, { default_branch: 'main' })
+      // No ruleset requires signatures. The classic protection keeps the default 404: no requirement.
+      if (route.startsWith(`GET ${api}/rules/branches/`)) return json(response, 200, [])
       if (route === `GET ${api}/installation`) return options.app?.installed ? json(response, 200, { id: 42 }) : json(response, 404, { message: 'Not Found' })
       if (options.app && route === 'GET /app') return json(response, 200, { slug: options.app.slug })
       if (options.app?.installed && route === 'POST /app/installations/42/access_tokens') {

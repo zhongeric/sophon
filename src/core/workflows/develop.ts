@@ -4,12 +4,13 @@ import type { MergeMethod, RepoConfig } from '../checks.ts'
 import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
-import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeResult, PullRequests } from '../platform.ts'
+import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeResult, PullRequests, Signing } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
 import { branchesSection, pruneBranches, reasonOf, type BranchFacts, type BranchRun, type PruneResult } from '../prune.ts'
 import type { Credentials, Provider } from '../providers.ts'
 import { asker, commentLimit, decisionLists, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
 import type { ModelChoice } from '../roles.ts'
+import { signingLine, type SigningRecord } from '../signing.ts'
 import { StopError } from '../stop.ts'
 import { BudgetStop, belowBudget, budgetGate, checkPriced, resolveBudget, usageOf, usageSection, zeroTokens, type Prices, type RunUsage, type UsageRow } from '../usage.ts'
 import { checkAllowedModels, checkFamilySwap, decisionSections, defaultAllowedModels, loopModelIds, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
@@ -48,8 +49,8 @@ export type DevelopInput = {
   issue?: number
 }
 
-/** `budget` is what remains of the development budget, so that the review loop stays inside it. */
-export type ReviewRequest = { runId: string; ask: string; head: string; full: boolean; pr: number; budget?: number }
+/** `budget` is what remains of the development budget, so that the review loop stays inside it. `branch` is the PR head branch. */
+export type ReviewRequest = { runId: string; ask: string; head: string; branch: string; full: boolean; pr: number; budget?: number }
 
 /** What the platform supplies. */
 export type DevelopDeps = {
@@ -66,6 +67,7 @@ export type DevelopDeps = {
   channel: Channel
   branches: Branches
   pulls: PullRequests
+  signing: Signing
   /** The checks and tests of a branch, run in its worktree. */
   checker(branch: Branch): Checker
   /** Runs the code review loop on a commit of the run's branch. */
@@ -145,7 +147,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const { ledger, branches, pulls } = deps
   const models = input.models.develop
   // What the report shows. Each stage fills its part.
-  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [], stoppedReview: null }
+  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, signing: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [], stoppedReview: null }
   const spentPasses = () => [...state.reviews, ...(state.stoppedReview ? [state.stoppedReview] : [])]
   // The review passes keep their usage in their own ledgers, so their spend counts here as extra spend.
   const budget = budgetGate({
@@ -271,6 +273,10 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     }
   })
   state.branch = branchName
+  // Before the first commit. The branch name comes from the intake slug, so the check cannot run before intake.
+  const signing = await step(ledger, 'signing', () => deps.signing.check([branchName]))
+  state.signing = signing
+  await deps.signing.apply(signing)
   const dev = await branches.branch(branchName, input.base)
   const scheduled = waves(planned.tasks, input.parallel ?? defaultParallel)
   for (const [index, wave] of scheduled.entries()) {
@@ -372,7 +378,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         // already counts the spend of its stopped attempt, so that spend is not taken from the remaining budget.
         const limit = budget.limit()
         const remaining = limit === undefined ? {} : { budget: limit - budget.spent() + (state.stoppedReview?.usage?.usd ?? 0) }
-        const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, full: input.full === true, pr: state.pr!.number, ...remaining })
+        const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, branch: branchName, full: input.full === true, pr: state.pr!.number, ...remaining })
         const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage }
         if (!loop.stopped) return result
         ledger.put(stoppedKey, result)
@@ -599,6 +605,7 @@ type ReportState = {
   route: Route | null
   plan: Plan | null
   branch: string | null
+  signing: SigningRecord | null
   head: string | null
   pr: { number: number; url: string } | null
   built: { task: PlanTask; log: BuildLog }[]
@@ -633,6 +640,7 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
     ...(state.intake ? [`- Title: ${state.intake.title}`] : []),
     ...(state.route ? [`- Route: ${state.route.spec ? 'spec, then plan' : 'plan'}, ${state.route.passes} review loop ${state.route.passes === 1 ? 'pass' : 'passes'}. ${state.intake?.reason ?? ''}`] : []),
     ...(state.branch ? [`- Branch: ${state.branch}${state.head ? ` at ${state.head.slice(0, 12)}` : ''}`] : []),
+    ...(state.signing ? [`- ${signingLine(state.signing)}`] : []),
     '',
     ...(criteria.length > 0 ? ['## Criteria', '', ...criteria.map(criterionLine), ''] : []),
     ...(state.plan ? ['## Plan', '', state.plan.smallest_change, ''] : []),

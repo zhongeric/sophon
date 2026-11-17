@@ -145,6 +145,7 @@ async function newInput(values: Values): Promise<{ input: LoopInput; source: Git
   if (values['ask-file']) ask = readFileSync(String(values['ask-file']), 'utf8')
   let ship: LoopInput['ship']
   let prNumber: number | undefined
+  let headRef: string | undefined
   if (values.pr) {
     const pr = Number(values.pr)
     const { stdout } = await exec('gh', ['pr', 'view', String(pr), '--json', 'title,body,baseRefName,headRefName,headRefOid'], { cwd: repo })
@@ -154,6 +155,7 @@ async function newInput(values: Values): Promise<{ input: LoopInput; source: Git
     head = view.headRefOid
     ask ??= `${view.title}\n\n${view.body}`
     prNumber = pr
+    headRef = view.headRefName
     if (values.ship) ship = { pr, headRef: view.headRefName }
   } else if (values.ship) throw new StopError('--ship needs --pr')
   if (!base) throw new StopError('give --pr or --base')
@@ -169,6 +171,7 @@ async function newInput(values: Values): Promise<{ input: LoopInput; source: Git
     source: `${repo} ${base}..${head}`,
     ...(values.stack ? { stack: String(values.stack) } : {}),
     ...(prNumber ? { pr: prNumber } : {}),
+    ...(headRef ? { headRef } : {}),
     ...(ship ? { ship } : {}),
     ...(values.full ? { full: true } : {}),
   }

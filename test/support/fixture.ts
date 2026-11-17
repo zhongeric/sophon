@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Contracts } from 'nanocode-ts'
-import type { Repo } from '../../src/core/platform.ts'
+import type { Repo, Signing } from '../../src/core/platform.ts'
 import type { Credentials } from '../../src/core/providers.ts'
 import { parseAnswers, type Channel, type Question } from '../../src/core/questions.ts'
 import type { Prices } from '../../src/core/usage.ts'
@@ -28,9 +28,18 @@ export const lightFixed = {
   test: '// SPDX-License-Identifier: MIT\npragma solidity 0.8.28;\n\nimport {Test} from "forge-std/Test.sol";\n\ncontract VaultTest is Test {\n    function test_deposit_succeeds() public {}\n}\n',
 }
 
+/** Signs each commit with a gpg.program that always fails, as on a machine without a usable key. */
+export function withoutKey(repo: string): void {
+  const config = (key: string, value: string) => execFileSync('git', ['config', key, value], { cwd: repo })
+  config('commit.gpgsign', 'true')
+  config('gpg.format', 'openpgp')
+  config('gpg.program', 'false')
+}
+
 /**
  * A repository whose feature branch adds a sub() that adds, with a test that catches it. With `light`, a Foundry
  * repository whose feature branch only changes docs and a test, with a Latin abbreviation and a vague test name.
+ * The repository has no usable key, so its own commits are unsigned.
  */
 export function fixtureRepo(options: { light?: boolean } = {}): string {
   const repo = mkdtempSync(join(tmpdir(), 'factory-repo-'))
@@ -42,7 +51,8 @@ export function fixtureRepo(options: { light?: boolean } = {}): string {
   run('init', '-q', '-b', 'main')
   run('config', 'user.email', 'test@example.com')
   run('config', 'user.name', 'Test')
-  run('config', 'commit.gpgsign', 'false')
+  withoutKey(repo)
+  const commit = (message: string) => run('-c', 'commit.gpgsign=false', 'commit', '-q', '-m', message)
   write('src/math.ts', 'export function add(a: number, b: number): number {\n  return a + b\n}\n')
   write('docs/v1.md', 'version 1\n')
   write('docs/v2.md', 'version 2\n')
@@ -58,13 +68,13 @@ export function fixtureRepo(options: { light?: boolean } = {}): string {
   )
   if (options.light) write('foundry.toml', '[profile.default]\nsolc = "0.8.28"\n')
   run('add', '-A')
-  run('commit', '-q', '-m', 'base')
+  commit('base')
   run('checkout', '-q', '-b', 'feature')
   if (options.light) {
     write('docs/v2.md', 'version 2, e.g. the second release\n')
     write('test/Vault.t.sol', lightFixed.test.replace('test_deposit_succeeds', 'testStuff'))
     run('add', '-A')
-    run('commit', '-q', '-m', 'document v2')
+    commit('document v2')
     return repo
   }
   write('src/math.ts', fixed.replace('a - b', 'a + b'))
@@ -72,7 +82,7 @@ export function fixtureRepo(options: { light?: boolean } = {}): string {
   symlinkSync('v2.md', join(repo, 'docs/current.md'))
   write('test/sub.test.ts', "import assert from 'node:assert/strict'\nimport { test } from 'node:test'\nimport { sub } from '../src/math.ts'\n\ntest('sub', () => assert.equal(sub(5, 3), 2))\n")
   run('add', '-A')
-  run('commit', '-q', '-m', 'add sub')
+  commit('add sub')
   return repo
 }
 
@@ -194,19 +204,21 @@ export async function loopInput(repo: string, runId: string): Promise<LoopInput>
 
 /**
  * Runs the loop on the fixture with the Node platform, a scripted model, and by default a channel that takes every
- * recommendation. `repo` can replace methods of the Node repo, for example the GitHub calls.
+ * recommendation. `signing` wraps the signing of the Node platform. `repo` can replace methods of the Node repo, for example
+ * the GitHub calls.
  */
 export async function runLoop(
   repo: string,
   runId: string,
   runsDir: string,
-  options: { dispatch: Contracts.RuntimeOptions['dispatch']; channel?: Channel; input?: LoopInput; prices?: Prices; budget?: number; repo?: (repo: Repo) => Repo },
+  options: { dispatch: Contracts.RuntimeOptions['dispatch']; channel?: Channel; input?: LoopInput; prices?: Prices; budget?: number; signing?: (signing: Signing) => Signing; repo?: (repo: Repo) => Repo },
 ) {
   const given = options.input ?? (await loopInput(repo, runId))
   const input = options.budget === undefined ? given : { ...given, budget: options.budget }
   const run = await nodeRun({ config: input.config, runId, runsDir, source: gitSource(repo) })
   const result = await codeReviewLoop(input, {
     ...run,
+    signing: options.signing ? options.signing(run.signing) : run.signing,
     channel: options.channel ?? memoryChannel().channel,
     credentials,
     dispatch: options.dispatch,

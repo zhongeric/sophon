@@ -7,9 +7,10 @@ import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { commandChecker, parseRepoConfig, readRepoConfig, repoConfigFile, requireChecks, resolveRepoConfig, type RepoConfig } from '../core/checks.ts'
 import { runLock } from '../core/egress.ts'
-import type { AgentStore, Files, Guides, PullRequests } from '../core/platform.ts'
+import type { AgentStore, Files, Guides, PullRequests, Signing } from '../core/platform.ts'
 import { profileDefaults, type RootFiles } from '../core/profiles.ts'
 import type { Credentials } from '../core/providers.ts'
+import type { SigningRecord } from '../core/signing.ts'
 import type { Channel } from '../core/questions.ts'
 import { loadResearchDomain, type ResearchConfig, type ResearchDomain, type ResearchFiles } from '../core/research.ts'
 import { StopError } from '../core/stop.ts'
@@ -19,9 +20,10 @@ import type { DevelopDeps, DevelopInput } from '../core/workflows/develop.ts'
 import type { ResearchDeps, ResearchInput } from '../core/workflows/research.ts'
 import { nodeArtifacts } from './artifacts.ts'
 import { diskFileSystem, guideFileSystem } from './disk.ts'
-import { gitBranches, gitRepo, gitTree, worktreePath, type GitSource } from './git.ts'
+import { gitBranches, gitRepo, gitTree, worktreePath, type GitCommits, type GitSource } from './git.ts'
 import { fileLedger } from './ledger.ts'
 import { localMachine } from './machine.ts'
+import { nodeSigning } from './signing.ts'
 
 export const agentsDir = fileURLToPath(new URL('../../agents/', import.meta.url))
 
@@ -150,19 +152,22 @@ export function dirFiles(dir: string): Files {
   }
 }
 
-export type NodeRun = Pick<LoopDeps, 'ledger' | 'repo' | 'checker' | 'files' | 'store' | 'guides'> & { dir: string }
+export type NodeRun = Pick<LoopDeps, 'ledger' | 'repo' | 'checker' | 'signing' | 'files' | 'store' | 'guides'> & { dir: string }
 
 /** The platform of one run on this machine: runs/<id>/ holds the ledger, the worktree, the journals and the report. */
 export async function nodeRun(options: { runsDir: string; runId: string; source: GitSource; config: RepoConfig }): Promise<NodeRun> {
   const dir = resolve(options.runsDir, options.runId)
   mkdirSync(dir, { recursive: true })
   const tree = join(dir, 'tree')
-  const repo = gitRepo(options.source, tree, `factory/${options.runId}`)
+  // The signing step sets the commit mode, and the repository reads it at each commit.
+  const commits: GitCommits = { unsigned: false }
+  const repo = gitRepo(options.source, tree, `factory/${options.runId}`, commits)
   return {
     dir,
     ledger: fileLedger(join(dir, 'state.json')),
     repo,
     checker: commandChecker(repo, options.config, localMachine(tree)),
+    signing: nodeSigning(options.source.repo, commits),
     files: dirFiles(dir),
     store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
     guides: await nodeGuides(options.config),
@@ -196,6 +201,10 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
   const dir = resolve(options.runsDir, input.runId)
   const branchesDir = join(dir, 'branches')
   mkdirSync(branchesDir, { recursive: true })
+  const commits: GitCommits = { unsigned: false }
+  const signing = nodeSigning(options.repo, commits)
+  // The answer for the development branch. Each review pass of that branch uses it and does not call GitHub again.
+  let recorded: SigningRecord | undefined
   const host = { credentials: options.credentials, dispatch: options.dispatch, log: options.log, module: options.module, prices: options.prices }
   return {
     ...host,
@@ -205,17 +214,25 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
     store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
     guides: await nodeGuides(input.config),
     channel: options.channel,
-    branches: gitBranches(options.repo, branchesDir),
+    branches: gitBranches(options.repo, branchesDir, commits),
+    signing: {
+      check: signing.check,
+      async apply(record) {
+        recorded = record
+        await signing.apply(record)
+      },
+    },
     pulls: options.pulls,
     checker: (branch) => commandChecker(branch, input.config, localMachine(worktreePath(branchesDir, branch.name))),
-    async review({ runId, ask, head, full, pr, budget }) {
+    async review({ runId, ask, head, branch, full, pr, budget }) {
       const source = { repo: options.repo, base: input.base, head }
       const run = await nodeRun({ config: input.config, runId, runsDir: options.runsDir, source })
       run.ledger.put('git', source)
-      const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}), ...(budget !== undefined ? { budgetOverride: budget } : {}), stopAtBudget: true }
+      const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, headRef: branch, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}), ...(budget !== undefined ? { budgetOverride: budget } : {}), stopAtBudget: true }
       // The pass runs again after a raise with a new remaining budget, so the budget is an override, not the recorded value.
       // At the budget, the pass stops without a question, and the development run asks with the run totals.
-      return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr) })
+      const passSigning: Signing = { apply: run.signing.apply, check: async (branches) => recorded ?? run.signing.check(branches) }
+      return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr), signing: passSigning })
     },
     ci: options.ci,
   }

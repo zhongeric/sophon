@@ -3,12 +3,13 @@ import type { CheckResult, RepoConfig } from '../checks.ts'
 import { assignIds, type Finding } from '../findings.ts'
 import { acceptRejection, findingQuestion, gate, rejectionQuestion, settle, type GateResult } from '../gate.ts'
 import { step, type Ledger } from '../ledger.ts'
-import type { AgentStore, Checker, Files, Frozen, Guides, Repo } from '../platform.ts'
+import type { AgentStore, Checker, Files, Frozen, Guides, Repo, Signing } from '../platform.ts'
 import { branchesSection, pruneBranches, reasonOf, type PruneResult, type PullState } from '../prune.ts'
 import { isLight, profilesById, staticFindings, triage, triageLine, type Triage } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
 import { asker, decisionLists, decisions, type Answer, type Channel } from '../questions.ts'
 import { reviewRoles, type ModelChoice } from '../roles.ts'
+import { signingLine, type SigningRecord } from '../signing.ts'
 import { askQuestions, intent, light, patch, review, splitReview, type LightLog, type PatchLog, type PatchOutcome, type Range, type RunContext, type Verdict } from '../steps.ts'
 import { StopError } from '../stop.ts'
 import { BudgetStop, budgetGate, checkPriced, resolveBudget, spendOf, usageOf, usageSection, type Prices, type RunUsage } from '../usage.ts'
@@ -107,6 +108,8 @@ export type LoopInput = {
   pr?: number
   /** On PASS, push the fixes to the PR branch (fast-forward only) and mark the PR ready. */
   ship?: { pr: number; headRef: string }
+  /** The PR head branch that the fixes go to. The signing check reads its rules. */
+  headRef?: string
   /** Run the full loop, also when triage allows the light loop. */
   full?: boolean
   /** The cost budget in USD. At the budget, the run asks the user to raise it or to stop. */
@@ -123,6 +126,7 @@ export type LoopDeps = {
   ledger: Ledger
   repo: Repo
   checker: Checker
+  signing: Signing
   /** Where the user answers questions. */
   channel: Channel
   files: Files
@@ -167,6 +171,10 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   // A run that deleted its fix branch cannot go on: the worktree is gone, so the first git call of a resume fails.
   const ended = ledger.get<LoopResult>('ended')
   if (ended) return ended
+  // Freeze commits, so the check runs before it. A review with --base only pushes no branch.
+  const headRef = input.headRef ?? input.ship?.headRef
+  const signing = await step(ledger, 'signing', () => deps.signing.check(headRef === undefined ? [] : [headRef]))
+  await deps.signing.apply(signing)
   const frozen = await step(ledger, 'freeze', () => repo.freeze())
   const stack = input.stack ?? input.config.stack
   // Triage also sees deleted files and the old path of each rename, so that a removal of code gets the full loop.
@@ -375,7 +383,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     const steps = ['- The run stopped at the cost budget before the steps finished.']
     // A resume with a higher budget goes on, so this prune step must not be the prune step of its end.
     const { pruned, lines } = await prune('prune.stopped', false)
-    const report = renderReport({ input, frozen, current, pass: false, criteria, triage: triaged, steps, checks: null, verdict: null, decisions: decisions(ledger), usage: usageReport.lines, note, branches: lines })
+    const report = renderReport({ input, frozen, current, pass: false, criteria, triage: triaged, signing, steps, checks: null, verdict: null, decisions: decisions(ledger), usage: usageReport.lines, note, branches: lines })
     deps.files.write('report.md', report)
     ledger.put('result', { pass: false, criteria, final: current, usage: usageReport.run, stopped: true })
     return end({ pass: false, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: true, pruned })
@@ -392,7 +400,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   const { pruned, lines } = await prune('prune', pass && input.ship !== undefined)
 
   const usageReport = usage()
-  const report = renderReport({ input, frozen, current, pass, criteria, triage: triaged, steps, checks, verdict, decisions: decisions(ledger), usage: usageReport.lines, note: null, branches: lines })
+  const report = renderReport({ input, frozen, current, pass, criteria, triage: triaged, signing, steps, checks, verdict, decisions: decisions(ledger), usage: usageReport.lines, note: null, branches: lines })
   deps.files.write('report.md', report)
   ledger.put('result', { pass, criteria, final: current, usage: usageReport.run, stopped: false })
   return end({ pass, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: false, pruned })
@@ -471,6 +479,7 @@ type ReportInput = {
   pass: boolean
   criteria: Criterion[]
   triage: Triage
+  signing: SigningRecord
   steps: string[]
   /** Null when the run stopped before the checks. */
   checks: CheckResult[] | null
@@ -491,6 +500,7 @@ function renderReport(run: ReportInput): string {
     `- Reviewed: ${short(run.frozen.base)}..${short(run.frozen.head)}`,
     `- Fixes: branch ${run.frozen.branch} at ${short(run.current)} (${run.frozen.location})`,
     `- Triage: \`${triageLine(run.triage)}\``,
+    `- ${signingLine(run.signing)}`,
     '',
     ...(run.note ? [run.note, ''] : []),
     '## Criteria',

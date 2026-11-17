@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync } fr
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import type { Signing } from '../src/core/platform.ts'
 import { PausedError, type Channel } from '../src/core/questions.ts'
 import { StopError } from '../src/core/stop.ts'
 import { BudgetStop, recordUsage, zeroTokens, type Prices } from '../src/core/usage.ts'
@@ -13,7 +14,7 @@ import { ghPullRequests } from '../src/node/github.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { nodeDevelop } from '../src/node/platform.ts'
 import { developInput, developScript, developRepo, fakePulls, mergeCommit, plan, runDevelop, scopeQuestion, sources } from './support/develop.ts'
-import { credentials, memoryChannel, module } from './support/fixture.ts'
+import { credentials, memoryChannel, module, withoutKey } from './support/fixture.ts'
 import { probeNetwork, scriptedDispatch, webSearch, type Turn } from './support/scripted-model.ts'
 import { visible, visibleLines, visibleWords } from './support/visible.ts'
 
@@ -73,6 +74,8 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.doesNotMatch(github.state.opened[0]!.body, /# Decisions of the user/)
 
   assert.match(result.report, /^# Development run: READY/)
+  // origin is a local bare repository, so the host commits unsigned, also without a usable key.
+  assert.match(result.report, /^- Commits: unsigned \(no GitHub origin\)$/m)
   assert.ok(visibleLines(result.report).length <= 10, result.report)
   assert.match(visible(result.report), /^PR: \S+$/m)
   assert.doesNotMatch(visible(result.report), /^- \[/m)
@@ -338,6 +341,38 @@ test('develop: a blocked builder stops the run with the reason, before any PR', 
   assert.match(result.report, /^- deleted factory\/task-blocked-sub \(stranded\)$/m)
 })
 
+test('develop: a signing stop after the plan ends the run before any builder and before any commit on the run branch', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const turns: Turn[] = []
+  const checked: string[][] = []
+  const signing = (node: Signing): Signing => ({
+    check: async (branches) => (checked.push(branches), node.check(branches)),
+    apply: async () => {
+      throw new StopError('Branch factory/dev-add-sub-mul requires signed commits (required by Protect main)')
+    },
+  })
+  await assert.rejects(
+    runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript(), turns), pulls: fakePulls().pulls, runId: 'signing-stop', signing }),
+    /requires signed commits \(required by Protect main\)/,
+  )
+  assert.deepEqual(checked, [['factory/dev-add-sub-mul']])
+  assert.ok(turns.some((turn) => turn.role === 'planner'))
+  assert.ok(!turns.some((turn) => turn.role === 'builder'))
+  await assert.rejects(git(repo, 'show-ref', '--verify', '--quiet', 'refs/heads/factory/dev-add-sub-mul'))
+})
+
+test('develop: a review pass uses the signing answer of the development branch and does not check again', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  const checked: string[][] = []
+  const record = { origin: true, branches: [{ branch: 'factory/dev-add-sub-mul', rulesets: [], classic: 'none' as const }], mode: 'unsigned' as const }
+  const signing = (node: Signing): Signing => ({ ...node, check: async (branches) => (checked.push(branches), record) })
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls: fakePulls([false, true]).pulls, runId: 'signing-pass', signing })
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(checked, [['factory/dev-add-sub-mul']])
+  assert.deepEqual(fileLedger(join(dir, 'signing-pass-review-1', 'state.json')).get('step:signing'), { result: record })
+})
+
 test('develop: a test command writes outside the task scope, checkpoint refuses, and the builder submits a blocked log', { timeout: 120_000 }, async () => {
   const { repo } = developRepo({
     stack: 'TypeScript',
@@ -439,6 +474,7 @@ type ScriptedPass = { usd: number; stopped: boolean }
 
 /** Runs the development workflow with a budget, and with review passes that the test gives in place of the review loop. */
 async function runBudget(repo: string, runsDir: string, options: { runId: string; budget: number; channel: Channel; passes: ScriptedPass[]; requests: ReviewRequest[]; prices?: Prices }) {
+  withoutKey(repo)
   const github = fakePulls([true])
   const input = { ...(await developInput(repo, options.runId)), budget: options.budget }
   const deps = await nodeDevelop({
