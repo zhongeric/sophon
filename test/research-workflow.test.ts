@@ -37,7 +37,7 @@ test('research: each clean box is a new checkout at a new path, and only the las
     reviewChannel: async () => channel,
     runsDir: runsDir(),
   })
-  const first = await deps.cleanBox(base)
+  const first = await deps.cleanBox(base, 'calibrate.hyp-001.1')
   const location = await first.run('pwd', { env: [], timeoutMs: 10_000 })
   assert.equal(location.exit_code, 0)
   let tree = location.output.trim()
@@ -47,7 +47,8 @@ test('research: each clean box is a new checkout at a new path, and only the las
     writeFileSync(join(tree, '.gitignore'), 'ignored\n')
     writeFileSync(join(tree, 'ignored'), 'output\n')
     writeFileSync(join(tree, 'untracked'), 'output\n')
-    const box = await deps.cleanBox(commit)
+    // The local platform ignores the key: the same key two times also gives a new checkout.
+    const box = await deps.cleanBox(commit, `reproduce.${commit}`)
     const next = await box.run('pwd', { env: [], timeoutMs: 10_000 })
     assert.equal(next.exit_code, 0)
     // A new path, so that an output that depends on the path does not reproduce. The earlier checkout is gone.

@@ -122,8 +122,11 @@ export type ResearchDeps = {
   pulls: PullRequests
   /** The checks and tests of a branch, run in its worktree. */
   checker(branch: Branch): Checker
-  /** A machine on a new checkout of a commit, outside every branch worktree, for the calibration and the reproduction. */
-  cleanBox(commit: string): Promise<ResearchBox>
+  /**
+   * A machine on a new checkout of a commit, outside every branch worktree, for the calibration and the reproduction.
+   * `key` names the step. A platform that resumes a step in a later call can give the same checkout for the same key.
+   */
+  cleanBox(commit: string, key: string): Promise<ResearchBox>
   /** Runs the code review loop on a commit of the run branch. */
   review(request: ReviewRequest): Promise<LoopResult>
   domain: ResearchDomain
@@ -723,7 +726,7 @@ async function calibrate(stages: Stages, analysis: Analysis): Promise<Calibratio
   const calibration = await step(deps.ledger, `calibrate.${hypothesis}.${round}`, async (): Promise<CalibrationRound> => {
     const threshold = preregThreshold(new TextDecoder().decode(await branch.tree.read(`/${path}`)))
     const head = await branch.head()
-    const box = await deps.cleanBox(head)
+    const box = await deps.cleanBox(head, `calibrate.${hypothesis}.${round}`)
     const known = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'known', path), hypothesis, round)
     const inject = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'inject', path), hypothesis, round)
     const verdict = calibrationVerdict(known.run, inject.run, threshold)
@@ -753,7 +756,7 @@ async function reproduce(stages: Stages, analyses: Analysis[], head: string): Pr
     const { hypothesis, path } = analysis.freeze
     const calibration = finalCalibration(analysis)
     const result = await step(deps.ledger, `reproduce.${hypothesis}.${head}`, async (): Promise<Reproduction> => {
-      box ??= deps.cleanBox(head)
+      box ??= deps.cleanBox(head, `reproduce.${head}`)
       const run = await runDomainCommand(deps.config, await box, 'reproduce', path)
       const verdict = compareReproduction(calibration.outputs, run)
       const artifact = await keep(deps, run, hypothesis, calibration.round)

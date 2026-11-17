@@ -77,10 +77,12 @@ async function freePort(): Promise<number> {
 /**
  * The real Worker under wrangler dev, in local mode, with `vars` as its bindings and a fresh Durable Object store.
  * Without `containers`, a test gives the Worker a machine over HTTP (MACHINE_URL), so that it needs no Docker.
+ * `persistTo` of an earlier Worker starts the Worker again on the same Durable Object store.
  */
-export async function startWorker(vars: Record<string, string>, options: { containers?: boolean } = {}) {
+export async function startWorker(vars: Record<string, string>, options: { containers?: boolean; persistTo?: string } = {}) {
   const port = await freePort()
-  const args = ['wrangler', 'dev', '--local', `--enable-containers=${options.containers === true}`, '--port', String(port), '--inspector-port', String(await freePort()), '--persist-to', mkdtempSync(join(tmpdir(), 'factory-do-'))]
+  const persistTo = options.persistTo ?? mkdtempSync(join(tmpdir(), 'factory-do-'))
+  const args = ['wrangler', 'dev', '--local', `--enable-containers=${options.containers === true}`, '--port', String(port), '--inspector-port', String(await freePort()), '--persist-to', persistTo]
   for (const [name, value] of Object.entries(vars)) args.push('--var', `${name}:${value}`)
   const env: NodeJS.ProcessEnv = { ...process.env, WRANGLER_SEND_METRICS: 'false', NO_COLOR: '1' }
   for (const name of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NODE_USE_ENV_PROXY']) delete env[name]
@@ -109,6 +111,7 @@ export async function startWorker(vars: Record<string, string>, options: { conta
   let stopping: Promise<void> | undefined
   return {
     url: `http://127.0.0.1:${port}`,
+    persistTo,
     output: () => output,
     /** Resolves when the whole wrangler dev process group exited. A second call gives the same promise. */
     stop: () => (stopping ??= stopGroup(child, graceMs)),

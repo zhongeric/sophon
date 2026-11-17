@@ -21,6 +21,7 @@ const example = {
     evaluate: 'python -m search.evaluate {prereg}',
     reproduce: 'python -m search.reproduce {prereg}',
   },
+  timeouts: { known: 7_200_000, reproduce: 7_200_000 },
   feeds: ['https://export.arxiv.org/rss/astro-ph'],
 }
 
@@ -95,6 +96,20 @@ test('commands need known, inject, evaluate and reproduce, and use only {prereg}
   rejects(commands({ sweep: '' }), 'research.commands.sweep', /non-empty string/)
   rejects(commands({ sweep: 'run {prereg} {target}' }), 'research.commands.sweep', /placeholder \{target\}, but only \{prereg\} and \{partition\}/)
   rejects(commands({ known: 'run {Prereg}' }), 'research.commands.known', /placeholder \{Prereg\}/)
+})
+
+test('timeouts are optional positive integers of milliseconds for the domain commands', () => {
+  const { timeouts: _, ...without } = example
+  assert.equal('timeouts' in (parse(without) ?? {}), false)
+  const all = { known: 1, inject: 2, evaluate: 3, reproduce: 4 }
+  assert.deepEqual(parse(research({ timeouts: all }))?.timeouts, all)
+  assert.deepEqual(parse(research({ timeouts: { inject: 60_000 } }))?.timeouts, { inject: 60_000 })
+  assert.deepEqual(parse(research({ timeouts: {} }))?.timeouts, {})
+  rejects(research({ timeouts: { sweep: 1_000 } }), 'research.timeouts.sweep', /not a known key/)
+  for (const value of [0, -1, 1.5, '1000', null, Number.MAX_SAFE_INTEGER + 1])
+    rejects(research({ timeouts: { known: value } }), 'research.timeouts.known', /must be a positive integer of milliseconds/)
+  rejects(research({ timeouts: 60_000 }), 'research.timeouts', /must be an object/)
+  rejects(research({ timeouts: [60_000] }), 'research.timeouts', /must be an object/)
 })
 
 test('a shell ${VAR} in a command is not a placeholder', () => {

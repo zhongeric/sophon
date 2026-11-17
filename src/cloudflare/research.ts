@@ -21,9 +21,8 @@ import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubPulls } from './pulls.ts'
 import { reviewPass } from './review.ts'
-import { answerersOf, credentialsFor, Runs, setupTimeoutMs } from './runs.ts'
+import { answerersOf, credentialsFor, Runs, setupTimeoutMs, type Call } from './runs.ts'
 import { sqlFiles } from './storage.ts'
-import { sqlSyncs } from './syncs.ts'
 import { encodePath } from './trees.ts'
 
 /**
@@ -53,35 +52,41 @@ export class ResearchRuns extends Runs<ResearchRequest> {
     return researchAnnouncement(run, request.by)
   }
 
-  protected async execute(run: string, request: ResearchRequest, ledger: Ledger, gh: GitHub, comments: Comments) {
+  protected async execute(run: string, request: ResearchRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call) {
     const { input, config, domain } = ledger.get<Notebook>('notebook') ?? (await this.notebook(run, request, gh, ledger))
     // A credential that names a Worker setting stops the run before any fetch.
     checkWorkerCredentials(domain.config.credentials)
     const { owner, repo } = request
     const log = (line: string) => console.log(`[${owner}/${repo}#${request.issue} ${run}] ${line}`)
     const sql = Sql.create(this.ctx.storage)
-    const syncs = sqlSyncs(this.ctx.storage.sql, run)
-    const box = this.box(syncs)
+    const { box, syncs, jobs } = await call.machine()
     const pending = new Map<string, Promise<void>>()
     const checker = (branch: Branch) => {
       const dir = `work/${branch.name.replace(/[^A-Za-z0-9._-]/g, '-')}`
-      const sync = () => syncWithSetup(box, syncs, pending, branch.tree, dir, { command: config.setup, timeoutMs: setupTimeoutMs }, log)
-      return commandChecker(branch, { ...config, setup: undefined }, boxMachine(box, dir, sync))
+      const sync = () => syncWithSetup(box, syncs, pending, branch.tree, dir, { command: config.setup, timeoutMs: setupTimeoutMs }, log, jobs)
+      return commandChecker(branch, { ...config, setup: undefined }, boxMachine(box, dir, sync, jobs))
     }
     const result = await research(input, {
       branches: sqlBranches({ gh, ledger, log, owner, repo, run, sql }),
       channel: commentChannel({ answerers: answerersOf(this.env, config.answerers), comments, pollMs: 0, waitMs: 0 }),
       checker,
-      // A new directory for each checkout, so that no file of an earlier command is in it. Only the last one stays.
-      async cleanBox(commit) {
-        const count = (ledger.get<number>('clean-boxes') ?? 0) + 1
-        ledger.put('clean-boxes', count)
-        if (count > 1) {
-          const previous = await box.exec(['rm', '-rf', '--', `clean/${run}/${count - 1}`], { cwd: '', env: boxEnv, timeoutMs: 10 * 60_000 })
-          if (previous.exit_code !== 0) throw new Error(`the removal of clean checkout ${count - 1} failed: ${previous.output.slice(-2000)}`)
+      // A new directory for each step key, so that no file of an earlier command is in it. Only the last one stays. A replay
+      // of the step, for example after a pause on its job, keeps the directory of the key.
+      async cleanBox(commit, key) {
+        const dirKey = `clean-dir:${key}`
+        let dir = ledger.get<string>(dirKey)
+        if (dir === undefined) {
+          const count = (ledger.get<number>('clean-boxes') ?? 0) + 1
+          ledger.put('clean-boxes', count)
+          if (count > 1) {
+            const previous = await box.exec(['rm', '-rf', '--', `clean/${run}/${count - 1}`], { cwd: '', env: boxEnv, timeoutMs: 10 * 60_000 })
+            if (previous.exit_code !== 0) throw new Error(`the removal of clean checkout ${count - 1} failed: ${previous.output.slice(-2000)}`)
+          }
+          dir = `clean/${run}/${count}`
+          ledger.put(dirKey, dir)
         }
         const tree = await commitTree({ ledger, run, sql }, commit)
-        return cleanBox(box, tree, `clean/${run}/${count}`, log)
+        return cleanBox(box, tree, dir, log, { deadline: call.deadline, key, ledger, runner: jobs })
       },
       config,
       credentials: credentialsFor(this.env, researchProviders(input.models)),

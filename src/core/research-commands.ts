@@ -67,8 +67,8 @@ function parseDomainOutput(name: DomainCommand, output: string): { json: DomainJ
 }
 
 /**
- * Runs one domain command of the notebook for one frozen prereg on a machine. The environment and the timeout are those
- * of the checks. The setup of the config runs before the first command on each machine, and a failed setup fails the command.
+ * Runs one domain command of the notebook for one frozen prereg on a machine. The environment is that of the checks. The
+ * timeout is that of research.timeouts for the command, else that of the checks. The setup of the config runs before the first command on each machine, and a failed setup fails the command.
  */
 export async function runDomainCommand(config: RepoConfig, machine: Machine, name: DomainCommand, preregPath: string): Promise<DomainRun> {
   if (!config.research) throw new Error('the notebook has no research config')
@@ -81,7 +81,7 @@ export async function runDomainCommand(config: RepoConfig, machine: Machine, nam
   }
   const failed = await setup()
   if (failed) return { name, command, exit_code: failed.exit_code, output: failed.output, json: null, problem: exitProblem(`the setup ${config.setup}`, failed.exit_code) }
-  const { exit_code, output } = await machine.run(command, options)
+  const { exit_code, output } = await machine.run(command, { ...options, timeoutMs: config.research.timeouts?.[name] ?? options.timeoutMs })
   if (exit_code !== 0) return { name, command, exit_code, output, json: null, problem: exitProblem(name, exit_code) }
   return { name, command, exit_code, output, ...parseDomainOutput(name, output) }
 }

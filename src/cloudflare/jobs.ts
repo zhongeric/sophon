@@ -1,0 +1,133 @@
+import type { Ledger } from '../core/ledger.ts'
+import { PausedError } from '../core/questions.ts'
+import type { Box, BoxResult, JobOptions } from './box.ts'
+
+/**
+ * A job in the ledger of the run. The ledger holds it before the job starts, so that a later call finds the job and
+ * does not start the command again.
+ *
+ * - `pause`: a host step. Its key is the same in each call, a later call polls the job, and the record keeps the result.
+ * - `wait`: an agent tool call. The call waits for the job, and the next call kills it when the call died first.
+ */
+export type JobRecord = {
+  id: string
+  key: string
+  argv: string[]
+  cwd: string
+  mode: 'pause' | 'wait'
+  state: 'open' | 'done' | 'killed'
+  started: number
+  /** The runner, that is the alarm call, that started the job. */
+  call: string
+  result?: BoxResult
+}
+
+export type JobRunner = {
+  /**
+   * Runs the job of `key` one time across calls: gives the result of a finished job, polls a running job, and starts the
+   * job again when the machine does not have it. Throws a PausedError at `deadline`, so that a later call polls the job.
+   */
+  pause(key: string, argv: string[], options: JobOptions & { deadline: number }): Promise<BoxResult>
+  /** Starts a new job and waits for its end in this call, with no deadline. */
+  wait(argv: string[], options: JobOptions): Promise<BoxResult>
+  /** Kills the open wait-mode jobs of earlier calls. Call it before an agent turn can run again. */
+  killStale(): Promise<void>
+  /** Kills all open jobs of the run, for the end of the run. */
+  killAll(): Promise<void>
+}
+
+// No key starts with step:, output: or report:, because these keys count as progress for callBudget.
+const openKey = 'jobs:open'
+const recordKey = (id: string) => `job:${id}`
+const pauseKey = (key: string) => `job-key:${key}`
+const firstPollMs = 250
+
+/** True when the ledger has a job that is not done or killed, so that the end of a run needs the machine only then. */
+export const hasOpenJobs = (ledger: Ledger): boolean => (ledger.get<string[]>(openKey) ?? []).length > 0
+
+/** The jobs of one alarm call on `box`, in the ledger of the run. `now` and `sleep` are for tests. */
+export function jobRunner(
+  box: Box,
+  ledger: Ledger,
+  options: { now?: () => number; sleep?: (ms: number) => Promise<void>; pollMs?: number } = {},
+): JobRunner {
+  const now = options.now ?? Date.now
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const pollMs = options.pollMs ?? 5_000
+  const call = crypto.randomUUID()
+  const describe = (record: JobRecord) => `\`${record.argv.join(' ')}\` in ${record.cwd || '/'}`
+  const save = (record: JobRecord) => {
+    ledger.put(recordKey(record.id), record)
+    const open = (ledger.get<string[]>(openKey) ?? []).filter((id) => id !== record.id)
+    ledger.put(openKey, record.state === 'open' ? [...open, record.id] : open)
+  }
+  const start = async (key: string, argv: string[], mode: JobRecord['mode'], { cwd, env, timeoutMs }: JobOptions) => {
+    const record: JobRecord = { argv, call, cwd, id: `job-${crypto.randomUUID()}`, key, mode, started: now(), state: 'open' }
+    save(record)
+    if (mode === 'pause') ledger.put(pauseKey(key), record.id)
+    await box.startJob(record.id, argv, { cwd, env, timeoutMs })
+    return record
+  }
+  const finish = (record: JobRecord, result: BoxResult) => {
+    save({ ...record, state: 'done', ...(record.mode === 'pause' ? { result } : {}) })
+    return result
+  }
+  const kill = async (record: JobRecord) => {
+    await box.killJob(record.id)
+    save({ ...record, state: 'killed' })
+  }
+  const killOpen = async (which: (record: JobRecord) => boolean) => {
+    for (const id of ledger.get<string[]>(openKey) ?? []) {
+      const record = ledger.get<JobRecord>(recordKey(id))
+      if (record && which(record)) await kill(record)
+    }
+  }
+  /** The waits between polls: short at first, so that a short command ends soon, then `pollMs`. */
+  const backoff = () => {
+    let next = firstPollMs
+    return () => {
+      const ms = Math.min(next, pollMs)
+      next *= 2
+      return ms
+    }
+  }
+  return {
+    async pause(key, argv, options) {
+      const interval = backoff()
+      for (;;) {
+        const id = ledger.get<string>(pauseKey(key))
+        const record = id === undefined ? undefined : ledger.get<JobRecord>(recordKey(id))
+        if (record?.state === 'done' && record.result) return record.result
+        let current: JobRecord
+        if (record?.state === 'open') {
+          const polled = await box.pollJob(record.id)
+          if (polled.state === 'done') return finish(record, polled.result)
+          // The next loop starts the job again, after the kill of what is left of it.
+          if (polled.state === 'missing') {
+            await kill(record)
+            continue
+          }
+          current = record
+        } else current = await start(key, argv, 'pause', options)
+        const left = options.deadline - now()
+        if (left <= 0) throw new PausedError(`waiting for the job ${describe(current)}`)
+        await sleep(Math.min(interval(), left))
+      }
+    },
+    async wait(argv, options) {
+      const record = await start(`${options.cwd}:${argv.join(' ')}`, argv, 'wait', options)
+      const interval = backoff()
+      for (;;) {
+        await sleep(interval())
+        const polled = await box.pollJob(record.id)
+        if (polled.state === 'done') return finish(record, polled.result)
+        if (polled.state === 'missing') {
+          await kill(record)
+          throw new Error(`the job ${describe(record)} is not in the machine, for example because the machine started again`)
+        }
+      }
+    },
+    killStale: () => killOpen((record) => record.mode === 'wait' && record.call !== call),
+    killAll: () => killOpen(() => true),
+  }
+}
