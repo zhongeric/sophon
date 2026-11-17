@@ -30,23 +30,22 @@ export async function deleteRemoteBranch(gh: GitHub, api: string, name: string):
 }
 
 /**
- * Makes `to` hold only the files of `commit`: a copy of `from` with .git, a hard reset to the commit, and then the
- * removal of each file that git does not track. Thus no uncommitted file of a branch tree gets into the copy.
+ * Makes `to` hold only the files of `commit`: a copy of the .git directory of `from`, and then a hard reset to the
+ * commit. No work file is copied, so git writes each file of the commit. A copied work file with an uncommitted change
+ * can stay after the reset, because git can see it as clean when its size and time stamp agree with the index.
  */
 export async function checkoutCommit(from: FileSystem.FileSystem, to: FileSystem.FileSystem, commit: string): Promise<void> {
-  await copyTree(from, to, { git: true })
-  const git = treeGit(to)
-  await git('reset', '-q', '--hard', commit)
-  const tracked = new Set((await git('ls-files')).split('\n').filter(Boolean))
+  const writer = treeWriter(to)
   const walk = async (dir: string) => {
-    for (const name of await to.list(dir)) {
-      const path = dir === '/' ? name : `${dir.slice(1)}/${name}`
-      if (path === '.git') continue
-      if ((await to.lstat!(`/${path}`))?.kind === 'directory') await walk(`/${path}`)
-      else if (!tracked.has(path)) await to.remove(`/${path}`)
+    if (!(await to.stat(dir))) await to.mkdir(dir)
+    for (const name of await from.list(dir)) {
+      const path = `${dir}/${name}`
+      if ((await from.lstat!(path))?.kind === 'directory') await walk(path)
+      else await writer.copy(from, path.slice(1))
     }
   }
-  await walk('/')
+  await walk('/.git')
+  await treeGit(to)('reset', '-q', '--hard', commit)
 }
 
 /**

@@ -23,7 +23,8 @@ test('checkoutCommit copies only the files of the commit, without the uncommitte
   await from.write('/later.txt', new TextEncoder().encode('later'))
   await git('add', '-A')
   await git('commit', '-q', '-m', 'two')
-  await from.write('/dir/edit.txt', new TextEncoder().encode('uncommitted'))
+  // The same size as the committed text, so that only the content tells the change.
+  await from.write('/dir/edit.txt', new TextEncoder().encode('work-copy'))
   await from.remove('/gone.txt')
   await from.write('/new.txt', new TextEncoder().encode('untracked'))
   const to = MemoryFileSystem.create()
@@ -31,7 +32,7 @@ test('checkoutCommit copies only the files of the commit, without the uncommitte
   assert.deepEqual([await read(to, '/kept.txt'), await read(to, '/gone.txt'), await read(to, '/dir/edit.txt')], ['one', 'tracked', 'committed'])
   assert.deepEqual([await exists(to, '/later.txt'), await exists(to, '/new.txt')], [false, false])
   // The source tree keeps its uncommitted work.
-  assert.equal(await read(from, '/dir/edit.txt'), 'uncommitted')
+  assert.equal(await read(from, '/dir/edit.txt'), 'work-copy')
 })
 
 const secret = 'webhook-secret'
