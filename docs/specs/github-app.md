@@ -1,6 +1,6 @@
 # Spec: the GitHub App
 
-Status: phase 1 is built. The Worker calls GitHub as the App `sophon-factory` when its secrets are set.
+Status: phases 1 and 2 are built. The Worker calls GitHub as the App `sophon-factory` when its secrets are set.
 
 ## Why
 

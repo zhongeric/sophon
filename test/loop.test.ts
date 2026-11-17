@@ -4,17 +4,38 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import type { Contracts } from 'nanocode-ts'
+import { callBudget, PlannedStop } from '../src/core/planned-stop.ts'
+import type { Checker, Repo } from '../src/core/platform.ts'
 import { profiles, staticFindings, triage } from '../src/core/profiles.ts'
+import type { Signing } from '../src/core/platform.ts'
 import { PausedError, type Channel } from '../src/core/questions.ts'
 import { StopError } from '../src/core/stop.ts'
-import { allowedModelsFrom, defaultAllowedModels, defaultModels, type LoopInput } from '../src/core/workflows/code-review-loop.ts'
-import { resumeInput } from '../src/node/cli.ts'
+import { allowedModelsFrom, codeReviewLoop, defaultAllowedModels, defaultModels, type LoopInput } from '../src/core/workflows/code-review-loop.ts'
+import { branchLine, resumeInput } from '../src/node/cli.ts'
 import { changedFiles, diff, touchedFiles } from '../src/node/git.ts'
 import { fileLedger } from '../src/node/ledger.ts'
-import { fixed, fixtureRepo, gitSource, lightFixed, loopInput, memoryChannel, runLoop, script, scriptFor } from './support/fixture.ts'
+import { nodeRun } from '../src/node/platform.ts'
+import { credentials, fixed, fixtureRepo, gitSource, lightFixed, loopInput, memoryChannel, module, runLoop, script, scriptFor, withoutKey } from './support/fixture.ts'
 import { probeNetwork, scriptedDispatch, webSearch, type Script, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
+
+/** Records each call of the test runner of the checker. With `setupFails`, each call gives a failed setup and runs nothing. */
+function testCalls(options: { setupFails?: boolean } = {}) {
+  const calls: string[][] = []
+  const checker = (real: Checker): Checker => ({
+    ...real,
+    tests: async (tests) => {
+      calls.push(tests)
+      if (options.setupFails) return [{ name: 'setup', command: 'npm ci', status: 'fail', exit_code: 1, output: 'npm ERR! setup failed' }]
+      return real.tests ? real.tests(tests) : []
+    },
+  })
+  return { calls, checker }
+}
+
+const patchOutput = (turns: Turn[]) => turns.filter((turn) => turn.role === 'patch' && turn.output).map((turn) => turn.output).join('\n')
 
 test('the loop reviews, gates, patches, swaps families, checks and passes', async () => {
   const repo = fixtureRepo()
@@ -47,6 +68,8 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   assert.match(gateLog, /FINDING bugs-001 \| track=bugs \| severity=critical \| ACTION=keep/)
   assert.match(gateLog, /FINDING min-001 \| track=minimize \| severity=low \| ACTION=keep/)
   assert.match(result.report, /skipped: min-001 \(inlining adds nothing\)/)
+  // The fixture has no origin and no usable key, so the host commits unsigned.
+  assert.match(result.report, /^- Commits: unsigned \(no GitHub origin\)$/m)
   assert.equal(readFileSync(join(result.dir, 'report.md'), 'utf8'), result.report)
 
   // Without a budget and prices, the Usage section shows the tokens of each agent and no price.
@@ -55,6 +78,178 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   assert.match(result.report, /^\| \*\*Total\*\* \| {2}\| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$0\.0000 \(2 models without a price\) \|$/m)
   assert.equal(result.stopped, false)
   assert.ok(result.usage.tokens.input > 0)
+
+  // A --base run keeps its fix branch for the user (decision 5), and only its worktree goes.
+  assert.equal(execFileSync('git', ['rev-parse', result.branch], { cwd: repo }).toString().trim(), result.final)
+  assert.ok(!existsSync(join(result.dir, 'tree')))
+  assert.deepEqual(result.pruned, { deleted: [], kept: [{ name: result.branch, reason: 'unapplied review fixes' }], failed: [] })
+  assert.doesNotMatch(result.report, /## Branches/)
+  assert.equal(branchLine(result, repo), `Fixes are on factory/e2e. Apply them with: git -C ${repo} merge --ff-only factory/e2e`)
+})
+
+test('the host refuses a patch log while a targeted test fails, and accepts it after the fix', async () => {
+  const repo = fixtureRepo()
+  const turns: Turn[] = []
+  const result = await runLoop(repo, 'break-first', runsDir(), { dispatch: scriptedDispatch(scriptFor({ tests: true, breakFirst: true }), turns) })
+
+  assert.equal(result.pass, true, result.report)
+  assert.equal(execFileSync('git', ['show', `${result.branch}:src/math.ts`], { cwd: repo }).toString(), fixed)
+  const output = patchOutput(turns)
+  assert.match(output, /refused: .*the targeted tests of your edits failed \(test\/add\.test\.ts, test\/sub\.test\.ts\)\. Fix the cause and submit again\. When you cannot fix it, revert your edit and list the finding in skipped with the reason\./)
+  assert.match(output, /--- tests \(exit code 1\) ---/)
+  assert.match(output, /3 !== 2/)
+  assert.doesNotMatch(output, /FAILING PATCH ACCEPTED/)
+  assert.match(output, /checks: syntax=skipped smoke=pass/)
+  assert.ok(turns.some((turn) => turn.role === 'patch' && turn.request.includes('the host runs the targeted tests of the files that you changed')))
+  assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 \(sub returns a - b\); skipped: min-001 \(inlining adds nothing\)$/m)
+})
+
+test('a failed setup at the patch gate accepts the log, and the report says that the targeted tests did not run', async () => {
+  const repo = fixtureRepo()
+  const { calls, checker } = testCalls({ setupFails: true })
+  const result = await runLoop(repo, 'gate-setup', runsDir(), { checker, dispatch: scriptedDispatch(script, []) })
+
+  assert.equal(result.pass, true, result.report)
+  assert.equal(execFileSync('git', ['show', `${result.branch}:src/math.ts`], { cwd: repo }).toString(), fixed)
+  assert.ok(calls.some((tests) => tests.join(' ') === 'test/add.test.ts test/sub.test.ts'), JSON.stringify(calls))
+  assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 .*; targeted tests did not run: the setup failed$/m)
+})
+
+test('a patch agent that changed no files submits without a gate run', async () => {
+  const { calls, checker } = testCalls()
+  const result = await runLoop(fixtureRepo(), 'no-edits', runsDir(), { checker, dispatch: scriptedDispatch(scriptFor({ rejectBug: true, tests: true }), []) })
+
+  // Only the run_tests call of the bugs reviewer reaches the test runner.
+  assert.deepEqual(calls, [['test/sub.test.ts']])
+  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(callers depend on the sum\); min-001 \(inlining adds nothing\)$/m)
+})
+
+test('a patch agent that reverts its edit after a refusal, because the targeted test fails at the base, can skip the finding', async () => {
+  const { calls, checker } = testCalls()
+  const base = fixed.replace('a - b', 'a + b')
+  const revert: Script = (turn) =>
+    turn.role === 'patch' && turn.output === null
+      ? {
+          cell: [
+            `await tools.Write({ file_path: '/repo/src/math.ts', content: ${JSON.stringify(`// sub\n${base}`)} })`,
+            `try { await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'commented sub' }], skipped: [{ id: 'min-001', reason: 'inlining adds nothing' }] }); text('FAILING PATCH ACCEPTED') } catch (error) { text('refused: ' + error) }`,
+            `await tools.Write({ file_path: '/repo/src/math.ts', content: ${JSON.stringify(base)} })`,
+            `await tools.submit_patch_log({ applied: [], skipped: [{ id: 'bugs-001', reason: 'test/sub.test.ts fails at the base' }, { id: 'min-001', reason: 'inlining adds nothing' }] })`,
+          ].join('\n'),
+        }
+      : script(turn)
+  const turns: Turn[] = []
+  const result = await runLoop(fixtureRepo(), 'revert', runsDir(), { checker, dispatch: scriptedDispatch(revert, turns) })
+
+  assert.match(patchOutput(turns), /refused: .*the targeted tests of your edits failed \(test\/add\.test\.ts, test\/sub\.test\.ts\)/)
+  assert.doesNotMatch(patchOutput(turns), /FAILING PATCH ACCEPTED/)
+  // The bugs reviewer and the first submit reach the test runner. The reverted edit does not count at the second submit.
+  assert.deepEqual(calls, [['test/sub.test.ts'], ['test/add.test.ts', 'test/sub.test.ts']])
+  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(test\/sub\.test\.ts fails at the base\); min-001 \(inlining adds nothing\)$/m)
+})
+
+test('a patch agent that reverses a directory rename after a failed test can skip without another gate run', async () => {
+  const { calls, checker } = testCalls()
+  const revert: Script = (turn) =>
+    turn.role === 'patch' && turn.output === null
+      ? {
+          cell: [
+            `text(JSON.stringify(await tools.Bash({ command: 'mv src moved' })))`,
+            `try { await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'moved src' }], skipped: [{ id: 'min-001', reason: 'inlining adds nothing' }] }); text('FAILING PATCH ACCEPTED') } catch (error) { text('refused: ' + error) }`,
+            `text(JSON.stringify(await tools.Bash({ command: 'mv moved src' })))`,
+            `await tools.submit_patch_log({ applied: [], skipped: [{ id: 'bugs-001', reason: 'test/sub.test.ts fails at the base' }, { id: 'min-001', reason: 'inlining adds nothing' }] })`,
+          ].join('\n'),
+        }
+      : script(turn)
+  const turns: Turn[] = []
+  const result = await runLoop(fixtureRepo(), 'revert-directory', runsDir(), { checker, dispatch: scriptedDispatch(revert, turns) })
+
+  assert.match(patchOutput(turns), /refused: .*the targeted tests of your edits failed \(test\/add\.test\.ts, test\/sub\.test\.ts\)/)
+  assert.doesNotMatch(patchOutput(turns), /FAILING PATCH ACCEPTED/)
+  assert.deepEqual(calls, [['test/sub.test.ts'], ['test/add.test.ts', 'test/sub.test.ts']])
+  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(test\/sub\.test\.ts fails at the base\); min-001 \(inlining adds nothing\)$/m)
+})
+
+const hasBranch = (repo: string, name: string) => {
+  try {
+    execFileSync('git', ['rev-parse', '--verify', `refs/heads/${name}`], { cwd: repo, stdio: 'pipe' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+test('a shipped run deletes its fix branch as applied, without a read of the PR state', async () => {
+  const repo = fixtureRepo()
+  const input = { ...(await loopInput(repo, 'ship')), pr: 7, ship: { pr: 7, headRef: 'feature' } }
+  const calls: string[] = []
+  const stub = (real: Repo): Repo => ({
+    ...real,
+    ship: async ({ pr, headRef }) => {
+      calls.push(`ship ${pr} ${headRef}`)
+    },
+    pullState: async () => {
+      calls.push('pullState')
+      return 'open'
+    },
+    deleteBranch: async () => {
+      calls.push('deleteBranch')
+      await real.deleteBranch()
+    },
+  })
+  const result = await runLoop(repo, 'ship', runsDir(), { dispatch: scriptedDispatch(script, []), input, repo: stub })
+
+  assert.equal(result.pass, true, result.report)
+  assert.deepEqual(calls, ['ship 7 feature', 'deleteBranch'])
+  assert.equal(hasBranch(repo, 'factory/ship'), false)
+  assert.ok(!existsSync(join(result.dir, 'tree')))
+  assert.match(result.report, /^## Branches\n\n- deleted factory\/ship \(applied\)$/m)
+  assert.equal(branchLine(result, repo), 'Deleted factory/ship: applied by --ship.')
+})
+
+test('a failed run whose PR closed deletes its fix branch as stranded', async () => {
+  const repo = fixtureRepo()
+  const input = { ...(await loopInput(repo, 'closed')), pr: 7 }
+  const dispatch = scriptedDispatch(scriptFor({ rejectBug: true, tests: true }), [])
+  const result = await runLoop(repo, 'closed', runsDir(), { dispatch, input, repo: (real) => ({ ...real, pullState: async () => 'closed' }) })
+
+  assert.equal(result.pass, false)
+  assert.equal(hasBranch(repo, 'factory/closed'), false)
+  assert.match(result.report, /^- deleted factory\/closed \(stranded\)$/m)
+  assert.equal(branchLine(result, repo), 'Deleted factory/closed: the PR closed without a merge.')
+})
+
+test('a resumed run whose fix branch the prune deleted returns its result without a git call', async () => {
+  const repo = fixtureRepo()
+  const dir = runsDir()
+  const input = { ...(await loopInput(repo, 'ended')), pr: 7 }
+  const closed = (real: Repo): Repo => ({ ...real, pullState: async () => 'closed' })
+  const first = await runLoop(repo, 'ended', dir, { dispatch: scriptedDispatch(scriptFor({ rejectBug: true, tests: true }), []), input, repo: closed })
+  assert.equal(hasBranch(repo, 'factory/ended'), false)
+
+  const turns: Turn[] = []
+  const second = await runLoop(repo, 'ended', dir, { dispatch: scriptedDispatch(script, turns), input, repo: closed })
+  assert.deepEqual(second, first)
+  assert.deepEqual(turns, [])
+})
+
+test('a failed delete is a note in the report, and the run still passes', async () => {
+  const repo = fixtureRepo()
+  const input = { ...(await loopInput(repo, 'refused-delete')), pr: 7 }
+  const stub = (real: Repo): Repo => ({
+    ...real,
+    pullState: async () => 'merged',
+    deleteBranch: async () => {
+      throw new Error('remote: permission denied')
+    },
+  })
+  const result = await runLoop(repo, 'refused-delete', runsDir(), { dispatch: scriptedDispatch(script, []), input, repo: stub })
+
+  assert.equal(result.pass, true, result.report)
+  assert.deepEqual(result.pruned?.failed, [{ name: 'factory/refused-delete', reason: 'remote: permission denied' }])
+  assert.match(result.report, /^## Branches\n\n- not deleted factory\/refused-delete: remote: permission denied$/m)
+  assert.equal(hasBranch(repo, 'factory/refused-delete'), true)
+  assert.ok(!existsSync(join(result.dir, 'tree')))
 })
 
 /** USD per million tokens: each scripted model call (8 input and 4 output tokens) costs $0.012. */
@@ -63,25 +258,42 @@ const testPrices = {
   'gpt-6.1-sol': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 },
 }
 
-test('at the cost budget, the run asks to raise it or to stop, and a stop ends the run without PASS', async () => {
+test('at the cost budget, the run posts a notice; at twice the budget, it asks, and a stop ends the run without PASS', async () => {
   const repo = fixtureRepo()
   const turns: Turn[] = []
-  const { channel, posted } = memoryChannel()
-  const result = await runLoop(repo, 'budget', runsDir(), { budget: 0.05, channel, dispatch: scriptedDispatch(script, turns), prices: testPrices })
+  // A stop from the budget question must not leave a rejection without a handler, also from the step 1 questions agent.
+  const unhandled: unknown[] = []
+  const listen = (reason: unknown) => void unhandled.push(reason)
+  process.on('unhandledRejection', listen)
+  const { channel, posted, notices, events } = memoryChannel({ 'budget.1': '/answer\nQ1: stop' })
+  let result: Awaited<ReturnType<typeof runLoop>>
+  try {
+    result = await runLoop(repo, 'budget', runsDir(), { budget: 0.025, channel, dispatch: scriptedDispatch(script, turns), prices: testPrices })
+    // The agents that the stop ended can reject after the run returns.
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  } finally {
+    process.off('unhandledRejection', listen)
+  }
+  assert.deepEqual(unhandled, [])
 
   const asked = posted.find((entry) => entry.batch.startsWith('budget.'))
   assert.ok(asked, JSON.stringify(posted.map((entry) => entry.batch)))
-  assert.equal(asked.questions[0]!.recommendation, 'Stop the run')
-  // The step 1 reviewers spent more than the budget, so no patch agent opened. The bugs reviewer starts last, after the
-  // diff split, so the budget can stop it before its first turn.
+  assert.equal(notices.length, 1)
+  assert.match(notices[0] ?? '', /of its budget of \$0\.0250\. The run continues\. At \$0\.0500, twice the budget, the host pauses/)
+  assert.ok(events.indexOf('notice') < events.indexOf('post budget.1'), JSON.stringify(events))
+  assert.deepEqual(asked.questions[0]!.options.slice(1), ['Raise the budget (write the new USD number)', 'Stop the run'])
+  assert.match(asked.questions[0]!.recommendation, /^Raise the budget to \$0\.\d{2}$/)
+  // The step 1 reviewers spent more than twice the budget, so no patch agent opened. The bugs reviewer starts last, after
+  // the diff split, so the budget can stop it before its first turn.
   assert.ok(turns.some((turn) => ['minimize', 'rules', 'anti-slop', 'bugs'].includes(turn.role)))
   assert.ok(!turns.some((turn) => turn.role === 'patch'))
   assert.deepEqual([result.pass, result.stopped], [false, true])
   assert.ok(result.usage.usd >= 0.05)
   assert.match(result.report, /^# Code review loop: FAIL/)
   assert.match(result.report, /cost budget/)
+  assert.match(result.report, /^- Commits: unsigned \(no GitHub origin\)$/m)
   assert.match(result.report, /^## Usage$/m)
-  assert.match(result.report, /^Budget: \$0\.0500\. Spent: \$0\.\d{4}\.$/m)
+  assert.match(result.report, /^Budget: \$0\.0250\. Spent: \$0\.\d{4}\.$/m)
   assert.equal(readFileSync(join(result.dir, 'report.md'), 'utf8'), result.report)
   assert.deepEqual(fileLedger(join(result.dir, 'state.json')).get<{ stopped: boolean }>('result')?.stopped, true)
 })
@@ -105,7 +317,9 @@ test('a docs and tests only change takes the light loop: host findings, one revi
   assert.deepEqual([...new Set(turns.map((turn) => `${turn.role}:${turn.provider}`))], ['light:claude'])
   const show = (path: string) => execFileSync('git', ['show', `${result.branch}:${path}`], { cwd: repo }).toString()
   assert.deepEqual([show('docs/v2.md'), show('test/Vault.t.sol')], [lightFixed.docs, lightFixed.test])
-  assert.match(turns.filter((turn) => turn.output).map((turn) => turn.output).join('\n'), /code refused: .*EACCES/)
+  const lightOutput = turns.filter((turn) => turn.output).map((turn) => turn.output).join('\n')
+  assert.match(lightOutput, /code refused: .*EACCES/)
+  assert.match(lightOutput, /checks: syntax=skipped smoke=pass/)
 
   const gateLog = readFileSync(join(result.dir, 'gate-log.txt'), 'utf8')
   assert.match(gateLog, /^TRIAGE path=light reason=docs-or-tests-only profiles=solidity,solidity-support,docs\n/)
@@ -122,7 +336,7 @@ test('triage sees deleted files and the old path of a rename, so a docs change t
   const run = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' })
   run('rm', '-q', 'test/add.test.ts')
   run('mv', 'src/math.ts', 'docs/math.md')
-  run('commit', '-q', '-m', 'remove code')
+  run('-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'remove code')
 
   assert.deepEqual((await changedFiles(repo, 'main', 'HEAD')).sort(), ['docs/math.md', 'docs/v2.md', 'test/Vault.t.sol'])
   const touched = (await touchedFiles(repo, 'main', 'HEAD')).sort()
@@ -144,6 +358,54 @@ test('a resumed run does not repeat finished steps', async () => {
   assert.equal(result.pass, true)
   for (const role of ['minimize', 'rules', 'bugs', 'anti-slop']) assert.ok(!second.some((turn) => turn.role === role), `${role} ran again`)
   assert.ok(second.some((turn) => turn.role === 'patch'))
+})
+
+test('a planned stop in step 1 ends the call only after the questions agent settled', async () => {
+  const repo = fixtureRepo()
+  const input = await loopInput(repo, 'stop')
+  const run = await nodeRun({ config: input.config, runId: 'stop', runsDir: runsDir(), source: gitSource(repo) })
+  const reviewed = () => ['minimize', 'rules', 'bugs', 'anti-slop'].every((id) => run.ledger.get(`step:step1.${id}`) !== undefined)
+  // The budget is spent when the step 1 reviewers finished, so the step 1 host check stops the run.
+  const ledger = callBudget(run.ledger, { budgetMs: 1000, startedAt: 0, now: () => (reviewed() ? 5000 : 0) })
+  const scripted = scriptedDispatch(scriptFor({ tests: false }), [])
+  // The questions agent answers only after the reviewers finished.
+  const dispatch: Contracts.RuntimeOptions['dispatch'] = async (request, signal, timing) => {
+    if (/Agent role: questions/.test(new TextDecoder().decode(request.body))) while (!reviewed()) await new Promise((resolve) => setTimeout(resolve, 10))
+    return scripted(request, signal, timing)
+  }
+  await assert.rejects(
+    codeReviewLoop(input, { ...run, ledger, channel: memoryChannel().channel, credentials, dispatch, log: () => {}, module }),
+    (error: unknown) => error instanceof PlannedStop && run.ledger.get('step:step1.questions') !== undefined,
+  )
+  assert.equal(run.ledger.get('step:step1.host'), undefined)
+})
+
+test('a signing check that stops ends the run before the freeze and before any model call', async () => {
+  const repo = fixtureRepo()
+  const dir = runsDir()
+  const turns: Turn[] = []
+  const signing = (node: Signing): Signing => ({ ...node, check: async () => { throw new StopError('Cannot read the signature rules of branch feature') } })
+  await assert.rejects(runLoop(repo, 'signing-stop', dir, { dispatch: scriptedDispatch(script, turns), signing }), /Cannot read the signature rules of branch feature/)
+  assert.equal(turns.length, 0)
+  assert.equal(existsSync(join(dir, 'signing-stop', 'tree')), false)
+  assert.equal(fileLedger(join(dir, 'signing-stop', 'state.json')).get('step:freeze'), undefined)
+})
+
+test('a resumed run uses the recorded signing answer and does not check again', async () => {
+  const repo = fixtureRepo()
+  const dir = runsDir()
+  const checks: string[][] = []
+  const signing = (node: Signing): Signing => ({ ...node, check: async (branches) => (checks.push(branches), node.check(branches)) })
+  const { channel, replies } = memoryChannel({ ask: null })
+  const input = { ...(await loopInput(repo, 'signing-resume')), headRef: 'feature' }
+  await assert.rejects(runLoop(repo, 'signing-resume', dir, { channel, dispatch: scriptedDispatch(script, []), input, signing }), PausedError)
+  assert.deepEqual(checks, [['feature']])
+
+  replies.ask = '/answer recommended'
+  const result = await runLoop(repo, 'signing-resume', dir, { channel, dispatch: scriptedDispatch(script, []), input, signing })
+  assert.equal(result.pass, true, result.report)
+  assert.deepEqual(checks, [['feature']])
+  assert.match(result.report, /^- Commits: unsigned \(no GitHub origin\)$/m)
 })
 
 test('a paused run without a recorded light model resumes with the default model', async () => {
@@ -174,7 +436,7 @@ test('host git returns raw Unicode paths in diffs and file lists', async () => {
   writeFileSync(join(repo, 'docs/café.log'), 'log\n')
   writeFileSync(join(repo, 'docs/café.md'), 'e.g. a cafe\n')
   execFileSync('git', ['add', '-A'], { cwd: repo })
-  execFileSync('git', ['commit', '-q', '-m', 'Unicode paths'], { cwd: repo })
+  execFileSync('git', ['-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'Unicode paths'], { cwd: repo })
   const changed = await changedFiles(repo, 'main', 'HEAD')
   const touched = await touchedFiles(repo, 'main', 'HEAD')
   for (const path of ['café/.env', 'docs/café.log', 'docs/café.md']) {
@@ -199,8 +461,13 @@ test('a run that crashed right after a patch commit keeps that commit when it re
   for (const key of keys.slice(keys.indexOf('step:step1.gate') + 1)) if (key.startsWith('step:') || key === 'result') delete state[key]
   writeFileSync(path, JSON.stringify(state))
 
-  const result = await runLoop(repo, 'crash', dir, { dispatch: scriptedDispatch(script, []) })
+  // The patch log was accepted before the crash, so the resumed step runs no agent and no gate.
+  const { calls, checker } = testCalls()
+  const turns: Turn[] = []
+  const result = await runLoop(repo, 'crash', dir, { checker, dispatch: scriptedDispatch(script, turns) })
   assert.equal(result.pass, true)
+  assert.deepEqual(calls, [])
+  assert.ok(!turns.some((turn) => turn.role === 'patch'))
   assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}/)
   assert.equal(execFileSync('git', ['show', `${result.branch}:src/math.ts`], { cwd: repo }).toString(), fixed)
 })
@@ -323,7 +590,10 @@ test('a run with only run questions asks nothing and lists them as decisions tha
 const constants = (name: string, count: number, replace: Record<number, number> = {}) =>
   Array.from({ length: count }, (_, i) => `export const ${name}${i} = ${replace[i] ?? i}\n`).join('')
 
-/** A repository whose feature branch adds about 800 lines in two directories, so that two bugs reviewers split it. */
+/**
+ * A repository whose feature branch adds about 800 lines in two directories, so that two bugs reviewers split it. Each
+ * directory has a test that imports its file.
+ */
 function largeRepo(): string {
   const repo = mkdtempSync(join(tmpdir(), 'factory-large-'))
   const run = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' })
@@ -334,19 +604,30 @@ function largeRepo(): string {
   run('init', '-q', '-b', 'main')
   run('config', 'user.email', 'test@example.com')
   run('config', 'user.name', 'Test')
-  run('config', 'commit.gpgsign', 'false')
-  write('.agent-factory.json', JSON.stringify({ stack: 'TypeScript', checks: { smoke: 'node -e "process.exit(0)"' } }))
+  withoutKey(repo)
+  write(
+    '.agent-factory.json',
+    JSON.stringify({
+      stack: 'TypeScript',
+      checks: { smoke: 'node -e "process.exit(0)"' },
+      tests: { pattern: '\\.test\\.ts$', command: 'env -u NODE_TEST_CONTEXT node --test {tests}' },
+    }),
+  )
   write('src/alpha/a.ts', constants('a', 1))
   write('src/beta/b.ts', constants('b', 1))
+  const imports = (name: string, dir: string) =>
+    `import assert from 'node:assert/strict'\nimport { test } from 'node:test'\nimport { ${name}0 } from '../src/${dir}/${name}.ts'\n\ntest('${name}0', () => assert.equal(${name}0, 0))\n`
+  write('test/alpha.test.ts', imports('a', 'alpha'))
+  write('test/beta.test.ts', imports('b', 'beta'))
   write('src/util.ts', 'export const util = 1\n')
   run('add', '-A')
-  run('commit', '-q', '-m', 'base')
+  run('-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'base')
   run('checkout', '-q', '-b', 'feature')
   write('src/alpha/a.ts', constants('a', 400))
   write('src/beta/b.ts', constants('b', 400))
   write('src/util.ts', 'export const util = 2\n')
   run('add', '-A')
-  run('commit', '-q', '-m', 'add constants')
+  run('-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'add constants')
   return repo
 }
 
@@ -399,7 +680,8 @@ const largeScript: Script = ({ role, output, request }) => {
 test('a large change splits the bugs review across reviewers, and patch agents work on separate files at the same time', async () => {
   const repo = largeRepo()
   const turns: Turn[] = []
-  const result = await runLoop(repo, 'large', runsDir(), { dispatch: scriptedDispatch(largeScript, turns) })
+  const { calls, checker } = testCalls()
+  const result = await runLoop(repo, 'large', runsDir(), { checker, dispatch: scriptedDispatch(largeScript, turns) })
   assert.equal(result.pass, true, result.report)
 
   // Two bugs reviewers, each with its share of the diff, and their findings in one list.
@@ -419,6 +701,8 @@ test('a large change splits the bugs review across reviewers, and patch agents w
   assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12} \(3 patch agents at the same time, then one for bugs-002\); applied: bugs-001 \(fixed\); anti-001 \(fixed\); anti-002 \(fixed\); bugs-002 \(fixed a3\)/)
   const show = (path: string) => execFileSync('git', ['show', `${result.branch}:${path}`], { cwd: repo }).toString()
   assert.deepEqual([show('src/alpha/a.ts'), show('src/beta/b.ts'), show('src/util.ts')], [largeFixed.alphaFinal, largeFixed.beta, largeFixed.util])
+  // Each patch agent gates only the tests of its own files: alpha, beta, nothing for util, and alpha for the deferred finding.
+  assert.deepEqual(calls.map((tests) => tests.join(' ')).sort(), ['test/alpha.test.ts', 'test/alpha.test.ts', 'test/beta.test.ts'])
   assert.deepEqual(fileLedger(join(result.dir, 'state.json')).get('groups:step1.patch'), [
     { ids: ['bugs-001'], files: ['src/alpha/a.ts'] },
     { ids: ['bugs-002', 'anti-001'], files: ['src/beta/b.ts'] },

@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import type { Ledger } from '../src/core/ledger.ts'
 import { github, GitHubError, refusedCredential, type GitHub } from '../src/cloudflare/github.ts'
 import { deleteRemoteBranch } from '../src/cloudflare/branches.ts'
 import { githubPulls } from '../src/cloudflare/pulls.ts'
+import { githubRepo } from '../src/cloudflare/repo.ts'
+import { sqliteStore } from '../src/node/platform.ts'
 
 const answer = (status: number, body: unknown = {}, headers: Record<string, string> = {}) => new Response(JSON.stringify(body), { headers, status })
 
@@ -267,4 +273,32 @@ test('a branch delete accepts a ref that is not there, but not a refused delete'
   const gone = stubbed(new GitHubError(404, 'Not Found'))
   await deleteRemoteBranch(gone.stub, '/repos/acme/app', 'factory/dev-x')
   assert.deepEqual(gone.calls.map((call) => call.method), ['DELETE'])
+})
+
+/** The repository of a review run of PR 7 on the stubbed GitHub client, with its fix branch factory/pr-7-x. */
+function stubbedRepo(stub: GitHub) {
+  const entries = new Map<string, unknown>()
+  const ledger: Ledger = { get: <T>(key: string) => entries.get(key) as T | undefined, put: (key, value) => void entries.set(key, value) }
+  const { sql } = sqliteStore(':memory:', join(mkdtempSync(join(tmpdir(), 'factory-github-')), 'agents'))
+  return githubRepo({ branch: 'factory/pr-7-x', gh: stub, ledger, log: () => {}, pull: { owner: 'acme', repo: 'app', pr: 7 }, runId: 'pr-7-x', sql })
+}
+
+test('the PR state of a GitHub repo is merged for a merge time, closed for a closed PR, else open', async () => {
+  const { calls, stub } = stubbed({ state: 'open', merged_at: null }, { state: 'closed', merged_at: '2026-11-16T12:00:00Z' }, { state: 'closed', merged_at: null })
+  const repo = stubbedRepo(stub)
+  assert.deepEqual([await repo.pullState(7), await repo.pullState(7), await repo.pullState(7)], ['open', 'merged', 'closed'])
+  assert.deepEqual(calls.map((call) => `${call.method} ${call.path}`), Array(3).fill('GET /repos/acme/app/pulls/7'))
+})
+
+test('a GitHub repo deletes its fix branch on GitHub, accepts an absent branch, and its release does nothing', async () => {
+  const ref = 'DELETE /repos/acme/app/git/refs/heads/factory/pr-7-x'
+  const deleted = stubbed(undefined)
+  await stubbedRepo(deleted.stub).deleteBranch()
+  assert.deepEqual(deleted.calls.map((call) => `${call.method} ${call.path}`), [ref])
+  const absent = stubbed(new GitHubError(422, 'Reference does not exist'), new GitHubError(404, 'Not Found'))
+  await stubbedRepo(absent.stub).deleteBranch()
+  assert.deepEqual(absent.calls.map((call) => `${call.method} ${call.path}`), [ref, 'GET /repos/acme/app/git/ref/heads/factory/pr-7-x'])
+  const released = stubbed()
+  await stubbedRepo(released.stub).release()
+  assert.deepEqual(released.calls, [])
 })

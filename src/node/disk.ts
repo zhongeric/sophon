@@ -60,7 +60,11 @@ export function diskFileSystem(root: string, protect: (path: string) => boolean 
     },
     async lstat(path) {
       try {
-        const info = await lstat(await resolve(path, true))
+        const normalized = FileSystem.normalize(path)
+        if (isHidden(normalized)) return null
+        // Resolve only the parent, so lstat reads the link, not its target.
+        const parent = await resolve(dirname(normalized), true)
+        const info = await lstat(join(parent, basename(normalized)))
         return info.isSymbolicLink() ? { ...toStat(info), kind: 'symlink' } : toStat(info)
       } catch {
         return null

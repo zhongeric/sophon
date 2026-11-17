@@ -8,6 +8,6 @@ The host found only docs and tests in this change, so the change cannot change b
 - Fix the lines that the change adds. In a doc section that the change touches, also delete text that the section does not need. Do not reword text only for style.
 - The host refuses your writes outside docs and tests.
 - Do not weaken tests. Do not delete or skip tests, or loosen assertions, to make them pass.
-- When you have the run_tests tool, run the test files that you changed. Run only those tests.
+- Before the log, run the targeted tests of the files that you changed (run_tests, when you have it). The host refuses the log while one fails. When you cannot fix the cause, revert your edit. For a host finding, list it in skipped, with the reason.
 - Do not commit. The host commits your changes.
 - Call submit_light_log one time. List every host finding ID one time: in applied, with the change, or in skipped, with the reason. List each other fix in fixes, with its location and the change.

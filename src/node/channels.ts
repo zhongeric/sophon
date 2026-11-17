@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { letter, parseAnswers, render, type Channel, type Comments } from '../core/questions.ts'
@@ -49,6 +49,9 @@ export function fileChannel(dir: string): Channel {
       return existsSync(path) ? parseAnswers(readFileSync(path, 'utf8'), questions) : null
     },
     where: (posted) => `${posted.ref} (reply in ${answersPath(posted.batch)})`,
+    async notice(_runId, text) {
+      appendFileSync(join(dir, 'notices.md'), `${text}\n\n`)
+    },
   }
 }
 
@@ -74,5 +77,8 @@ export function terminalChannel(input: NodeJS.ReadableStream, output: NodeJS.Wri
       }
     },
     where: () => 'the terminal',
+    async notice(_runId, text) {
+      output.write(`\n${text}\n`)
+    },
   }
 }

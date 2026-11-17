@@ -173,6 +173,11 @@ test('checks with tests off run no test command, and checks by default run the t
   commands.length = 0
   assert.deepEqual((await checker.checks(['src/math.ts'])).map(({ name }) => name), ['typecheck', 'tests'])
   assert.deepEqual(commands, ['npm run check', "node --test 'test/math.test.ts'"])
+  // The run_checks of an agent runs the checks without tests.
+  commands.length = 0
+  assert.ok(checker.agentChecks)
+  assert.deepEqual((await checker.agentChecks(['src/math.ts'])).map(({ name }) => name), ['typecheck'])
+  assert.deepEqual(commands, ['npm run check'])
 })
 
 test('the config file and its protect entries are protected', () => {

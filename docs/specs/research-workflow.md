@@ -1,6 +1,7 @@
 # Spec: the research workflow
 
-Status: scoping. Nothing is built. Section 11 is the build plan.
+Status: R1 is built, on the local platform and on Cloudflare: part 1 (stages 0 to 4) and part 2 (stages 5, 6, 9
+and 11). Section 11 is the build plan.
 
 This spec defines a third workflow of agent-factory: the **research workflow**. A swarm of agents reads large public
 data, makes hypotheses, tests them, and reports a candidate or a calibrated null. The design is domain-neutral. A
@@ -56,7 +57,7 @@ The principles of the development workflow hold. These follow from them.
 
 | Stage | Like | Who | What the host enforces |
 | --- | --- | --- | --- |
-| 0 Intake | intake | intake agent, read-only, with the domain's egress | No spend before the user confirms the program. The same batch asks the budget cap. |
+| 0 Intake | intake | intake agent, read-only, with the domain's egress | No spend before the user confirms the program. The same batch asks the budget: a notice at the budget, a pause at two times the budget. |
 | 1 Survey | spec | surveyors at the same time, one for each lens of the domain (for example literature, known objects, data coverage) | Each claim cites an artifact with a quote. The host finds the quote in the artifact. |
 | 2 Hypotheses | step 1 reviewers | generators on different model families and lenses | Schema: statement, why past work missed it, data, test, kill criterion, cost. The host merges duplicates by their data and test. |
 | 3 Pick | gate, held findings | the user | No spend on a hypothesis that the user did not pick. |
@@ -93,8 +94,9 @@ user labels it. Scout is read-only and periodic: a cron trigger and a Durable Ob
 - **Breadth:** the host maps one role over many items (lenses, candidate batches, partitions) in a bounded pool. Each
   item is a ledger step, so a resumed run does not run it again.
 - **Depth:** inside one turn, a surveyor or the analyst can start nanocode subagents, as builders can.
-  Only the root agent submits. Today the host sets no limit on the count or the budget of subagents. Section 6.2 adds
-  these limits for each role.
+  Only the root agent submits. In each root turn, `openAgent` limits the subagents that run at the same time, the
+  subagents that start, and their tokens. In `roles.ts`, a role gets limits, no subagents, or no limit.
+  A spawn over a limit fails with an error that the agent sees.
 - **Diversity:** generators and skeptics get different model families and different lenses, because agents of one
   family can share a mistake. The family-swap check applies to the skeptic passes.
 - **Model tiers:** screeners on a cheap tier. Judgment roles on the strong tier. A research run has its own
@@ -123,12 +125,12 @@ Each is a separate PR. Each is also useful to the other workflows, or is off for
 | --- | --- | --- |
 | Usage and a cost budget | `agent.ts` (`model.call.completed` events), the ledger, the reports | G6, RG2. |
 | Artifacts | `platform.ts` and both platforms | A content-addressed store. Local: a directory. Cloudflare: the run's object storage. The ledger holds IDs, never bulk data. |
-| Egress with provenance | `agent.ts` (`web_search`, `fetch`), `workspace.ts` (shell `fetch`) | A role can reach allowlisted origins. The design requires the egress to refuse the holdout to agents from intake and set a maximum size for each request. Each response body is an artifact. The other roles stay offline. `egress.ts` has the egress and the run lock. The egress does not yet set a maximum size for a request. It sets one for each response. Each response also has a JSON provenance record as a second artifact, with its ID in the `x-provenance-id` header. `openAgent` uses the egress. The shell uses it only when the host gives `hostFetch` to the workspace layout. |
+| Egress with provenance | `agent.ts` (`web_search`, `fetch`), `workspace.ts` (shell `fetch`) | A role can reach allowlisted origins. The design requires the egress to refuse the holdout to agents from intake and set a maximum size for each request. Each response body is an artifact. The other roles stay offline. `egress.ts` has the egress and the run lock. The egress sets a maximum size for each request (`max_request_bytes`, default 8 KiB for the URL, the headers and the body) and for each response. Each response also has a JSON provenance record as a second artifact, with its ID in the `x-provenance-id` header. `openAgent` uses the egress. The shell uses it only when the host gives `hostFetch` to the workspace layout. |
 | Evidence on artifacts | `findings.ts` | A location can be `artifact:<id>` with a line or no line. The fragment rules stay. |
 | `python` profile | `profiles.ts`, the build image | Notebooks are Python. The repository's setup installs the domain's packages. |
 | Roles by workflow | `roles.ts` | The research roles in a table of their own. |
 | A bounded pool | `plan.ts` (`waves`) | Sweeps, screens and generators. |
-| Subagent limits | `agent.ts` (`openAgent`) | RD1. The host sets the count and the budget of subagents for each role. |
+| Subagent limits | `agent.ts` (`openAgent`), `subagents.ts`, `roles.ts` | RD1. Section 5 gives the limits. |
 
 ### 6.3 The domain, in the notebook
 
@@ -160,8 +162,21 @@ The `holdout` file names the targets and the query ranges that the egress refuse
 The egress refuses the holdout to agents from the start of the run, before a prereg exists.
 The prereg section "Holdout" refers to this file and does not define the holdout.
 
-The host takes the command strings from the base branch. `{prereg}` is the path of the frozen prereg, and
-`{partition}` identifies the current data partition. `feeds` are the sources of scout (section 3).
+The host takes the command strings from the base branch. It replaces `{prereg}` with the quoted path of the frozen
+prereg. `{partition}` identifies the current data partition. `feeds` are the sources of scout (section 3).
+
+The last line of a command output that is not empty is a JSON object:
+
+| Command | Last line |
+| --- | --- |
+| `known` | `{"recall": <number 0..1>, "outputs": {"<path>": "<sha256 hex>"}}` |
+| `inject`, `reproduce` | `{"outputs": {"<path>": "<sha256 hex>"}}` |
+
+- The calibration passes only when the `known` recall is equal to or more than the `known_recall` of the prereg. The
+  `inject` outputs are the artifacts for completeness and false positives.
+- A non-zero exit, a timeout, or a last line that is not a JSON object of this shape is a failed round. The failure
+  text gives the end of the output.
+- `reproduce` on a clean checkout must give the same hashes as the calibration.
 
 agent-factory holds the roles and their generic guides (`agents/research/*.md`). The domain's guides add to them,
 as profile guides do today.
@@ -179,8 +194,14 @@ as profile guides do today.
 
 ## 7. Platforms
 
-- **Cloudflare first.** One `ResearchRuns` object per program holds the ledger, the sessions and the artifacts. The
-  box is the run's container, as for development runs.
+- **Cloudflare first.** One `ResearchRuns` Durable Object for each program issue holds the ledger, the sessions and
+  the artifacts. The run ID is `research-<issue>-<stamp>`.
+  - The box is the build container of the object, as for development runs. The calibration and `reproduce` run in a
+    new clean checkout of the commit in the same container.
+  - The agent egress is an `EgressHost` over the artifacts of the object. Archive credentials come from Worker secrets.
+    A credential with the name of a host secret or of a Worker setting stops the run before the first fetch.
+  - Three start paths: a `/research` comment or the `agent-research` label on a notebook issue,
+    `POST /research/<owner>/<repo>/<issue>`, and `npm run remote -- research <issue>`.
 - **Local** runs the same workflow, for tests and for development of the workflow.
 - **Large sweeps** go to a larger container.
 - **No mirrors.** Runs fetch queries, cutouts and per-target data. A program never copies a whole archive.
@@ -219,7 +240,7 @@ as profile guides do today.
 | # | Gap | Default |
 | --- | --- | --- |
 | RG1 | The box's own network access | The box reaches the network through the host egress, after setup. Until then, the report says that the holdout lock binds agents only, and that box commands can send data out of the run. |
-| RG2 | Cost (G6) | A cap per program, set at intake. The host pauses and asks at 80% of the cap. At the cap, the host stops the fan-out. |
+| RG2 | Cost (G6) | A budget per program, set at intake, with the rule of G6: a notice at the budget, and a pause with one question at two times the budget. No pause at 80%, and no stop of the fan-out. |
 | RG3 | Data volume | No mirrors. Artifacts over a size limit stay on the box and are named by hash. |
 | RG4 | Archives change | Each fetch records its hash and time. `reproduce` reports a drift. |
 | RG5 | Many trials in one program | The host counts each trial. The dossier reports the count. |
@@ -234,7 +255,7 @@ as profile guides do today.
 | Phase | Scope | Exit |
 | --- | --- | --- |
 | R0 | The core changes of section 6.2, with the holdout lock for agents. | Each rail has tests. A scripted run fetches through the egress and cites an artifact. |
-| R1 | The research workflow on Cloudflare: stages 0 to 6, 9 and 11, per-target analysis, no sweep and no holdout test. | A notebook run recovers a known set blind, with a completeness curve, in a dossier PR. |
+| R1 | The research workflow on Cloudflare: stages 0 to 6, 9 and 11, per-target analysis, no sweep and no holdout test. Part 1 builds stages 0 to 4 locally, with the CLI `src/node/research.ts`. Part 2 builds stages 5, 6, 9 and 11 locally: the build, the calibration in two rounds at most, the vet, the dossier, `reproduce` on a clean checkout, and the dossier PR with one pass of the code review loop. Part 3 runs R1 on Cloudflare (section 7): `ResearchRuns`, the Worker egress and the three start paths. | A notebook run recovers a known set blind, with a completeness curve, in a dossier PR. |
 | R2 | The sweep, the screeners, the holdout test (stage 10) and the trial count. | A program over thousands of targets ends in a vetted top few or a calibrated null. |
 | R3 | Submission with a `/go`. | One submission that the user approved. |
 | R4 | Scout: the domain's feeds, the weekly digest and proposal issues. | Four weekly digests, and one proposal that the user takes. |

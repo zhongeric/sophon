@@ -86,28 +86,40 @@ export function recordUsage(ledger: Ledger, agentId: string, model: string, even
   let total = record.total
   let changed = false
   for (const logged of events) {
-    const inner = (logged.event as { event?: InnerEvent } | null)?.event
-    if (inner?.type !== 'model.call.completed') continue
-    const run = typeof inner.request_id === 'string' ? inner.request_id : (logged.request_id ?? '')
-    const seq = typeof inner.seq === 'number' ? inner.seq : logged.seq
-    const seen = agent.seen[run]
-    if (seen !== undefined && seq <= seen) continue
-    agent.seen = { ...agent.seen, [run]: seq }
+    const call = modelCall((logged.event as { event?: unknown } | null)?.event, logged)
+    if (!call) continue
+    const seen = agent.seen[call.run]
+    if (seen !== undefined && call.seq <= seen) continue
+    agent.seen = { ...agent.seen, [call.run]: call.seq }
     changed = true
+    if (call.replayed) continue
+    agent.tokens = addTokens(agent.tokens, call.tokens)
+    total = addTokens(total, call.tokens)
+  }
+  if (!changed) return
+  ledger.put(usageKey, { agents: { ...record.agents, [agentId]: agent }, total } satisfies UsageRecord)
+}
+
+/** One completed model call. `run` and `seq` identify it, so that a republished event counts one time. */
+export type ModelCall = { run: string; seq: number; replayed: boolean; tokens: Tokens }
+
+/** Reads a `model.call.completed` event of the SDK. `logged` gives the run and the sequence when the event has none. */
+export function modelCall(event: unknown, logged: Contracts.LoggedEvent): ModelCall | undefined {
+  const inner = event as InnerEvent | null | undefined
+  if (inner?.type !== 'model.call.completed') return undefined
+  const usage = inner.payload?.usage
+  return {
+    run: typeof inner.request_id === 'string' ? inner.request_id : (logged.request_id ?? ''),
+    seq: typeof inner.seq === 'number' ? inner.seq : logged.seq,
     // A replayed call comes from the journal: the provider did not bill it again.
-    if (inner.payload?.timing?.replayed === true) continue
-    const usage = inner.payload?.usage
-    const tokens = {
+    replayed: inner.payload?.timing?.replayed === true,
+    tokens: {
       input: count(usage?.input_tokens),
       cached: count(usage?.input_tokens_details?.cached_tokens),
       cache_write: count(usage?.input_tokens_details?.cache_write_tokens),
       output: count(usage?.output_tokens),
-    }
-    agent.tokens = addTokens(agent.tokens, tokens)
-    total = addTokens(total, tokens)
+    },
   }
-  if (!changed) return
-  ledger.put(usageKey, { agents: { ...record.agents, [agentId]: agent }, total } satisfies UsageRecord)
 }
 
 type InnerEvent = {
@@ -186,6 +198,12 @@ export function resolveBudget(ledger: Ledger, recorded: number | undefined, over
   return value
 }
 
+/** A new budget round makes sure that later questions do not read answers for the removed limit. */
+export function clearBudget(ledger: Ledger): void {
+  const state = budgetState(ledger)
+  if (state.limit !== undefined) ledger.put(budgetKey, { round: state.round + 1 } satisfies BudgetState)
+}
+
 /** The user chose to stop the run at the cost budget. */
 export class BudgetStop extends Error {
   override name = 'BudgetStop'
@@ -199,11 +217,16 @@ export function belowBudget(spent: number, limit: number): boolean {
 
 const raiseOption = 'Raise the budget (write the new USD number)'
 const stopOption = 'Stop the run'
+const raiseTo = /^Raise the budget to \$(\d+(?:\.\d+)?)$/
+const noticeKey = (round: number) => `budget-notice.${round}`
+
+/** Twice the spend, rounded up to the cent. The small offset keeps round-off from adding a cent. */
+const doubled = (spent: number) => Math.max(1, Math.ceil(spent * 200 - 1e-6)) / 100
 
 /**
- * Compares the spend with the budget before each agent turn. At the budget or over it, the run asks the user to raise
- * the budget or to stop. Concurrent checks share one question. The answers do not go into the decisions of the run,
- * because the agents read those.
+ * Compares the spend with the budget before each agent turn. At the budget, the run posts one notice for each budget
+ * round and continues. At twice the budget, the run asks the user to raise the budget or to stop. Concurrent checks
+ * share one notice and one question. The answers do not go into the decisions of the run, because the agents read those.
  */
 export function budgetGate(options: {
   ledger: Ledger
@@ -211,16 +234,44 @@ export function budgetGate(options: {
   runId: string
   prices: Prices
   log(line: string): void
-  /** USD that the ledger does not record, for example finished review passes. */
-  extraSpend?: () => number
-  /** Stop at the budget without a question, as in a hotfix run, because the recommendation is to stop. */
+  /** Precomputed rows that the ledger does not record, for example finished review passes. Their USD counts as spend. */
+  extraRows?: () => UsageRow[]
+  /** At twice the budget, raise the budget to twice the spend without a question, as in a hotfix run. */
   recommend?: boolean
+  /** Stop at the budget without a notice or a question, as in a nested review pass. */
+  stopAtBudget?: boolean
 }) {
   const { ledger, prices } = options
   const ask = asker(ledger, options.channel, options.runId, options.log, { decisions: false })
-  const spent = () => spendOf(ledger, prices).usd + (options.extraSpend?.() ?? 0)
+  const extra = () => options.extraRows?.() ?? []
+  const spent = () => spendOf(ledger, prices).usd + extra().reduce((sum, row) => sum + (row.usd ?? 0), 0)
   const limit = () => budgetState(ledger).limit
   let pending: Promise<void> | undefined
+
+  /** The three most expensive steps by USD. Rows without a price do not show. */
+  const costliest = () => {
+    const rows = [...usageOf(ledger).agents, ...extra()].flatMap((row) => {
+      const price = prices[row.model]
+      const usd = row.usd ?? (price ? costOf(row.tokens, price) : undefined)
+      return usd === undefined ? [] : [{ step: row.step, usd }]
+    })
+    const top = rows.sort((a, b) => b.usd - a.usd).slice(0, 3)
+    return top.length > 0 ? ` The most expensive steps: ${top.map((row) => `${row.step} ${formatUsd(row.usd)}`).join(', ')}.` : ''
+  }
+  const notify = async (text: string) => {
+    const notice = `${text}${costliest()}`
+    options.log(`budget notice: ${notice}`)
+    // The notice only informs, and the run log has it, so a failed post does not stop the run.
+    try {
+      await options.channel.notice?.(options.runId, notice)
+    } catch (error) {
+      options.log(`budget notice failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  const raise = (state: BudgetState, value: number) => {
+    ledger.put(budgetKey, { ...state, limit: value, round: state.round + 1 } satisfies BudgetState)
+    options.log(`budget raised to ${formatUsd(value)}`)
+  }
 
   const settle = async (): Promise<void> => {
     for (;;) {
@@ -228,16 +279,32 @@ export function budgetGate(options: {
       const now = spent()
       if (state.limit === undefined || belowBudget(now, state.limit)) return
       const stop = new BudgetStop(`stopped at the cost budget: spent ${formatUsd(now)} of ${formatUsd(state.limit)}`)
-      // A hotfix run takes the recommendation, and the recommendation is to stop.
-      if (options.recommend) throw stop
+      if (options.stopAtBudget) throw stop
+      const pause = !belowBudget(now, 2 * state.limit)
+      const target = doubled(now)
+      if (pause && options.recommend) {
+        // A hotfix run takes the recommendation, and the recommendation is to raise the budget.
+        raise(state, target)
+        await notify(`The run spent about ${formatUsd(now)} of its budget of ${formatUsd(state.limit)}. This is a hotfix run, so the host raised the budget to ${formatUsd(target)}, and the run continues.`)
+        return
+      }
+      if (!ledger.get(noticeKey(state.round))) {
+        const next = options.recommend
+          ? 'the host raises the budget to twice the spend, and the run continues'
+          : 'the host pauses and asks you to raise the budget or to stop the run'
+        await notify(`The run spent about ${formatUsd(now)} of its budget of ${formatUsd(state.limit)}. The run continues. At ${formatUsd(2 * state.limit)}, twice the budget, ${next}.`)
+        ledger.put(noticeKey(state.round), true)
+      }
+      if (!pause) return
       const batch = `budget.${state.round}`
+      const recommended = `Raise the budget to $${target.toFixed(2)}`
       const questions: Question[] = [
         {
           id: 'Q1',
           question: `The run spent about ${formatUsd(now)} of its budget of ${formatUsd(state.limit)}. Raise the budget or stop the run?`,
-          why: 'The host opens no more agent turns until the spend is below the budget. To raise the budget, write a new USD number above the spend.',
-          options: [raiseOption, stopOption],
-          recommendation: stopOption,
+          why: 'The spend is twice the budget or more. The host opens no more agent turns until you answer. To raise the budget to a different value, write a USD number above the spend.',
+          options: [recommended, raiseOption, stopOption],
+          recommendation: recommended,
           // Spend over the budget is the user's decision (D11).
           level: 'user',
           rule: 'spend',
@@ -246,15 +313,17 @@ export function budgetGate(options: {
       await ask.post(batch, questions)
       const text = ((await ask.wait(batch))[0]?.answer ?? stopOption).trim()
       if (text === stopOption || /^stop\b/i.test(text)) throw stop
-      const raised = /^\$?\s*(\d+(?:\.\d+)?)$/.exec(text)
+      // The recorded option gives the value, so that a resume raises to the value of the question.
+      const raised = raiseTo.exec(text) ?? /^\$?\s*(\d+(?:\.\d+)?)$/.exec(text)
       const value = raised ? Number(raised[1]) : Number.NaN
       if (belowBudget(now, value)) {
-        ledger.put(budgetKey, { ...state, limit: value, round: state.round + 1 } satisfies BudgetState)
-        options.log(`budget raised to ${formatUsd(value)}`)
+        raise(state, value)
         return
       }
       options.log(`budget answer ${JSON.stringify(text)} is not a number above the spend, asking again`)
+      // The new round asks again, but the user has the notice of this budget already.
       ledger.put(budgetKey, { ...state, round: state.round + 1 } satisfies BudgetState)
+      ledger.put(noticeKey(state.round + 1), true)
     }
   }
 

@@ -1,25 +1,35 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Ledger } from '../core/ledger.ts'
+import { callBudget, PlannedStop } from '../core/planned-stop.ts'
 import { apiKeyCredential, type Credentials, type Provider } from '../core/providers.ts'
-import { PausedError, type Comments } from '../core/questions.ts'
+import type { Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
+import { afterError, alarmBudgetMs, countRestart, initCounters, progressLedger } from './alarm.ts'
+import { containerBox, httpBox, type Box, type SyncStore } from './box.ts'
 import { githubComments } from './comments.ts'
+import type { WorkerSetting } from './egress.ts'
 import type { DevelopmentRuns } from './develop.ts'
-import { GitHubError, refusedCredential, type GitHub } from './github.ts'
+import { GitHubError, type GitHub } from './github.ts'
 import { githubAccess, type InstallationTokens } from './github-app.ts'
+import type { State } from './prune.ts'
+import type { ResearchRuns } from './research.ts'
 import type { PullRequestRuns } from './run.ts'
 import { createTables, sqlFiles, sqlLedger } from './storage.ts'
 
 export type Env = {
   PULL_REQUESTS: DurableObjectNamespace<PullRequestRuns>
   DEVELOPMENT_RUNS: DurableObjectNamespace<DevelopmentRuns>
+  RESEARCH_RUNS: DurableObjectNamespace<ResearchRuns>
   /** The token of the runs when the GitHub App secrets are not set. */
   GITHUB_TOKEN?: string
   /** With GITHUB_APP_PRIVATE_KEY, runs call GitHub as the App. */
   GITHUB_APP_ID?: string
   /** The private key of the App, in PKCS#8 PEM. */
   GITHUB_APP_PRIVATE_KEY?: string
-  GITHUB_WEBHOOK_SECRET: string
+  /** The secret of the webhook of each repository. GITHUB_APP_WEBHOOK_SECRET replaces it when set. */
+  GITHUB_WEBHOOK_SECRET?: string
+  /** The secret of the App webhook. */
+  GITHUB_APP_WEBHOOK_SECRET?: string
   ANTHROPIC_API_KEY?: string
   OPENAI_API_KEY?: string
   /** GitHub logins, comma-separated, that can start runs and answer questions. Without it, no one can. */
@@ -34,15 +44,22 @@ export type Env = {
   MODEL_PRICES?: string
   CI_TIMEOUT_MINUTES?: string
   PAUSE_POLL_SECONDS?: string
+  /** The wall time in seconds of one alarm call before the run stops at a safe point and continues in the next call. Default: 480. */
+  ALARM_BUDGET_SECONDS?: string
   /** Endpoint overrides, for gateways and for local tests. */
   GITHUB_API_URL?: string
   ANTHROPIC_URL?: string
   OPENAI_URL?: string
-  /** A machine endpoint that replaces the development run's container, for local tests. */
+  /** A machine endpoint that replaces the build container of the runs, for local tests. */
   MACHINE_URL?: string
+  /** An endpoint that gets each request that the research egress approved, as /<host><path>, for local tests. */
+  EGRESS_URL?: string
 }
 
-export type State = 'queued' | 'running' | 'paused' | 'passed' | 'failed' | 'error'
+/** The keys that are in only one of Env and workerSettings. The Worker typecheck fails on the line below when there is one. */
+type SettingGap = Exclude<keyof Env, WorkerSetting> | Exclude<WorkerSetting, keyof Env>
+export const sameSettings: [SettingGap] extends [never] ? true : SettingGap = true
+
 export type RunRow = { run: string; state: State; note: string; created: number; request: string }
 /** The result of `resume`: `state` is the state of the latest run before the call, or null when there is no run. */
 export type ResumeResult = { resumed: boolean; state: State | null; reason: string }
@@ -61,13 +78,14 @@ export type RunRequest = { owner: string; repo: string; by: string }
 /** While a run works, its alarm stays this far ahead, so that a run whose isolate died restarts from its ledger. */
 const heartbeatMs = 60_000
 const heartbeatEveryMs = 20_000
-const maxAttempts = 3
-/** Restarts of a run whose isolate died with no finished step in between, before the run stops. */
-const maxRestarts = 5
-const retryMs = 60_000
-const defaultPauseSeconds = 60
 /** How long CI can take, when CI_TIMEOUT_MINUTES does not say. */
 export const defaultCiTimeoutMinutes = 30
+/**
+ * The container stops after this long without a command. A stopped container comes back empty. Its start clears
+ * the sync state in SQL, so the next sync copies the trees again.
+ */
+const containerIdleMs = 30 * 60_000
+export const setupTimeoutMs = 20 * 60_000
 
 export function allowedUsers(env: Env): string[] {
   return (env.ALLOWED_USERS ?? '')
@@ -110,6 +128,13 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
   /** Runs the work, or resumes it from the ledger. Returns whether it passed, and the comment for the end of the run. */
   protected abstract execute(run: string, request: Request, ledger: Ledger, gh: GitHub, comments: Comments): Promise<{ passed: boolean; summary: string }>
 
+  /** The build machine of this object: MACHINE_URL in local tests, else the object's Cloudflare Container. */
+  protected box(syncs: SyncStore): Box {
+    if (this.env.MACHINE_URL) return httpBox(this.env.MACHINE_URL)
+    if (!this.ctx.container) throw new StopError('this Worker has no container for builds: add the containers section of wrangler.jsonc and deploy again')
+    return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => syncs.clear() })
+  }
+
   async start(request: Request): Promise<{ run: string; started: boolean }> {
     const active = this.active()
     if (active) return { run: active.run, started: false }
@@ -146,19 +171,28 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     return { runs, result: latest ? (sqlLedger(this.ctx.storage.sql, latest.run).get('result') ?? null) : null }
   }
 
+  /** The state and the ship flag of a run, for the prune of its branches, or null when this object has no such run. */
+  runState(run: string): { state: State; ship: boolean } | null {
+    const row = this.row(run)
+    if (!row) return null
+    const request = JSON.parse(row.request) as { ship?: unknown }
+    return { ship: request.ship === true, state: row.state }
+  }
+
   report(run?: string): string | null {
     const latest = run ?? this.ctx.storage.sql.exec<RunRow>('select run from factory_runs order by created desc limit 1').toArray()[0]?.run
     return latest ? sqlFiles(this.ctx.storage.sql, latest).read('report.md') : null
   }
 
   override async alarm(): Promise<void> {
+    const startedAt = Date.now()
     const row = this.active()
     if (!row || this.busy) return
     this.busy = true
     const heartbeat = setInterval(() => void this.ctx.storage.setAlarm(Date.now() + heartbeatMs), heartbeatEveryMs)
     await this.ctx.storage.setAlarm(Date.now() + heartbeatMs)
     const request = JSON.parse(row.request) as Request
-    const ledger = progressLedger(sqlLedger(this.ctx.storage.sql, row.run))
+    const ledger = callBudget(progressLedger(sqlLedger(this.ctx.storage.sql, row.run)), { budgetMs: alarmBudgetMs(this.env.ALARM_BUDGET_SECONDS), startedAt })
     const target = `${request.owner}/${request.repo}#${this.number(request)}`
     // Without a client, the run cannot post: a failed GitHub setup goes only to the state note.
     let comments: Comments | undefined
@@ -169,39 +203,24 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       app = access.app
       const posts = githubComments(access.gh, request.owner, request.repo, this.number(request))
       comments = posts
-      if (row.state === 'running') {
-        // The last invocation died mid-run. Count it, so that a crash that repeats stops instead of looping.
-        const restarts = (ledger.get<number>('restarts') ?? 0) + 1
-        ledger.put('restarts', restarts)
-        if (restarts > maxRestarts) throw new StopError(`the run died ${maxRestarts} times without finishing a step, for example on the memory or CPU limit`)
-      }
+      initCounters(ledger)
+      if (row.state === 'running') countRestart(ledger)
       this.setState(row.run, 'running', '')
       await once(ledger, 'announced', () => posts.post(this.announcement(row.run, request)))
       const result = await this.execute(row.run, request, ledger, access.gh, posts)
       this.setState(row.run, result.passed ? 'passed' : 'failed', '')
       await once(ledger, 'summary', () => posts.post(result.summary))
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      if (error instanceof PausedError) {
-        ledger.put('attempts', 0)
-        this.setState(row.run, 'paused', message)
-        next = Date.now() + Number(this.env.PAUSE_POLL_SECONDS ?? defaultPauseSeconds) * 1_000
-      } else {
-        const attempts = (ledger.get<number>('attempts') ?? 0) + 1
-        ledger.put('attempts', attempts)
-        console.error(`[${row.run}] attempt ${attempts} failed`, error)
-        // A refused credential or permission does not fix itself: stop at once instead of retrying.
-        const permanent = error instanceof StopError || refusedCredential(error)
-        if (permanent || attempts >= maxAttempts) {
-          this.setState(row.run, 'error', message)
-          const hint = error instanceof GitHubError ? (app ? ' Check the permissions of the GitHub App.' : ' Check the permissions of GITHUB_TOKEN.') : ''
-          await comments
-            ?.post(`agent-factory stopped run \`${row.run}\`: ${message}${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${target}\`.`)
-            .catch(() => undefined)
-        } else {
-          this.setState(row.run, 'queued', `attempt ${attempts} failed: ${message}`)
-          next = Date.now() + retryMs
-        }
+      const outcome = afterError(ledger, error, { now: Date.now(), pauseSeconds: this.env.PAUSE_POLL_SECONDS })
+      if (error instanceof PlannedStop) console.log(`[${row.run}] planned stop after ${Math.round((Date.now() - startedAt) / 1_000)} s of wall time`)
+      if (outcome.attempts !== null) console.error(`[${row.run}] attempt ${outcome.attempts} failed`, error)
+      this.setState(row.run, outcome.state, outcome.note)
+      next = outcome.next
+      if (outcome.state === 'error') {
+        const hint = error instanceof GitHubError ? (app ? ' Check the permissions of the GitHub App.' : ' Check the permissions of GITHUB_TOKEN.') : ''
+        await comments
+          ?.post(`agent-factory stopped run \`${row.run}\`: ${outcome.note}${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${target}\`.`)
+          .catch(() => undefined)
       }
     } finally {
       clearInterval(heartbeat)
@@ -223,20 +242,6 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
 
   protected setState(run: string, state: State, note: string) {
     this.ctx.storage.sql.exec('update factory_runs set state = ?, note = ? where run = ?', state, note, run)
-  }
-}
-
-/** A finished step is progress: it clears the counts of failed attempts and restarts. */
-function progressLedger(ledger: Ledger): Ledger {
-  return {
-    get: (key) => ledger.get(key),
-    put(key, value) {
-      ledger.put(key, value)
-      if (key.startsWith('step:')) {
-        ledger.put('attempts', 0)
-        ledger.put('restarts', 0)
-      }
-    },
   }
 }
 

@@ -1,17 +1,23 @@
 import { Sql } from 'nanocode-ts/cloudflare'
 import module from 'nanocode-ts/nanocode_wasm.wasm'
+import { commandChecker, type RepoConfig } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
+import type { Checker } from '../core/platform.ts'
 import { commentChannel, commentLimit, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { parsePrices, zeroTokens, type RunUsage } from '../core/usage.ts'
 import { allowedModelsFrom, codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
-import { ciChecker } from './checker.ts'
+import { reviewAnnouncement } from './announcements.ts'
+import { boxMachine, syncWithSetup } from './box.ts'
+import { ciChecker, reviewChecker } from './checker.ts'
 import { baseConfig } from './config.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
-import { githubRepo, type PullRequest } from './repo.ts'
-import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
+import { githubRepo, type GitHubRepo, type PullRequest } from './repo.ts'
+import { githubSigning } from './signing.ts'
+import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs } from './runs.ts'
 import { sqlFiles, sqlLedger } from './storage.ts'
+import { sqlSyncs } from './syncs.ts'
 
 export { allowedUsers, type Env } from './runs.ts'
 
@@ -36,7 +42,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
   }
 
   protected announcement(run: string, request: StartRequest) {
-    return `agent-factory started review run \`${run}\` for @${request.by}. Questions for you will appear here; answer them with a \`/answer\` comment.`
+    return reviewAnnouncement(run, request.by)
   }
 
   /** The result of a review run, with its fixes as a commit on GitHub, or what the run waits for. */
@@ -71,9 +77,11 @@ export class PullRequestRuns extends Runs<StartRequest> {
     const log = (line: string) => console.log(`[${request.owner}/${request.repo}#${request.pr} ${run}] ${line}`)
     const sql = Sql.create(this.ctx.storage)
     const repo = githubRepo({ branch, gh, ledger, log, pull, runId: run, sql })
+    const signing = githubSigning(gh, request.owner, request.repo)
+    const ci = ciChecker({ branch, gh, ledger, pull, repo, timeoutMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000 })
     const result = await codeReviewLoop(input, {
       channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, pollMs: 0, waitMs: 0 }),
-      checker: ciChecker({ branch, gh, ledger, pull, repo, timeoutMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000 }),
+      checker: input.config.tests ? this.machineChecker(run, repo, input.config, ci, log) : ci,
       credentials: credentialsFor(this.env, providersOf(input.models)),
       files: sqlFiles(this.ctx.storage.sql, run),
       guides: await bundledGuides(),
@@ -82,9 +90,22 @@ export class PullRequestRuns extends Runs<StartRequest> {
       module,
       prices,
       repo,
+      // The run also pushes its fixes to the publish branch, so the check also reads the rules of that branch.
+      signing: { apply: signing.apply, check: (branches) => signing.check([...branches, branch]) },
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
     return { passed: result.pass, summary: summary(run, result) }
+  }
+
+  /** The review tree has a directory of its own, because the runs of all objects share one MACHINE_URL machine. */
+  private machineChecker(run: string, repo: GitHubRepo, config: RepoConfig, ci: Checker, log: (line: string) => void): Checker {
+    const syncs = sqlSyncs(this.ctx.storage.sql, run)
+    const box = this.box(syncs)
+    const dir = `review/${run}`
+    const pending = new Map<string, Promise<void>>()
+    // The setup runs after each full copy, so a container that came back empty installs its dependencies again.
+    const sync = () => syncWithSetup(box, syncs, pending, repo.tree, dir, { command: config.setup, timeoutMs: setupTimeoutMs }, log)
+    return reviewChecker(ci, commandChecker(repo, { ...config, setup: undefined }, boxMachine(box, dir, sync)))
   }
 
   /** The run's input. The checks and rails come from the base branch, so a PR cannot change its own. */
@@ -102,6 +123,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
       allowedModels: allowedModelsFrom(this.env.ALLOWED_MODELS),
       ask: request.ask ?? `${view.title}\n\n${view.body ?? ''}`.trim(),
       config,
+      headRef: view.head.ref,
       models: mergeModels(overrides),
       pr: request.pr,
       runId: run,

@@ -23,6 +23,17 @@ const vars = (mock: { url: string }) => ({
   OPENAI_URL: `${mock.url}/v1`,
   PAUSE_POLL_SECONDS: '2',
 })
+/** The vars with the mock machine, for review runs whose config has tests: they run the tests on a build machine. */
+const withMachine = (mock: { url: string }) => ({ ...vars(mock), MACHINE_URL: `${mock.url}/machine` })
+/** Starts the Worker, and closes the mock when wrangler dev does not start. */
+async function startFor(mock: { close: () => Promise<void> }, ...args: Parameters<typeof startWorker>) {
+  try {
+    return await startWorker(...args)
+  } catch (error) {
+    await mock.close()
+    throw error
+  }
+}
 const comment = (login: string, body: string) => ({ action: 'created', comment: { body, user: { login } }, issue: { number: 7, pull_request: {} }, repository })
 
 test('on Cloudflare, development collects a stopped review before a budget raise starts its replacement', { timeout: 360_000 }, async () => {
@@ -30,7 +41,7 @@ test('on Cloudflare, development collects a stopped review before a budget raise
   const issues = { 5: { body: 'Add sub and mul next to add, with tests.', title: 'Add sub and mul' } }
   const mock = await mockServices(repo, { botLogin: 'factory-bot', issues, name: 'app', owner: 'acme', script: developScript() })
   const free = { input: 0, cached_input: 0, cache_write: 0, output: 0 }
-  const worker = await startWorker({
+  const worker = await startFor(mock, {
     ...vars(mock),
     MACHINE_URL: `${mock.url}/machine`,
     MODEL_PRICES: JSON.stringify({ 'claude-opus-5-5': free, 'gpt-6.1-sol': { ...free, output: 1_000_000 } }),
@@ -50,6 +61,10 @@ test('on Cloudflare, development collects a stopped review before a budget raise
     const asked = await until(() => on(5).find((entry) => /batch=budget\./.test(entry.body)), 300_000, describe)
     assert.ok(!on(5).some((entry) => entry.body.includes('Is this the ask?')), describe())
     assert.match(asked.body, /Raise the budget or stop the run\?/)
+    assert.match(asked.body, /Raise the budget to \$\d+\.\d{2} \(recommended\)/)
+    // The stopped review spent more than twice the budget: the run posted the notice before the question.
+    const noticed = on(5).findIndex((entry) => /of its budget of \$1\.00\. The run continues\./.test(entry.body))
+    assert.ok(noticed !== -1 && noticed < on(5).indexOf(asked), describe())
     const pull = [...mock.state.pulls.keys()][0]
     assert.ok(pull !== undefined, describe())
     const first = await status(pull)
@@ -73,15 +88,15 @@ test('on Cloudflare, development collects a stopped review before a budget raise
     assert.ok(cumulative, done.body)
     assert.equal(Number(cumulative[1]), totals.reduce((a, b) => a + b, 0))
   } finally {
-    worker.stop()
-    mock.close()
+    await worker.stop()
+    await mock.close()
   }
 })
 
-test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, and pushes the fixes', { timeout: 240_000 }, async () => {
+test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, pushes the fixes, and the close of the PR prunes them', { timeout: 240_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
-  const worker = await startWorker(vars(mock))
+  const worker = await startFor(mock, withMachine(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 120)))}\nrequests: ${mock.state.requests.slice(-15).join(', ')}\nworker:\n${worker.output().slice(-3000)}`
   try {
     assert.equal((await sendWebhook(worker.url, null, 'issue_comment', comment('maintainer', '/review'))).status, 401)
@@ -99,6 +114,8 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
     assert.match(done.body, /CI \(push\): pass/)
     assert.match(done.body, /May sub return a negative number\? \*\*No, throw an error\*\*/)
     assert.equal(mock.fileAt(`refs/heads/factory/${started.run}`, 'src/math.ts'), fixed)
+    // The signing check also reads the rules of the publish branch.
+    assert.ok(mock.state.requests.includes(`GET /repos/acme/app/rules/branches/${encodeURIComponent(`factory/${started.run}`)}`))
 
     const status = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: { state: string }[] }
     assert.equal(status.runs[0]?.state, 'passed')
@@ -107,19 +124,32 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
     assert.deepEqual(providers, new Set(['codex']))
     const report = await (await fetch(`${worker.url}/runs/acme/app/7/report`, { headers: { authorization: 'Bearer admin' } })).text()
     assert.match(report, /Step 1 findings: host=0, minimize=1, rules=0, bugs=1, anti-slop=0/)
-    // Review runs on Cloudflare have no test runner: the agents that run tests elsewhere hear that CI runs them.
+    // The config has tests, so the run tests on the build machine: the agents that run tests get run_tests, not the text that CI runs them.
     const told = (role: string) => mock.state.turns.some((turn) => turn.role === role && turn.request.includes('This run has no run_tests tool'))
-    assert.deepEqual([told('patch'), told('bugs'), told('minimize')], [true, true, false])
+    const offered = (role: string) => mock.state.turns.some((turn) => turn.role === role && turn.request.includes('Run specific test files of /repo'))
+    assert.deepEqual([told('patch'), told('bugs'), told('minimize')], [false, false, false])
+    assert.deepEqual([offered('patch'), offered('bugs')], [true, true])
+
+    // The sweep keeps the fix branch while the PR is open. The close of the PR prunes it, but never the head branch outside factory/.
+    const fixes = `factory/${started.run}`
+    assert.equal((await fetch(`${worker.url}/prune/acme/app`, { method: 'POST' })).status, 401)
+    const swept = await fetch(`${worker.url}/prune/acme/app`, { headers: { authorization: 'Bearer admin' }, method: 'POST' })
+    assert.equal(swept.status, 200)
+    assert.deepEqual(await swept.json(), { deleted: [], failed: [], kept: [{ name: fixes, reason: 'unapplied review fixes' }] })
+    mock.closePull(7, false)
+    const closed = { action: 'closed', pull_request: { head: { ref: 'feature' }, number: 7 }, repository }
+    assert.deepEqual(await (await sendWebhook(worker.url, secret, 'pull_request', closed)).json(), { deleted: [{ name: fixes, rule: 'stranded' }], failed: [], kept: [] })
+    assert.deepEqual(mock.state.deleted, [fixes])
   } finally {
-    worker.stop()
-    mock.close()
+    await worker.stop()
+    await mock.close()
   }
 })
 
 test('on Cloudflare, a fork PR stops before any work, because its fixes would run in this repository CI', { timeout: 120_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', headRepo: 'mallory/app', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
-  const worker = await startWorker(vars(mock))
+  const worker = await startFor(mock, vars(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}`
   try {
     await sendWebhook(worker.url, secret, 'issue_comment', comment('maintainer', '/review --ship'))
@@ -128,8 +158,48 @@ test('on Cloudflare, a fork PR stops before any work, because its fixes would ru
     assert.equal(mock.state.turns.length, 0)
     assert.equal(mock.state.refs.size, 0)
   } finally {
-    worker.stop()
-    mock.close()
+    await worker.stop()
+    await mock.close()
+  }
+})
+
+test('on Cloudflare, a /review patch agent that breaks a test gets the failing output at its log, fixes the cause, and the host accepts the log', { timeout: 180_000 }, async () => {
+  const repo = fixtureRepo()
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ breakFirst: true, runQuestion: true, tests: true }) })
+  const worker = await startFor(mock, withMachine(mock))
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
+  try {
+    const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })).json()) as { run: string }
+    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 150_000, describe)
+    assert.match(done.body, /agent-factory: PASS/, done.body)
+    assert.equal(mock.fileAt(`refs/heads/factory/${started.run}`, 'src/math.ts'), fixed)
+    const output = mock.state.turns.filter((turn) => turn.role === 'patch' && turn.output).map((turn) => turn.output).join('\n')
+    assert.match(output, /refused: .*the targeted tests of your edits failed \(test\/add\.test\.ts, test\/sub\.test\.ts\)/)
+    assert.match(output, /3 !== 2/)
+    assert.doesNotMatch(output, /FAILING PATCH ACCEPTED/)
+    assert.match(output, /checks: syntax=skipped smoke=pass/)
+    // The gate ran the targeted tests on the machine, in the directory of the review run.
+    const gate = mock.state.commands.filter((entry) => entry.cwd === `review/${started.run}` && entry.argv.join(' ').includes("--test 'test/add.test.ts' 'test/sub.test.ts'"))
+    assert.ok(gate.length >= 2, JSON.stringify(mock.state.commands.map((entry) => [entry.cwd, entry.argv.join(' ').slice(0, 120)])))
+  } finally {
+    await worker.stop()
+    await mock.close()
+  }
+})
+
+test('on Cloudflare, a review whose config has tests stops before any work when the Worker has no container and no machine', { timeout: 120_000 }, async () => {
+  const repo = fixtureRepo()
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  const worker = await startFor(mock, vars(mock))
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
+  try {
+    await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })
+    const stopped = await until(() => mock.state.comments.find((entry) => entry.body.includes('stopped run')), 60_000, describe)
+    assert.match(stopped.body, /this Worker has no container for builds: add the containers section of wrangler\.jsonc and deploy again/)
+    assert.equal(mock.state.turns.length, 0)
+  } finally {
+    await worker.stop()
+    await mock.close()
   }
 })
 
@@ -137,7 +207,7 @@ test('on Cloudflare, with the GitHub App secrets, a repository without the App s
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { app: { installed: false, slug: 'sophon-factory' }, botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
   const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } })
-  const worker = await startWorker({ ...vars(mock), GITHUB_APP_ID: '12345', GITHUB_APP_PRIVATE_KEY: privateKey })
+  const worker = await startFor(mock, { ...vars(mock), GITHUB_APP_ID: '12345', GITHUB_APP_PRIVATE_KEY: privateKey })
   const admin = { authorization: 'Bearer admin' }
   const describe = () => `requests: ${mock.state.requests.join(', ')}\nworker:\n${worker.output().slice(-3000)}`
   try {
@@ -153,15 +223,50 @@ test('on Cloudflare, with the GitHub App secrets, a repository without the App s
     assert.match(lookup?.authorization ?? '', /^Bearer [\w-]+\.[\w-]+\.[\w-]+$/)
     assert.ok(!mock.state.authorizations.some((entry) => entry.authorization.includes('github-token')), describe())
   } finally {
-    worker.stop()
-    mock.close()
+    await worker.stop()
+    await mock.close()
+  }
+})
+
+test('on Cloudflare, the App webhook secret replaces the webhook secret, and comment, issue and PR events of the App bot start no run', { timeout: 120_000 }, async () => {
+  const repo = fixtureRepo()
+  const mock = await mockServices(repo, { app: { installed: true, slug: 'sophon-factory' }, botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } })
+  const appSecret = 'app-webhook-secret'
+  // The bot is an allowed user here, so only the bot filter keeps its /review and labels from starting runs.
+  const worker = await startFor(mock, { ...vars(mock), ALLOWED_USERS: 'Maintainer,sophon-factory[bot]', GITHUB_APP_ID: '12345', GITHUB_APP_PRIVATE_KEY: privateKey, GITHUB_APP_WEBHOOK_SECRET: appSecret })
+  const describe = () => `requests: ${mock.state.requests.join(', ')}\nworker:\n${worker.output().slice(-3000)}`
+  const appLookups = () => mock.state.requests.filter((route) => route === 'GET /app').length
+  const bot = { login: 'Sophon-Factory[bot]' }
+  try {
+    assert.equal((await sendWebhook(worker.url, secret, 'issue_comment', comment('mallory', '/review'))).status, 401)
+    assert.deepEqual(await (await sendWebhook(worker.url, appSecret, 'issue_comment', { ...comment('mallory', '/review'), sender: { login: 'mallory' } })).json(), { ignored: 'not an allowed user' })
+    assert.equal(appLookups(), 0, describe())
+
+    const ignored = { ignored: 'the App bot' }
+    assert.deepEqual(await (await sendWebhook(worker.url, appSecret, 'issue_comment', { ...comment('sophon-factory[bot]', '/review'), sender: bot })).json(), ignored)
+    const label = (name: string) => ({ action: 'labeled', label: { name }, repository, sender: bot })
+    assert.deepEqual(await (await sendWebhook(worker.url, appSecret, 'pull_request', { ...label('agent-review'), pull_request: { number: 7 } })).json(), ignored)
+    assert.deepEqual(await (await sendWebhook(worker.url, appSecret, 'issues', { ...label('agent-develop'), issue: { number: 5 } })).json(), ignored)
+    assert.equal(appLookups(), 1, describe())
+
+    const workflow = { action: 'completed', repository, sender: bot, workflow_run: { head_branch: 'factory/pr-7-x', pull_requests: [{ number: 7 }] } }
+    assert.deepEqual(await (await sendWebhook(worker.url, appSecret, 'workflow_run', workflow)).json(), { woke: [7] })
+    assert.equal(appLookups(), 1, describe())
+    for (const number of [5, 7]) {
+      const status = (await (await fetch(`${worker.url}/runs/acme/app/${number}`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: unknown[] }
+      assert.deepEqual(status.runs, [], describe())
+    }
+  } finally {
+    await worker.stop()
+    await mock.close()
   }
 })
 
 test('on Cloudflare, the admin route starts a run, and the run picks up the answer without the webhook', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
-  const worker = await startWorker(vars(mock))
+  const worker = await startFor(mock, withMachine(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 120)))}`
   const admin = { authorization: 'Bearer admin', 'content-type': 'application/json' }
   try {
@@ -172,6 +277,8 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
     assert.match(await refused.text(), /budget must be a positive number/)
     const refusedDevelop = await fetch(`${worker.url}/develop/acme/app/5`, { body: JSON.stringify({ budget: 'abc' }), headers: admin, method: 'POST' })
     assert.equal(refusedDevelop.status, 400)
+    assert.equal((await fetch(`${worker.url}/develop/acme/app/5`, { body: 'null', headers: admin, method: 'POST' })).status, 400)
+    assert.equal((await fetch(`${worker.url}/runs/acme/app/7`, { body: 'null', headers: admin, method: 'POST' })).status, 400)
     for (const number of [5, 7]) {
       const status = (await (await fetch(`${worker.url}/runs/acme/app/${number}`, { headers: admin })).json()) as { runs: unknown[] }
       assert.deepEqual(status.runs, [])
@@ -181,22 +288,26 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
     const again = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin, method: 'POST' })).json()) as { run: string; started: boolean }
     assert.deepEqual(again, { run: started.run, started: false })
 
-    await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
-    assert.match(mock.state.comments[0]!.body, /for @Maintainer/)
+    const asked = await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
+    assert.match(mock.state.comments[0]!.body, /for `Maintainer`/)
+    assert.doesNotMatch(mock.state.comments[0]!.body, /@/)
+    // answerersOf gives the ALLOWED_USERS fallback in lower case, and GitHub mentions ignore case.
+    assert.match(asked.body.split('\n')[0]!, /^@maintainer$/i)
     mock.comment('maintainer', '/answer recommended')
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/)
+    assert.doesNotMatch(done.body, /@Maintainer/i)
     assert.match(done.body, /May sub return a negative number\? \*\*Yes, return -2\*\* \(recommended\)/)
   } finally {
-    worker.stop()
-    mock.close()
+    await worker.stop()
+    await mock.close()
   }
 })
 
 test('on Cloudflare, a docs and tests only change takes the light loop, with host findings from the virtual git diff', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo({ light: true })
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
-  const worker = await startWorker(vars(mock))
+  const worker = await startFor(mock, withMachine(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
   try {
     const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })).json()) as { run: string }
@@ -208,14 +319,15 @@ test('on Cloudflare, a docs and tests only change takes the light loop, with hos
     assert.match(report, /TRIAGE path=light reason=docs-or-tests-only/)
     assert.match(report, /Light review: commit [0-9a-f]{12}; applied: host-001 .*; host-002 /)
   } finally {
-    worker.stop()
-    mock.close()
+    await worker.stop()
+    await mock.close()
   }
 })
 
 test('on Cloudflare, deleted source files and the old paths of renamed source files require the full loop', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo({ light: true })
-  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' })
+  // The fixture has no usable key, so its own commits are unsigned.
+  const git = (...args: string[]) => execFileSync('git', ['-c', 'commit.gpgsign=false', ...args], { cwd: repo, stdio: 'pipe' })
   git('checkout', '-q', 'main')
   writeFileSync(join(repo, 'src/removed.ts'), 'export const removed = true\n')
   git('add', '-A')
@@ -248,7 +360,7 @@ test('on Cloudflare, deleted source files and the old paths of renamed source fi
       return { cell: 'await tools.submit_findings({ findings: [] })' }
     },
   })
-  const worker = await startWorker(vars(mock))
+  const worker = await startFor(mock, withMachine(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
   try {
     await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })
@@ -261,8 +373,8 @@ test('on Cloudflare, deleted source files and the old paths of renamed source fi
     assert.ok(mock.state.turns.some((turn) => turn.role === 'minimize'))
     assert.ok(!mock.state.turns.some((turn) => turn.role === 'light'))
   } finally {
-    worker.stop()
-    mock.close()
+    await worker.stop()
+    await mock.close()
   }
 })
 
@@ -271,7 +383,7 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
   // The open question is a run question, so the run asks nothing on the PR (D11).
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ runQuestion: true, tests: false }) })
   mock.state.ciStatus = 403
-  const worker = await startWorker(vars(mock))
+  const worker = await startFor(mock, withMachine(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}`
   const admin = { authorization: 'Bearer admin' }
   const modelCalls = () => mock.state.requests.filter((route) => route.startsWith('POST /v1/')).length
@@ -299,8 +411,8 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
     assert.deepEqual(await finished.json(), { reason: 'the run is complete with PASS. Start a new run to try again', resumed: false, state: 'passed' })
     assert.deepEqual(await (await resume(8)).json(), { reason: 'there is no run. Start a run first', resumed: false, state: null })
   } finally {
-    worker.stop()
-    mock.close()
+    await worker.stop()
+    await mock.close()
   }
 })
 
@@ -316,7 +428,10 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
   const mock = await mockServices(repo, { botLogin: 'factory-bot', issues, name: 'app', owner: 'acme', script: developScript({ reviewFix: true }) })
   // FACTORY_CONTAINERS=1 runs the build machine as a real local container (it needs Docker). Else the mock is the machine.
   const containers = process.env.FACTORY_CONTAINERS === '1'
-  const worker = await startWorker(containers ? vars(mock) : { ...vars(mock), MACHINE_URL: `${mock.url}/machine` }, { containers })
+  // A budget of 1 ms makes each alarm call stop at its first safe point after new work, so the run passes across
+  // several alarm calls (D12).
+  const budget = { ...vars(mock), ALARM_BUDGET_SECONDS: '0.001' }
+  const worker = await startFor(mock, containers ? budget : { ...budget, MACHINE_URL: `${mock.url}/machine` }, { containers })
   const on = (number: number) => mock.state.comments.filter((entry) => entry.issue === number)
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 160)]))}\nworker:\n${worker.output().slice(-4000)}`
   try {
@@ -326,6 +441,7 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     // The intake agent raised no user question, so the run takes its recommendations and does not ask on the issue (D11).
     const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
     assert.match(done.body, /^# Development run: READY/, done.body)
+    assert.match(done.body, /^- Alarm calls: [1-9]\d* planned stops?, \d+ crash restarts?$/m, done.body)
     assert.ok(!on(5).some((entry) => entry.body.includes('agent-factory:questions')), describe())
     assert.match(done.body, /## Decisions the run made\n\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\*/)
     const [number, pull] = [...mock.state.pulls].find(([, entry]) => entry.head === 'factory/dev-add-sub-mul')!
@@ -349,18 +465,22 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     assert.ok(on(number).some((entry) => entry.body.startsWith('### agent-factory: PASS')), describe())
     assert.ok(on(number).some((entry) => entry.body.startsWith('# Development run: READY')))
 
-    // With the standing permission, the host merged the PR at the head that the final CI checked, then deleted only the run's branch.
+    // With the standing permission, the host merged the PR at the head that the final CI checked. Then it deleted the run's branch, and the
+    // prune deleted the review fix branch, whose fixes the run merged.
     assert.deepEqual(mock.state.merges.map(({ pr, method, sha }) => ({ pr, method, sha })), [{ method: 'squash', pr: number, sha: mock.state.refs.get(branch) }])
     const merged = `Merged by the host (squash): ${mock.state.merges[0]!.commit}.`
     assert.ok(done.body.includes(merged), done.body)
     assert.ok(on(number).some((entry) => entry.body.startsWith('# Development run: READY') && entry.body.includes(merged)))
-    assert.deepEqual(mock.state.deleted, ['factory/dev-add-sub-mul'])
+    assert.equal(mock.state.deleted.length, 2, JSON.stringify(mock.state.deleted))
+    assert.equal(mock.state.deleted[0], 'factory/dev-add-sub-mul')
+    assert.match(mock.state.deleted[1]!, new RegExp(`^factory/pr-${number}-`))
+    assert.match(done.body, new RegExp(`^- deleted factory/pr-${number}-\\S+ \\(applied\\)$`, 'm'))
     assert.deepEqual([mock.fileAt('refs/heads/main', 'src/sub.ts'), mock.fileAt('refs/heads/main', 'src/mul.ts')], [sources.sub, sources.mul])
     const status = (await (await fetch(`${worker.url}/runs/acme/app/5`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: { run: string; state: string }[] }
     assert.deepEqual(status.runs.map((run) => run.state), ['passed'])
   } finally {
-    worker.stop()
-    mock.close()
+    await worker.stop()
+    await mock.close()
   }
 })
 
@@ -373,7 +493,7 @@ test('on Cloudflare, /develop asks a user question of the intake agent on the is
   })
   const issues = { 5: { body: 'Add sub and mul next to add, with tests.', title: 'Add sub and mul' } }
   const mock = await mockServices(repo, { botLogin: 'factory-bot', issues, name: 'app', owner: 'acme', script: developScript({ askScope: true }) })
-  const worker = await startWorker({ ...vars(mock), MACHINE_URL: `${mock.url}/machine` })
+  const worker = await startFor(mock, { ...vars(mock), MACHINE_URL: `${mock.url}/machine` })
   const on = (number: number) => mock.state.comments.filter((entry) => entry.issue === number)
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 160)]))}\nworker:\n${worker.output().slice(-4000)}`
   try {
@@ -391,10 +511,12 @@ test('on Cloudflare, /develop asks a user question of the intake agent on the is
     const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
     assert.match(done.body, /^# Development run: READY/, done.body)
     assert.equal(on(5).filter((entry) => entry.body.includes('agent-factory:questions')).length, 1, describe())
+    assert.match(asked.body.split('\n')[0]!, /^@maintainer$/i)
+    assert.doesNotMatch(done.body, /@Maintainer/i)
     assert.match(done.body, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
     assert.match(done.body, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\*.*\n- Is this the ask\? .*\*\*Yes, go on\*\*.*\n\n## Decisions the run made\n\n- Write a spec before the plan\? \*\*Plan now\*\*/)
   } finally {
-    worker.stop()
-    mock.close()
+    await worker.stop()
+    await mock.close()
   }
 })

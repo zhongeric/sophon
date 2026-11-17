@@ -2,6 +2,8 @@ import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import type { CiJob } from './ci.ts'
 import type { CheckResult, MergeMethod } from './checks.ts'
+import type { SigningRecord } from './signing.ts'
+import type { PullState } from './prune.ts'
 
 /** The frozen review target. `base` and `head` are commit IDs that `Repo.diff` accepts. */
 export type Frozen = { base: string; head: string; branch: string; location: string }
@@ -23,6 +25,11 @@ export type Repo = {
   head(): Promise<string>
   /** Puts the fixes on the PR branch, without force, and marks the PR ready. */
   ship(target: { pr: number; headRef: string }): Promise<void>
+  pullState(pr: number): Promise<PullState>
+  /** Deletes the fix branch of the run on origin and locally, with its worktree. A branch that is absent counts as deleted. */
+  deleteBranch(): Promise<void>
+  /** Removes the worktree of the run. The branch stays. */
+  release(): Promise<void>
 }
 
 /** A branch in a worktree of its own, where one builder writes. The host commits. */
@@ -54,6 +61,10 @@ export type Branches = {
    * origin counts as deleted, for example when the repository deletes head branches after a merge.
    */
   deleteRemote(name: string): Promise<void>
+  /** Removes the worktree that has the branch, wherever it is, then deletes the local branch. A branch that is absent counts as deleted. */
+  deleteLocal(name: string): Promise<void>
+  /** Removes every worktree of the run. The branches stay. */
+  release(): Promise<void>
 }
 
 /** The result of a merge. GitHub can refuse a merge, for example for a conflict, a changed head or a check that is not green. */
@@ -73,6 +84,14 @@ export type PullRequests = {
   failureLog(job: CiJob): Promise<string>
 }
 
+/** Whether the commits of a run are signed. Each platform has its own. */
+export type Signing = {
+  /** Reads the signature rules of the branches that the run pushes and gives the commit mode. No GitHub call without a GitHub origin or without branches. */
+  check(branches: string[]): Promise<SigningRecord>
+  /** Prepares the commits of this process for the recorded answer, before the first commit. Throws StopError when the host cannot commit as the answer requires. */
+  apply(record: SigningRecord): Promise<void>
+}
+
 /** Runs the repository's checks. `tests` runs test files during agent turns, or is null where the platform cannot. */
 export type Checker = {
   /**
@@ -81,6 +100,11 @@ export type Checker = {
    */
   checks(changed: string[], options?: { tests?: boolean }): Promise<CheckResult[]>
   tests: ((tests: string[]) => Promise<CheckResult[]>) | null
+  /**
+   * The configured checks without tests, on a real machine, for the run_checks tool of an agent. Absent where the
+   * platform has no machine for agents. An agent tool never calls `checks`, because on Cloudflare it is the CI.
+   */
+  agentChecks?: (changed: string[]) => Promise<CheckResult[]>
 }
 
 /** The output files of the run, such as report.md and gate-log.txt. */

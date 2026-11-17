@@ -192,7 +192,10 @@ Each stage below lists who does the work, what the host enforces, and where the 
   again.
 - The PR body of a run with an issue says `Closes #<issue>`, thus GitHub closes the issue when the PR merges.
 - When GitHub refuses the merge, the PR stays ready, and the report gives the reason.
-- After a merge, the host deletes only the remote branch of the run, and the report gives the merge commit.
+- After a merge, the report gives the merge commit.
+- The host deletes the branches of a run. A task branch goes after its merge into the development branch. When the
+  run ends, the host deletes its merged, applied and stranded branches, and the report lists them. The branches of an
+  open PR, and of a run that can go on, stay. The `pull_request` closed webhook and the sweep delete the others.
 - Review runs never merge, because the host does not merge a PR of a person.
 
 ## 4. Profiles
@@ -317,7 +320,7 @@ decision that the run made (D11).
 
 ## 7. Platforms
 
-The builder needs a real toolchain: `forge`, `node`, package installs. The review loop does not.
+The builder needs a real toolchain: `forge`, `node`, package installs. The review loop needs one only for tests.
 
 - **Local (Node):** the builder uses a git worktree and runs commands on this machine, with the trust limits in the
   README.
@@ -329,6 +332,8 @@ The builder needs a real toolchain: `forge`, `node`, package installs. The revie
   - The container only runs commands: `setup`, checks and tests on a copy of a branch that the object syncs in.
     It gets no secret and no git remote. One image (Node 22, git, Foundry) serves every profile for now.
   - Pushes go through the Git Data API. The review loop runs as a review run of the new PR, in its own object.
+  - Each review run whose config has tests has a container of its own for `setup`, tests and the checks of agents.
+    The final checks stay CI.
   - Entry: `npm run remote -- develop owner/repo#<issue>`, a `/develop` comment, or the `agent-develop` label. The
     issue is the ask, verbatim, and its comments carry the intake and spec questions and the report.
 
@@ -348,7 +353,8 @@ Each decision records a conflict between two rules, and the choice.
 | D8 | **Tests first against a lazy draft.** evm-cortex says tests first. The plan rules say a lazy first draft. | The draft includes its tests, and done-looks-like names them. A bug fix starts with a failing test. |
 | D9 | **Solidity style conflicts.** Test names (three schemes), error names (`ManagerLocked` or `Oracle_StalePrice`), event tense, immutable case, pinned compiler (0.8.24, 0.8.26, 0.8.28), NatSpec on internal functions, coverage (90% or 100%), ReentrancyGuard scope (all external calls or value paths only). | One precedence rule: repo rules > the `solidity` profile > evm-cortex. The D9 picks below are the values of the profile, in `agents/profiles/solidity.md`. |
 | D10 | **Questions at once or one at a time.** | Batch per stage. On an async channel, each round trip costs minutes or hours. |
-| D11 | **Which questions go to the user.** Ask the user about each open choice, or let the run decide most choices. In one afternoon, runs posted 137 questions, and only two of them needed the user. | A question goes to the user only when the choice obeys one of these rules: (1) `scope`: it removes or adds scope compared with the ask. A reading of an unclear ask that keeps its intent is not a change of scope. (2) `capability`: it changes what agents can get to or do across workflows (network and web search, protected paths, secrets, allowed models, blinding). (3) `spend`: it commits spend over the budget, or a permanent or public action (a merge without standing permission, a deploy, a publication). (4) `decision`: it does not agree with a recorded D or RD row. Such a question is `user` level and names its rule. Every other question is `run` level: the host uses the recommendation at once, with no post and no pause, and records it as a decision that the run made. The route questions of step 0 and the rejection question of a critical or high finding are `run` level. When the intake agent asks a `user` question, "Is this the ask?" is `user` level, with rule `scope`, so that the user sees the summary. A held finding is `user` level, with the rule of the finding. The budget question at the cap (#11, see RG2 in `research-workflow.md`) is `user` level, with rule `spend`. A question from an older ledger without a level counts as `user` level. |
+| D11 | **Which questions go to the user.** Ask the user about each open choice, or let the run decide most choices. In one afternoon, runs posted 137 questions, and only two of them needed the user. | A question goes to the user only when the choice obeys one of these rules: (1) `scope`: it removes or adds scope compared with the ask. A reading of an unclear ask that keeps its intent is not a change of scope. (2) `capability`: it changes what agents can get to or do across workflows (network and web search, protected paths, secrets, allowed models, blinding). (3) `spend`: it commits spend over the budget, or a permanent or public action (a merge without standing permission, a deploy, a publication). (4) `decision`: it does not agree with a recorded D or RD row. Such a question is `user` level and names its rule. Every other question is `run` level: the host uses the recommendation at once, with no post and no pause, and records it as a decision that the run made. The route questions of step 0 and the rejection question of a critical or high finding are `run` level. When the intake agent asks a `user` question, "Is this the ask?" is `user` level, with rule `scope`, so that the user sees the summary. A held finding is `user` level, with the rule of the finding. The budget question at two times the budget (#11, see RG2 in `research-workflow.md`) is `user` level, with rule `spend`. A question from an older ledger without a level counts as `user` level. |
+| D12 | **Alarm budget.** Cloudflare stops one alarm call of a Durable Object after 15 minutes of wall time. A run can work for longer, and each cut counts as a crash restart. | **A time budget for each alarm call:** `ALARM_BUDGET_SECONDS`, default 480. After the budget, the host stops the run at the next safe point: before a new step, a new agent turn or a nudge, never inside a turn. Each call records at least one new step or turn before it can stop. The next alarm call starts at once and continues from the ledger and the journals. A planned stop does not change `attempts` or `restarts`. The host logs a warning when one agent turn takes more than 7 minutes. The report shows the counts of planned stops and crash restarts. |
 
 ### D9 picks
 
@@ -390,7 +396,7 @@ No rule covers these yet. Each default applies until the user replaces it.
 | G3 | Backend conventions: API shape, errors, logging, config, migrations | Follow the repo. Validate external input at the boundary. Additive migrations first. |
 | G4 | A security path for code that is not Solidity | Dependency and secret scans as host checks in the `typescript` profile. A focused security track in the review loop for auth and data paths. |
 | G5 | Frontend and backend deploys | Out of scope until the deploy workflow. The PR is the end of this workflow. |
-| G6 | Budgets: CI-fix rounds, review rounds, cost | Two CI-fix rounds, then a blocker. The pass count from triage, then FAIL. Built: the ledger records the tokens of each agent and of the run, and each report has a Usage section with the estimated USD from `MODEL_PRICES`. An optional cost budget per run (`--budget`, or `budget` of the admin routes) pauses the run before an agent turn at the budget with one question: raise it or stop. A stop ends a review run with FAIL and a development run as stopped, with the reason "cost budget". |
+| G6 | Budgets: CI-fix rounds, review rounds, cost | Two CI-fix rounds, then a blocker. The pass count from triage, then FAIL. Built: the ledger records the tokens of each agent and of the run, and each report has a Usage section with the estimated USD from `MODEL_PRICES`. An optional cost budget per run (`--budget`, or `budget` of the admin routes) is a soft limit. At the budget, the host posts one notice with the spend, the budget and the three most expensive steps, and the run continues. At two times the budget, the run pauses with one question: raise the budget or stop. The recommendation is a raise to two times the spend, so a hotfix run raises it without a question and posts a notice. Each raise starts a new budget with the same two steps. A nested review pass gets 2 x budget - spend, and stops there without a question. A stop ends a review run with FAIL and a development run as stopped, with the reason "cost budget". |
 | G7 | Where the frozen package and notes live | The PR description, written by the host, plus the run ledger. |
 | G8 | Mixed-stack monorepos | Profiles match per package. Each package's strictest policy applies to its files. |
 | G9 | Docs, config and CI changes | `docs` and `ci-infra` profiles (section 4.4). |
@@ -411,8 +417,7 @@ No rule covers these yet. Each default applies until the user replaces it.
 - The late bugs pass runs when a patch changed code since the freeze, and reviews every fix since then. Thus step 1
   fixes also get a bugs review.
 - Step 2 has no diff to review when the step 1 patch changed nothing. The run records that and goes on.
-- On Cloudflare, review agents cannot run tests: CI checks the result. Builders of development runs can, on the
-  build container.
+- On Cloudflare, a review run without tests in its config has no test runner: CI checks the result.
 - On Cloudflare, in-process git reads a symlink as the content of its target. A PR that only changes the target of a
   symlink shows no change to the reviewers. The fixes never change a symlink.
 - On Cloudflare, a PR with 3,000 or more files stops, files over the size limit of the tree are skipped, and the

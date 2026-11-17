@@ -33,7 +33,15 @@ export type Role<Id extends string = string> = {
   tests: boolean
   /** When true, the role may get the egress of the domain. When false, the role stays offline. */
   egress: boolean
+  /** The nanocode subagents of the role. Without this field, the role gets no subagents. */
+  subagents?: SubagentLimit | 'unlimited'
 }
+
+/** The limits of the subagents of one root turn. `tokens` counts the input and output tokens of the subagents only. */
+export type SubagentLimit = { concurrent: number; perTurn: number; tokens: number }
+
+/** RD1 of the research spec: the host bounds the subagents of a research role. */
+const researchSubagents: SubagentLimit = { concurrent: 3, perTurn: 6, tokens: 2_000_000 }
 
 /** One workflow's roles: each key is the id of its role. */
 export type RoleTable<Id extends string> = { [Key in Id]: Role<Key> }
@@ -100,12 +108,26 @@ export const developRoles: RoleTable<DevelopRoleId> = {
   intake: { id: 'intake', guides: ['shared/factory.md', 'intake.md'], stackGuides: false, tests: false, egress: false },
   spec: { id: 'spec', guides: ['shared/factory.md', 'spec.md', 'shared/ste.md'], stackGuides: false, tests: false, egress: false },
   planner: { id: 'planner', guides: ['shared/factory.md', 'planner.md', 'shared/ste.md'], stackGuides: true, tests: false, egress: false },
-  builder: { id: 'builder', guides: ['shared/factory.md', 'builder.md', 'shared/ste.md'], stackGuides: true, tests: true, egress: false },
+  builder: {
+    id: 'builder',
+    guides: ['shared/factory.md', 'builder.md', 'shared/ste.md'],
+    stackGuides: true,
+    tests: true,
+    egress: false,
+    subagents: 'unlimited',
+  },
 }
 
 export const researchRoles: RoleTable<ResearchRoleId> = {
   intake: { id: 'intake', guides: ['shared/factory.md', 'research/intake.md'], stackGuides: false, tests: false, egress: true },
-  surveyor: { id: 'surveyor', guides: ['shared/factory.md', 'research/surveyor.md'], stackGuides: false, tests: false, egress: true },
+  surveyor: {
+    id: 'surveyor',
+    guides: ['shared/factory.md', 'research/surveyor.md'],
+    stackGuides: false,
+    tests: false,
+    egress: true,
+    subagents: researchSubagents,
+  },
   generator: { id: 'generator', guides: ['shared/factory.md', 'research/generator.md'], stackGuides: false, tests: false, egress: true },
   preregistrar: {
     id: 'preregistrar',
@@ -122,7 +144,14 @@ export const researchRoles: RoleTable<ResearchRoleId> = {
     tests: false,
     egress: false,
   },
-  analyst: { id: 'analyst', guides: ['shared/factory.md', 'research/analyst.md', 'shared/ste.md'], stackGuides: true, tests: true, egress: true },
+  analyst: {
+    id: 'analyst',
+    guides: ['shared/factory.md', 'research/analyst.md', 'shared/ste.md'],
+    stackGuides: true,
+    tests: true,
+    egress: true,
+    subagents: researchSubagents,
+  },
   writer: { id: 'writer', guides: ['shared/factory.md', 'research/writer.md', 'shared/ste.md'], stackGuides: false, tests: false, egress: false },
   builder: developRoles.builder,
 }

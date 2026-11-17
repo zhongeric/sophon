@@ -5,13 +5,13 @@ import { join } from 'node:path'
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../../src/core/ci.ts'
 import type { MergeMethod } from '../../src/core/checks.ts'
-import type { MergeResult, PullRequests } from '../../src/core/platform.ts'
+import type { MergeResult, PullRequests, Signing } from '../../src/core/platform.ts'
 import type { Channel } from '../../src/core/questions.ts'
 import type { Prices } from '../../src/core/usage.ts'
 import { defaultModels } from '../../src/core/workflows/code-review-loop.ts'
 import { defaultDevelopModels, develop, type DevelopInput } from '../../src/core/workflows/develop.ts'
 import { loadRepoConfig, nodeDevelop } from '../../src/node/platform.ts'
-import { credentials, memoryChannel, module } from './fixture.ts'
+import { credentials, memoryChannel, module, withoutKey } from './fixture.ts'
 import type { Script } from './scripted-model.ts'
 
 /**
@@ -225,12 +225,26 @@ export async function developInput(repo: string, runId: string, options: { issue
   }
 }
 
-/** Runs the development workflow on the Node platform, with a scripted model, fake PRs and CI, and memory channels. */
+/**
+ * Runs the development workflow on the Node platform, with a scripted model, fake PRs and CI, and memory channels. The
+ * repository has no usable key. `signing` wraps the signing of the Node platform. With `keep`, the local deletes and the
+ * worktree removal do nothing, so that a test can read a worktree after the run.
+ */
 export async function runDevelop(
   repo: string,
   runsDir: string,
-  options: { runId: string; dispatch: Contracts.RuntimeOptions['dispatch']; pulls: PullRequests; channel?: Channel; input?: DevelopInput; prices?: Prices },
+  options: {
+    runId: string
+    dispatch: Contracts.RuntimeOptions['dispatch']
+    pulls: PullRequests
+    channel?: Channel
+    input?: DevelopInput
+    prices?: Prices
+    signing?: (signing: Signing) => Signing
+    keep?: boolean
+  },
 ) {
+  withoutKey(repo)
   const input = options.input ?? (await developInput(repo, options.runId))
   const deps = await nodeDevelop({
     channel: options.channel ?? memoryChannel().channel,
@@ -246,5 +260,7 @@ export async function runDevelop(
     reviewChannel: async () => memoryChannel().channel,
     runsDir,
   })
-  return { ...(await develop(input, deps)), dir: deps.dir }
+  const branches = options.keep ? { ...deps.branches, deleteLocal: async () => {}, release: async () => {} } : deps.branches
+  const signed = options.signing ? { ...deps, signing: options.signing(deps.signing) } : deps
+  return { ...(await develop(input, { ...signed, branches })), dir: deps.dir }
 }

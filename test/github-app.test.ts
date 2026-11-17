@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { appJwt, githubAccess, type GitHubSecrets, type InstallationTokens } from '../src/cloudflare/github-app.ts'
+import { appBotLogin, appJwt, githubAccess, type BotLogins, type GitHubSecrets, type InstallationTokens } from '../src/cloudflare/github-app.ts'
 import { StopError } from '../src/core/stop.ts'
 import { mockServices } from './support/mock-services.ts'
 
@@ -34,7 +34,7 @@ async function withMock(app: { slug: string; installed: boolean; expiresInSecond
   try {
     await run(mock)
   } finally {
-    mock.close()
+    await mock.close()
     rmSync(repo, { force: true, recursive: true })
   }
 }
@@ -140,5 +140,31 @@ test('a repository without the App stops with the install link of the slug from 
     await stops(githubAccess(appSecrets(mock.url), 'acme', 'app', new Map()), /https:\/\/github\.com\/apps\/sophon-factory\/installations\/new/)
     assert.deepEqual(mock.state.requests, ['GET /repos/acme/app/installation', 'GET /app'])
     assert.ok(mock.state.authorizations.every((entry) => signed(entry.authorization.replace(/^Bearer /, ''))))
+  })
+})
+
+test('the login of the App bot comes from GET /app with the App JWT, one time for each cache', async () => {
+  await withMock({ installed: true, slug: 'sophon-factory' }, async (mock) => {
+    const cache: BotLogins = new Map()
+    assert.equal(await appBotLogin(appSecrets(mock.url), cache), 'sophon-factory[bot]')
+    assert.equal(await appBotLogin(appSecrets(mock.url), cache), 'sophon-factory[bot]')
+    assert.deepEqual(mock.state.requests, ['GET /app'])
+    assert.ok(signed(mock.state.authorizations[0]?.authorization.replace(/^Bearer /, '') ?? ''))
+  })
+})
+
+test('without the App secrets, the login of the App bot is undefined and no request goes to GitHub', async () => {
+  await withMock({ installed: true, slug: 'sophon-factory' }, async (mock) => {
+    assert.equal(await appBotLogin({ GITHUB_API_URL: mock.url, GITHUB_TOKEN: 'personal' }, new Map()), undefined)
+    assert.equal(await appBotLogin({ GITHUB_API_URL: mock.url, GITHUB_APP_ID: '123' }, new Map()), undefined)
+    assert.deepEqual(mock.state.requests, [])
+  })
+})
+
+test('a failed GET /app is not cached', async () => {
+  await withMock(undefined, async (mock) => {
+    const cache: BotLogins = new Map()
+    await assert.rejects(appBotLogin(appSecrets(mock.url), cache))
+    assert.equal(cache.size, 0)
   })
 })

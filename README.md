@@ -83,11 +83,11 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
   runs one command for each test file.
 - `protect` lists paths that agents cannot write. A `*` matches inside one path segment.
 - `env` lists extra environment variables for the checks. `guides` mounts reference material at `/guides/<name>`.
-- `answerers` limits who can answer questions. `research` configures a research notebook
-  ([spec, section 6.3](docs/specs/research-workflow.md)).
+- `answerers` limits who can answer questions. `research` configures a research notebook. Its `known`, `inject` and
+  `reproduce` commands print a JSON last line ([spec, section 6.3](docs/specs/research-workflow.md#63-the-domain-in-the-notebook)).
 - Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
-  file that no test imports gets the test files that have its base name as a word. A builder's `run_checks` runs
-  only the checks. The targeted tests run one time, when the builder submits its build log.
+  file that no test imports gets the test files that have its base name as a word. The `run_checks` of builders,
+  patch agents and light agents runs only the checks. Their targeted tests run one time, when they submit their log.
 - `merge` (`"squash"`, `"merge"` or `"rebase"`) is the standing permission for the host to merge a ready development
   PR with that method. Without it, the host does not merge.
 
@@ -99,27 +99,31 @@ The STE dictionary is optional: see [agents/guides/ste/README.md](agents/guides/
 npm run review -- --repo ~/src/app --pr 123     # review a PR, add --ship to push the fixes and mark it ready on PASS
 npm run review -- --repo ~/src/app --base main --ask-file ask.md
 npm run develop -- --repo ~/src/app --ask "Add a fee switch, off by default"
+node --disable-warning=ExperimentalWarning src/node/research.ts --repo ~/src/notebook --program-file program.md  # ends in a dossier PR, needs gh auth login
 npm run review -- --run <id>                     # resume a run, also with npm run develop
 ```
 
 - **Questions** that need you (D11) go to the PR, the terminal, or `runs/<run>/questions-<batch>.md`. Answer with `/answer` and one
   line for each question (`Q1: b`, or your own words), or with `/answer recommended`.
 - **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
-  fixes are on the local branch `factory/<run>`.
+  fixes stay on `factory/<run>`. The run deletes it at its end after `--ship` or a closed PR.
 - **Models:** `--models file.json` sets the model of each role.
-- **Budget:** `--budget <usd>` caps the spend of a run. At the cap, the run asks you to raise it or stop. Prices come
-  from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`, `cached_input`, `cache_write`,
-  `output`). Each report shows the usage of each step.
+- **Budget:** `--budget <usd>` sets a soft limit on the spend of a run. At the budget, the run posts a notice and
+  continues. At two times the budget, it asks you to raise the budget or stop, and `/answer recommended` raises it to
+  two times the spend. Prices come from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`,
+  `cached_input`, `cache_write`, `output`). Each report shows the usage of each step.
 - **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
+- **Commits:** the host commits unsigned, unless a GitHub rule requires signed commits on a branch that the run pushes.
+  Then signing must work without a prompt.
 
 ## Cloudflare
 
-You need Workers Paid, Containers for development runs, and Docker on the machine that deploys. When you set
-`GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`, the Worker calls GitHub as that GitHub App. The key must be PKCS#8
-(`openssl pkcs8 -topk8 -nocrypt`). Without them, the Worker uses `GITHUB_TOKEN`, a fine-grained token with read and
-write access to Contents, Pull requests and Issues, and read access to Actions and Commit statuses. Each target
-repository needs CI on pull requests and on pushes to `factory/**`. Fork PRs are refused, because that CI would run
-fork code with the repository secrets.
+You need Workers Paid, Containers for development runs, research runs and review runs whose config has tests, and
+Docker on the machine that deploys. When you set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`, the Worker calls
+GitHub as that GitHub App. The key must be PKCS#8 (`openssl pkcs8 -topk8 -nocrypt`). Without them, the Worker uses
+`GITHUB_TOKEN`, a fine-grained token with read and write access to Contents, Pull requests and Issues, and read access
+to Actions and Commit statuses. Each target repository needs CI on pull requests and on pushes to `factory/**`. Fork
+PRs are refused, because that CI would run fork code with the repository secrets.
 
 ```bash
 npx wrangler deploy
@@ -129,7 +133,8 @@ done
 ```
 
 `ALLOWED_USERS` is the GitHub logins, comma-separated, that can start runs and answer questions. Set `MODEL_PRICES`
-as a secret to use budgets.
+as a secret to use budgets. The `secret` of a research credential is the name of a Worker secret that you set with
+`npx wrangler secret put <NAME>`. It cannot be a host secret or a Worker setting.
 
 `npm run remote` starts and follows runs. It reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from
 `.secrets/cloudflare.env`.
@@ -137,18 +142,23 @@ as a secret to use budgets.
 ```bash
 npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full, --budget)
 npm run remote -- develop acme/app#45    # a development run on an issue (--base, --hotfix, --full, --parallel, --budget)
+npm run remote -- research acme/app#45   # a research run on a program issue (--base, --parallel, --budget)
 npm run remote -- resume acme/app#45     # wake a paused run after you answer
 npm run remote -- status acme/app#45     # or report
+npm run remote -- prune acme/app         # delete the merged, applied and stranded factory/* branches
 npm run metrics                          # CPU, memory and network of each build container
 ```
 
-The webhook is optional. With it, a `/review` or `/develop` comment, or the `agent-review` or `agent-develop`
-label, starts a run, and answers take effect at once. Without it, runs poll for answers and CI. Point it at
-`https://<worker>/github/webhook`, with the events Issue comments, Issues, Pull requests, Workflow runs and Statuses.
+The webhook is optional. With it, a `/review`, `/develop` or `/research` comment, or the `agent-review`,
+`agent-develop` or `agent-research` label, starts a run, and answers take effect at once. Without it, runs poll for
+answers and CI. One App webhook replaces the webhook of each repository: point it at
+`https://<worker>/github/webhook` and set its secret as `GITHUB_APP_WEBHOOK_SECRET`. Without that secret, the Worker
+checks the webhook of each repository with `GITHUB_WEBHOOK_SECRET`. Use the events Issue comments, Issues, Pull
+requests, Workflow runs and Statuses. The Worker ignores the comment, issue and PR events of its own bot.
 
 A Durable Object holds the ledger, the repository tree and the agent sessions of each run. Alarms drive the run and
-resume it after a crash. Development runs run their checks in a Cloudflare Container that has no secrets. Commits
-and pushes go through the GitHub API.
+resume it after a crash. Development and research runs run their commands, and review runs with tests run their
+tests, in a Cloudflare Container that has no secrets. Commits and pushes go through the GitHub API.
 The object keeps the sync state of each container directory in SQL, so after a restart the next sync sends only the
 changed files and does not run the setup again.
 A development PR says `Closes #<issue>`.
@@ -160,7 +170,7 @@ agents/            the guidelines of each role, with profiles/ for each stack an
 src/core/          the workflows, the rules and the agent host, with no platform code
 src/node/          the local CLIs
 src/cloudflare/    the Worker and the Durable Objects
-containers/build/  the build image of development runs
+containers/build/  the build image of development and review runs
 docs/specs/        the designs and their decisions
 ```
 

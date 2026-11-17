@@ -1,5 +1,5 @@
 import type { Contracts } from 'nanocode-ts'
-import { SqlFileSystem } from 'nanocode-ts/bash'
+import { SqlFileSystem, type FileSystem } from 'nanocode-ts/bash'
 import type { Ledger } from '../core/ledger.ts'
 import type { Branch, Branches } from '../core/platform.ts'
 import { StopError } from '../core/stop.ts'
@@ -26,6 +26,64 @@ export async function deleteRemoteBranch(gh: GitHub, api: string, name: string):
     if (!(error instanceof GitHubError) || (error.status !== 404 && error.status !== 422)) throw error
     // GitHub answers 422 for a ref that does not exist. It also answers 422 when it refuses to delete a ref, for example a protected branch.
     if (error.status === 422 && (await remoteExists(gh, api, name))) throw error
+  }
+}
+
+/**
+ * Makes `to` hold only the files of `commit`: a copy of the .git directory of `from`, and then a hard reset to the
+ * commit. No work file is copied, so git writes each file of the commit. A copied work file with an uncommitted change
+ * can stay after the reset, because git can see it as clean when its size and time stamp agree with the index.
+ */
+export async function checkoutCommit(from: FileSystem.FileSystem, to: FileSystem.FileSystem, commit: string): Promise<void> {
+  const writer = treeWriter(to)
+  const walk = async (dir: string) => {
+    if (!(await to.stat(dir))) await to.mkdir(dir)
+    for (const name of await from.list(dir)) {
+      const path = `${dir}/${name}`
+      if ((await from.lstat!(path))?.kind === 'directory') await walk(path)
+      else await writer.copy(from, path.slice(1))
+    }
+  }
+  await walk('/.git')
+  await treeGit(to)('reset', '-q', '--hard', commit)
+}
+
+/**
+ * A tree of the files of a local commit of a run branch, from the first branch tree that has the commit. The ledger
+ * keeps the scope of each complete tree, so a resume does not copy again.
+ */
+export async function commitTree(options: { sql: Contracts.SqlHost; ledger: Ledger; run: string }, commit: string): Promise<FileSystem.FileSystem> {
+  const { ledger } = options
+  const key = `commit-tree:${commit}`
+  const recorded = ledger.get<string>(key)
+  if (recorded) return SqlFileSystem.create(options.sql, { scope: recorded })
+  for (const entry of Object.values(ledger.get<Record<string, Tree>>('trees') ?? {})) {
+    const from = SqlFileSystem.create(options.sql, { scope: entry.scope })
+    if (!(await treeGit(from)('log', '--format=%H')).split('\n').includes(commit)) continue
+    // A crashed copy leaves a partial tree: each attempt writes a fresh scope.
+    const scope = `commit:${options.run}:${commit.slice(0, 12)}:${Date.now()}`
+    const tree = SqlFileSystem.create(options.sql, { scope })
+    await checkoutCommit(from, tree, commit)
+    ledger.put(key, scope)
+    return tree
+  }
+  throw new Error(`no branch of the run has the commit ${commit}`)
+}
+
+/**
+ * The tree with a mkdir that also makes the missing parents and accepts a directory that exists, as the disk tree of the
+ * Node host does. The workflows rely on it, for example for /prereg in a notebook that has it.
+ */
+function mkdirAll(tree: SqlFileSystem.SqlFileSystem): SqlFileSystem.SqlFileSystem {
+  return {
+    ...tree,
+    async mkdir(path) {
+      let dir = ''
+      for (const part of path.split('/').filter(Boolean)) {
+        dir += `/${part}`
+        if ((await tree.stat(dir))?.kind !== 'directory') await tree.mkdir(dir)
+      }
+    },
   }
 }
 
@@ -106,7 +164,7 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
     const existing = (output: string) => nameStatus(output).filter(([status]) => status !== 'D').map(([, path]) => path)
     return {
       name,
-      tree,
+      tree: mkdirAll(tree),
       head,
       changedFiles: async (from, to) => existing(await git('diff', '--name-status', `${localOf(from)}..${localOf(to)}`)),
       committedFiles: async () => (await git('ls-files')).split('\n').filter(Boolean),
@@ -206,5 +264,8 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
       return sha
     },
     deleteRemote: (name) => deleteRemoteBranch(gh, api, name),
+    // The SQL trees are Durable Object data of the run, and they stay. No local branch or worktree exists to remove.
+    deleteLocal: async () => {},
+    release: async () => {},
   }
 }

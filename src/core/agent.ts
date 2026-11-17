@@ -3,6 +3,8 @@ import { checkEgress, egressFetch, type Egress, type EgressHost } from './egress
 import type { Ledger } from './ledger.ts'
 import type { AgentStore } from './platform.ts'
 import { dispatcher, type Credentials, type Provider } from './providers.ts'
+import type { Role } from './roles.ts'
+import { subagentLimits } from './subagents.ts'
 import { recordUsage } from './usage.ts'
 import { repoMount } from './workspace.ts'
 
@@ -18,7 +20,8 @@ export type AgentSpec = {
   instructions: string
   workspace: Contracts.WorkspaceHost
   tools: HostTools
-  subagents?: boolean
+  /** Without it, the agent gets no subagents. A limit makes openAgent refuse a spawn over the limit. */
+  subagents?: Role['subagents']
   /** The network access of the agent. Without it, the agent is offline. */
   egress?: Egress
 }
@@ -30,6 +33,8 @@ export type AgentHost = {
   credentials: Credentials
   /** Replaces the credentialed dispatch, for scripted models in tests. */
   dispatch?: Contracts.RuntimeOptions['dispatch']
+  /** Replaces the runtime factory, for tests that change what the runtime answers. */
+  instantiate?: typeof AgentRuntime.instantiate
   /** Runs before the host opens an agent turn, for example to compare the spend with the budget. A rejection stops the turn. */
   beforeTurn?: () => Promise<void>
   /** The artifacts, the lock and the secrets of the egress. Only an agent with an egress uses it. */
@@ -78,12 +83,15 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
   const sessionKey = `session:${spec.id}`
   const sessionId = host.ledger.get<string>(sessionKey) ?? Contracts.sessionUuid()
   host.ledger.put(sessionKey, sessionId)
+  const limits = typeof spec.subagents === 'object' ? subagentLimits(host.ledger, spec.id, spec.subagents) : undefined
+  const dispatch = host.dispatch ?? dispatcher(host.credentials, spec.provider)
 
   const connect = async () => {
-    const runtime = await AgentRuntime.instantiate(host.module, host.store.sql, {
+    const runtime = await (host.instantiate ?? AgentRuntime.instantiate)(host.module, host.store.sql, {
       published(events) {
         host.store.record(spec.id, events)
         recordUsage(host.ledger, spec.id, spec.model, events)
+        limits?.observe(events)
         for (const event of events) {
           const line = describe(event)
           if (line) host.log(`${spec.id}: ${line}`)
@@ -105,12 +113,12 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
         workspace_tools: 'all',
         // Web search runs at the provider, outside the egress and its lock (RD9 of the research spec).
         web_search: spec.egress?.web_search ?? false,
-        subagents: spec.subagents ?? false,
-        ...(spec.subagents ? { subagent_models: [{ harness: spec.provider, model: spec.model }] } : {}),
+        subagents: spec.subagents !== undefined,
+        ...(spec.subagents !== undefined ? { subagent_models: [{ harness: spec.provider, model: spec.model }] } : {}),
         tools: Object.values(spec.tools).map((tool) => tool.definition),
       },
       {
-        dispatch: host.dispatch ?? dispatcher(host.credentials, spec.provider),
+        dispatch: limits ? limits.dispatch(dispatch) : dispatch,
         fetch: agentFetch,
         tools: {
           call(name, input, _signal, context) {
@@ -128,9 +136,14 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
   let runtime = await connect()
   return {
     async ask(requestId, prompt) {
+      limits?.begin(requestId)
       const submitted = await runtime.submit(scope, { metadata: { agent: spec.id }, prompt, request_id: requestId })
       if (submitted.submitted === 'too_large') throw new Error(`${spec.id}: prompt of ${submitted.bytes} bytes is too large`)
-      if (submitted.submitted === 'conflict') throw new Error(`${spec.id}: turn ${requestId} exists with another prompt`)
+      if (submitted.submitted === 'conflict') {
+        // The turn keeps the prompt of its journal, because the agent already worked from it. A deploy can change the prompt text.
+        if (!(await runtime.turn(scope, requestId))) throw new Error(`${spec.id}: turn ${requestId} exists with another prompt`)
+        host.log(`${spec.id}: the prompt of turn ${requestId} changed, so the turn continues with the prompt of its journal`)
+      }
       for (let reconnects = 0; ; ) {
         const view = await runtime.turn(scope, requestId)
         if (view && finished.has(view.report.status)) {
@@ -170,22 +183,33 @@ export async function runTurn<T>(
 ): Promise<T> {
   const recorded = host.ledger.get<T>(turn.key)
   if (recorded !== undefined) return recorded
+  host.ledger.safePoint?.()
   await host.beforeTurn?.()
   const retriesKey = `retries:${spec.id}:${turn.request}`
   const retries = host.ledger.get<number>(retriesKey) ?? 0
   const request = retries === 0 ? turn.request : `${turn.request}-retry-${retries}`
   const agent = await openAgent(spec, host)
+  const ask = async (id: string, text: string) => {
+    const started = Date.now()
+    try {
+      return await agent.ask(id, text)
+    } finally {
+      const used = Date.now() - started
+      if (used > longTurnMs) host.log(`${spec.id}: warning: turn ${id} took ${Math.round(used / 1000)} s, more than ${longTurnMs / 60_000} minutes`)
+    }
+  }
   let failed = false
   try {
-    const report = await agent.ask(request, retries === 0 ? prompt : `${retryNote}\n\n${prompt}`)
+    const report = await ask(request, retries === 0 ? prompt : `${retryNote}\n\n${prompt}`)
     failed = report.status === 'failed'
     if (host.ledger.get(turn.key) === undefined) {
       if (report.status !== 'completed') throw new Error(`${spec.id}: turn ${report.status}: ${JSON.stringify(report.error ?? null)}`)
       // The first turn keeps the nudge request ID of earlier runs, so that their journals resume.
       const nudge = request === 'task' ? 'nudge' : `${request}-nudge`
-      // The nudge is a new agent turn, so the budget check applies to it too.
+      // The nudge is a new agent turn, so the safe point and the budget check apply to it too.
+      host.ledger.safePoint?.()
       await host.beforeTurn?.()
-      failed = (await agent.ask(nudge, `You ended the turn without calling ${tool}. Call tools.${tool} now.`)).status === 'failed'
+      failed = (await ask(nudge, `You ended the turn without calling ${tool}. Call tools.${tool} now.`)).status === 'failed'
     }
   } finally {
     if (failed && host.ledger.get(turn.key) === undefined) host.ledger.put(retriesKey, retries + 1)
@@ -195,6 +219,9 @@ export async function runTurn<T>(
   if (output === undefined) throw new Error(`${spec.id} did not call ${tool}`)
   return output
 }
+
+/** A turn that takes longer than this can pass the wall-time limit of a Cloudflare alarm call, so the host logs a warning. */
+const longTurnMs = 7 * 60_000
 
 /** The start of the prompt that asks again after a failed turn. The failed turn can have stopped before any work. */
 const retryNote = 'Your last turn stopped with an error before it finished. Here is the task again. Keep the work that you already did in this session.'

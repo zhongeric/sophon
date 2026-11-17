@@ -104,7 +104,33 @@ const checkEnv = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 
 const defaultTimeoutMs = 30 * 60_000
 const toolOutputTailChars = 8_000
 
-const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
+export const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
+
+/** The options of each command that the host runs from the config: the check environment and the config timeout. */
+export function commandOptions(config: RepoConfig): { env: string[]; timeoutMs: number } {
+  return { env: [...checkEnv, ...(config.env ?? [])].filter((name) => !hostSecrets.includes(name)), timeoutMs: config.timeout_ms ?? defaultTimeoutMs }
+}
+
+/**
+ * A function that runs the setup of the config one time. A failed setup runs again at the next call.
+ * The function gives the failed result, or null when the setup passed or the config has no setup.
+ */
+export function setupOnce<T extends { exit_code: number | null }>(config: RepoConfig, run: (command: string) => Promise<T>): () => Promise<T | null> {
+  let ready: Promise<T | null> | null = null
+  return async () => {
+    if (!config.setup) return null
+    ready ??= run(config.setup).then((result) => (result.exit_code === 0 ? null : result))
+    try {
+      const failed = await ready
+      if (failed) ready = null
+      return failed
+    } catch (error) {
+      ready = null
+      throw error
+    }
+  }
+}
+
 const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes)
 
 /** The parts of a repository that the checks read. */
@@ -172,20 +198,13 @@ export async function targetedTests(repo: Tree, config: RepoConfig, changed: str
 
 /** Checks that run the configured commands on a machine. Commands come from the config only. */
 export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine): Checker {
-  const env = [...checkEnv, ...(config.env ?? [])].filter((name) => !hostSecrets.includes(name))
+  const options = commandOptions(config)
   const run = async (name: string, command: string): Promise<CheckResult> => {
-    const result = await machine.run(command, { env, timeoutMs: config.timeout_ms ?? defaultTimeoutMs })
+    const result = await machine.run(command, options)
     return { name, command, status: result.exit_code === 0 ? 'pass' : 'fail', ...result }
   }
-  // The setup runs one time for each checker, which is one worktree. A failed setup runs again at the next check.
-  let ready: Promise<CheckResult | null> | null = null
-  const setup = async (): Promise<CheckResult | null> => {
-    if (!config.setup) return null
-    ready ??= run('setup', config.setup).then((result) => (result.status === 'pass' ? null : result))
-    const failed = await ready
-    if (failed) ready = null
-    return failed
-  }
+  // The setup runs one time for each checker, which is one worktree.
+  const setup = setupOnce(config, (command) => run('setup', command))
   const runTests = async (tests: string[]): Promise<CheckResult[]> => {
     if (!config.tests || tests.length === 0) return []
     const failed = await setup()
@@ -196,30 +215,28 @@ export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine)
     for (const test of tests) results.push(await run(`test ${test}`, command.replace('{test}', quote(test))))
     return results
   }
-  return {
-    async checks(changed, options = {}) {
-      const failed = await setup()
-      if (failed) return [failed]
-      const results: CheckResult[] = []
-      for (const [name, check] of Object.entries(config.checks)) {
-        const { command, files } = typeof check === 'string' ? { command: check, files: undefined } : check
-        if (!command.includes('{files}')) {
-          results.push(await run(name, command))
-          continue
-        }
-        const matching: string[] = []
-        for (const path of changed) if ((files ? new RegExp(files).test(path) : true) && (await exists(repo, path))) matching.push(path)
-        if (matching.length === 0) results.push({ name, command, status: 'skipped', exit_code: null, output: 'no changed files match' })
-        else results.push(await run(name, command.replace('{files}', matching.map(quote).join(' '))))
+  const checks: Checker['checks'] = async (changed, options = {}) => {
+    const failed = await setup()
+    if (failed) return [failed]
+    const results: CheckResult[] = []
+    for (const [name, check] of Object.entries(config.checks)) {
+      const { command, files } = typeof check === 'string' ? { command: check, files: undefined } : check
+      if (!command.includes('{files}')) {
+        results.push(await run(name, command))
+        continue
       }
-      if (options.tests === false) return results
-      const tests = await targetedTests(repo, config, changed)
-      if (tests.length === 0) results.push({ name: 'tests', command: config.tests?.command ?? '', status: 'skipped', exit_code: null, output: 'no targeted tests' })
-      else results.push(...(await runTests(tests)))
-      return results
-    },
-    tests: config.tests ? runTests : null,
+      const matching: string[] = []
+      for (const path of changed) if ((files ? new RegExp(files).test(path) : true) && (await exists(repo, path))) matching.push(path)
+      if (matching.length === 0) results.push({ name, command, status: 'skipped', exit_code: null, output: 'no changed files match' })
+      else results.push(await run(name, command.replace('{files}', matching.map(quote).join(' '))))
+    }
+    if (options.tests === false) return results
+    const tests = await targetedTests(repo, config, changed)
+    if (tests.length === 0) results.push({ name: 'tests', command: config.tests?.command ?? '', status: 'skipped', exit_code: null, output: 'no targeted tests' })
+    else results.push(...(await runTests(tests)))
+    return results
   }
+  return { checks, tests: config.tests ? runTests : null, agentChecks: (changed) => checks(changed, { tests: false }) }
 }
 
 export const runTestsTool: Contracts.HostTool = {
@@ -247,3 +264,20 @@ export async function callRunTests(repo: Pick<Repo, 'committedFiles'>, config: R
   if (tests.length === 0 || refused.length > 0) throw new Error(`not committed test files: ${refused.join(', ') || '(none given)'}`)
   return (await run(tests)).map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-toolOutputTailChars) }))
 }
+
+const checkOutputTailChars = 4_000
+
+/** The run_checks tool of an editing agent. `files` names the files that it checks, and `more` ends the description. */
+export const runChecksTool = (files: string, more = ''): Contracts.HostTool => ({
+  name: 'run_checks',
+  description: `Run the repository's configured checks (for example typecheck, lint, build) on ${files}, on the real machine. It runs no tests. Returns each status and the end of its output.${more}`,
+  parameters: { type: 'object', properties: {}, additionalProperties: false },
+})
+
+/** The result of run_checks for an agent: each status and the end of its output. */
+export const checkTails = (results: CheckResult[]) =>
+  results.map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-checkOutputTailChars) }))
+
+/** The failed checks or tests in the refusal of a submit: the name, the exit code and the end of the output of each. */
+export const failureText = (failed: CheckResult[]): string[] =>
+  failed.map(({ name, exit_code, output }) => `--- ${name} (exit code ${exit_code ?? 'none'}) ---\n${output.slice(-checkOutputTailChars)}`)

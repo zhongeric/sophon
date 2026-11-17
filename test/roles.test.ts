@@ -55,6 +55,17 @@ test('the research table has its nine roles, and only four of them may get the e
   assert.deepEqual(researchRoles.intake.guides, ['shared/factory.md', 'research/intake.md'])
 })
 
+test('surveyor and analyst get bounded subagents, both builders get unlimited ones, and the other roles get none', () => {
+  const limit = { concurrent: 3, perTurn: 6, tokens: 2_000_000 }
+  assert.deepEqual(researchRoles.surveyor.subagents, limit)
+  assert.deepEqual(researchRoles.analyst.subagents, limit)
+  assert.equal(developRoles.builder.subagents, 'unlimited')
+  assert.equal(researchRoles.builder.subagents, 'unlimited')
+  for (const table of Object.values(tables)) {
+    assert.deepEqual(ids(table, (role) => role.subagents !== undefined), ids(table, (role) => ['analyst', 'builder', 'surveyor'].includes(role.id)))
+  }
+})
+
 test('guideFiles holds each guide of each table and profile one time', () => {
   assert.equal(new Set(guideFiles).size, guideFiles.length)
   const all = [...Object.values(tables).flatMap((table) => Object.values(table).flatMap((role) => role.guides)), ...profiles.flatMap((profile) => profile.guides)]
