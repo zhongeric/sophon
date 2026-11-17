@@ -3,8 +3,11 @@ import type { Ledger } from '../core/ledger.ts'
 import { callBudget, PlannedStop } from '../core/planned-stop.ts'
 import { apiKeyCredential, type Credentials, type Provider } from '../core/providers.ts'
 import type { Comments } from '../core/questions.ts'
+import { StopError } from '../core/stop.ts'
 import { afterError, alarmBudgetMs, countRestart, initCounters, progressLedger } from './alarm.ts'
+import { containerBox, httpBox, type Box, type SyncStore } from './box.ts'
 import { githubComments } from './comments.ts'
+import type { WorkerSetting } from './egress.ts'
 import type { DevelopmentRuns } from './develop.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { githubAccess, type InstallationTokens } from './github-app.ts'
@@ -49,7 +52,13 @@ export type Env = {
   OPENAI_URL?: string
   /** A machine endpoint that replaces the development run's container, for local tests. */
   MACHINE_URL?: string
+  /** An endpoint that gets each request that the research egress approved, as /<host><path>, for local tests. */
+  EGRESS_URL?: string
 }
+
+/** The keys that are in only one of Env and workerSettings. The Worker typecheck fails on the line below when there is one. */
+type SettingGap = Exclude<keyof Env, WorkerSetting> | Exclude<WorkerSetting, keyof Env>
+export const sameSettings: [SettingGap] extends [never] ? true : SettingGap = true
 
 export type RunRow = { run: string; state: State; note: string; created: number; request: string }
 /** The result of `resume`: `state` is the state of the latest run before the call, or null when there is no run. */
@@ -71,6 +80,12 @@ const heartbeatMs = 60_000
 const heartbeatEveryMs = 20_000
 /** How long CI can take, when CI_TIMEOUT_MINUTES does not say. */
 export const defaultCiTimeoutMinutes = 30
+/**
+ * The container stops after this long without a command. A stopped container comes back empty. Its start clears
+ * the sync state in SQL, so the next sync copies the trees again.
+ */
+const containerIdleMs = 30 * 60_000
+export const setupTimeoutMs = 20 * 60_000
 
 export function allowedUsers(env: Env): string[] {
   return (env.ALLOWED_USERS ?? '')
@@ -206,6 +221,13 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     }
     if (next === null) await this.ctx.storage.deleteAlarm()
     else await this.ctx.storage.setAlarm(next)
+  }
+
+  /** The machine of the run's commands: the MACHINE_URL endpoint, else the object's Cloudflare Container. */
+  protected box(syncs: SyncStore): Box {
+    if (this.env.MACHINE_URL) return httpBox(this.env.MACHINE_URL)
+    if (!this.ctx.container) throw new StopError('this Worker has no container for builds: add the containers section of wrangler.jsonc and deploy again')
+    return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => syncs.clear() })
   }
 
   protected active(): RunRow | undefined {

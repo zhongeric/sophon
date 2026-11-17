@@ -118,12 +118,12 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 
 ## Cloudflare
 
-You need Workers Paid, Containers for development runs, and Docker on the machine that deploys. When you set
-`GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`, the Worker calls GitHub as that GitHub App. The key must be PKCS#8
-(`openssl pkcs8 -topk8 -nocrypt`). Without them, the Worker uses `GITHUB_TOKEN`, a fine-grained token with read and
-write access to Contents, Pull requests and Issues, and read access to Actions and Commit statuses. Each target
-repository needs CI on pull requests and on pushes to `factory/**`. Fork PRs are refused, because that CI would run
-fork code with the repository secrets.
+You need Workers Paid, Containers for development and research runs, and Docker on the machine that deploys. When
+you set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`, the Worker calls GitHub as that GitHub App. The key must be
+PKCS#8 (`openssl pkcs8 -topk8 -nocrypt`). Without them, the Worker uses `GITHUB_TOKEN`, a fine-grained token with
+read and write access to Contents, Pull requests and Issues, and read access to Actions and Commit statuses. Each
+target repository needs CI on pull requests and on pushes to `factory/**`. Fork PRs are refused, because that CI
+would run fork code with the repository secrets.
 
 ```bash
 npx wrangler deploy
@@ -133,7 +133,8 @@ done
 ```
 
 `ALLOWED_USERS` is the GitHub logins, comma-separated, that can start runs and answer questions. Set `MODEL_PRICES`
-as a secret to use budgets.
+as a secret to use budgets. The `secret` of a research credential is the name of a Worker secret that you set with
+`npx wrangler secret put <NAME>`. It cannot be a host secret or a Worker setting.
 
 `npm run remote` starts and follows runs. It reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from
 `.secrets/cloudflare.env`.
@@ -141,22 +142,23 @@ as a secret to use budgets.
 ```bash
 npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full, --budget)
 npm run remote -- develop acme/app#45    # a development run on an issue (--base, --hotfix, --full, --parallel, --budget)
+npm run remote -- research acme/app#45   # a research run on a program issue (--base, --parallel, --budget)
 npm run remote -- resume acme/app#45     # wake a paused run after you answer
 npm run remote -- status acme/app#45     # or report
 npm run remote -- prune acme/app         # delete the merged, applied and stranded factory/* branches
 npm run metrics                          # CPU, memory and network of each build container
 ```
 
-The webhook is optional. With it, a `/review` or `/develop` comment, or the `agent-review` or `agent-develop`
-label, starts a run, and answers take effect at once. Without it, runs poll for answers and CI. One App webhook
-replaces the webhook of each repository: point it at `https://<worker>/github/webhook` and set its secret as
-`GITHUB_APP_WEBHOOK_SECRET`. Without that secret, the Worker checks the webhook of each repository with
-`GITHUB_WEBHOOK_SECRET`. Use the events Issue comments, Issues, Pull requests, Workflow runs and Statuses. The Worker
-ignores the comment, issue and PR events of its own bot.
+The webhook is optional. With it, a `/review`, `/develop` or `/research` comment, or the `agent-review`,
+`agent-develop` or `agent-research` label, starts a run, and answers take effect at once. Without it, runs poll for
+answers and CI. One App webhook replaces the webhook of each repository: point it at
+`https://<worker>/github/webhook` and set its secret as `GITHUB_APP_WEBHOOK_SECRET`. Without that secret, the Worker
+checks the webhook of each repository with `GITHUB_WEBHOOK_SECRET`. Use the events Issue comments, Issues, Pull
+requests, Workflow runs and Statuses. The Worker ignores the comment, issue and PR events of its own bot.
 
 A Durable Object holds the ledger, the repository tree and the agent sessions of each run. Alarms drive the run and
-resume it after a crash. Development runs run their checks in a Cloudflare Container that has no secrets. Commits
-and pushes go through the GitHub API.
+resume it after a crash. Development and research runs run their commands in a Cloudflare Container that has no
+secrets. Commits and pushes go through the GitHub API.
 The object keeps the sync state of each container directory in SQL, so after a restart the next sync sends only the
 changed files and does not run the setup again.
 A development PR says `Closes #<issue>`.

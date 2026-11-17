@@ -1,5 +1,5 @@
 import { DevelopmentRuns, type DevelopRequest } from './develop.ts'
-import { ResearchRuns } from './research.ts'
+import { ResearchRuns, type ResearchRequest } from './research.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
 import { sameSecret, verifySignature } from './github.ts'
@@ -12,6 +12,7 @@ export { DevelopmentRuns, PullRequestRuns, ResearchRuns }
 const key = (owner: string, repo: string, number: number) => `${owner}/${repo}#${number}`.toLowerCase()
 const pullRequest = (env: Env, owner: string, repo: string, pr: number) => env.PULL_REQUESTS.get(env.PULL_REQUESTS.idFromName(key(owner, repo, pr)))
 const issue = (env: Env, owner: string, repo: string, number: number) => env.DEVELOPMENT_RUNS.get(env.DEVELOPMENT_RUNS.idFromName(key(owner, repo, number)))
+const research = (env: Env, owner: string, repo: string, number: number) => env.RESEARCH_RUNS.get(env.RESEARCH_RUNS.idFromName(key(owner, repo, number)))
 const accepted = (body: unknown) => Response.json(body, { status: 202 })
 /** The installation tokens of the sweeps in this isolate. The runs keep their own. */
 const tokens: InstallationTokens = new Map()
@@ -30,10 +31,17 @@ async function prune(env: Env, owner: string, repo: string, only?: (name: string
 
 const botLogins: BotLogins = new Map()
 
-/** The review runs of a PR, or the development runs of an issue. GitHub numbers both in one sequence, so a number is one or the other. */
+/**
+ * The review runs of a PR, else the development or the research runs of an issue: the object whose latest run started
+ * last. GitHub numbers PRs and issues in one sequence, so a number is one or the other.
+ */
 async function runsOf(env: Env, owner: string, repo: string, number: number) {
   const reviews = pullRequest(env, owner, repo, number)
-  return (await reviews.status()).runs.length > 0 ? reviews : issue(env, owner, repo, number)
+  if ((await reviews.status()).runs.length > 0) return reviews
+  const develops = issue(env, owner, repo, number)
+  const researches = research(env, owner, repo, number)
+  const [developed, researched] = await Promise.all([develops.status(), researches.status()])
+  return (researched.runs[0]?.created ?? -1) > (developed.runs[0]?.created ?? -1) ? researches : develops
 }
 
 type DevelopOptions = Pick<DevelopRequest, 'base' | 'hotfix' | 'full' | 'parallel'>
@@ -46,6 +54,12 @@ function developOptions(source: { base?: unknown; hotfix?: unknown; full?: unkno
     ...(source.full === true ? { full: true } : {}),
     ...(Number(source.parallel) >= 1 ? { parallel: Math.floor(Number(source.parallel)) } : {}),
   }
+}
+
+/** The options of a research run, from the admin route's body or from the words after /research. */
+function researchOptions(source: { base?: unknown; parallel?: unknown }): Pick<ResearchRequest, 'base' | 'parallel'> {
+  const { base, parallel } = developOptions(source)
+  return { ...(base ? { base } : {}), ...(parallel ? { parallel } : {}) }
 }
 
 const commandOptions = (text: string): DevelopOptions =>
@@ -71,7 +85,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
     if (request.method === 'POST' && url.pathname === '/github/webhook') return webhook(request, env)
-    const route = /^\/(runs|develop)\/([^/]+)\/([^/]+)\/(\d+)(?:\/(report|resume))?$/.exec(url.pathname)
+    const route = /^\/(runs|develop|research)\/([^/]+)\/([^/]+)\/(\d+)(?:\/(report|resume))?$/.exec(url.pathname)
     const pruneRoute = /^\/prune\/([^/]+)\/([^/]+)$/.exec(url.pathname)
     if (!route && !pruneRoute) return new Response('agent-factory', { status: url.pathname === '/' ? 200 : 404 })
     if (!env.ADMIN_TOKEN || !sameSecret(request.headers.get('authorization') ?? '', `Bearer ${env.ADMIN_TOKEN}`)) return new Response('unauthorized', { status: 401 })
@@ -88,6 +102,13 @@ export default {
       const budget = budgetOf(options)
       if (budget instanceof Response) return budget
       return accepted(await issue(env, owner, repo, Number(number)).start({ by, issue: Number(number), owner, repo, ...developOptions(options), ...budget }))
+    }
+    if (kind === 'research') {
+      if (request.method !== 'POST' || action) return new Response('method not allowed', { status: 405 })
+      const options = (await request.json().catch(() => ({}))) as Record<string, unknown>
+      const budget = budgetOf(options)
+      if (budget instanceof Response) return budget
+      return accepted(await research(env, owner, repo, Number(number)).start({ by, issue: Number(number), owner, repo, ...researchOptions(options), ...budget }))
     }
     const pr = Number(number)
     if (request.method === 'POST' && !action) {
@@ -122,7 +143,9 @@ type Payload = {
 
 /**
  * GitHub webhooks: `/review` and the agent-review label start a review run on a PR, `/develop` and the agent-develop
- * label start a development run on an issue, and `/answer` and CI results (workflow runs, statuses) wake a paused run. A
+ * label start a development run on an issue, `/research` and the agent-research label start a research run on an issue,
+ * and `/answer` and CI results (workflow runs, statuses) wake a paused run. An `/answer` on an issue wakes its
+ * development run and its research run. A
  * closed PR prunes its factory/* head branch and its review fix branches. Other comment, issue and PR events of the App
  * bot do nothing, so that the posts of a run do not start or wake runs.
  */
@@ -153,8 +176,13 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       if (/^\/answer\b/.test(text)) return accepted({ resumed: (await runs.resume()).resumed })
     } else {
       const runs = issue(env, owner, repo, number)
+      const researches = research(env, owner, repo, number)
       if (/^\/develop\b/.test(text)) return accepted(await runs.start({ by, issue: number, owner, repo, ...commandOptions(text) }))
-      if (/^\/answer\b/.test(text)) return accepted({ resumed: (await runs.resume()).resumed })
+      if (/^\/research\b/.test(text)) return accepted(await researches.start({ by, issue: number, owner, repo, ...researchOptions(commandOptions(text)) }))
+      if (/^\/answer\b/.test(text)) {
+        const [developed, researched] = await Promise.all([runs.resume(), researches.resume()])
+        return accepted({ resumed: developed.resumed || researched.resumed })
+      }
     }
   }
   if (event === 'pull_request' && payload.action === 'labeled' && payload.label?.name === 'agent-review' && payload.pull_request && allowed(payload.sender?.login))
@@ -166,6 +194,8 @@ async function webhook(request: Request, env: Env): Promise<Response> {
   }
   if (event === 'issues' && payload.action === 'labeled' && payload.label?.name === 'agent-develop' && payload.issue && !payload.issue.pull_request && allowed(payload.sender?.login))
     return accepted(await issue(env, owner, repo, payload.issue.number).start({ by: payload.sender!.login, issue: payload.issue.number, owner, repo }))
+  if (event === 'issues' && payload.action === 'labeled' && payload.label?.name === 'agent-research' && payload.issue && !payload.issue.pull_request && allowed(payload.sender?.login))
+    return accepted(await research(env, owner, repo, payload.issue.number).start({ by: payload.sender!.login, issue: payload.issue.number, owner, repo }))
   if (event === 'workflow_run' || event === 'check_suite' || event === 'check_run' || event === 'status') {
     const suite = payload.workflow_run ?? payload.check_suite ?? payload.check_run?.check_suite
     const branches = suite ? [suite.head_branch ?? ''] : (payload.branches ?? []).map((branch) => branch.name)
