@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, realpathSync } from 'node:fs'
+import { join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import type { Branch, Branches, Frozen, Repo } from '../core/platform.ts'
 import type { RootFiles } from '../core/profiles.ts'
@@ -63,23 +63,82 @@ export async function currentCommit(tree: string): Promise<string> {
 
 export type GitSource = { repo: string; base: string; head: string }
 
-/** A local git repository: the review runs in a worktree of its own, on branch `branch`. */
+/**
+ * A local git repository: the review runs in a worktree of its own, on branch `branch`. A resumed run after a release
+ * has no worktree. Each git method recreates it from the branch, and the loop calls one before an agent reads the tree.
+ */
 export function gitRepo(source: GitSource, tree: string, branch: string): Repo {
+  const ensure = async () => {
+    if (existsSync(tree) || !(await branchExists(source.repo, branch))) return
+    await git(source.repo, 'worktree', 'prune')
+    await git(source.repo, 'worktree', 'add', tree, branch)
+  }
+  const inTree =
+    <A extends unknown[], T>(run: (...args: A) => Promise<T>) =>
+    async (...args: A) => {
+      await ensure()
+      return run(...args)
+    }
   return {
     tree: diskFileSystem(tree),
     freeze: () => freeze(source.repo, source.base, source.head, tree, branch),
-    diff: (from, to) => diff(tree, from, to),
-    changedFiles: (from, to) => changedFiles(tree, from, to),
-    touchedFiles: (from, to) => touchedFiles(tree, from, to),
-    committedFiles: () => trackedFiles(tree),
-    commit: (message) => commitAll(tree, message),
-    head: () => currentCommit(tree),
-    async ship({ pr, headRef }) {
+    diff: inTree((from: string, to: string) => diff(tree, from, to)),
+    changedFiles: inTree((from: string, to: string) => changedFiles(tree, from, to)),
+    touchedFiles: inTree((from: string, to: string) => touchedFiles(tree, from, to)),
+    committedFiles: inTree(() => trackedFiles(tree)),
+    commit: inTree((message: string) => commitAll(tree, message)),
+    head: inTree(() => currentCommit(tree)),
+    ship: inTree(async ({ pr, headRef }: { pr: number; headRef: string }) => {
       await git(tree, 'push', 'origin', `HEAD:refs/heads/${headRef}`)
       const run = gh(tree)
       if ((JSON.parse(await run(['pr', 'view', String(pr), '--json', 'isDraft'])) as { isDraft: boolean }).isDraft) await run(['pr', 'ready', String(pr)])
+    }),
+    async pullState(pr) {
+      const { state } = JSON.parse(await gh(source.repo)(['pr', 'view', String(pr), '--json', 'state'])) as { state: string }
+      return state === 'MERGED' ? 'merged' : state === 'CLOSED' ? 'closed' : 'open'
     },
+    async deleteBranch() {
+      // A local --base run can have no origin.
+      const remotes = (await git(source.repo, 'remote')).split('\n')
+      if (remotes.includes('origin') && (await remoteBranchExists(source.repo, branch))) await git(source.repo, 'push', 'origin', '--delete', `refs/heads/${branch}`)
+      await deleteLocalBranch(source.repo, branch)
+    },
+    release: () => removeWorktrees(source.repo, (path) => isUnder(path, tree)),
   }
+}
+
+/** The worktrees of the repository, with the branch of each, or null for a detached worktree. */
+async function worktrees(repo: string): Promise<{ path: string; branch: string | null }[]> {
+  // A worktree whose directory is gone stays registered until a prune, and blocks a new worktree of its branch.
+  await git(repo, 'worktree', 'prune')
+  return (await git(repo, 'worktree', 'list', '--porcelain'))
+    .split('\n\n')
+    .filter(Boolean)
+    .map((block) => {
+      const lines = block.split('\n')
+      const path = lines.find((line) => line.startsWith('worktree '))?.slice('worktree '.length) ?? ''
+      const ref = lines.find((line) => line.startsWith('branch '))?.slice('branch '.length)
+      return { path, branch: ref?.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : null }
+    })
+}
+
+/** True when `path` is `dir` or inside it. git gives real paths, so a symlinked temp directory compares by its real path too. */
+function isUnder(path: string, dir: string): boolean {
+  const roots = [resolve(dir), ...(existsSync(dir) ? [realpathSync(dir)] : [])]
+  return roots.some((root) => path === root || path.startsWith(root + sep))
+}
+
+/** Removes the worktrees that `match` selects, never the main worktree. Their branches stay. */
+async function removeWorktrees(repo: string, match: (path: string, branch: string | null) => boolean): Promise<void> {
+  const [, ...linked] = await worktrees(repo)
+  for (const entry of linked) if (match(entry.path, entry.branch)) await git(repo, 'worktree', 'remove', '--force', entry.path)
+}
+
+/** Removes the worktree of the branch, wherever it is, then deletes the branch. An absent branch counts as deleted. */
+async function deleteLocalBranch(repo: string, name: string): Promise<void> {
+  await removeWorktrees(repo, (_path, branch) => branch === name)
+  // -D: a squash merge or a merge on GitHub leaves the branch unmerged in the local history.
+  if (await branchExists(repo, name)) await git(repo, 'branch', '-D', name)
 }
 
 /** Where the worktree of a branch lives, under the run's directory. */
@@ -161,6 +220,8 @@ export function gitBranches(repo: string, dir: string): Branches {
     async deleteRemote(name) {
       if (await remoteBranchExists(repo, name)) await git(repo, 'push', 'origin', '--delete', `refs/heads/${name}`)
     },
+    deleteLocal: (name) => deleteLocalBranch(repo, name),
+    release: () => removeWorktrees(repo, (path) => isUnder(path, dir)),
   }
 }
 

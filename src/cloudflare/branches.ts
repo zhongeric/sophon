@@ -206,5 +206,8 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
       return sha
     },
     deleteRemote: (name) => deleteRemoteBranch(gh, api, name),
+    // The SQL trees are Durable Object data of the run, and they stay. No local branch or worktree exists to remove.
+    deleteLocal: async () => {},
+    release: async () => {},
   }
 }

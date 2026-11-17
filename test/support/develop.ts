@@ -225,11 +225,14 @@ export async function developInput(repo: string, runId: string, options: { issue
   }
 }
 
-/** Runs the development workflow on the Node platform, with a scripted model, fake PRs and CI, and memory channels. */
+/**
+ * Runs the development workflow on the Node platform, with a scripted model, fake PRs and CI, and memory channels.
+ * With `keep`, the local deletes and the worktree removal do nothing, so that a test can read a worktree after the run.
+ */
 export async function runDevelop(
   repo: string,
   runsDir: string,
-  options: { runId: string; dispatch: Contracts.RuntimeOptions['dispatch']; pulls: PullRequests; channel?: Channel; input?: DevelopInput; prices?: Prices },
+  options: { runId: string; dispatch: Contracts.RuntimeOptions['dispatch']; pulls: PullRequests; channel?: Channel; input?: DevelopInput; prices?: Prices; keep?: boolean },
 ) {
   const input = options.input ?? (await developInput(repo, options.runId))
   const deps = await nodeDevelop({
@@ -246,5 +249,6 @@ export async function runDevelop(
     reviewChannel: async () => memoryChannel().channel,
     runsDir,
   })
-  return { ...(await develop(input, deps)), dir: deps.dir }
+  const branches = options.keep ? { ...deps.branches, deleteLocal: async () => {}, release: async () => {} } : deps.branches
+  return { ...(await develop(input, { ...deps, branches })), dir: deps.dir }
 }
