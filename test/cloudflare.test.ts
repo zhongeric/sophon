@@ -355,8 +355,9 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
   const mock = await mockServices(repo, { botLogin: 'factory-bot', issues, name: 'app', owner: 'acme', script: developScript({ reviewFix: true }) })
   // FACTORY_CONTAINERS=1 runs the build machine as a real local container (it needs Docker). Else the mock is the machine.
   const containers = process.env.FACTORY_CONTAINERS === '1'
-  // A budget of 2 s makes each alarm call stop at a safe point, so the run passes across several alarm calls (D12).
-  const budget = { ...vars(mock), ALARM_BUDGET_SECONDS: '2' }
+  // With the mock services, an alarm call takes less than 2 s. A budget of 1 ms makes each alarm call stop at its first
+  // safe point after new work, so the run passes across several alarm calls (D12).
+  const budget = { ...vars(mock), ALARM_BUDGET_SECONDS: '0.001' }
   const worker = await startWorker(containers ? budget : { ...budget, MACHINE_URL: `${mock.url}/machine` }, { containers })
   const on = (number: number) => mock.state.comments.filter((entry) => entry.issue === number)
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 160)]))}\nworker:\n${worker.output().slice(-4000)}`
