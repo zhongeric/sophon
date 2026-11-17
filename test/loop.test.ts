@@ -159,17 +159,33 @@ const testPrices = {
   'gpt-6.1-sol': { input: 1000, cached_input: 100, cache_write: 1000, output: 1000 },
 }
 
-test('at the cost budget, the run asks to raise it or to stop, and a stop ends the run without PASS', async () => {
+test('at the cost budget, the run posts a notice; at twice the budget, it asks, and a stop ends the run without PASS', async () => {
   const repo = fixtureRepo()
   const turns: Turn[] = []
-  const { channel, posted } = memoryChannel()
-  const result = await runLoop(repo, 'budget', runsDir(), { budget: 0.05, channel, dispatch: scriptedDispatch(script, turns), prices: testPrices })
+  // A stop from the budget question must not leave a rejection without a handler, also from the step 1 questions agent.
+  const unhandled: unknown[] = []
+  const listen = (reason: unknown) => void unhandled.push(reason)
+  process.on('unhandledRejection', listen)
+  const { channel, posted, notices, events } = memoryChannel({ 'budget.1': '/answer\nQ1: stop' })
+  let result: Awaited<ReturnType<typeof runLoop>>
+  try {
+    result = await runLoop(repo, 'budget', runsDir(), { budget: 0.025, channel, dispatch: scriptedDispatch(script, turns), prices: testPrices })
+    // The agents that the stop ended can reject after the run returns.
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  } finally {
+    process.off('unhandledRejection', listen)
+  }
+  assert.deepEqual(unhandled, [])
 
   const asked = posted.find((entry) => entry.batch.startsWith('budget.'))
   assert.ok(asked, JSON.stringify(posted.map((entry) => entry.batch)))
-  assert.equal(asked.questions[0]!.recommendation, 'Stop the run')
-  // The step 1 reviewers spent more than the budget, so no patch agent opened. The bugs reviewer starts last, after the
-  // diff split, so the budget can stop it before its first turn.
+  assert.equal(notices.length, 1)
+  assert.match(notices[0] ?? '', /of its budget of \$0\.0250\. The run continues\. At \$0\.0500, twice the budget, the host pauses/)
+  assert.ok(events.indexOf('notice') < events.indexOf('post budget.1'), JSON.stringify(events))
+  assert.deepEqual(asked.questions[0]!.options.slice(1), ['Raise the budget (write the new USD number)', 'Stop the run'])
+  assert.match(asked.questions[0]!.recommendation, /^Raise the budget to \$0\.\d{2}$/)
+  // The step 1 reviewers spent more than twice the budget, so no patch agent opened. The bugs reviewer starts last, after
+  // the diff split, so the budget can stop it before its first turn.
   assert.ok(turns.some((turn) => ['minimize', 'rules', 'anti-slop', 'bugs'].includes(turn.role)))
   assert.ok(!turns.some((turn) => turn.role === 'patch'))
   assert.deepEqual([result.pass, result.stopped], [false, true])
@@ -178,7 +194,7 @@ test('at the cost budget, the run asks to raise it or to stop, and a stop ends t
   assert.match(result.report, /cost budget/)
   assert.match(result.report, /^- Commits: unsigned \(no GitHub origin\)$/m)
   assert.match(result.report, /^## Usage$/m)
-  assert.match(result.report, /^Budget: \$0\.0500\. Spent: \$0\.\d{4}\.$/m)
+  assert.match(result.report, /^Budget: \$0\.0250\. Spent: \$0\.\d{4}\.$/m)
   assert.equal(readFileSync(join(result.dir, 'report.md'), 'utf8'), result.report)
   assert.deepEqual(fileLedger(join(result.dir, 'state.json')).get<{ stopped: boolean }>('result')?.stopped, true)
 })

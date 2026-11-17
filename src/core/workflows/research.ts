@@ -287,10 +287,10 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     stoppedReview: null,
   }
   const spentPasses = () => [...state.reviews, ...(state.stoppedReview ? [state.stoppedReview] : [])]
-  // The review pass keeps its usage in its own ledger, so its spend counts here as extra spend.
+  // The review pass keeps its usage in its own ledger, so its rows count here as extra rows.
   const budget = budgetGate({
     channel: deps.channel,
-    extraSpend: () => spentPasses().reduce((sum, review) => sum + review.usage.usd, 0),
+    extraRows: () => spentPasses().map(reviewRow),
     ledger,
     log: deps.log,
     prices,
@@ -473,10 +473,10 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     state.stoppedReview = ledger.get<Review>(stoppedKey) ?? null
     for (;;) {
       await budget.check()
-      // After the check, the spend is below the limit, so the remaining budget is positive. The ledger of the pass
-      // already counts the spend of its stopped attempt, so that spend is not taken from the remaining budget.
+      // After the check, the spend is below twice the limit, where the gate pauses (#60), so the remaining budget is
+      // positive. The ledger of the pass already counts the spend of its stopped attempt, so that spend is not taken from it.
       const limit = budget.limit()
-      const remaining = limit === undefined ? {} : { budget: limit - budget.spent() + (state.stoppedReview?.usage.usd ?? 0) }
+      const remaining = limit === undefined ? {} : { budget: 2 * limit - budget.spent() + (state.stoppedReview?.usage.usd ?? 0) }
       const loop = await deps.review({ runId: `${input.runId}-review-1`, ask: reviewAsk(input, state.analyses), head: at, branch: branchName, full: false, pr, ...remaining })
       const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage }
       if (!loop.stopped) return result
@@ -813,7 +813,7 @@ function hostQuestions(intake: ResearchIntake, cap: number | undefined): [Questi
       id: capId(intake),
       question: 'What is the cost cap of this run?',
       why: [
-        'At the cap, the host asks you to raise it or to stop the run before it opens the next agent turn. Write a USD number for another cap.',
+        'At the cap, the host posts a notice, and the run continues. At twice the cap, the host asks you to raise the cap or to stop the run. Write a USD number for another cap.',
         ...(cap === undefined ? ['MODEL_PRICES has no price for some models of this run, and a cap needs a price for each model.'] : []),
       ].join(' '),
       options: cap === undefined ? [noCap] : [recommended, noCap],

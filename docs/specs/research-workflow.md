@@ -57,7 +57,7 @@ The principles of the development workflow hold. These follow from them.
 
 | Stage | Like | Who | What the host enforces |
 | --- | --- | --- | --- |
-| 0 Intake | intake | intake agent, read-only, with the domain's egress | No spend before the user confirms the program. The same batch asks the budget cap. |
+| 0 Intake | intake | intake agent, read-only, with the domain's egress | No spend before the user confirms the program. The same batch asks the budget: a notice at the budget, a pause at two times the budget. |
 | 1 Survey | spec | surveyors at the same time, one for each lens of the domain (for example literature, known objects, data coverage) | Each claim cites an artifact with a quote. The host finds the quote in the artifact. |
 | 2 Hypotheses | step 1 reviewers | generators on different model families and lenses | Schema: statement, why past work missed it, data, test, kill criterion, cost. The host merges duplicates by their data and test. |
 | 3 Pick | gate, held findings | the user | No spend on a hypothesis that the user did not pick. |
@@ -234,7 +234,7 @@ as profile guides do today.
 | # | Gap | Default |
 | --- | --- | --- |
 | RG1 | The box's own network access | The box reaches the network through the host egress, after setup. Until then, the report says that the holdout lock binds agents only, and that box commands can send data out of the run. |
-| RG2 | Cost (G6) | A cap per program, set at intake. The host pauses and asks at 80% of the cap. At the cap, the host stops the fan-out. |
+| RG2 | Cost (G6) | A budget per program, set at intake, with the rule of G6: a notice at the budget, and a pause with one question at two times the budget. No pause at 80%, and no stop of the fan-out. |
 | RG3 | Data volume | No mirrors. Artifacts over a size limit stay on the box and are named by hash. |
 | RG4 | Archives change | Each fetch records its hash and time. `reproduce` reports a drift. |
 | RG5 | Many trials in one program | The host counts each trial. The dossier reports the count. |

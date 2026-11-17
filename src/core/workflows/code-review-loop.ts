@@ -113,11 +113,14 @@ export type LoopInput = {
   headRef?: string
   /** Run the full loop, also when triage allows the light loop. */
   full?: boolean
-  /** The cost budget in USD. At the budget, the run asks the user to raise it or to stop. */
+  /** The cost budget in USD. At the budget, the run posts a notice. At twice the budget, it asks the user to raise it or to stop. */
   budget?: number
   /** A budget of the current invocation, for example --budget on a resume. It replaces the budget, and the ledger does not record it. */
   budgetOverride?: number
-  /** Stop at the budget without a question, because the development run that started this loop asks with the run totals. */
+  /**
+   * Stop at the budget without a notice or a question. The development run that started this loop gives it the budget up
+   * to twice the run budget, and its own gate asks with the run totals.
+   */
   stopAtBudget?: boolean
 }
 
@@ -165,7 +168,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   if (resolveBudget(deps.ledger, input.budget, input.budgetOverride) !== undefined) checkPriced(loopModelIds(input.models), prices)
 
   const { ledger, repo } = deps
-  const budget = budgetGate({ channel: deps.channel, ledger, log: deps.log, prices, recommend: input.stopAtBudget === true, runId: input.runId })
+  const budget = budgetGate({ channel: deps.channel, ledger, log: deps.log, prices, runId: input.runId, stopAtBudget: input.stopAtBudget === true })
   // A resume without --budget must not apply the override again, so the recorded input does not keep it.
   const { budgetOverride, ...recorded } = input
   ledger.put('input', recorded)
@@ -264,6 +267,9 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     const asked = step(ledger, 'step1.questions', () => askQuestions(context, 'step1.questions', input.models.step1.questions, step1Range)).then((list) =>
       questions.post('ask', list),
     )
+    // When a step 1 reviewer rejects first, the loop does not await `asked`. This handler prevents an unhandled rejection,
+    // and `await asked` below still gets the error.
+    asked.catch(() => undefined)
     // The bugs review is the slowest track: on a large diff, the host splits it across reviewers.
     const reviewed = settleAll(
       step1Roles.map((id) =>

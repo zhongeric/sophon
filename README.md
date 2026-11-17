@@ -108,9 +108,10 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 - **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
   fixes stay on `factory/<run>`. The run deletes it at its end after `--ship` or a closed PR.
 - **Models:** `--models file.json` sets the model of each role.
-- **Budget:** `--budget <usd>` caps the spend of a run. At the cap, the run asks you to raise it or stop. Prices come
-  from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`, `cached_input`, `cache_write`,
-  `output`). Each report shows the usage of each step.
+- **Budget:** `--budget <usd>` sets a soft limit on the spend of a run. At the budget, the run posts a notice and
+  continues. At two times the budget, it asks you to raise the budget or stop, and `/answer recommended` raises it to
+  two times the spend. Prices come from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`,
+  `cached_input`, `cache_write`, `output`). Each report shows the usage of each step.
 - **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
 - **Commits:** the host commits unsigned, unless a GitHub rule requires signed commits on a branch that the run pushes.
   Then signing must work without a prompt.

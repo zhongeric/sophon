@@ -59,6 +59,10 @@ test('on Cloudflare, development collects a stopped review before a budget raise
     const asked = await until(() => on(5).find((entry) => /batch=budget\./.test(entry.body)), 300_000, describe)
     assert.ok(!on(5).some((entry) => entry.body.includes('Is this the ask?')), describe())
     assert.match(asked.body, /Raise the budget or stop the run\?/)
+    assert.match(asked.body, /Raise the budget to \$\d+\.\d{2} \(recommended\)/)
+    // The stopped review spent more than twice the budget: the run posted the notice before the question.
+    const noticed = on(5).findIndex((entry) => /of its budget of \$1\.00\. The run continues\./.test(entry.body))
+    assert.ok(noticed !== -1 && noticed < on(5).indexOf(asked), describe())
     const pull = [...mock.state.pulls.keys()][0]
     assert.ok(pull !== undefined, describe())
     const first = await status(pull)
