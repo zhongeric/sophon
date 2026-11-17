@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Contracts } from 'nanocode-ts'
-import type { Repo, Signing } from '../../src/core/platform.ts'
+import type { Checker, Repo, Signing } from '../../src/core/platform.ts'
 import type { Credentials } from '../../src/core/providers.ts'
 import { parseAnswers, type Channel, type Question } from '../../src/core/questions.ts'
 import type { Prices } from '../../src/core/usage.ts'
@@ -112,12 +112,15 @@ const openQuestion = {
 export const script = scriptFor({ tests: true })
 
 /**
- * The scripted agents. Without `tests`, as on Cloudflare where CI runs the tests, no agent calls run_tests.
+ * The scripted agents. Without `tests`, as on Cloudflare where CI runs the tests, no agent calls run_tests or run_checks.
  * `holdBug` marks the bug as the user's decision. `rejectBug` makes the patch agent reject it. `runQuestion` makes the
- * open question a run question, so that the run does not ask the user.
+ * open question a run question, so that the run does not ask the user. `breakFirst` makes the patch agent submit a sub
+ * that fails test/sub.test.ts, then write the fix and submit again.
  */
-export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBug?: boolean; runQuestion?: boolean }): Script {
+export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBug?: boolean; runQuestion?: boolean; breakFirst?: boolean }): Script {
   const runTests = (code: string) => (options.tests ? [code] : [])
+  const runChecks = runTests(`text('checks: ' + (await tools.run_checks({})).map((result) => result.name + '=' + result.status).join(' '))`)
+  const patchLog = `await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'sub returns a - b' }], skipped: [{ id: 'min-001', reason: 'inlining adds nothing' }] })`
   return ({ role, output }) => {
   if (output !== null) return { text: 'done' }
   const findings = (list: unknown[]) => `await tools.submit_findings({ findings: ${JSON.stringify(list)} }); text('submitted')`
@@ -145,11 +148,18 @@ export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBu
       return {
         cell: [
           `await tools.Read({ file_path: '/repo/src/math.ts' })`,
+          ...(options.breakFirst
+            ? [
+                `await tools.Write({ file_path: '/repo/src/math.ts', content: ${JSON.stringify(fixed.replace('a - b', 'a - b + 1'))} })`,
+                `try { ${patchLog}; text('FAILING PATCH ACCEPTED') } catch (error) { text('refused: ' + error) }`,
+                ...runChecks,
+              ]
+            : []),
           `await tools.Write({ file_path: '/repo/src/math.ts', content: ${JSON.stringify(fixed)} })`,
           `try { await tools.Write({ file_path: '/repo/.agent-factory.json', content: '{}' }); text('PROTECTED WRITE ALLOWED') } catch (error) { text('protected: ' + error) }`,
           ...runTests(`text(JSON.stringify(await tools.run_tests({ tests: ['test/sub.test.ts'] })))`),
           `text(JSON.stringify(await tools.Bash({ command: 'cat /review/decisions.md /review/gate-log.txt' })))`,
-          `await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'sub returns a - b' }], skipped: [{ id: 'min-001', reason: 'inlining adds nothing' }] })`,
+          patchLog,
         ].join('\n'),
       }
     case 'questions':
@@ -164,6 +174,7 @@ export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBu
           `try { await tools.Write({ file_path: '/repo/src/math.ts', content: 'x' }); text('CODE WRITE ALLOWED') } catch (error) { text('code refused: ' + error) }`,
           `await tools.Write({ file_path: '/repo/docs/v2.md', content: ${JSON.stringify(lightFixed.docs)} })`,
           `await tools.Write({ file_path: '/repo/test/Vault.t.sol', content: ${JSON.stringify(lightFixed.test)} })`,
+          ...runChecks,
           `await tools.submit_light_log({ applied: [{ id: 'host-001', change: 'wrote for example' }, { id: 'host-002', change: 'renamed testStuff to test_deposit_succeeds' }], skipped: [], fixes: [{ location: 'docs/v2.md:1', change: 'kept the release name' }] })`,
         ].join('\n'),
       }
@@ -215,19 +226,29 @@ export async function loopInput(repo: string, runId: string): Promise<LoopInput>
 /**
  * Runs the loop on the fixture with the Node platform, a scripted model, and by default a channel that takes every
  * recommendation. `signing` wraps the signing of the Node platform. `repo` can replace methods of the Node repo, for example
- * the GitHub calls.
+ * the GitHub calls. `checker` wraps the checker of the Node platform.
  */
 export async function runLoop(
   repo: string,
   runId: string,
   runsDir: string,
-  options: { dispatch: Contracts.RuntimeOptions['dispatch']; channel?: Channel; input?: LoopInput; prices?: Prices; budget?: number; signing?: (signing: Signing) => Signing; repo?: (repo: Repo) => Repo },
+  options: {
+    dispatch: Contracts.RuntimeOptions['dispatch']
+    channel?: Channel
+    input?: LoopInput
+    prices?: Prices
+    budget?: number
+    signing?: (signing: Signing) => Signing
+    repo?: (repo: Repo) => Repo
+    checker?: (checker: Checker) => Checker
+  },
 ) {
   const given = options.input ?? (await loopInput(repo, runId))
   const input = options.budget === undefined ? given : { ...given, budget: options.budget }
   const run = await nodeRun({ config: input.config, runId, runsDir, source: gitSource(repo) })
   const result = await codeReviewLoop(input, {
     ...run,
+    checker: options.checker ? options.checker(run.checker) : run.checker,
     signing: options.signing ? options.signing(run.signing) : run.signing,
     channel: options.channel ?? memoryChannel().channel,
     credentials,

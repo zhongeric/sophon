@@ -9,14 +9,14 @@ import { addTokens, parsePrices, zeroTokens, type RunUsage } from '../core/usage
 import { allowedModelsFrom, mergeModels, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { cutReport, defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels, type ReviewRequest } from '../core/workflows/develop.ts'
 import { developAnnouncement } from './announcements.ts'
-import { boxMachine, containerBox, httpBox, syncWithSetup, type Box, type SyncStore } from './box.ts'
+import { boxMachine, syncWithSetup } from './box.ts'
 import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubPulls } from './pulls.ts'
 import { githubSigning } from './signing.ts'
 import { baseConfig } from './config.ts'
-import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
+import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs } from './runs.ts'
 import { sqlFiles } from './storage.ts'
 import { sqlSyncs } from './syncs.ts'
 import { encodePath } from './trees.ts'
@@ -26,13 +26,6 @@ import { encodePath } from './trees.ts'
  * `budget` is the cost budget in USD.
  */
 export type DevelopRequest = { owner: string; repo: string; issue: number; by: string; base?: string; hotfix?: boolean; full?: boolean; parallel?: number; budget?: number }
-
-/**
- * The container stops after this long without a command. A stopped container comes back empty. Its start clears
- * the sync state in SQL, so the next sync copies the trees again.
- */
-const containerIdleMs = 30 * 60_000
-const setupTimeoutMs = 20 * 60_000
 
 /**
  * The development runs of one issue. The brain stays here: the ledger, the branches as trees in SQL, every agent
@@ -89,12 +82,6 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     // A run that waits for the user, for example for CI, stops on an error, so that the admin resume starts it again from its ledger.
     if (result.resume) throw new StopError(result.resume)
     return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
-  }
-
-  private box(syncs: SyncStore): Box {
-    if (this.env.MACHINE_URL) return httpBox(this.env.MACHINE_URL)
-    if (!this.ctx.container) throw new StopError('this Worker has no container for builds: add the containers section of wrangler.jsonc and deploy again')
-    return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => syncs.clear() })
   }
 
   /**

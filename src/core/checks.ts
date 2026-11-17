@@ -215,30 +215,28 @@ export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine)
     for (const test of tests) results.push(await run(`test ${test}`, command.replace('{test}', quote(test))))
     return results
   }
-  return {
-    async checks(changed, options = {}) {
-      const failed = await setup()
-      if (failed) return [failed]
-      const results: CheckResult[] = []
-      for (const [name, check] of Object.entries(config.checks)) {
-        const { command, files } = typeof check === 'string' ? { command: check, files: undefined } : check
-        if (!command.includes('{files}')) {
-          results.push(await run(name, command))
-          continue
-        }
-        const matching: string[] = []
-        for (const path of changed) if ((files ? new RegExp(files).test(path) : true) && (await exists(repo, path))) matching.push(path)
-        if (matching.length === 0) results.push({ name, command, status: 'skipped', exit_code: null, output: 'no changed files match' })
-        else results.push(await run(name, command.replace('{files}', matching.map(quote).join(' '))))
+  const checks: Checker['checks'] = async (changed, options = {}) => {
+    const failed = await setup()
+    if (failed) return [failed]
+    const results: CheckResult[] = []
+    for (const [name, check] of Object.entries(config.checks)) {
+      const { command, files } = typeof check === 'string' ? { command: check, files: undefined } : check
+      if (!command.includes('{files}')) {
+        results.push(await run(name, command))
+        continue
       }
-      if (options.tests === false) return results
-      const tests = await targetedTests(repo, config, changed)
-      if (tests.length === 0) results.push({ name: 'tests', command: config.tests?.command ?? '', status: 'skipped', exit_code: null, output: 'no targeted tests' })
-      else results.push(...(await runTests(tests)))
-      return results
-    },
-    tests: config.tests ? runTests : null,
+      const matching: string[] = []
+      for (const path of changed) if ((files ? new RegExp(files).test(path) : true) && (await exists(repo, path))) matching.push(path)
+      if (matching.length === 0) results.push({ name, command, status: 'skipped', exit_code: null, output: 'no changed files match' })
+      else results.push(await run(name, command.replace('{files}', matching.map(quote).join(' '))))
+    }
+    if (options.tests === false) return results
+    const tests = await targetedTests(repo, config, changed)
+    if (tests.length === 0) results.push({ name: 'tests', command: config.tests?.command ?? '', status: 'skipped', exit_code: null, output: 'no targeted tests' })
+    else results.push(...(await runTests(tests)))
+    return results
   }
+  return { checks, tests: config.tests ? runTests : null, agentChecks: (changed) => checks(changed, { tests: false }) }
 }
 
 export const runTestsTool: Contracts.HostTool = {

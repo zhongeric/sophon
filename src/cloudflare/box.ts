@@ -144,6 +144,18 @@ export async function syncTree(
   return files
 }
 
+/** A setup command that failed in a sync, with its result, so that a caller can report it as a failed check. */
+export class SetupError extends Error {
+  readonly command: string
+  readonly result: BoxResult
+
+  constructor(command: string, result: BoxResult) {
+    super(`the setup command failed: ${result.output.slice(-2000)}`)
+    this.command = command
+    this.result = result
+  }
+}
+
 /** What a directory of the machine got from its last complete sync: the sync ID in its marker, and its manifest. */
 export type SyncState = { sync: string; files: Map<string, string> }
 
@@ -230,7 +242,7 @@ async function syncOnce(
     const setupStarted = Date.now()
     const result = await box.exec(['bash', '-c', setup.command], { cwd: dir, env: boxEnv, timeoutMs: setup.timeoutMs })
     log(`setup ${dir}: ${result.exit_code === 0 ? 'pass' : 'fail'}, ${next.size} files in ${Date.now() - setupStarted} ms`)
-    if (result.exit_code !== 0) throw new Error(`the setup command failed: ${result.output.slice(-2000)}`)
+    if (result.exit_code !== 0) throw new SetupError(setup.command, result)
   }
   const sync = crypto.randomUUID()
   const written = await box.exec(['bash', '-c', 'printf %s "$2" > "$1"', 'bash', marker, sync], { cwd: '', env: boxEnv, timeoutMs: 60_000 })

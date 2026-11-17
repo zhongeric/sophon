@@ -6,7 +6,7 @@ import { test } from 'node:test'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import { hostFetch, type AgentHost } from '../src/core/agent.ts'
 import { runLock } from '../src/core/egress.ts'
-import { createWorkspace, guard, readOnly } from '../src/core/workspace.ts'
+import { allowFiles, createWorkspace, guard, readOnly, recordEdits } from '../src/core/workspace.ts'
 import { diskFileSystem } from '../src/node/disk.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { sqliteStore } from '../src/node/platform.ts'
@@ -84,6 +84,22 @@ test('the guard keeps the same rails on a virtual file system', async () => {
   await workspace.write('/repo/src/b.ts', 'b')
   assert.equal(new TextDecoder().decode(await fs.read('/src/b.ts')), 'b')
   assert.equal(new TextDecoder().decode(await fs.read('/package.json')), '{}')
+})
+
+test('an edit record keeps each written, removed and renamed path in the ledger, and no refused change', async () => {
+  const fs = MemoryFileSystem.create({ files: { '/src/a.ts': 'a', '/src/b.ts': 'b', '/docs/c.md': 'c', '/package.json': '{}' } })
+  const ledger = fileLedger(join(mkdtempSync(join(tmpdir(), 'factory-edits-')), 'state.json'))
+  const open = () => createWorkspace({ repo: recordEdits(allowFiles(guard(fs), (path) => path !== 'package.json'), ledger, 'edits:patch'), review: {} })
+  const workspace = await open()
+  await workspace.write('/repo/src/a.ts', 'x')
+  await workspace.write('/repo/src/a.ts', 'y')
+  await assert.rejects(workspace.write('/repo/package.json', 'x'), /EACCES/)
+  await run(workspace, 'rm src/b.ts')
+  assert.deepEqual(ledger.get('edits:patch'), ['src/a.ts', 'src/b.ts'])
+
+  // A new workspace on the same ledger, as in a resumed turn, adds to the paths of the turn before.
+  await run(await open(), 'mv docs/c.md docs/d.md')
+  assert.deepEqual(ledger.get('edits:patch'), ['src/a.ts', 'src/b.ts', 'docs/c.md', 'docs/d.md'])
 })
 
 test('a shell with a layout fetch sends curl through that fetch, and a shell without it refuses', async () => {

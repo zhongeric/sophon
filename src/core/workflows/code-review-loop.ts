@@ -195,6 +195,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     stackGuides: triaged.guides,
     guides: deps.guides,
     tests: deps.checker.tests,
+    agentChecks: deps.checker.agentChecks,
   }
   deps.log(`froze ${frozen.head.slice(0, 12)} over base ${frozen.base.slice(0, 12)}: ${touched.length} files, ${frozen.location}`)
   deps.log(triageLine(triaged))
@@ -479,7 +480,8 @@ function patchLine(label: string, outcome: PatchOutcome<PatchLog | LightLog> | n
   const split = outcome.split
     ? ` (${outcome.split.agents} patch agents at the same time${outcome.split.deferred.length ? `, then one for ${outcome.split.deferred.join(', ')}` : ''})`
     : ''
-  return `- ${label}: ${outcome.changed ? `commit ${short(outcome.after)}` : 'no commit'}${split}; applied: ${applied}; skipped: ${skipped}${fixes}${scope}`
+  const note = outcome.note ? `; ${outcome.note}` : ''
+  return `- ${label}: ${outcome.changed ? `commit ${short(outcome.after)}` : 'no commit'}${split}; applied: ${applied}; skipped: ${skipped}${fixes}${scope}${note}`
 }
 
 type ReportInput = {

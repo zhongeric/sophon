@@ -1,6 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
+import type { FileSystem } from 'nanocode-ts/bash'
 import { runTurn, submitOnce, type AgentHost, type AgentSpec, type HostTools } from './agent.ts'
-import { callRunTests, isProtected, runTestsTool, type RepoConfig } from './checks.ts'
+import { callRunTests, isProtected, runTestsTool, targetedTests, type RepoConfig } from './checks.ts'
 import { assignIds, checkFindings, parseLocation, submitFindings, type Finding } from './findings.ts'
 import { step } from './ledger.ts'
 import { settleAll } from './planned-stop.ts'
@@ -8,7 +9,7 @@ import type { Checker, Frozen, Guides, Repo } from './platform.ts'
 import { checkQuestions, decisionsFile, decisionsLine, submitQuestions, type Question } from './questions.ts'
 import { instructions, reviewRoles, type ModelChoice, type Role } from './roles.ts'
 import { bugsShards, diffFiles, diffOf, fileOwners, patchGroups, type PatchGroup } from './split.ts'
-import { allowFiles, createWorkspace, guard, readOnly } from './workspace.ts'
+import { allowFiles, createWorkspace, guard, readOnly, recordEdits } from './workspace.ts'
 
 /** What every step of one review run shares. */
 export type RunContext = {
@@ -22,6 +23,8 @@ export type RunContext = {
   stackGuides: string[]
   guides: Guides
   tests: Checker['tests']
+  /** The run_checks of the editing agents, where the platform has a machine for agents. */
+  agentChecks?: Checker['agentChecks']
 }
 
 export type Range = { from: string; to: string }
@@ -143,7 +146,85 @@ export type PatchOutcome<Log extends PatchLog = PatchLog> = {
   outOfScope: string[]
   /** When the host split the findings: the count of patch agents that worked at the same time, and the findings that waited for one more agent. */
   split?: { agents: number; deferred: string[] }
+  /** For the report, when the targeted tests of an agent did not run at its submit. */
+  note?: string
 }
+
+const toolOutputTailChars = 4_000
+const editsKey = (id: string) => `edits:${id}`
+const untestedKey = (id: string) => `untested:${id}`
+
+const setupFailedNote = 'targeted tests did not run: the setup failed'
+
+/** The writable tree of one editing agent, which records the paths that the agent changes. */
+const editTree = (context: RunContext, id: string, tree: FileSystem.FileSystem) => recordEdits(tree, context.host.ledger, editsKey(id))
+
+/** The recorded edits of an agent that still exist in the tree. */
+async function existingEdits(context: RunContext, id: string): Promise<string[]> {
+  const paths: string[] = []
+  for (const path of context.host.ledger.get<string[]>(editsKey(id)) ?? []) if ((await context.repo.tree.stat(`/${path}`)) !== null) paths.push(path)
+  return paths
+}
+
+const runChecksTool: Contracts.HostTool = {
+  name: 'run_checks',
+  description:
+    "Run the repository's configured checks (for example typecheck, lint, build) on the files that the change and your edits changed, on the real machine. It runs no tests. Returns each status and the end of its output.",
+  parameters: { type: 'object', properties: {}, additionalProperties: false },
+}
+
+/** run_checks for an editing agent: the files changed since the freeze base, and the edits of the agent. */
+function checkTools(context: RunContext, id: string): HostTools {
+  const run = context.agentChecks
+  if (!run) return {}
+  return {
+    run_checks: {
+      definition: runChecksTool,
+      async call() {
+        const { repo, frozen } = context
+        const changed = [...new Set([...(await repo.changedFiles(frozen.base, await repo.head())), ...(await existingEdits(context, id))])]
+        return (await run(changed)).map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-toolOutputTailChars) }))
+      },
+    },
+  }
+}
+
+const gated = (context: RunContext) => context.tests !== null && Boolean(context.config.tests)
+const gateText = 'When you submit, the host runs the targeted tests of the files that you changed, and refuses the log while one fails.'
+
+/** The submit tool of an editing agent, with the gate in its description when the gate runs. */
+const gateTool = (context: RunContext, definition: Contracts.HostTool): Contracts.HostTool =>
+  gated(context) ? { ...definition, description: `${definition.description} ${gateText}` } : definition
+
+/**
+ * The gate at the submit of an editing agent: the targeted tests of only the files that this agent changed, also its
+ * new test files. A failure refuses the log. A failed setup runs no test, so the host accepts the log and records the note.
+ */
+async function testGate(context: RunContext, id: string): Promise<void> {
+  const { tests, config } = context
+  const edits = context.host.ledger.get<string[]>(editsKey(id)) ?? []
+  if (!tests || !config.tests || edits.length === 0) return
+  const pattern = new RegExp(config.tests.pattern)
+  const added = (await existingEdits(context, id)).filter((path) => pattern.test(path))
+  const targeted = [...new Set([...(await targetedTests(context.repo, config, edits)), ...added])]
+  if (targeted.length === 0) return
+  const failed = (await tests(targeted)).filter((result) => result.status !== 'pass')
+  if (failed.length === 0) return
+  if (failed.some((result) => result.name === 'setup')) {
+    context.host.ledger.put(untestedKey(id), true)
+    return
+  }
+  throw new Error(
+    [
+      `the targeted tests of your edits failed (${targeted.join(', ')}). Fix the cause and submit again. When you cannot fix it, revert your edit and list the finding in skipped with the reason.`,
+      ...failed.map(({ name, exit_code, output }) => `--- ${name} (exit code ${exit_code ?? 'none'}) ---\n${output.slice(-toolOutputTailChars)}`),
+    ].join('\n'),
+  )
+}
+
+/** The report note of a step when the gate of one of its agents did not run its tests. */
+const gateNote = (context: RunContext, ids: string[]): { note?: string } =>
+  ids.some((id) => context.host.ledger.get(untestedKey(id)) === true) ? { note: setupFailedNote } : {}
 
 const submitPatchLog: Contracts.HostTool = {
   name: 'submit_patch_log',
@@ -219,7 +300,10 @@ export async function patch(context: RunContext, id: string, model: ModelChoice,
   if (kept.length === 0) return { before, after: before, changed: false, log: null, outOfScope: [] }
   // A step that one agent started before the host split patches stays with that agent.
   const groups = context.host.ledger.get(`session:${id}`) === undefined ? recordedGroups(context, id, kept) : [{ findings: kept, files: [] }]
-  if (groups.length === 1) return commitEdits(context, before, await patchTurn(context, id, model, kept, gateLog, before, { kind: 'all' }), kept, message)
+  if (groups.length === 1) {
+    const log = await patchTurn(context, id, model, kept, gateLog, before, { kind: 'all' })
+    return { ...(await commitEdits(context, before, log, kept, message)), ...gateNote(context, [id]) }
+  }
 
   const { ledger } = context.host
   const owners = fileOwners(groups, { ...ledger.get<Record<string, number>>(`claims:${id}`) }, (claims) => ledger.put(`claims:${id}`, claims))
@@ -240,7 +324,8 @@ export async function patch(context: RunContext, id: string, model: ModelChoice,
       ? await patchTurn(context, `${id}.deferred`, model, deferred.map((entry) => kept.find((finding) => finding.id === entry.id)!), gateLog, before, { kind: 'deferred', notes: deferred })
       : { applied: [], skipped: [] }
   const log = checkPatchLog({ applied: [...logs.flatMap((entry) => entry.applied), ...waited.applied], skipped: [...logs.flatMap((entry) => entry.skipped), ...waited.skipped] }, kept)
-  return { ...(await commitEdits(context, before, log, kept, message)), split: { agents: groups.length, deferred: deferred.map((entry) => entry.id) } }
+  const ids = [...groups.map((_, index) => `${id}.${index + 1}`), `${id}.deferred`]
+  return { ...(await commitEdits(context, before, log, kept, message)), split: { agents: groups.length, deferred: deferred.map((entry) => entry.id) }, ...gateNote(context, ids) }
 }
 
 /** The patch groups of a step, recorded so that a resumed step keeps the same agents. */
@@ -278,11 +363,18 @@ async function patchTurn<Log extends PatchLog = PatchLog>(
     ...(mode.kind === 'deferred' ? { '/deferred.json': JSON.stringify(mode.notes, null, 2) } : {}),
   }
   const tree = guard(context.repo.tree, (path) => isProtected(context.config, path))
-  const workspace = await createWorkspace({ repo: mode.kind === 'share' ? allowFiles(tree, mode.allow) : tree, review, guides: context.guides.mounts })
-  const tools =
-    mode.kind === 'share'
-      ? submitOnce(context.host, `output:${id}`, submitSharePatchLog, async (input) => checkPatchLog(input, findings, true))
-      : submitOnce(context.host, `output:${id}`, submitPatchLog, async (input) => checkPatchLog(input, findings))
+  const workspace = await createWorkspace({ repo: editTree(context, id, mode.kind === 'share' ? allowFiles(tree, mode.allow) : tree), review, guides: context.guides.mounts })
+  const submit = async (input: unknown, deferred: boolean) => {
+    const log = checkPatchLog(input, findings, deferred)
+    await testGate(context, id)
+    return log
+  }
+  const tools = {
+    ...checkTools(context, id),
+    ...(mode.kind === 'share'
+      ? submitOnce(context.host, `output:${id}`, gateTool(context, submitSharePatchLog), (input) => submit(input, true))
+      : submitOnce(context.host, `output:${id}`, gateTool(context, submitPatchLog), (input) => submit(input, false))),
+  }
   const prompt = [
     ...patchIntro(mode, findings.map((finding) => finding.id).join(', ')),
     "- Gate log: /review/gate-log.txt. A note on a finding is the user's instruction for its fix.",
@@ -297,6 +389,7 @@ async function patchTurn<Log extends PatchLog = PatchLog>(
         ]
       : []),
     '',
+    ...(gated(context) ? [gateText] : []),
     'Edit the files in /repo. Then call submit_patch_log one time.',
   ].join('\n')
   return runTurn<Log>(context.host, spec(context, id, reviewRoles.patch, model, workspace, tools), prompt, 'submit_patch_log')
@@ -370,13 +463,17 @@ export async function light(
   const inputs = await reviewInputs(context, range)
   const review = { ...inputs.files, '/host-findings.json': JSON.stringify(options.kept, null, 2), '/gate-log.txt': options.gateLog.join('\n') }
   const repo = allowFiles(guard(context.repo.tree, (path) => isProtected(context.config, path)), options.allow)
-  const workspace = await createWorkspace({ repo, review, guides: context.guides.mounts })
-  const tools = submitOnce(context.host, `output:${id}`, submitLightLog, async (input) => {
-    const log = checkPatchLog(input, options.kept) as LightLog
-    if (!Array.isArray(log.fixes) || log.fixes.some((fix) => typeof fix?.location !== 'string' || typeof fix.change !== 'string'))
-      throw new Error('fixes must be an array of { location, change }')
-    return log
-  })
+  const workspace = await createWorkspace({ repo: editTree(context, id, repo), review, guides: context.guides.mounts })
+  const tools = {
+    ...checkTools(context, id),
+    ...submitOnce(context.host, `output:${id}`, gateTool(context, submitLightLog), async (input) => {
+      const log = checkPatchLog(input, options.kept) as LightLog
+      if (!Array.isArray(log.fixes) || log.fixes.some((fix) => typeof fix?.location !== 'string' || typeof fix.change !== 'string'))
+        throw new Error('fixes must be an array of { location, change }')
+      await testGate(context, id)
+      return log
+    }),
+  }
   const kept = options.kept.map((finding) => finding.id).join(', ')
   const prompt = [
     'Review this change, and fix it.',
@@ -391,10 +488,11 @@ export async function light(
     '',
     'Triage: docs or tests only. The host refuses your writes outside docs and tests.',
     '',
+    ...(gated(context) ? [gateText] : []),
     'Edit the files in /repo. Then call submit_light_log one time.',
   ].join('\n')
   const log = await runTurn<LightLog>(context.host, spec(context, id, reviewRoles.light, model, workspace, tools), prompt, 'submit_light_log')
-  return commitEdits(context, before, log, options.kept, options.message)
+  return { ...(await commitEdits(context, before, log, options.kept, options.message)), ...gateNote(context, [id]) }
 }
 
 export type Verdict = { satisfied: boolean; gaps: string[]; summary: string }

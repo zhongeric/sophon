@@ -3,6 +3,7 @@ import type { CheckResult } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Checker } from '../core/platform.ts'
 import { PausedError } from '../core/questions.ts'
+import { SetupError } from './box.ts'
 import type { GitHub } from './github.ts'
 import type { GitHubRepo, PullRequest } from './repo.ts'
 
@@ -37,5 +38,27 @@ export function ciChecker(options: { gh: GitHub; pull: PullRequest; repo: GitHub
       if (pending.length > 0) throw new PausedError(`waiting for CI on ${sha.slice(0, 12)}: ${pending.map((result) => result.name).join(', ')}`)
       return results.map((result) => ({ name: result.name, command: result.url, status: result.ok ? 'pass' : 'fail', exit_code: null, output: '' }))
     },
+  }
+}
+
+/**
+ * The checker of a review run whose config has tests: the final checks stay CI, and the tests and the checks of the
+ * agents run on the build machine. A failed setup there gives a failed result named setup, so that the gate of an
+ * editing agent accepts its log with the report note.
+ */
+export function reviewChecker(ci: Checker, machine: Checker): Checker {
+  const settle = async (run: () => Promise<CheckResult[]>): Promise<CheckResult[]> => {
+    try {
+      return await run()
+    } catch (error) {
+      if (!(error instanceof SetupError)) throw error
+      return [{ name: 'setup', command: error.command, status: 'fail', ...error.result }]
+    }
+  }
+  const { tests, agentChecks } = machine
+  return {
+    checks: ci.checks,
+    tests: tests && ((paths) => settle(() => tests(paths))),
+    ...(agentChecks ? { agentChecks: (changed: string[]) => settle(() => agentChecks(changed)) } : {}),
   }
 }
