@@ -17,9 +17,13 @@ export type ResearchConfig = {
   prereg_sections: string[]
   commands: { known: string; inject: string; evaluate: string; reproduce: string; sweep?: string }
   credentials?: Record<string, ResearchCredential>
+  /** The timeout in ms of each domain command. A missing key takes the timeout of the checks. */
+  timeouts?: ResearchTimeouts
   /** Normalized https URLs for scout (R4). The host reads them, thus egress does not limit their hosts. */
   feeds?: string[]
 }
+
+export type ResearchTimeouts = Partial<Record<'known' | 'inject' | 'evaluate' | 'reproduce', number>>
 
 /**
  * The holdout file. `refuse` is the list of URL prefixes that the egress refuses to agents. Each prefix has the
@@ -145,7 +149,20 @@ function credentials(value: unknown, key: string, egress: string[], fail: Fail):
   return parsed
 }
 
-const researchKeys = ['egress', 'holdout', 'lenses', 'guides', 'checklist', 'prereg_sections', 'commands', 'credentials', 'feeds']
+const timeoutKeys: readonly (keyof ResearchTimeouts)[] = ['known', 'inject', 'evaluate', 'reproduce']
+
+function timeouts(value: unknown, key: string, fail: Fail): ResearchTimeouts {
+  const entries = object(value, key, [...timeoutKeys], fail)
+  const parsed: ResearchTimeouts = {}
+  for (const name of timeoutKeys) {
+    const ms = entries[name]
+    if (ms === undefined) continue
+    parsed[name] = typeof ms === 'number' && Number.isSafeInteger(ms) && ms > 0 ? ms : fail(`${key}.${name}`, 'must be a positive integer of milliseconds')
+  }
+  return parsed
+}
+
+const researchKeys = ['egress', 'holdout', 'lenses', 'guides', 'checklist', 'prereg_sections', 'commands', 'credentials', 'timeouts', 'feeds']
 
 /** Parses the research field of .agent-factory.json. Each error names `source` and the bad key. */
 export function parseResearchConfig(value: unknown, source: string): ResearchConfig {
@@ -171,6 +188,7 @@ export function parseResearchConfig(value: unknown, source: string): ResearchCon
   }
   if (commands.sweep !== undefined) config.commands.sweep = command(commands.sweep, 'research.commands.sweep', [...prereg, 'partition'], fail)
   if (research.credentials !== undefined) config.credentials = credentials(research.credentials, 'research.credentials', egress, fail)
+  if (research.timeouts !== undefined) config.timeouts = timeouts(research.timeouts, 'research.timeouts', fail)
   if (research.feeds !== undefined) config.feeds = feedList(research.feeds, 'research.feeds', fail)
   return config
 }

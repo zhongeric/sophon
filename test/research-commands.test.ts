@@ -56,6 +56,18 @@ test('the command gets the quoted prereg path, the check environment without hos
   assert.deepEqual(result.json, { recall: 1, outputs: {} })
 })
 
+test('a domain command takes its own timeout from research.timeouts, and the setup and other commands keep the config timeout', async () => {
+  const { machine, calls } = fakeMachine({ 'make setup': { exit_code: 0, output: '' }, 'search': ok({ recall: 1, outputs: {} }) })
+  const withTimeouts = { ...config, setup: 'make setup', research: { ...research, timeouts: { known: 7_200_000 } } }
+  for (const name of ['known', 'inject'] as const) await runDomainCommand(withTimeouts, machine, name, 'prereg/hyp-001-v1.md')
+  assert.deepEqual(calls.map(({ command, timeoutMs }) => [command.split(' ').slice(0, 2).join(' '), timeoutMs]), [['make setup', 5_000], ['search known', 7_200_000], ['search inject', 5_000]])
+
+  const fallback = fakeMachine({ 'search known': ok({ recall: 1, outputs: {} }) })
+  const { timeout_ms: _, ...withoutTimeout } = config
+  await runDomainCommand({ ...withoutTimeout, research: { ...research, timeouts: { inject: 1_000 } } }, fallback.machine, 'known', 'prereg/hyp-001-v1.md')
+  assert.equal(fallback.calls[0]?.timeoutMs, 30 * 60_000)
+})
+
 test('the setup runs one time for each machine, and a failed setup fails the command', async () => {
   const { machine, calls } = fakeMachine({ 'make setup': { exit_code: 0, output: '' }, 'search': ok({ recall: 1, outputs: {} }) })
   const withSetup = { ...config, setup: 'make setup' }

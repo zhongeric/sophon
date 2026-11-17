@@ -2,8 +2,9 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { tmpdir } from 'node:os'
+import { constants, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { commandResult, type BoxResult, type JobState } from '../../src/cloudflare/box.ts'
 import { scriptedDispatch, type Script, type Turn } from './scripted-model.ts'
 
 export type MockComment = { id: number; issue: number; user: { login: string }; body: string; created_at: string; updated_at: string; html_url: string }
@@ -58,8 +59,12 @@ export async function mockServices(
     requests: [] as string[],
     /** The authorization header of each request, so that a test can see which credential the host used. */
     authorizations: [] as { route: string; authorization: string }[],
-    /** The commands that the machine ran, with their directories. */
+    /** The commands that the machine ran, with their directories. A job start is also here. */
     commands: [] as { argv: string[]; cwd: string }[],
+    /** The jobs that the machine started, so that a test can count the starts of a command. */
+    jobs: [] as { id: string; argv: string[]; cwd: string }[],
+    /** True for a command whose job the machine loses at start. */
+    loseJob: (_argv: string[]) => false,
     /** The HTTP status of the workflow-runs endpoint, so that a test can withhold the Actions permission. */
     ciStatus: 200,
     /** The PR merges that the host made, with the squash commit on main of each. */
@@ -154,6 +159,50 @@ export async function mockServices(
       child.stdin.end(body.stdin ? Buffer.from(body.stdin, 'base64') : undefined)
     })
 
+  /**
+   * The jobs of the machine. They belong to this test process, not to workerd, so they live through a restart of
+   * wrangler dev. A job keeps its output and its result, so that a poll after its start request finds them.
+   */
+  const jobs = new Map<string, { child: ChildProcess; output: string; result: BoxResult | null; timer: NodeJS.Timeout }>()
+  /** Kills the process group of a job: the job runs detached, so its pid is its group. */
+  const killGroup = (child: ChildProcess) => {
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL')
+    } catch {
+      // The group is gone.
+    }
+  }
+  const startJob = (body: { id: string; argv: string[]; cwd: string; env: Record<string, string>; timeoutMs: number }) => {
+    if (jobs.has(body.id)) throw new Error(`the job ${body.id} started before`)
+    state.jobs.push({ argv: body.argv, cwd: body.cwd, id: body.id })
+    state.commands.push({ argv: body.argv, cwd: body.cwd })
+    if (state.loseJob(body.argv)) return
+    const cwd = join(machineRoot, body.cwd)
+    mkdirSync(cwd, { recursive: true })
+    const started = Date.now()
+    const child = spawn(body.argv[0]!, body.argv.slice(1), { cwd, detached: true, env: { ...body.env, PATH: process.env.PATH ?? '' }, stdio: ['ignore', 'pipe', 'pipe'] })
+    // The test process does not wait for a job when it ends.
+    child.unref()
+    const job = { child, output: '', result: null as BoxResult | null, timer: setTimeout(() => killGroup(child), body.timeoutMs) }
+    jobs.set(body.id, job)
+    const append = (chunk: Buffer) => (job.output = (job.output + chunk.toString()).slice(-20_000))
+    child.stdout?.on('data', append)
+    child.stderr?.on('data', append)
+    child.on('error', (error) => {
+      clearTimeout(job.timer)
+      job.result ??= { exit_code: 127, output: String(error) }
+    })
+    child.on('close', (code, signal) => {
+      clearTimeout(job.timer)
+      job.result ??= commandResult(code ?? 128 + (signal ? constants.signals[signal] : 0), job.output, Date.now() - started, body.timeoutMs)
+    })
+  }
+  const pollJob = (id: string): JobState => {
+    const job = jobs.get(id)
+    if (!job) return { state: 'missing' }
+    return job.result ? { result: job.result, state: 'done' } : { state: 'running' }
+  }
+
   const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? '/', 'http://localhost')
     const body = await read(request)
@@ -184,6 +233,19 @@ export async function mockServices(
         response.writeHead(reply.status, { 'content-type': 'text/event-stream' })
         response.end(await reply.text())
         return
+      }
+      if (route === 'POST /machine/jobs/start') {
+        const { argv, cwd, env, id, timeoutMs } = input()
+        if (typeof timeoutMs !== 'number') throw new Error(`${route}: timeoutMs must be a number`)
+        const environment = Object.fromEntries(Object.entries(object(env, 'env')).map(([key, value]) => [key, string(value, `env.${key}`)]))
+        startJob({ argv: strings(argv, 'argv'), cwd: string(cwd, 'cwd'), env: environment, id: string(id, 'id'), timeoutMs })
+        return json(response, 200, {})
+      }
+      if (route === 'POST /machine/jobs/poll') return json(response, 200, pollJob(string(input().id, 'id')))
+      if (route === 'POST /machine/jobs/kill') {
+        const job = jobs.get(string(input().id, 'id'))
+        if (job && !job.result) killGroup(job.child)
+        return json(response, 200, {})
       }
       if (route === 'POST /machine') {
         const { argv, cwd, env, stdin, timeoutMs } = input()
@@ -399,8 +461,8 @@ export async function mockServices(
     else pull.closed = true
   }
   /**
-   * Kills the running commands of the machine and closes the server with all its connections, also the keep-alive
-   * connections of workerd. Resolves when the server closed. A second call gives the same promise.
+   * Kills the running commands and jobs of the machine and closes the server with all its connections, also the
+   * keep-alive connections of workerd. Resolves when the server closed. A second call gives the same promise.
    */
   let closing: Promise<void> | undefined
   const close = () =>
@@ -412,6 +474,12 @@ export async function mockServices(
         for (const pipe of [child.stdin, child.stdout, child.stderr]) pipe?.destroy()
       }
       machines.clear()
+      for (const job of jobs.values()) {
+        clearTimeout(job.timer)
+        if (job.result) continue
+        killGroup(job.child)
+        for (const pipe of [job.child.stdout, job.child.stderr]) pipe?.destroy()
+      }
       server.close((error) => (error ? reject(error) : resolve()))
       server.closeAllConnections()
     }))

@@ -11,10 +11,12 @@ import type { WorkerSetting } from './egress.ts'
 import type { DevelopmentRuns } from './develop.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { githubAccess, type InstallationTokens } from './github-app.ts'
+import { hasOpenJobs, jobRunner, resetJobStarts, type JobRunner } from './jobs.ts'
 import type { State } from './prune.ts'
 import type { ResearchRuns } from './research.ts'
 import type { PullRequestRuns } from './run.ts'
 import { createTables, sqlFiles, sqlLedger } from './storage.ts'
+import { sqlSyncs } from './syncs.ts'
 
 export type Env = {
   PULL_REQUESTS: DurableObjectNamespace<PullRequestRuns>
@@ -75,6 +77,20 @@ const notResumed: Record<Exclude<State, 'paused'>, string> = {
 /** What starts a run, and who started it. */
 export type RunRequest = { owner: string; repo: string; by: string }
 
+/** The build machine of a run, the sync state of its directories, and the jobs of the run on it. */
+export type RunMachine = { box: Box; syncs: SyncStore; jobs: JobRunner }
+
+/** What one alarm call gives to execute(). */
+export type Call = {
+  /** The end of the call budget. A host step that waits for a job pauses the run at this time. */
+  deadline: number
+  /**
+   * The machine of the run. Its first use in an alarm call kills the wait-mode jobs of earlier calls, so that no job of
+   * a turn that did not finish runs when the turn runs again.
+   */
+  machine(): Promise<RunMachine>
+}
+
 /** While a run works, its alarm stays this far ahead, so that a run whose isolate died restarts from its ledger. */
 const heartbeatMs = 60_000
 const heartbeatEveryMs = 20_000
@@ -126,7 +142,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
   protected abstract runName(request: Request, stamp: string): string
   protected abstract announcement(run: string, request: Request): string
   /** Runs the work, or resumes it from the ledger. Returns whether it passed, and the comment for the end of the run. */
-  protected abstract execute(run: string, request: Request, ledger: Ledger, gh: GitHub, comments: Comments): Promise<{ passed: boolean; summary: string }>
+  protected abstract execute(run: string, request: Request, ledger: Ledger, gh: GitHub, comments: Comments, call: Call): Promise<{ passed: boolean; summary: string }>
 
   /** The build machine of this object: MACHINE_URL in local tests, else the object's Cloudflare Container. */
   protected box(syncs: SyncStore): Box {
@@ -158,6 +174,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       const ledger = sqlLedger(this.ctx.storage.sql, latest.run)
       ledger.put('attempts', 0)
       ledger.put('restarts', 0)
+      resetJobStarts(ledger)
       this.setState(latest.run, 'queued', 'resumed after an error')
       reason = 'started the run again from its ledger after the error'
     } else if (state !== 'paused') return { reason: notResumed[state], resumed: false, state }
@@ -192,7 +209,9 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     const heartbeat = setInterval(() => void this.ctx.storage.setAlarm(Date.now() + heartbeatMs), heartbeatEveryMs)
     await this.ctx.storage.setAlarm(Date.now() + heartbeatMs)
     const request = JSON.parse(row.request) as Request
-    const ledger = callBudget(progressLedger(sqlLedger(this.ctx.storage.sql, row.run)), { budgetMs: alarmBudgetMs(this.env.ALARM_BUDGET_SECONDS), startedAt })
+    const budgetMs = alarmBudgetMs(this.env.ALARM_BUDGET_SECONDS)
+    const ledger = callBudget(progressLedger(sqlLedger(this.ctx.storage.sql, row.run)), { budgetMs, startedAt })
+    const call = this.call(row.run, ledger, startedAt + budgetMs)
     const target = `${request.owner}/${request.repo}#${this.number(request)}`
     // Without a client, the run cannot post: a failed GitHub setup goes only to the state note.
     let comments: Comments | undefined
@@ -207,8 +226,9 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       if (row.state === 'running') countRestart(ledger)
       this.setState(row.run, 'running', '')
       await once(ledger, 'announced', () => posts.post(this.announcement(row.run, request)))
-      const result = await this.execute(row.run, request, ledger, access.gh, posts)
+      const result = await this.execute(row.run, request, ledger, access.gh, posts, call)
       this.setState(row.run, result.passed ? 'passed' : 'failed', '')
+      await this.killJobs(row.run, ledger, call)
       await once(ledger, 'summary', () => posts.post(result.summary))
     } catch (error) {
       const outcome = afterError(ledger, error, { now: Date.now(), pauseSeconds: this.env.PAUSE_POLL_SECONDS })
@@ -217,6 +237,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       this.setState(row.run, outcome.state, outcome.note)
       next = outcome.next
       if (outcome.state === 'error') {
+        await this.killJobs(row.run, ledger, call)
         const hint = error instanceof GitHubError ? (app ? ' Check the permissions of the GitHub App.' : ' Check the permissions of GITHUB_TOKEN.') : ''
         await comments
           ?.post(`agent-factory stopped run \`${row.run}\`: ${outcome.note}${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${target}\`.`)
@@ -228,6 +249,32 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     }
     if (next === null) await this.ctx.storage.deleteAlarm()
     else await this.ctx.storage.setAlarm(next)
+  }
+
+  /** The call of a run: the machine and its job runner start on the first use, because a run without a box has no machine. */
+  private call(run: string, ledger: Ledger, deadline: number): Call {
+    let machine: Promise<RunMachine> | undefined
+    const start = async (): Promise<RunMachine> => {
+      const syncs = sqlSyncs(this.ctx.storage.sql, run)
+      const box = this.box(syncs)
+      const jobs = jobRunner(box, ledger)
+      await jobs.killStale()
+      return { box, jobs, syncs }
+    }
+    return {
+      deadline,
+      machine: () => (machine ??= start()),
+    }
+  }
+
+  /** Kills the open jobs of a run that ended. The run result stays when the kill fails, because a job ends at its timeout. */
+  private async killJobs(run: string, ledger: Ledger, call: Call): Promise<void> {
+    if (!hasOpenJobs(ledger)) return
+    try {
+      await (await call.machine()).jobs.killAll()
+    } catch (error) {
+      console.error(`[${run}] the kill of the open jobs failed`, error)
+    }
   }
 
   protected active(): RunRow | undefined {

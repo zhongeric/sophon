@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -8,11 +10,14 @@ import { test } from 'node:test'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import type { SqlValue } from '../src/cloudflare/artifacts.ts'
 import { artifactSizeLimit } from '../src/core/artifacts.ts'
-import { boxMachine, cleanBox, containerBox, SetupError, syncTree, syncWithSetup, type Box } from '../src/cloudflare/box.ts'
+import { boxMachine, cleanBox, containerBox, httpBox, SetupError, syncTree, syncWithSetup, type Box, type BoxResult } from '../src/cloudflare/box.ts'
 import { reviewChecker } from '../src/cloudflare/checker.ts'
+import { jobRunner } from '../src/cloudflare/jobs.ts'
 import { createSyncTables, sqlSyncs, type SyncSql } from '../src/cloudflare/syncs.ts'
 import { commandChecker } from '../src/core/checks.ts'
+import type { Ledger } from '../src/core/ledger.ts'
 import type { Checker } from '../src/core/platform.ts'
+import { mockServices } from './support/mock-services.ts'
 
 /** Durable Object SQL over node:sqlite. A new store over the same database is a new object after a restart. */
 function fakeSql(): SyncSql {
@@ -33,8 +38,17 @@ function fakeSql(): SyncSql {
   return sql
 }
 
-/** A machine whose root is a local directory, so that a test can look at what the sync wrote. */
+function memoryLedger(): Ledger {
+  const state = new Map<string, unknown>()
+  return { get: <T>(key: string) => state.get(key) as T | undefined, put: (key, value) => void state.set(key, value) }
+}
+
+/**
+ * A machine whose root is a local directory, so that a test can look at what the sync wrote. A job is a local process
+ * in a group of its own, and its start is in `commands` as `job <argv>`.
+ */
 function localBox(root: string, commands: string[]): Box {
+  const jobs = new Map<string, { child: ChildProcess; output: string; result: BoxResult | null }>()
   return {
     async start() {},
     async exec(argv, { cwd, stdin }) {
@@ -42,6 +56,29 @@ function localBox(root: string, commands: string[]): Box {
       mkdirSync(join(root, cwd), { recursive: true })
       const result = spawnSync(argv[0]!, argv.slice(1), { cwd: join(root, cwd), input: stdin ? Buffer.from(stdin) : undefined })
       return { exit_code: result.status, output: `${result.stdout}${result.stderr}` }
+    },
+    async startJob(id, argv, { cwd }) {
+      commands.push(`job ${argv.join(' ')}`)
+      mkdirSync(join(root, cwd), { recursive: true })
+      const child = spawn(argv[0]!, argv.slice(1), { cwd: join(root, cwd), detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      const job = { child, output: '', result: null as BoxResult | null }
+      jobs.set(id, job)
+      child.stdout.on('data', (chunk: Buffer) => (job.output += chunk.toString()))
+      child.stderr.on('data', (chunk: Buffer) => (job.output += chunk.toString()))
+      child.on('close', (code) => (job.result = { exit_code: code, output: job.output }))
+    },
+    async pollJob(id) {
+      const job = jobs.get(id)
+      if (!job) return { state: 'missing' }
+      return job.result ? { result: job.result, state: 'done' } : { state: 'running' }
+    },
+    async killJob(id) {
+      const pid = jobs.get(id)?.child.pid
+      try {
+        if (pid !== undefined) process.kill(-pid, 'SIGKILL')
+      } catch {
+        // The group is gone.
+      }
     },
   }
 }
@@ -70,16 +107,22 @@ test('a sync copies the whole tree without .git, then only what changed or went 
   )
 })
 
-/** A container whose root is a local directory. It comes back empty when it starts, as a stopped Cloudflare Container does. */
+/**
+ * A container whose root is a local directory. It comes back empty when it starts, as a stopped Cloudflare Container
+ * does. `renewals` counts the calls that renew its inactivity timeout.
+ */
 function localContainer(root: string, exitCode?: number) {
   const container = {
     running: false,
+    renewals: 0,
     start() {
       rmSync(root, { force: true, recursive: true })
       mkdirSync(root, { recursive: true })
       container.running = true
     },
-    async setInactivityTimeout() {},
+    async setInactivityTimeout() {
+      container.renewals += 1
+    },
     async exec(argv: string[], options: { cwd: string; stdin?: ReadableStream }) {
       // The box wraps each command in timeout -k 10 <seconds>.
       const command = argv.slice(4)
@@ -128,7 +171,7 @@ function syncFixture() {
   const lines: string[] = []
   const local = localBox(root, commands)
   const box: Box = {
-    start: () => local.start(),
+    ...local,
     async exec(argv, options) {
       if (fixture.failTar && argv[0] === 'tar') {
         commands.push(argv.join(' '))
@@ -326,4 +369,157 @@ test('a clean box reads the exact bytes of a file, and refuses a path outside it
   writeFileSync(join(dir, 'huge.bin'), '')
   truncateSync(join(dir, 'huge.bin'), artifactSizeLimit + 1)
   await assert.rejects(box.read('huge.bin'), new RegExp(`read huge.bin: the file has ${artifactSizeLimit + 1} bytes, over the limit`))
+})
+
+/** Polls a job until it ends, for at most 10 s. */
+async function jobResult(box: Box, id: string): Promise<BoxResult> {
+  for (let polls = 0; polls < 100; polls++) {
+    const polled = await box.pollJob(id)
+    if (polled.state === 'done') return polled.result
+    assert.equal(polled.state, 'running')
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`the job ${id} did not end in 10 s`)
+}
+
+/** A started container box over a local directory, and the directory. */
+async function containerJobs() {
+  const root = mkdtempSync(join(tmpdir(), 'factory-jobs-'))
+  const container = localContainer(root)
+  const box = containerBox(container, { inactivityMs: 60_000, onStart: () => {} })
+  await box.start()
+  return { box, container, root }
+}
+
+test('a container job runs detached in its directory, and each poll renews the inactivity timeout', async () => {
+  const { box, container, root } = await containerJobs()
+  mkdirSync(join(root, 'work/x'), { recursive: true })
+  await box.startJob('job-1', ['bash', '-c', 'echo out; echo err >&2; pwd -P; exit 3'], { cwd: 'work/x', env: {}, timeoutMs: 60_000 })
+  const renewals = container.renewals
+  assert.deepEqual(await jobResult(box, 'job-1'), { exit_code: 3, output: `out\nerr\n${realpathSync(join(root, 'work/x'))}\n` })
+  assert.ok(container.renewals > renewals)
+  // The output and the exit code are in the job directory, not in the work directory.
+  assert.deepEqual(readdirSync(join(root, 'work/x')), [])
+  assert.deepEqual(readdirSync(join(root, 'jobs/job-1')).sort(), ['exit', 'limit', 'output', 'pgid', 'started'])
+})
+
+test('a container job keeps the result rules of a command and the last 20,000 characters of its output', async () => {
+  const { box, root } = await containerJobs()
+  await box.startJob('slow', ['sleep', '5'], { cwd: '', env: {}, timeoutMs: 1_000 })
+  await box.startJob('killed', ['bash', '-c', 'kill -9 $$'], { cwd: '', env: {}, timeoutMs: 60_000 })
+  await box.startJob('long', ['bash', '-c', 'head -c 100000 /dev/zero | tr "\\0" a; printf end'], { cwd: '', env: {}, timeoutMs: 60_000 })
+  assert.deepEqual(await jobResult(box, 'slow'), { exit_code: null, output: '\n[host] killed after 1000 ms' })
+  const killed = await jobResult(box, 'killed')
+  assert.equal(killed.exit_code, 137)
+  assert.match(killed.output, /killed before its time limit/)
+  assert.deepEqual(await jobResult(box, 'long'), { exit_code: 0, output: `${'a'.repeat(19_997)}end` })
+  // The poll keeps only the bytes that it reads, and a poll again gives the same result.
+  assert.equal(statSync(join(root, 'jobs/long/output')).size, 80_000)
+  assert.deepEqual(await jobResult(box, 'long'), { exit_code: 0, output: `${'a'.repeat(19_997)}end` })
+
+  // timeout sends its SIGKILL 10 s after the limit, so the test writes the files of a 137 at the limit.
+  const late = join(root, 'jobs/late')
+  mkdirSync(late)
+  for (const [name, value] of Object.entries({ limit: '1000\n', started: '5000\n', exit: '137 6000\n', output: 'partial' })) writeFileSync(join(late, name), value)
+  assert.deepEqual(await box.pollJob('late'), { result: { exit_code: null, output: 'partial\n[host] killed after 1000 ms' }, state: 'done' })
+})
+
+test('a kill stops the process group of a container job with its child, and the job is then missing', async () => {
+  const { box, root } = await containerJobs()
+  assert.deepEqual(await box.pollJob('none'), { state: 'missing' })
+  await box.killJob('none')
+
+  await box.startJob('group', ['bash', '-c', 'sleep 60 & echo $! > child.pid; wait'], { cwd: '', env: {}, timeoutMs: 60_000 })
+  let child = 0
+  for (let tries = 0; tries < 100 && !child; tries++) {
+    child = existsSync(join(root, 'child.pid')) ? Number(readFileSync(join(root, 'child.pid'), 'utf8')) : 0
+    if (!child) await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  assert.ok(child > 0)
+  assert.deepEqual(await box.pollJob('group'), { state: 'running' })
+  await box.killJob('group')
+  // A killed process can stay a zombie until its parent reaps it.
+  const gone = () => !existsSync(`/proc/${child}/stat`) || / Z /.test(readFileSync(`/proc/${child}/stat`, 'utf8').replace(/^.*\)/, ''))
+  let state = await box.pollJob('group')
+  for (let tries = 0; tries < 50 && (state.state !== 'missing' || !gone()); tries++) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    state = await box.pollJob('group')
+  }
+  assert.equal(gone(), true)
+  assert.deepEqual(state, { state: 'missing' })
+  assert.equal(existsSync(join(root, 'jobs/group')), false)
+  // A kill removes the job directory, so an ID can never name /jobs or its parent.
+  await assert.rejects(box.killJob('..'), /the job ID "\.\." is not a valid file name/)
+})
+
+test('a branch machine and its setup run their commands as wait-mode jobs', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'factory-box-'))
+  const commands: string[] = []
+  const box = localBox(root, commands)
+  const ledger = memoryLedger()
+  const runner = jobRunner(box, ledger, { pollMs: 20 })
+  const tree = MemoryFileSystem.create({ files: { '/a.txt': 'a' } })
+  const setup = { command: 'echo installed > setup.txt', timeoutMs: 60_000 }
+  const pending = new Map<string, Promise<void>>()
+  const sync = () => syncWithSetup(box, sqlSyncs(fakeSql(), 'run-1'), pending, tree, 'work/x', setup, () => {}, runner)
+  const machine = boxMachine(box, 'work/x', sync, runner)
+
+  assert.deepEqual(await machine.run('cat a.txt setup.txt', { env: [], timeoutMs: 60_000 }), { exit_code: 0, output: 'ainstalled\n' })
+  assert.deepEqual(
+    commands.filter((command) => command.startsWith('job ')),
+    ['job bash -c echo installed > setup.txt', 'job bash -c cat a.txt setup.txt'],
+  )
+  assert.deepEqual(ledger.get('jobs:open'), [])
+})
+
+test('the test machine runs jobs over HTTP with the same result rules, and kills a job by its process group', async () => {
+  const mock = await mockServices(mkdtempSync(join(tmpdir(), 'factory-repo-')), {
+    botLogin: 'factory-bot',
+    name: 'app',
+    owner: 'acme',
+    script: () => {
+      throw new Error('this test has no model turns')
+    },
+  })
+  try {
+    const box = httpBox(`${mock.url}/machine`)
+    const options = { cwd: 'work/x', env: {}, timeoutMs: 60_000 }
+    await box.startJob('quick', ['bash', '-c', 'echo out; exit 3'], options)
+    await box.startJob('slow', ['sleep', '5'], { ...options, timeoutMs: 500 })
+    await box.startJob('group', ['bash', '-c', 'sleep 60 & wait'], options)
+    assert.deepEqual(await jobResult(box, 'quick'), { exit_code: 3, output: 'out\n' })
+    assert.deepEqual(await jobResult(box, 'slow'), { exit_code: null, output: '\n[host] killed after 500 ms' })
+    assert.deepEqual(await box.pollJob('none'), { state: 'missing' })
+    assert.deepEqual(await box.pollJob('group'), { state: 'running' })
+    await box.killJob('group')
+    assert.equal((await jobResult(box, 'group')).exit_code, 137)
+    assert.deepEqual(
+      mock.state.jobs.map((job) => [job.id, job.cwd]),
+      [['quick', 'work/x'], ['slow', 'work/x'], ['group', 'work/x']],
+    )
+  } finally {
+    await mock.close()
+  }
+})
+
+test('the test machine refuses a poll or a command result that is not valid', async () => {
+  let answer: unknown = {}
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify(answer))
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const box = httpBox(`http://127.0.0.1:${(server.address() as AddressInfo).port}/machine`)
+    for (const invalid of [{}, null, { state: 'done' }, { result: { exit_code: '0', output: '' }, state: 'done' }, { result: { exit_code: 0 }, state: 'done' }]) {
+      answer = invalid
+      await assert.rejects(box.pollJob('job-1'), /answered without a job state/)
+    }
+    answer = { result: { exit_code: null, output: 'out' }, state: 'done' }
+    assert.deepEqual(await box.pollJob('job-1'), { result: { exit_code: null, output: 'out' }, state: 'done' })
+    answer = { exit_code: 1.5, output: '' }
+    await assert.rejects(box.exec(['true'], { cwd: '', env: {}, timeoutMs: 1_000 }), /answered without a command result/)
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
 })

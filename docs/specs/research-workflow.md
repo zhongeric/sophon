@@ -153,6 +153,7 @@ reads it from the base branch, so a run cannot change its own rails.
       "evaluate": "python -m search.evaluate {prereg}",
       "reproduce": "python -m search.reproduce {prereg}"
     },
+    "timeouts": { "known": 7200000, "reproduce": 7200000 },
     "feeds": ["https://export.arxiv.org/rss/astro-ph"]
   }
 }
@@ -164,6 +165,7 @@ The prereg section "Holdout" refers to this file and does not define the holdout
 
 The host takes the command strings from the base branch. It replaces `{prereg}` with the quoted path of the frozen
 prereg. `{partition}` identifies the current data partition. `feeds` are the sources of scout (section 3).
+`timeouts` gives the timeout in ms of each domain command. A missing key takes `timeout_ms`, else 30 minutes.
 
 The last line of a command output that is not empty is a JSON object:
 

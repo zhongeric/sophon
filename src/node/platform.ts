@@ -294,7 +294,8 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
     pulls: options.pulls,
     checker: (branch) => commandChecker(branch, config, machine(branch)),
     // A new checkout each time, at a new path, so that no file of an earlier command or of the branch worktree is in it,
-    // and an output that depends on the path does not reproduce. Only the last checkout stays on disk.
+    // and an output that depends on the path does not reproduce. Only the last checkout stays on disk. A local run does
+    // not pause, so it ignores the step key.
     async cleanBox(commit) {
       const previous = join(dir, `clean-${cleanCheckouts}`)
       if (existsSync(previous)) await git(options.repo, 'worktree', 'remove', '--force', previous)
@@ -302,7 +303,7 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
       const tree = join(dir, `clean-${cleanCheckouts}`)
       if (existsSync(tree)) await git(options.repo, 'worktree', 'remove', '--force', tree)
       await git(options.repo, 'worktree', 'add', '--detach', tree, commit)
-      return { ...localMachine(tree), read: diskFileSystem(tree).read }
+      return { ...localMachine(tree), id: crypto.randomUUID(), read: diskFileSystem(tree).read }
     },
     async review({ runId, ask, head, full, pr, budget }) {
       const reviewSource = { repo: options.repo, base: input.base, head }

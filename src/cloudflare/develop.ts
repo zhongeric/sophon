@@ -17,9 +17,8 @@ import { githubPulls } from './pulls.ts'
 import { githubSigning } from './signing.ts'
 import { baseConfig } from './config.ts'
 import { reviewPass } from './review.ts'
-import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs } from './runs.ts'
+import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs, type Call } from './runs.ts'
 import { sqlFiles } from './storage.ts'
-import { sqlSyncs } from './syncs.ts'
 import { encodePath } from './trees.ts'
 
 /**
@@ -47,21 +46,20 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     return developAnnouncement(run, request.by)
   }
 
-  protected async execute(run: string, request: DevelopRequest, ledger: Ledger, gh: GitHub, comments: Comments) {
+  protected async execute(run: string, request: DevelopRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call) {
     const input = ledger.get<DevelopInput>('input') ?? (await this.input(run, request, gh))
     const prices = parsePrices(this.env.MODEL_PRICES)
     const { owner, repo } = request
     const log = (line: string) => console.log(`[${owner}/${repo}#${request.issue} ${run}] ${line}`)
     const sql = Sql.create(this.ctx.storage)
-    const syncs = sqlSyncs(this.ctx.storage.sql, run)
-    const box = this.box(syncs)
+    const { box, syncs, jobs } = await call.machine()
     const setup = input.config.setup
     const pending = new Map<string, Promise<void>>()
     const checker = (branch: Branch) => {
       const dir = `work/${branch.name.replace(/[^A-Za-z0-9._-]/g, '-')}`
       // The setup runs after each full copy, so a container that came back empty installs its dependencies again.
-      const sync = () => syncWithSetup(box, syncs, pending, branch.tree, dir, { command: setup, timeoutMs: setupTimeoutMs }, log)
-      return commandChecker(branch, { ...input.config, setup: undefined }, boxMachine(box, dir, sync))
+      const sync = () => syncWithSetup(box, syncs, pending, branch.tree, dir, { command: setup, timeoutMs: setupTimeoutMs }, log, jobs)
+      return commandChecker(branch, { ...input.config, setup: undefined }, boxMachine(box, dir, sync, jobs))
     }
     const result = await develop(input, {
       branches: sqlBranches({ gh, ledger, log, owner, repo, run, sql }),

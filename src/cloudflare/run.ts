@@ -15,9 +15,8 @@ import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubRepo, type GitHubRepo, type PullRequest } from './repo.ts'
 import { githubSigning } from './signing.ts'
-import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs } from './runs.ts'
+import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs, type Call, type RunMachine } from './runs.ts'
 import { sqlFiles, sqlLedger } from './storage.ts'
-import { sqlSyncs } from './syncs.ts'
 
 export { allowedUsers, type Env } from './runs.ts'
 
@@ -67,7 +66,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     }
   }
 
-  protected async execute(run: string, request: StartRequest, ledger: Ledger, gh: GitHub, comments: Comments) {
+  protected async execute(run: string, request: StartRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call) {
     const recorded = ledger.get<LoopInput>('input')
     // A run that started before a model role existed has no choice for it: use the default.
     const input = recorded ? { ...recorded, models: mergeModels(recorded.models) } : await this.input(run, request, gh)
@@ -79,9 +78,10 @@ export class PullRequestRuns extends Runs<StartRequest> {
     const repo = githubRepo({ branch, gh, ledger, log, pull, runId: run, sql })
     const signing = githubSigning(gh, request.owner, request.repo)
     const ci = ciChecker({ branch, gh, ledger, pull, repo, timeoutMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000 })
+    const machine = input.config.tests ? await call.machine() : undefined
     const result = await codeReviewLoop(input, {
       channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, pollMs: 0, waitMs: 0 }),
-      checker: input.config.tests ? this.machineChecker(run, repo, input.config, ci, log) : ci,
+      checker: machine ? machineChecker(machine, run, repo, input.config, ci, log) : ci,
       credentials: credentialsFor(this.env, providersOf(input.models)),
       files: sqlFiles(this.ctx.storage.sql, run),
       guides: await bundledGuides(),
@@ -95,17 +95,6 @@ export class PullRequestRuns extends Runs<StartRequest> {
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
     return { passed: result.pass, summary: summary(run, result) }
-  }
-
-  /** The review tree has a directory of its own, because the runs of all objects share one MACHINE_URL machine. */
-  private machineChecker(run: string, repo: GitHubRepo, config: RepoConfig, ci: Checker, log: (line: string) => void): Checker {
-    const syncs = sqlSyncs(this.ctx.storage.sql, run)
-    const box = this.box(syncs)
-    const dir = `review/${run}`
-    const pending = new Map<string, Promise<void>>()
-    // The setup runs after each full copy, so a container that came back empty installs its dependencies again.
-    const sync = () => syncWithSetup(box, syncs, pending, repo.tree, dir, { command: config.setup, timeoutMs: setupTimeoutMs }, log)
-    return reviewChecker(ci, commandChecker(repo, { ...config, setup: undefined }, boxMachine(box, dir, sync)))
   }
 
   /** The run's input. The checks and rails come from the base branch, so a PR cannot change its own. */
@@ -134,6 +123,15 @@ export class PullRequestRuns extends Runs<StartRequest> {
       ...(request.stopAtBudget ? { stopAtBudget: true } : {}),
     }
   }
+}
+
+/** The review tree has a directory of its own, because the runs of all objects share one MACHINE_URL machine. */
+function machineChecker({ box, syncs, jobs }: RunMachine, run: string, repo: GitHubRepo, config: RepoConfig, ci: Checker, log: (line: string) => void): Checker {
+  const dir = `review/${run}`
+  const pending = new Map<string, Promise<void>>()
+  // The setup runs after each full copy, so a container that came back empty installs its dependencies again.
+  const sync = () => syncWithSetup(box, syncs, pending, repo.tree, dir, { command: config.setup, timeoutMs: setupTimeoutMs }, log, jobs)
+  return reviewChecker(ci, commandChecker(repo, { ...config, setup: undefined }, boxMachine(box, dir, sync, jobs)))
 }
 
 function summary(run: string, result: LoopResult): string {
