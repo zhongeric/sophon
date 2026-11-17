@@ -3,6 +3,8 @@ import { existsSync, realpathSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import type { Branch, Branches, Frozen, Repo } from '../core/platform.ts'
+import type { RootFiles } from '../core/profiles.ts'
+import type { ResearchFiles } from '../core/research.ts'
 import { withoutHostSecrets } from '../core/secrets.ts'
 import { gh } from './channels.ts'
 import { diskFileSystem } from './disk.ts'
@@ -220,5 +222,47 @@ export function gitBranches(repo: string, dir: string): Branches {
     },
     deleteLocal: (name) => deleteLocalBranch(repo, name),
     release: () => removeWorktrees(repo, (path) => isUnder(path, dir)),
+  }
+}
+
+type TreeEntry = { mode: string; type: string; object: string; name: string }
+
+/** The entries that `git ls-tree` gives for a path, or for the root without a path. Names are relative to the root. */
+async function treeEntries(repo: string, commit: string, spec?: string): Promise<TreeEntry[]> {
+  const out = await git(repo, 'ls-tree', '-z', '--full-tree', commit, ...(spec === undefined ? [] : ['--', spec]))
+  return out.split('\0').flatMap((line) => {
+    const match = /^(\d+) (\w+) ([0-9a-f]+)\t(.+)$/s.exec(line)
+    return match ? [{ mode: match[1]!, type: match[2]!, object: match[3]!, name: match[4]! }] : []
+  })
+}
+
+/** A regular file. Symlinks (mode 120000) are not files, as for the readers of a working copy and of Cloudflare. */
+const isFile = (entry: TreeEntry) => entry.type === 'blob' && entry.mode !== '120000'
+
+/**
+ * The files of a commit, read with git and never from the working copy: `files` by path relative to the root, and
+ * `root` for the config and the profile markers.
+ */
+export function gitTree(repo: string, commit: string): { files: ResearchFiles; root: RootFiles } {
+  const clean = (path: string) => path.split('/').filter((part) => part !== '' && part !== '.').join('/')
+  const read = async (path: string) => {
+    const name = clean(path)
+    const entry = name === '' ? undefined : (await treeEntries(repo, commit, name)).find((item) => item.name === name)
+    return entry && isFile(entry) ? git(repo, 'cat-file', 'blob', entry.object) : null
+  }
+  const list = async (dir: string) => {
+    const name = clean(dir)
+    const entries = name === '' ? await treeEntries(repo, commit) : await treeEntries(repo, commit, `${name}/`)
+    // git does not keep empty directories, so a directory without entries does not exist.
+    if (entries.length === 0) return null
+    return entries.filter(isFile).map((entry) => entry.name.slice(name === '' ? 0 : name.length + 1))
+  }
+  return {
+    files: { read, list },
+    root: {
+      exists: async (name) => (await treeEntries(repo, commit, clean(name))).some((entry) => entry.name === clean(name)),
+      read,
+      list: async () => (await list('')) ?? [],
+    },
   }
 }

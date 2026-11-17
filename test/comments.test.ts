@@ -105,6 +105,7 @@ test('the question comment has the marker, one line about how to answer, then ev
 test('each start comment is one line', () => {
   for (const text of [developAnnouncement('dev-5-1', 'maintainer'), reviewAnnouncement('pr-7-1', 'maintainer')]) {
     assert.doesNotMatch(text, /\n/)
-    assert.match(text, /^agent-factory started (development|review) run `(dev-5-1|pr-7-1)` for @maintainer\. .*`\/answer`/)
+    assert.doesNotMatch(text, /@/)
+    assert.match(text, /^agent-factory started (development|review) run `(dev-5-1|pr-7-1)` for `maintainer`\. .*`\/answer`/)
   }
 })

@@ -5,7 +5,8 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
-import { commandChecker, parseRepoConfig, readRepoConfig, requireChecks, resolveRepoConfig, type RepoConfig } from '../core/checks.ts'
+import { commandChecker, parseRepoConfig, readRepoConfig, repoConfigFile, requireChecks, resolveRepoConfig, type RepoConfig } from '../core/checks.ts'
+import { runLock } from '../core/egress.ts'
 import type { AgentStore, Files, Guides, PullRequests } from '../core/platform.ts'
 import { profileDefaults, type RootFiles } from '../core/profiles.ts'
 import type { Credentials } from '../core/providers.ts'
@@ -15,8 +16,10 @@ import { StopError } from '../core/stop.ts'
 import type { Prices } from '../core/usage.ts'
 import { codeReviewLoop, type LoopDeps } from '../core/workflows/code-review-loop.ts'
 import type { DevelopDeps, DevelopInput } from '../core/workflows/develop.ts'
+import type { ResearchDeps, ResearchInput } from '../core/workflows/research.ts'
+import { nodeArtifacts } from './artifacts.ts'
 import { diskFileSystem, guideFileSystem } from './disk.ts'
-import { gitBranches, gitRepo, worktreePath, type GitSource } from './git.ts'
+import { gitBranches, gitRepo, gitTree, worktreePath, type GitSource } from './git.ts'
 import { fileLedger } from './ledger.ts'
 import { localMachine } from './machine.ts'
 
@@ -49,6 +52,11 @@ export async function loadRepoConfig(repo: string, path?: string): Promise<RepoC
   if (path && !existsSync(path)) throw new StopError(`${path} does not exist`)
   const config = path ? resolveRepoConfig(await profileDefaults(root), parseRepoConfig(readFileSync(path, 'utf8'), path)) : await readRepoConfig(root, `in ${repo}`)
   requireChecks(config, repo)
+  return withHomeGuides(config)
+}
+
+/** A guide path that starts with ~/ is in the home directory. */
+function withHomeGuides(config: RepoConfig): RepoConfig {
   const guides = Object.entries(config.guides ?? {}).map(([name, guide]) => [name, guide.replace(/^~(?=\/)/, homedir())])
   return { ...config, guides: Object.fromEntries(guides) }
 }
@@ -210,5 +218,62 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
       return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr) })
     },
     ci: options.ci,
+  }
+}
+
+export type NodeResearchOptions = {
+  runsDir: string
+  /** The notebook working copy. The run reads its base commit and commits the frozen preregs on a branch of its own. */
+  repo: string
+  input: ResearchInput
+  channel: Channel
+  credentials: Credentials
+  module: WebAssembly.Module
+  dispatch?: Contracts.RuntimeOptions['dispatch']
+  prices?: Prices
+  /** Where the egress finds the secrets of the research config. Default: process.env. */
+  env?: Record<string, string | undefined>
+  /** Replaces the global fetch of the egress, for tests. */
+  fetch?: typeof fetch
+  log(line: string): void
+}
+
+/**
+ * The platform of one research run on this machine: runs/<id>/ holds the ledger, the journals, the artifacts, the
+ * report and the branch worktrees. The config, the holdout, the checklist and the guides come from the base commit,
+ * never from the working copy, so an uncommitted change cannot move the holdout.
+ */
+export async function nodeResearch(options: NodeResearchOptions): Promise<ResearchDeps & { dir: string }> {
+  const { input } = options
+  const dir = resolve(options.runsDir, input.runId)
+  const branchesDir = join(dir, 'branches')
+  mkdirSync(branchesDir, { recursive: true })
+  const source = `at ${input.baseRef}`
+  const base = gitTree(options.repo, input.base)
+  const config = await readRepoConfig(base.root, source)
+  if (!config.research) throw new StopError(`${repoConfigFile} ${source} has no research field`)
+  const domain = await loadResearchDomain(config.research, base.files, source)
+  const ledger = fileLedger(join(dir, 'state.json'))
+  const env = options.env ?? process.env
+  return {
+    dir,
+    module: options.module,
+    ledger,
+    files: dirFiles(dir),
+    store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
+    guides: await nodeGuides(withHomeGuides(config)),
+    credentials: options.credentials,
+    dispatch: options.dispatch,
+    prices: options.prices,
+    channel: options.channel,
+    branches: gitBranches(options.repo, branchesDir),
+    domain,
+    egress: {
+      artifacts: nodeArtifacts(dir),
+      lock: runLock(ledger, domain.holdout.refuse),
+      secret: (name) => env[name],
+      ...(options.fetch ? { fetch: options.fetch } : {}),
+    },
+    log: options.log,
   }
 }

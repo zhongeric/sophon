@@ -20,7 +20,10 @@ export type Env = {
   GITHUB_APP_ID?: string
   /** The private key of the App, in PKCS#8 PEM. */
   GITHUB_APP_PRIVATE_KEY?: string
-  GITHUB_WEBHOOK_SECRET: string
+  /** The secret of the webhook of each repository. GITHUB_APP_WEBHOOK_SECRET replaces it when set. */
+  GITHUB_WEBHOOK_SECRET?: string
+  /** The secret of the App webhook. */
+  GITHUB_APP_WEBHOOK_SECRET?: string
   ANTHROPIC_API_KEY?: string
   OPENAI_API_KEY?: string
   /** GitHub logins, comma-separated, that can start runs and answer questions. Without it, no one can. */

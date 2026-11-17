@@ -2,7 +2,7 @@ import { DevelopmentRuns, type DevelopRequest } from './develop.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
 import { sameSecret, verifySignature } from './github.ts'
-import { githubAccess, type InstallationTokens } from './github-app.ts'
+import { appBotLogin, githubAccess, type BotLogins, type InstallationTokens } from './github-app.ts'
 import { sweepBranches } from './prune.ts'
 import { allowedUsers, PullRequestRuns, type Env } from './run.ts'
 
@@ -26,6 +26,8 @@ async function prune(env: Env, owner: string, repo: string, only?: (name: string
     ...(only ? { only } : {}),
   })
 }
+
+const botLogins: BotLogins = new Map()
 
 /** The review runs of a PR, or the development runs of an issue. GitHub numbers both in one sequence, so a number is one or the other. */
 async function runsOf(env: Env, owner: string, repo: string, number: number) {
@@ -120,15 +122,23 @@ type Payload = {
 /**
  * GitHub webhooks: `/review` and the agent-review label start a review run on a PR, `/develop` and the agent-develop
  * label start a development run on an issue, and `/answer` and CI results (workflow runs, statuses) wake a paused run. A
- * closed PR prunes its factory/* head branch and its review fix branches.
+ * closed PR prunes its factory/* head branch and its review fix branches. Other comment, issue and PR events of the App
+ * bot do nothing, so that the posts of a run do not start or wake runs.
  */
 async function webhook(request: Request, env: Env): Promise<Response> {
   const body = await request.text()
-  if (!(await verifySignature(env.GITHUB_WEBHOOK_SECRET, body, request.headers.get('x-hub-signature-256')))) return new Response('bad signature', { status: 401 })
+  const secret = env.GITHUB_APP_WEBHOOK_SECRET || env.GITHUB_WEBHOOK_SECRET
+  if (!secret || !(await verifySignature(secret, body, request.headers.get('x-hub-signature-256')))) return new Response('bad signature', { status: 401 })
   const event = request.headers.get('x-github-event')
   const payload = JSON.parse(body) as Payload
   const [owner = '', repo = ''] = payload.repository.full_name.split('/')
   const allowed = (login: string | undefined) => allowedUsers(env).some((user) => user.toLowerCase() === login?.toLowerCase())
+  // Only a sender that ends with [bot] makes the GET /app request, so human and CI deliveries cost no request.
+  const sender = payload.sender?.login.toLowerCase() ?? ''
+  // A closed PR still prunes its branches, also when the App merged it: the prune starts and wakes no run.
+  const closedPr = event === 'pull_request' && payload.action === 'closed'
+  if ((event === 'issue_comment' || event === 'issues' || event === 'pull_request') && !closedPr && sender.endsWith('[bot]') && sender === (await appBotLogin(env, botLogins))?.toLowerCase())
+    return accepted({ ignored: 'the App bot' })
 
   if (event === 'issue_comment' && payload.action === 'created' && payload.issue && payload.comment) {
     const by = payload.comment.user.login

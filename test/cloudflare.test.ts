@@ -169,6 +169,41 @@ test('on Cloudflare, with the GitHub App secrets, a repository without the App s
   }
 })
 
+test('on Cloudflare, the App webhook secret replaces the webhook secret, and comment, issue and PR events of the App bot start no run', { timeout: 120_000 }, async () => {
+  const repo = fixtureRepo()
+  const mock = await mockServices(repo, { app: { installed: true, slug: 'sophon-factory' }, botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } })
+  const appSecret = 'app-webhook-secret'
+  // The bot is an allowed user here, so only the bot filter keeps its /review and labels from starting runs.
+  const worker = await startWorker({ ...vars(mock), ALLOWED_USERS: 'Maintainer,sophon-factory[bot]', GITHUB_APP_ID: '12345', GITHUB_APP_PRIVATE_KEY: privateKey, GITHUB_APP_WEBHOOK_SECRET: appSecret })
+  const describe = () => `requests: ${mock.state.requests.join(', ')}\nworker:\n${worker.output().slice(-3000)}`
+  const appLookups = () => mock.state.requests.filter((route) => route === 'GET /app').length
+  const bot = { login: 'Sophon-Factory[bot]' }
+  try {
+    assert.equal((await sendWebhook(worker.url, secret, 'issue_comment', comment('mallory', '/review'))).status, 401)
+    assert.deepEqual(await (await sendWebhook(worker.url, appSecret, 'issue_comment', { ...comment('mallory', '/review'), sender: { login: 'mallory' } })).json(), { ignored: 'not an allowed user' })
+    assert.equal(appLookups(), 0, describe())
+
+    const ignored = { ignored: 'the App bot' }
+    assert.deepEqual(await (await sendWebhook(worker.url, appSecret, 'issue_comment', { ...comment('sophon-factory[bot]', '/review'), sender: bot })).json(), ignored)
+    const label = (name: string) => ({ action: 'labeled', label: { name }, repository, sender: bot })
+    assert.deepEqual(await (await sendWebhook(worker.url, appSecret, 'pull_request', { ...label('agent-review'), pull_request: { number: 7 } })).json(), ignored)
+    assert.deepEqual(await (await sendWebhook(worker.url, appSecret, 'issues', { ...label('agent-develop'), issue: { number: 5 } })).json(), ignored)
+    assert.equal(appLookups(), 1, describe())
+
+    const workflow = { action: 'completed', repository, sender: bot, workflow_run: { head_branch: 'factory/pr-7-x', pull_requests: [{ number: 7 }] } }
+    assert.deepEqual(await (await sendWebhook(worker.url, appSecret, 'workflow_run', workflow)).json(), { woke: [7] })
+    assert.equal(appLookups(), 1, describe())
+    for (const number of [5, 7]) {
+      const status = (await (await fetch(`${worker.url}/runs/acme/app/${number}`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: unknown[] }
+      assert.deepEqual(status.runs, [], describe())
+    }
+  } finally {
+    worker.stop()
+    mock.close()
+  }
+})
+
 test('on Cloudflare, the admin route starts a run, and the run picks up the answer without the webhook', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
@@ -192,11 +227,15 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
     const again = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin, method: 'POST' })).json()) as { run: string; started: boolean }
     assert.deepEqual(again, { run: started.run, started: false })
 
-    await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
-    assert.match(mock.state.comments[0]!.body, /for @Maintainer/)
+    const asked = await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
+    assert.match(mock.state.comments[0]!.body, /for `Maintainer`/)
+    assert.doesNotMatch(mock.state.comments[0]!.body, /@/)
+    // answerersOf gives the ALLOWED_USERS fallback in lower case, and GitHub mentions ignore case.
+    assert.match(asked.body.split('\n')[0]!, /^@maintainer$/i)
     mock.comment('maintainer', '/answer recommended')
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/)
+    assert.doesNotMatch(done.body, /@Maintainer/i)
     assert.match(done.body, /May sub return a negative number\? \*\*Yes, return -2\*\* \(recommended\)/)
   } finally {
     worker.stop()
@@ -406,6 +445,8 @@ test('on Cloudflare, /develop asks a user question of the intake agent on the is
     const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
     assert.match(done.body, /^# Development run: READY/, done.body)
     assert.equal(on(5).filter((entry) => entry.body.includes('agent-factory:questions')).length, 1, describe())
+    assert.match(asked.body.split('\n')[0]!, /^@maintainer$/i)
+    assert.doesNotMatch(done.body, /@Maintainer/i)
     assert.match(done.body, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
     assert.match(done.body, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\*.*\n- Is this the ask\? .*\*\*Yes, go on\*\*.*\n\n## Decisions the run made\n\n- Write a spec before the plan\? \*\*Plan now\*\*/)
   } finally {

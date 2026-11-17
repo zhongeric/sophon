@@ -1,6 +1,6 @@
 # Spec: the research workflow
 
-Status: scoping. Nothing is built. Section 11 is the build plan.
+Status: part 1 of R1, stages 0 to 4 on the local platform, is built. Section 11 is the build plan.
 
 This spec defines a third workflow of agent-factory: the **research workflow**. A swarm of agents reads large public
 data, makes hypotheses, tests them, and reports a candidate or a calibrated null. The design is domain-neutral. A
@@ -93,8 +93,9 @@ user labels it. Scout is read-only and periodic: a cron trigger and a Durable Ob
 - **Breadth:** the host maps one role over many items (lenses, candidate batches, partitions) in a bounded pool. Each
   item is a ledger step, so a resumed run does not run it again.
 - **Depth:** inside one turn, a surveyor or the analyst can start nanocode subagents, as builders can.
-  Only the root agent submits. Today the host sets no limit on the count or the budget of subagents. Section 6.2 adds
-  these limits for each role.
+  Only the root agent submits. In each root turn, `openAgent` limits the subagents that run at the same time, the
+  subagents that start, and their tokens. In `roles.ts`, a role gets limits, no subagents, or no limit.
+  A spawn over a limit fails with an error that the agent sees.
 - **Diversity:** generators and skeptics get different model families and different lenses, because agents of one
   family can share a mistake. The family-swap check applies to the skeptic passes.
 - **Model tiers:** screeners on a cheap tier. Judgment roles on the strong tier. A research run has its own
@@ -123,12 +124,12 @@ Each is a separate PR. Each is also useful to the other workflows, or is off for
 | --- | --- | --- |
 | Usage and a cost budget | `agent.ts` (`model.call.completed` events), the ledger, the reports | G6, RG2. |
 | Artifacts | `platform.ts` and both platforms | A content-addressed store. Local: a directory. Cloudflare: the run's object storage. The ledger holds IDs, never bulk data. |
-| Egress with provenance | `agent.ts` (`web_search`, `fetch`), `workspace.ts` (shell `fetch`) | A role can reach allowlisted origins. The design requires the egress to refuse the holdout to agents from intake and set a maximum size for each request. Each response body is an artifact. The other roles stay offline. `egress.ts` has the egress and the run lock. The egress does not yet set a maximum size for a request. It sets one for each response. Each response also has a JSON provenance record as a second artifact, with its ID in the `x-provenance-id` header. `openAgent` uses the egress. The shell uses it only when the host gives `hostFetch` to the workspace layout. |
+| Egress with provenance | `agent.ts` (`web_search`, `fetch`), `workspace.ts` (shell `fetch`) | A role can reach allowlisted origins. The design requires the egress to refuse the holdout to agents from intake and set a maximum size for each request. Each response body is an artifact. The other roles stay offline. `egress.ts` has the egress and the run lock. The egress sets a maximum size for each request (`max_request_bytes`, default 8 KiB for the URL, the headers and the body) and for each response. Each response also has a JSON provenance record as a second artifact, with its ID in the `x-provenance-id` header. `openAgent` uses the egress. The shell uses it only when the host gives `hostFetch` to the workspace layout. |
 | Evidence on artifacts | `findings.ts` | A location can be `artifact:<id>` with a line or no line. The fragment rules stay. |
 | `python` profile | `profiles.ts`, the build image | Notebooks are Python. The repository's setup installs the domain's packages. |
 | Roles by workflow | `roles.ts` | The research roles in a table of their own. |
 | A bounded pool | `plan.ts` (`waves`) | Sweeps, screens and generators. |
-| Subagent limits | `agent.ts` (`openAgent`) | RD1. The host sets the count and the budget of subagents for each role. |
+| Subagent limits | `agent.ts` (`openAgent`), `subagents.ts`, `roles.ts` | RD1. Section 5 gives the limits. |
 
 ### 6.3 The domain, in the notebook
 
@@ -234,7 +235,7 @@ as profile guides do today.
 | Phase | Scope | Exit |
 | --- | --- | --- |
 | R0 | The core changes of section 6.2, with the holdout lock for agents. | Each rail has tests. A scripted run fetches through the egress and cites an artifact. |
-| R1 | The research workflow on Cloudflare: stages 0 to 6, 9 and 11, per-target analysis, no sweep and no holdout test. | A notebook run recovers a known set blind, with a completeness curve, in a dossier PR. |
+| R1 | The research workflow on Cloudflare: stages 0 to 6, 9 and 11, per-target analysis, no sweep and no holdout test. Part 1 builds stages 0 to 4 locally, with the CLI `src/node/research.ts`. | A notebook run recovers a known set blind, with a completeness curve, in a dossier PR. |
 | R2 | The sweep, the screeners, the holdout test (stage 10) and the trial count. | A program over thousands of targets ends in a vetted top few or a calibrated null. |
 | R3 | Submission with a `/go`. | One submission that the user approved. |
 | R4 | Scout: the domain's feeds, the weekly digest and proposal issues. | Four weekly digests, and one proposal that the user takes. |

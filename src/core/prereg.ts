@@ -90,10 +90,16 @@ export type FrozenPrereg = {
 
 /**
  * Makes the frozen Markdown of a checked prereg. The same input always gives the same text.
- * Without an amendment, the version is 1. An amendment gives the earlier frozen version and a reason, and gets the next version.
+ * Without an amendment, the version is options.version, or 1. An amendment gives the earlier frozen version and a reason, and gets the next version.
+ * The version option lets the host skip a file that already exists, for example a v1 from an earlier run.
  */
-export async function freezePrereg(prereg: Prereg, amendment: { previous?: FrozenPrereg; reason?: string } = {}): Promise<FrozenPrereg> {
+export async function freezePrereg(
+  prereg: Prereg,
+  amendment: { previous?: FrozenPrereg; reason?: string } = {},
+  options: { version?: number } = {},
+): Promise<FrozenPrereg> {
   const { previous, reason } = amendment
+  if (options.version !== undefined && (!Number.isInteger(options.version) || options.version < 1)) throw new Error('the first version must be an integer of 1 or more')
   const amends = previous !== undefined || reason !== undefined
   if (amends) {
     const problems = [
@@ -103,7 +109,7 @@ export async function freezePrereg(prereg: Prereg, amendment: { previous?: Froze
     ]
     if (problems.length > 0) throw new Error(problems.join('\n'))
   }
-  const version = previous ? previous.version + 1 : 1
+  const version = previous ? previous.version + 1 : (options.version ?? 1)
   const markdown = [
     `# Prereg ${prereg.hypothesis} v${version}`,
     '',

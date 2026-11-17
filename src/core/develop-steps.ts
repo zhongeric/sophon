@@ -22,8 +22,8 @@ export type DevelopContext = {
 
 const toolOutputTailChars = 4_000
 
-function agent(context: DevelopContext, id: string, role: Role, model: ModelChoice, workspace: Contracts.WorkspaceHost, tools: HostTools, subagents = false): AgentSpec {
-  return { id, ...model, instructions: instructions(role, { read: context.guides.read, stackGuides: context.stackGuides }), tools, workspace, subagents }
+function agent(context: DevelopContext, id: string, role: Role, model: ModelChoice, workspace: Contracts.WorkspaceHost, tools: HostTools): AgentSpec {
+  return { id, ...model, instructions: instructions(role, { read: context.guides.read, stackGuides: context.stackGuides }), tools, workspace, subagents: role.subagents }
 }
 
 /** A read-only workspace on the base tree, for the agents that read before anyone writes. */
@@ -215,5 +215,5 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
   const decided = decisionsFile(context.host.ledger)
   const workspace = await createWorkspace({ repo, review: { ...task.review, ...decided }, guides: context.guides.mounts })
   const prompt = [task.prompt, ...decisionsLine(decided)].join('\n')
-  return runTurn(context.host, agent(context, task.id, developRoles.builder, task.model, workspace, tools, true), prompt, 'submit_build_log', task.turn)
+  return runTurn(context.host, agent(context, task.id, developRoles.builder, task.model, workspace, tools), prompt, 'submit_build_log', task.turn)
 }
