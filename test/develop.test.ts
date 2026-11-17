@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import type { Signing } from '../src/core/platform.ts'
 import { PausedError, type Channel } from '../src/core/questions.ts'
 import { StopError } from '../src/core/stop.ts'
-import { recordUsage, zeroTokens, type Prices } from '../src/core/usage.ts'
+import { BudgetStop, recordUsage, zeroTokens, type Prices } from '../src/core/usage.ts'
 import { develop, type ReviewRequest } from '../src/core/workflows/develop.ts'
 import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
@@ -93,6 +93,14 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.doesNotMatch(github.state.opened[0]!.body, /Closes/)
   await git(origin, 'rev-parse', '--verify', 'refs/heads/factory/dev-add-sub-mul')
 
+  // The open PR keeps the development branch. The task branches and the review fix branch are gone, and so are the worktrees.
+  await git(repo, 'show-ref', '--verify', '--quiet', 'refs/heads/factory/dev-add-sub-mul')
+  assert.equal(existsSync(worktreePath(join(result.dir, 'branches'), 'factory/dev-add-sub-mul')), false)
+  for (const name of ['factory/task-dev-sub', 'factory/task-dev-mul', 'factory/task-dev-tests', 'factory/dev-review-1'])
+    await assert.rejects(git(repo, 'show-ref', '--verify', '--quiet', `refs/heads/${name}`), name)
+  assert.match(result.report, /^- deleted factory\/dev-review-1 \(applied\)$/m)
+  assert.doesNotMatch(result.report, /deleted factory\/dev-add-sub-mul/)
+
   // The Usage section: the development agents, the review pass with the USD of all its agents, and the total.
   assert.match(result.report, /^## Usage$/m)
   assert.match(result.report, /^\| intake \| claude-opus-5-5 \| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$0\.\d{4} \|$/m)
@@ -101,16 +109,22 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.doesNotMatch(result.report, /^Budget:/m)
 })
 
-test('develop: with the merge permission, the host merges the ready PR at the checked head and deletes only the remote branch', { timeout: 120_000 }, async () => {
+test('develop: with the merge permission, the host merges the ready PR at the checked head and deletes the branches of the run', { timeout: 120_000 }, async () => {
   const { repo, origin } = developRepo(undefined, { merge: 'squash' })
   const dir = runsDir()
-  const github = fakePulls([false, true])
+  // The prune deletes the local branch after the merge, so the head is read at the merge.
+  let head = ''
+  const github = fakePulls([false, true], {
+    merge: () => {
+      head = execFileSync('git', ['rev-parse', 'refs/heads/factory/dev-add-sub-mul'], { cwd: repo }).toString().trim()
+      return { merged: true, sha: mergeCommit }
+    },
+  })
   const input = await developInput(repo, 'merged', { issue: 12 })
   const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), input, pulls: github.pulls, runId: 'merged' })
 
   assert.equal(result.status, 'ready', result.report)
   assert.deepEqual(github.state.ready, [9])
-  const head = (await git(repo, 'rev-parse', 'refs/heads/factory/dev-add-sub-mul')).trim()
   assert.equal(github.state.shas.at(-1), head)
   assert.deepEqual(github.state.merges, [{ pr: 9, method: 'squash', sha: head }])
   assert.match(github.state.opened[0]!.body, /^Closes #12\n\n/)
@@ -120,9 +134,15 @@ test('develop: with the merge permission, the host merges the ready PR at the ch
   assert.equal(github.state.comments.length, 1)
   assert.ok(github.state.comments[0]!.includes(`Merged by the host (squash): ${mergeCommit}.`))
   assert.deepEqual(fileLedger(join(result.dir, 'state.json')).get('result'), { status: 'ready', pr: result.pr, branch: result.branch, merge: result.merge })
-  // Only the remote branch is gone. The local branch stays.
+  // The remote branch and the local branches of the run are gone. The Branches section in the details lists each one time.
   await assert.rejects(git(origin, 'rev-parse', '--verify', 'refs/heads/factory/dev-add-sub-mul'))
-  await git(repo, 'show-ref', '--verify', '--quiet', 'refs/heads/factory/dev-add-sub-mul')
+  for (const name of ['factory/dev-add-sub-mul', 'factory/merged-review-1', 'factory/task-merged-sub', 'factory/task-merged-mul', 'factory/task-merged-tests'])
+    await assert.rejects(git(repo, 'show-ref', '--verify', '--quiet', `refs/heads/${name}`), name)
+  assert.match(result.report, /^- deleted factory\/dev-add-sub-mul \(merged\)$/m)
+  assert.match(result.report, /^- deleted factory\/merged-review-1 \(applied\)$/m)
+  assert.equal(result.report.match(/factory\/dev-add-sub-mul \(merged\)/g)?.length, 1)
+  assert.ok(result.report.indexOf('<details>') < result.report.indexOf('## Branches'), result.report)
+  assert.ok(result.report.indexOf('## Branches') < result.report.indexOf('</details>'), result.report)
 
   // A resumed run does not merge again and posts no new comment.
   const again = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), input, pulls: github.pulls, runId: 'merged' })
@@ -175,6 +195,9 @@ test('develop: a merge whose branch delete fails keeps the run merged and notes 
   assert.equal(result.status, 'ready', result.report)
   assert.deepEqual(result.merge, { method: 'merge', sha: mergeCommit })
   assert.match(result.report, new RegExp(`^Merged by the host \\(merge\\): ${mergeCommit}\\. The host did not delete the branch factory/dev-add-sub-mul: .+\\.$`, 'm'))
+  // The prune cannot reach origin either: each failed delete is a line of the Branches section, and the note does not repeat in it.
+  assert.match(result.report, /^- not deleted factory\/undeleted-review-1: .+$/m)
+  assert.doesNotMatch(result.report, /deleted factory\/dev-add-sub-mul/)
 })
 
 test('develop: a run that fails a criterion with the merge permission does not merge', { timeout: 120_000 }, async () => {
@@ -250,6 +273,10 @@ test('develop: a run without CI blocks, and the resumed run with CI posts its ne
   assert.ok(first.resume)
   assert.match(first.resume, /^No CI ran on [0-9a-f]{12}\./)
   assert.ok(first.report.includes(first.resume))
+  // A resumable stop is not the end of the run: the development branch and its worktree stay.
+  await git(repo, 'show-ref', '--verify', '--quiet', 'refs/heads/factory/dev-add-sub-mul')
+  assert.ok(existsSync(worktreePath(join(first.dir, 'branches'), 'factory/dev-add-sub-mul')))
+  assert.doesNotMatch(first.report, /^## Branches$/m)
 
   github.state.noCi = false
   const second = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls: github.pulls, runId: 'no-ci' })
@@ -307,6 +334,11 @@ test('develop: a blocked builder stops the run with the reason, before any PR', 
   assert.match(result.report, /Task sub is blocked: sub needs a package that is not installed/)
   assert.equal(github.state.opened.length, 0)
   assert.deepEqual(github.state.merges, [])
+  // Without a PR, the branches of the blocked run are stranded.
+  for (const name of ['factory/dev-add-sub-mul', 'factory/task-blocked-sub', 'factory/task-blocked-mul'])
+    await assert.rejects(git(repo, 'show-ref', '--verify', '--quiet', `refs/heads/${name}`), name)
+  assert.match(result.report, /^- deleted factory\/dev-add-sub-mul \(stranded\)$/m)
+  assert.match(result.report, /^- deleted factory\/task-blocked-sub \(stranded\)$/m)
 })
 
 test('develop: a signing stop after the plan ends the run before any builder and before any commit on the run branch', { timeout: 120_000 }, async () => {
@@ -352,6 +384,7 @@ test('develop: a test command writes outside the task scope, checkpoint refuses,
   const github = fakePulls()
   const result = await runDevelop(repo, runsDir(), {
     runId: 'scope',
+    keep: true,
     pulls: github.pulls,
     dispatch: scriptedDispatch((turn) => {
       if (turn.role !== 'builder' || turn.output !== null || !turn.request.includes('Build task sub:')) return script(turn)
@@ -390,6 +423,7 @@ test('develop: checkpoint refuses an out-of-scope file type change from a test c
   const github = fakePulls()
   const result = await runDevelop(repo, runsDir(), {
     runId: 'type-change',
+    keep: true,
     pulls: github.pulls,
     dispatch: scriptedDispatch((turn) => {
       if (turn.role !== 'builder' || turn.output !== null || !turn.request.includes('Build task sub:')) return script(turn)
@@ -483,6 +517,70 @@ test('develop: at the budget, the run asks with the run totals and a stop ends i
   assert.equal(requests.length, 0)
 })
 
+test('develop: a stop in a build wave waits for a delayed task branch before pruning', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const input = await developInput(repo, 'wave-stop')
+  const github = fakePulls()
+  const deps = await nodeDevelop({
+    channel: memoryChannel().channel,
+    ci: { pollMs: 10, startMs: 1_000, waitMs: 5_000 },
+    credentials,
+    dispatch: scriptedDispatch(developScript(), []),
+    input,
+    log: () => {},
+    module,
+    pulls: github.pulls,
+    repo,
+    reviewChannel: async () => memoryChannel().channel,
+    runsDir: runsDir(),
+  })
+  const created: string[] = []
+  const probed: string[] = []
+  let release = () => {}
+  const createSibling = new Promise<void>((resolve) => { release = resolve })
+  let stopped = () => {}
+  const firstStopped = new Promise<void>((resolve) => { stopped = resolve })
+  const running = develop(input, {
+    ...deps,
+    branches: {
+      ...deps.branches,
+      async branch(name, from) {
+        if (name === 'factory/task-wave-stop-mul') await createSibling
+        const branch = await deps.branches.branch(name, from)
+        if (!name.startsWith('factory/task-wave-stop-')) return branch
+        created.push(name)
+        if (name === 'factory/task-wave-stop-sub') {
+          stopped()
+          throw new BudgetStop('stopped in a build wave')
+        }
+        throw new Error('sibling failed after the budget stop')
+      },
+      async exists(name) {
+        if (name.startsWith('factory/task-wave-stop-')) probed.push(name)
+        return deps.branches.exists(name)
+      },
+    },
+  })
+  await firstStopped
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  const prematureProbes = [...probed]
+  release()
+  const result = await running
+
+  assert.deepEqual(prematureProbes, [])
+  assert.equal(result.status, 'stopped', result.report)
+  assert.equal(result.pr, null)
+  assert.deepEqual(created.sort(), ['factory/task-wave-stop-mul', 'factory/task-wave-stop-sub'])
+  for (const task of ['sub', 'mul']) {
+    const name = `factory/task-wave-stop-${task}`
+    assert.equal(deps.ledger.get(`step:build.${task}`), undefined)
+    await assert.rejects(git(repo, 'show-ref', '--verify', '--quiet', `refs/heads/${name}`), name)
+    assert.ok(result.report.includes(`- deleted ${name} (stranded)`), result.report)
+  }
+  assert.doesNotMatch(result.report, /deleted factory\/task-wave-stop-tests/)
+  assert.equal(github.state.opened.length, 0)
+})
+
 test('develop: a review pass that stops at its budget is not recorded, and a resume with a higher budget runs it again', { timeout: 120_000 }, async () => {
   const { repo } = developRepo()
   const dir = runsDir()
@@ -549,6 +647,9 @@ test('develop: $0.20 of development and $0.70 of review pause at a $0.90 budget,
   assert.equal(requests[0]?.budget, 0.7)
   assert.equal(fileLedger(path).get('step:review.1'), undefined)
   assert.equal(fileLedger(path).get('result'), undefined)
+  // A pause is not the end of the run, so the development branch stays.
+  assert.equal(fileLedger(path).get('prune'), undefined)
+  await git(repo, 'show-ref', '--verify', '--quiet', 'refs/heads/factory/dev-add-sub-mul')
 
   replies[question.batch] = '/answer\nQ1: 1.2'
   const result = await runBudget(repo, dir, { ...options, passes: [{ usd: 0.7, stopped: false }] })

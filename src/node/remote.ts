@@ -5,7 +5,7 @@ import { parseParallel } from '../core/plan.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
 
-const usage = `Usage: npm run remote -- <command> <number> [options]
+const usage = `Usage: npm run remote -- <command> <number or repo> [options]
 
 Drives the Cloudflare Worker without the GitHub webhook.
 
@@ -18,8 +18,10 @@ Commands:
                     print the state of the latest run and the reason (exit 1 when the run does not wake)
   status <number>   Print the runs of the PR or issue
   report <number>   Print the report of the latest run
+  prune <repo>      Delete the factory/* branches that are merged, applied or stranded, and print each deleted,
+                    kept and failed branch (exit 0 also with failed deletes)
 
-<pr>, <issue> and <number> are owner/repo#123, or a GitHub PR or issue URL.
+<pr>, <issue> and <number> are owner/repo#123, or a GitHub PR or issue URL. <repo> is owner/repo, or its GitHub URL.
 
 start and develop also take --budget <usd>, the cost budget of the run in USD. At the budget, the run asks
 on the PR or issue to raise the budget or to stop.
@@ -32,6 +34,48 @@ export function parseTarget(text: string): { owner: string; repo: string; pr: nu
   const match = /^(?:https:\/\/github\.com\/)?([\w.-]+)\/([\w.-]+)(?:#|\/pull\/|\/issues\/)(\d+)\/?$/.exec(text.trim())
   if (!match) throw new StopError(`${text} is not owner/repo#123 or a GitHub PR or issue URL`)
   return { owner: match[1]!, pr: Number(match[3]), repo: match[2]! }
+}
+
+export function parseRepo(text: string): { owner: string; repo: string } {
+  const match = /^(?:https:\/\/github\.com\/)?([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(text.trim())
+  if (!match) throw new StopError(`${text} is not owner/repo or a GitHub repository URL`)
+  return { owner: match[1]!, repo: match[2]! }
+}
+
+/**
+ * Gives the lines and the exit code for a prune response: one line for each deleted, kept and failed branch. A failed
+ * delete does not change the exit code. A failed route, or a body without the three valid lists, gives the raw text and exit code 1.
+ */
+export function pruneOutcome({ ok, text }: { ok: boolean; text: string }): { code: number; text: string } {
+  if (!ok) return { code: 1, text }
+  let body: unknown
+  try {
+    body = JSON.parse(text)
+  } catch {
+    return { code: 1, text }
+  }
+  // The detail is the rule of a deleted branch, else the reason.
+  type Entry = { name: string; detail: string }
+  const list = (key: string, detail: string, valid = (_value: string) => true): Entry[] | null => {
+    const value = typeof body === 'object' && body !== null && key in body ? (body as Record<string, unknown>)[key] : undefined
+    if (!Array.isArray(value)) return null
+    const entries = value.map((item: unknown) => {
+      if (typeof item !== 'object' || item === null) return null
+      const fields = item as Record<string, unknown>
+      const [name, info] = [fields.name, fields[detail]]
+      return typeof name === 'string' && typeof info === 'string' && valid(info) ? { name, detail: info } : null
+    })
+    return entries.every((entry): entry is Entry => entry !== null) ? entries : null
+  }
+  const deleted = list('deleted', 'rule', (rule) => ['merged', 'applied', 'stranded'].includes(rule))
+  const [kept, failed] = [list('kept', 'reason'), list('failed', 'reason')]
+  if (!deleted || !kept || !failed) return { code: 1, text }
+  const lines = [
+    ...deleted.map((branch) => `deleted ${branch.name} (${branch.detail})`),
+    ...kept.map((branch) => `kept ${branch.name}: ${branch.detail}`),
+    ...failed.map((branch) => `failed ${branch.name}: ${branch.detail}`),
+  ]
+  return { code: 0, text: lines.length > 0 ? lines.join('\n') : 'no factory/* branches' }
 }
 
 /**
@@ -94,8 +138,16 @@ async function main(): Promise<number> {
     console.log(usage)
     return values.help ? 0 : 2
   }
-  const { owner, repo, pr } = parseTarget(target)
   if (values.budget !== undefined && command !== 'start' && command !== 'develop') throw new StopError('only start and develop take --budget')
+  if (command === 'prune') {
+    const { owner, repo } = parseRepo(target)
+    const factory = setting('FACTORY_URL').replace(/\/$/, '')
+    const response = await fetch(`${factory}/prune/${owner}/${repo}`, { headers: { authorization: `Bearer ${setting('ADMIN_TOKEN')}` }, method: 'POST' })
+    const outcome = pruneOutcome({ ok: response.ok, text: await response.text() })
+    console.log(outcome.text)
+    return outcome.code
+  }
+  const { owner, repo, pr } = parseTarget(target)
   const budget = values.budget !== undefined ? { budget: parseBudget(values.budget) } : {}
   const factory = setting('FACTORY_URL').replace(/\/$/, '')
   const url = `${factory}/runs/${owner}/${repo}/${pr}`

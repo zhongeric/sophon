@@ -3,6 +3,7 @@ import type { FileSystem } from 'nanocode-ts/bash'
 import type { CiJob } from './ci.ts'
 import type { CheckResult, MergeMethod } from './checks.ts'
 import type { SigningRecord } from './signing.ts'
+import type { PullState } from './prune.ts'
 
 /** The frozen review target. `base` and `head` are commit IDs that `Repo.diff` accepts. */
 export type Frozen = { base: string; head: string; branch: string; location: string }
@@ -24,6 +25,11 @@ export type Repo = {
   head(): Promise<string>
   /** Puts the fixes on the PR branch, without force, and marks the PR ready. */
   ship(target: { pr: number; headRef: string }): Promise<void>
+  pullState(pr: number): Promise<PullState>
+  /** Deletes the fix branch of the run on origin and locally, with its worktree. A branch that is absent counts as deleted. */
+  deleteBranch(): Promise<void>
+  /** Removes the worktree of the run. The branch stays. */
+  release(): Promise<void>
 }
 
 /** A branch in a worktree of its own, where one builder writes. The host commits. */
@@ -55,6 +61,10 @@ export type Branches = {
    * origin counts as deleted, for example when the repository deletes head branches after a merge.
    */
   deleteRemote(name: string): Promise<void>
+  /** Removes the worktree that has the branch, wherever it is, then deletes the local branch. A branch that is absent counts as deleted. */
+  deleteLocal(name: string): Promise<void>
+  /** Removes every worktree of the run. The branches stay. */
+  release(): Promise<void>
 }
 
 /** The result of a merge. GitHub can refuse a merge, for example for a conflict, a changed head or a check that is not green. */

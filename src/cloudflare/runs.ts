@@ -7,6 +7,7 @@ import { githubComments } from './comments.ts'
 import type { DevelopmentRuns } from './develop.ts'
 import { GitHubError, refusedCredential, type GitHub } from './github.ts'
 import { githubAccess, type InstallationTokens } from './github-app.ts'
+import type { State } from './prune.ts'
 import type { PullRequestRuns } from './run.ts'
 import { createTables, sqlFiles, sqlLedger } from './storage.ts'
 
@@ -45,7 +46,6 @@ export type Env = {
   MACHINE_URL?: string
 }
 
-export type State = 'queued' | 'running' | 'paused' | 'passed' | 'failed' | 'error'
 export type RunRow = { run: string; state: State; note: string; created: number; request: string }
 /** The result of `resume`: `state` is the state of the latest run before the call, or null when there is no run. */
 export type ResumeResult = { resumed: boolean; state: State | null; reason: string }
@@ -147,6 +147,14 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     const runs = this.ctx.storage.sql.exec<RunRow>('select run, state, note, created from factory_runs order by created desc').toArray()
     const latest = runs[0]
     return { runs, result: latest ? (sqlLedger(this.ctx.storage.sql, latest.run).get('result') ?? null) : null }
+  }
+
+  /** The state and the ship flag of a run, for the prune of its branches, or null when this object has no such run. */
+  runState(run: string): { state: State; ship: boolean } | null {
+    const row = this.row(run)
+    if (!row) return null
+    const request = JSON.parse(row.request) as { ship?: unknown }
+    return { ship: request.ship === true, state: row.state }
   }
 
   report(run?: string): string | null {

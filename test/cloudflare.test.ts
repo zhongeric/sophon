@@ -78,7 +78,7 @@ test('on Cloudflare, development collects a stopped review before a budget raise
   }
 })
 
-test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, and pushes the fixes', { timeout: 240_000 }, async () => {
+test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, pushes the fixes, and the close of the PR prunes them', { timeout: 240_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
   const worker = await startWorker(vars(mock))
@@ -112,6 +112,17 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
     // Review runs on Cloudflare have no test runner: the agents that run tests elsewhere hear that CI runs them.
     const told = (role: string) => mock.state.turns.some((turn) => turn.role === role && turn.request.includes('This run has no run_tests tool'))
     assert.deepEqual([told('patch'), told('bugs'), told('minimize')], [true, true, false])
+
+    // The sweep keeps the fix branch while the PR is open. The close of the PR prunes it, but never the head branch outside factory/.
+    const fixes = `factory/${started.run}`
+    assert.equal((await fetch(`${worker.url}/prune/acme/app`, { method: 'POST' })).status, 401)
+    const swept = await fetch(`${worker.url}/prune/acme/app`, { headers: { authorization: 'Bearer admin' }, method: 'POST' })
+    assert.equal(swept.status, 200)
+    assert.deepEqual(await swept.json(), { deleted: [], failed: [], kept: [{ name: fixes, reason: 'unapplied review fixes' }] })
+    mock.closePull(7, false)
+    const closed = { action: 'closed', pull_request: { head: { ref: 'feature' }, number: 7 }, repository }
+    assert.deepEqual(await (await sendWebhook(worker.url, secret, 'pull_request', closed)).json(), { deleted: [{ name: fixes, rule: 'stranded' }], failed: [], kept: [] })
+    assert.deepEqual(mock.state.deleted, [fixes])
   } finally {
     worker.stop()
     mock.close()
@@ -391,12 +402,16 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     assert.ok(on(number).some((entry) => entry.body.startsWith('### agent-factory: PASS')), describe())
     assert.ok(on(number).some((entry) => entry.body.startsWith('# Development run: READY')))
 
-    // With the standing permission, the host merged the PR at the head that the final CI checked, then deleted only the run's branch.
+    // With the standing permission, the host merged the PR at the head that the final CI checked. Then it deleted the run's branch, and the
+    // prune deleted the review fix branch, whose fixes the run merged.
     assert.deepEqual(mock.state.merges.map(({ pr, method, sha }) => ({ pr, method, sha })), [{ method: 'squash', pr: number, sha: mock.state.refs.get(branch) }])
     const merged = `Merged by the host (squash): ${mock.state.merges[0]!.commit}.`
     assert.ok(done.body.includes(merged), done.body)
     assert.ok(on(number).some((entry) => entry.body.startsWith('# Development run: READY') && entry.body.includes(merged)))
-    assert.deepEqual(mock.state.deleted, ['factory/dev-add-sub-mul'])
+    assert.equal(mock.state.deleted.length, 2, JSON.stringify(mock.state.deleted))
+    assert.equal(mock.state.deleted[0], 'factory/dev-add-sub-mul')
+    assert.match(mock.state.deleted[1]!, new RegExp(`^factory/pr-${number}-`))
+    assert.match(done.body, new RegExp(`^- deleted factory/pr-${number}-\\S+ \\(applied\\)$`, 'm'))
     assert.deepEqual([mock.fileAt('refs/heads/main', 'src/sub.ts'), mock.fileAt('refs/heads/main', 'src/mul.ts')], [sources.sub, sources.mul])
     const status = (await (await fetch(`${worker.url}/runs/acme/app/5`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: { run: string; state: string }[] }
     assert.deepEqual(status.runs.map((run) => run.state), ['passed'])

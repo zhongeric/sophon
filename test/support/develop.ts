@@ -227,7 +227,8 @@ export async function developInput(repo: string, runId: string, options: { issue
 
 /**
  * Runs the development workflow on the Node platform, with a scripted model, fake PRs and CI, and memory channels. The
- * repository has no usable key. `signing` wraps the signing of the Node platform.
+ * repository has no usable key. `signing` wraps the signing of the Node platform. With `keep`, the local deletes and the
+ * worktree removal do nothing, so that a test can read a worktree after the run.
  */
 export async function runDevelop(
   repo: string,
@@ -240,6 +241,7 @@ export async function runDevelop(
     input?: DevelopInput
     prices?: Prices
     signing?: (signing: Signing) => Signing
+    keep?: boolean
   },
 ) {
   withoutKey(repo)
@@ -258,5 +260,7 @@ export async function runDevelop(
     reviewChannel: async () => memoryChannel().channel,
     runsDir,
   })
-  return { ...(await develop(input, options.signing ? { ...deps, signing: options.signing(deps.signing) } : deps)), dir: deps.dir }
+  const branches = options.keep ? { ...deps.branches, deleteLocal: async () => {}, release: async () => {} } : deps.branches
+  const signed = options.signing ? { ...deps, signing: options.signing(deps.signing) } : deps
+  return { ...(await develop(input, { ...signed, branches })), dir: deps.dir }
 }

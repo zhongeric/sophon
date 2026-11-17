@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Contracts } from 'nanocode-ts'
-import type { Signing } from '../../src/core/platform.ts'
+import type { Repo, Signing } from '../../src/core/platform.ts'
 import type { Credentials } from '../../src/core/providers.ts'
 import { parseAnswers, type Channel, type Question } from '../../src/core/questions.ts'
 import type { Prices } from '../../src/core/usage.ts'
@@ -204,13 +204,14 @@ export async function loopInput(repo: string, runId: string): Promise<LoopInput>
 
 /**
  * Runs the loop on the fixture with the Node platform, a scripted model, and by default a channel that takes every
- * recommendation. `signing` wraps the signing of the Node platform.
+ * recommendation. `signing` wraps the signing of the Node platform. `repo` can replace methods of the Node repo, for example
+ * the GitHub calls.
  */
 export async function runLoop(
   repo: string,
   runId: string,
   runsDir: string,
-  options: { dispatch: Contracts.RuntimeOptions['dispatch']; channel?: Channel; input?: LoopInput; prices?: Prices; budget?: number; signing?: (signing: Signing) => Signing },
+  options: { dispatch: Contracts.RuntimeOptions['dispatch']; channel?: Channel; input?: LoopInput; prices?: Prices; budget?: number; signing?: (signing: Signing) => Signing; repo?: (repo: Repo) => Repo },
 ) {
   const given = options.input ?? (await loopInput(repo, runId))
   const input = options.budget === undefined ? given : { ...given, budget: options.budget }
@@ -224,6 +225,7 @@ export async function runLoop(
     log: () => {},
     module,
     prices: options.prices,
+    repo: options.repo ? options.repo(run.repo) : run.repo,
   })
   return { ...result, dir: run.dir }
 }
