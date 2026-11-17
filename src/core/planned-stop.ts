@@ -9,9 +9,10 @@ export class PlannedStop extends Error {
 const progressPrefixes = ['step:', 'output:', 'report:'] as const
 
 /**
- * The ledger of one host call with a time budget. Its safe point stops the run with a PlannedStop when the budget is
- * spent, but only after the call recorded new work. Thus each call moves the run forward, also with a very small budget.
- * A put of a key that the ledger already holds, for example the report of a replayed journal turn, is not new work.
+ * The ledger of one host call with a time budget. Its safe point stops the run with a PlannedStop when the next work does
+ * not fit in the time that is left, but only after the call recorded new work. Thus each call moves the run forward, also
+ * with a very small budget. A put of a key that the ledger already holds, for example the report of a replayed journal
+ * turn, is not new work.
  */
 export function callBudget(ledger: Ledger, budget: { budgetMs: number; startedAt: number; now?: () => number }): Ledger {
   const now = budget.now ?? Date.now
@@ -23,10 +24,13 @@ export function callBudget(ledger: Ledger, budget: { budgetMs: number; startedAt
       ledger.put(key, value)
       if (fresh) progress = true
     },
-    safePoint() {
+    safePoint(nextMs = 0) {
       const used = now() - budget.startedAt
-      if (progress && used >= budget.budgetMs) throw new PlannedStop(`the call used ${Math.round(used / 1000)} s of its budget of ${Math.round(budget.budgetMs / 1000)} s`)
+      if (!progress || used + nextMs < budget.budgetMs) return
+      const next = nextMs > 0 ? `, and the next turn can take ${Math.round(nextMs / 1000)} s` : ''
+      throw new PlannedStop(`the call used ${Math.round(used / 1000)} s of its budget of ${Math.round(budget.budgetMs / 1000)} s${next}`)
     },
+    timeLeft: () => budget.budgetMs - (now() - budget.startedAt),
   }
 }
 

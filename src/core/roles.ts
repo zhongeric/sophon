@@ -35,6 +35,8 @@ export type Role<Id extends string = string> = {
   egress: boolean
   /** The nanocode subagents of the role. Without this field, the role gets no subagents. */
   subagents?: SubagentLimit | 'unlimited'
+  /** The most wall time that one turn of the role takes. A turn starts only when the alarm call has this much time left (D12). */
+  turnMs: number
 }
 
 /** The limits of the subagents of one root turn. `tokens` counts the input and output tokens of the subagents only. */
@@ -42,6 +44,10 @@ export type SubagentLimit = { concurrent: number; perTurn: number; tokens: numbe
 
 /** RD1 of the research spec: the host bounds the subagents of a research role. */
 const researchSubagents: SubagentLimit = { concurrent: 3, perTurn: 6, tokens: 2_000_000 }
+
+// Each turn time of a review or development role is above the longest turn of the role in the runs of November 2026.
+// The research roles had no runs then: their turn times are estimates.
+const minutes = (count: number) => count * 60_000
 
 /** One workflow's roles: each key is the id of its role. */
 export type RoleTable<Id extends string> = { [Key in Id]: Role<Key> }
@@ -56,6 +62,7 @@ export const reviewRoles: RoleTable<ReviewRoleId> = {
     findings: { track: 'minimize', prefix: 'min' },
     tests: false,
     egress: false,
+    turnMs: minutes(2),
   },
   rules: {
     id: 'rules',
@@ -64,8 +71,9 @@ export const reviewRoles: RoleTable<ReviewRoleId> = {
     findings: { track: 'rules', prefix: 'rules' },
     tests: false,
     egress: false,
+    turnMs: minutes(2),
   },
-  bugs: { id: 'bugs', guides: [...reviewer, 'bugs.md'], stackGuides: true, findings: { track: 'bugs', prefix: 'bugs' }, tests: true, egress: false },
+  bugs: { id: 'bugs', guides: [...reviewer, 'bugs.md'], stackGuides: true, findings: { track: 'bugs', prefix: 'bugs' }, tests: true, egress: false, turnMs: minutes(6) },
   'anti-slop': {
     id: 'anti-slop',
     guides: [...reviewer, 'anti-slop.md', 'shared/ste.md'],
@@ -73,6 +81,7 @@ export const reviewRoles: RoleTable<ReviewRoleId> = {
     findings: { track: 'anti-slop', prefix: 'anti' },
     tests: false,
     egress: false,
+    turnMs: minutes(2),
   },
   'late-minimize': {
     id: 'late-minimize',
@@ -81,6 +90,7 @@ export const reviewRoles: RoleTable<ReviewRoleId> = {
     findings: { track: 'minimize', prefix: 'late-min' },
     tests: false,
     egress: false,
+    turnMs: minutes(2),
   },
   'late-rules': {
     id: 'late-rules',
@@ -89,6 +99,7 @@ export const reviewRoles: RoleTable<ReviewRoleId> = {
     findings: { track: 'rules', prefix: 'late-rules' },
     tests: false,
     egress: false,
+    turnMs: minutes(5),
   },
   'late-bugs': {
     id: 'late-bugs',
@@ -97,17 +108,26 @@ export const reviewRoles: RoleTable<ReviewRoleId> = {
     findings: { track: 'bugs', prefix: 'late-bugs' },
     tests: true,
     egress: false,
+    turnMs: minutes(6),
   },
-  patch: { id: 'patch', guides: ['shared/factory.md', 'patch.md', 'shared/ste.md'], stackGuides: true, tests: true, egress: false },
-  intent: { id: 'intent', guides: ['shared/factory.md', 'intent.md'], stackGuides: false, tests: false, egress: false },
-  questions: { id: 'questions', guides: ['shared/factory.md', 'questions.md'], stackGuides: false, tests: false, egress: false },
-  light: { id: 'light', guides: ['shared/factory.md', 'light.md', 'anti-slop.md', 'shared/ste.md'], stackGuides: true, tests: true, egress: false },
+  patch: { id: 'patch', guides: ['shared/factory.md', 'patch.md', 'shared/ste.md'], stackGuides: true, tests: true, egress: false, turnMs: minutes(6) },
+  intent: { id: 'intent', guides: ['shared/factory.md', 'intent.md'], stackGuides: false, tests: false, egress: false, turnMs: minutes(2) },
+  questions: { id: 'questions', guides: ['shared/factory.md', 'questions.md'], stackGuides: false, tests: false, egress: false, turnMs: minutes(2) },
+  light: {
+    id: 'light',
+    guides: ['shared/factory.md', 'light.md', 'anti-slop.md', 'shared/ste.md'],
+    stackGuides: true,
+    tests: true,
+    egress: false,
+    turnMs: minutes(7),
+  },
 }
 
 export const developRoles: RoleTable<DevelopRoleId> = {
-  intake: { id: 'intake', guides: ['shared/factory.md', 'intake.md'], stackGuides: false, tests: false, egress: false },
-  spec: { id: 'spec', guides: ['shared/factory.md', 'spec.md', 'shared/ste.md'], stackGuides: false, tests: false, egress: false },
-  planner: { id: 'planner', guides: ['shared/factory.md', 'planner.md', 'shared/ste.md'], stackGuides: true, tests: false, egress: false },
+  intake: { id: 'intake', guides: ['shared/factory.md', 'intake.md'], stackGuides: false, tests: false, egress: false, turnMs: minutes(2) },
+  spec: { id: 'spec', guides: ['shared/factory.md', 'spec.md', 'shared/ste.md'], stackGuides: false, tests: false, egress: false, turnMs: minutes(3) },
+  planner: { id: 'planner', guides: ['shared/factory.md', 'planner.md', 'shared/ste.md'], stackGuides: true, tests: false, egress: false, turnMs: minutes(7) },
+  // A builder turn that runs out of time continues in a new turn (D12), so its turn time only keeps it at the start of a call.
   builder: {
     id: 'builder',
     guides: ['shared/factory.md', 'builder.md', 'shared/ste.md'],
@@ -115,11 +135,12 @@ export const developRoles: RoleTable<DevelopRoleId> = {
     tests: true,
     egress: false,
     subagents: 'unlimited',
+    turnMs: minutes(12),
   },
 }
 
 export const researchRoles: RoleTable<ResearchRoleId> = {
-  intake: { id: 'intake', guides: ['shared/factory.md', 'research/intake.md'], stackGuides: false, tests: false, egress: true },
+  intake: { id: 'intake', guides: ['shared/factory.md', 'research/intake.md'], stackGuides: false, tests: false, egress: true, turnMs: minutes(3) },
   surveyor: {
     id: 'surveyor',
     guides: ['shared/factory.md', 'research/surveyor.md'],
@@ -127,22 +148,25 @@ export const researchRoles: RoleTable<ResearchRoleId> = {
     tests: false,
     egress: true,
     subagents: researchSubagents,
+    turnMs: minutes(12),
   },
-  generator: { id: 'generator', guides: ['shared/factory.md', 'research/generator.md'], stackGuides: false, tests: false, egress: true },
+  generator: { id: 'generator', guides: ['shared/factory.md', 'research/generator.md'], stackGuides: false, tests: false, egress: true, turnMs: minutes(7) },
   preregistrar: {
     id: 'preregistrar',
     guides: ['shared/factory.md', 'research/preregistrar.md', 'shared/ste.md'],
     stackGuides: false,
     tests: false,
     egress: false,
+    turnMs: minutes(5),
   },
-  skeptic: { id: 'skeptic', guides: ['shared/factory.md', 'research/skeptic.md'], stackGuides: false, tests: false, egress: false },
+  skeptic: { id: 'skeptic', guides: ['shared/factory.md', 'research/skeptic.md'], stackGuides: false, tests: false, egress: false, turnMs: minutes(5) },
   'late-skeptic': {
     id: 'late-skeptic',
     guides: ['shared/factory.md', 'research/skeptic.md', 'research/late-skeptic.md'],
     stackGuides: false,
     tests: false,
     egress: false,
+    turnMs: minutes(5),
   },
   analyst: {
     id: 'analyst',
@@ -151,8 +175,9 @@ export const researchRoles: RoleTable<ResearchRoleId> = {
     tests: true,
     egress: true,
     subagents: researchSubagents,
+    turnMs: minutes(12),
   },
-  writer: { id: 'writer', guides: ['shared/factory.md', 'research/writer.md', 'shared/ste.md'], stackGuides: false, tests: false, egress: false },
+  writer: { id: 'writer', guides: ['shared/factory.md', 'research/writer.md', 'shared/ste.md'], stackGuides: false, tests: false, egress: false, turnMs: minutes(7) },
   builder: developRoles.builder,
 }
 

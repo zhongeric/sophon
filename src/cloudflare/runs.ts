@@ -46,7 +46,7 @@ export type Env = {
   MODEL_PRICES?: string
   CI_TIMEOUT_MINUTES?: string
   PAUSE_POLL_SECONDS?: string
-  /** The wall time in seconds of one alarm call before the run stops at a safe point and continues in the next call. Default: 480. */
+  /** The wall time in seconds that one alarm call plans for. A turn starts only when it fits, and its commands end by then. Default: 780. */
   ALARM_BUDGET_SECONDS?: string
   /** Endpoint overrides, for gateways and for local tests. */
   GITHUB_API_URL?: string
@@ -257,7 +257,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     const start = async (): Promise<RunMachine> => {
       const syncs = sqlSyncs(this.ctx.storage.sql, run)
       const box = this.box(syncs)
-      const jobs = jobRunner(box, ledger)
+      const jobs = jobRunner(box, ledger, { deadline })
       await jobs.killStale()
       return { box, jobs, syncs }
     }

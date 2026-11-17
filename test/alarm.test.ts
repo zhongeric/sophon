@@ -65,7 +65,7 @@ test('initCounters sets absent counters to 0 and keeps present ones', () => {
   assert.deepEqual([ledger.get(plannedStopsKey), ledger.get(crashRestartsKey)], [3, 0])
 })
 
-test('alarmBudgetMs parses ALARM_BUDGET_SECONDS, and falls back to 480 s for a value that is not valid', () => {
-  for (const value of [undefined, '', 'abc', '0', '-5']) assert.equal(alarmBudgetMs(value), 480_000, String(value))
+test('alarmBudgetMs parses ALARM_BUDGET_SECONDS, and falls back to 780 s for a value that is not valid', () => {
+  for (const value of [undefined, '', 'abc', '0', '-5']) assert.equal(alarmBudgetMs(value), 780_000, String(value))
   assert.equal(alarmBudgetMs('2'), 2_000)
 })
