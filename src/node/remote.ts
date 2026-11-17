@@ -122,10 +122,8 @@ export function setting(name: string): string {
   return value
 }
 
-/** The options of the command line. */
 export type RemoteOptions = { base?: string; budget?: string; full?: boolean; hotfix?: boolean; parallel?: string; ship?: boolean }
 
-/** A request to the Worker. */
 export type RemoteRequest = { body?: string; method: 'GET' | 'POST'; path: string }
 
 /** Checks the options of a command and gives its request to the Worker. A bad option stops before any network call. */

@@ -259,29 +259,27 @@ test('exit code 137 before the time limit is a kill, not a timeout', async () =>
   assert.match(timedOut.output, /killed after 60000 ms/)
 })
 
-test('a clean box copies only the tree, runs the setup once, and runs its commands in the directory without a sync', async () => {
+test('a clean box copies only the tree, runs no setup, and runs its commands in the directory without a sync', async () => {
   const root = mkdtempSync(join(tmpdir(), 'factory-clean-'))
   const commands: string[] = []
   const lines: string[] = []
   const tree = MemoryFileSystem.create({ files: { '/.git/HEAD': 'ref', '/a.txt': 'a', '/src/b.ts': 'b' } })
-  const box = await cleanBox(localBox(root, commands), tree, 'clean-1', { command: 'echo run >> setup.log', timeoutMs: 60_000 }, (line) => lines.push(line))
+  const box = await cleanBox(localBox(root, commands), tree, 'clean-1', (line) => lines.push(line))
   const dir = join(root, 'clean-1')
 
-  assert.deepEqual(readdirSync(dir).sort(), ['a.txt', 'setup.log', 'src'])
+  assert.deepEqual(readdirSync(dir).sort(), ['a.txt', 'src'])
   assert.equal(readFileSync(join(dir, 'src/b.ts'), 'utf8'), 'b')
+  assert.equal(lines.length, 1)
+  assert.match(lines[0] ?? '', /^sync clean-1: full, 2 files sent in \d+ ms$/)
   commands.length = 0
-  assert.deepEqual(await box.run('cat a.txt setup.log && pwd -P', { env: [], timeoutMs: 60_000 }), { exit_code: 0, output: `arun\n${realpathSync(dir)}\n` })
-  assert.deepEqual(commands, ['bash -c cat a.txt setup.log && pwd -P'])
-  assert.equal(readFileSync(join(dir, 'setup.log'), 'utf8'), 'run\n')
-  assert.match(lines.at(-1) ?? '', /^setup clean-1: pass, 2 files in \d+ ms$/)
-
-  await assert.rejects(cleanBox(localBox(root, []), tree, 'clean-2', { command: 'echo broken && exit 1', timeoutMs: 60_000 }, () => {}), /the setup command failed: broken/)
+  assert.deepEqual(await box.run('cat a.txt && pwd -P', { env: [], timeoutMs: 60_000 }), { exit_code: 0, output: `a${realpathSync(dir)}\n` })
+  assert.deepEqual(commands, ['bash -c cat a.txt && pwd -P'])
 })
 
 test('a clean box reads the exact bytes of a file, and refuses a path outside its directory or a missing file', async () => {
   const root = mkdtempSync(join(tmpdir(), 'factory-clean-'))
   const tree = MemoryFileSystem.create({ files: { '/a.txt': 'a' } })
-  const box = await cleanBox(localBox(root, []), tree, 'clean-1', { command: undefined, timeoutMs: 60_000 }, () => {})
+  const box = await cleanBox(localBox(root, []), tree, 'clean-1', () => {})
   const dir = join(root, 'clean-1')
   const binary = Uint8Array.from({ length: 256 }, (_, index) => index)
   // Over two chunks, with every byte value, so that a wrong offset or a lost byte changes the result.

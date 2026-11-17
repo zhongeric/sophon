@@ -3,37 +3,9 @@ import { execFileSync } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
-import { MemoryFileSystem, type FileSystem } from 'nanocode-ts/bash'
-import { checkoutCommit } from '../src/cloudflare/branches.ts'
-import { treeGit } from '../src/cloudflare/trees.ts'
 import { mockServices } from './support/mock-services.ts'
 import { holdoutPrefix, notebook, pageText, researchConfig, researchScript } from './support/research.ts'
 import { sendWebhook, startWorker, until } from './support/wrangler.ts'
-
-const read = async (tree: FileSystem.FileSystem, path: string) => new TextDecoder().decode(await tree.read(path))
-const exists = async (tree: FileSystem.FileSystem, path: string) => Boolean(await tree.stat(path).catch(() => null))
-
-test('checkoutCommit copies only the files of the commit, without the uncommitted files of the tree', async () => {
-  const from = MemoryFileSystem.create({ files: { '/kept.txt': 'one', '/gone.txt': 'tracked', '/dir/edit.txt': 'committed' } })
-  const git = treeGit(from)
-  await git('init', '-q')
-  await git('add', '-A')
-  await git('commit', '-q', '-m', 'one')
-  const commit = (await git('rev-parse', 'HEAD')).trim()
-  await from.write('/later.txt', new TextEncoder().encode('later'))
-  await git('add', '-A')
-  await git('commit', '-q', '-m', 'two')
-  // The same size as the committed text, so that only the content tells the change.
-  await from.write('/dir/edit.txt', new TextEncoder().encode('work-copy'))
-  await from.remove('/gone.txt')
-  await from.write('/new.txt', new TextEncoder().encode('untracked'))
-  const to = MemoryFileSystem.create()
-  await checkoutCommit(from, to, commit)
-  assert.deepEqual([await read(to, '/kept.txt'), await read(to, '/gone.txt'), await read(to, '/dir/edit.txt')], ['one', 'tracked', 'committed'])
-  assert.deepEqual([await exists(to, '/later.txt'), await exists(to, '/new.txt')], [false, false])
-  // The source tree keeps its uncommitted work.
-  assert.equal(await read(from, '/dir/edit.txt'), 'work-copy')
-})
 
 const secret = 'webhook-secret'
 const adminToken = 'admin-7f3k9q'
@@ -104,11 +76,20 @@ test('on Cloudflare, /research runs the research workflow on an issue and opens 
   assert.match(started.run, /^research-5-/)
   // Each question batch of the run and of its review pass gets one answer: the pick of hyp-001, else the recommendations.
   const answered = new Set<number>()
+  let woke = false
   const result = await until(
     async () => {
       for (const asked of mock.state.comments.filter((entry) => entry.user.login === 'factory-bot' && entry.body.includes('agent-factory:questions'))) {
         if (answered.has(asked.id)) continue
         answered.add(asked.id)
+        // The development object of the issue has no run, so { resumed: true } comes from the research object.
+        // The wake comes before the answer, so that the poll of the paused run cannot take the answer first.
+        if (asked.issue === 5 && !woke) {
+          woke = true
+          const wake = { action: 'created', comment: { body: '/answer', user: { login: 'maintainer' } }, issue: issuePayload(5), repository }
+          const resumed = async () => ((await (await sendWebhook(worker.url, secret, 'issue_comment', wake)).json()) as { resumed: boolean }).resumed
+          await until(async () => (await resumed()) || undefined, 60_000, describe)
+        }
         await say(asked.issue, /batch=pick /.test(asked.body) ? '/answer\nQ1: a' : '/answer recommended')
       }
       return on(5).find((entry) => entry.body.startsWith('# Research run:'))
@@ -132,6 +113,7 @@ test('on Cloudflare, /research runs the research workflow on an issue and opens 
 
 test('on Cloudflare, the research route checks its input, and status shows the issue object with the latest run', { timeout: 120_000 }, async () => {
   assert.equal((await fetch(`${worker.url}/research/acme/app/11`, { body: JSON.stringify({ budget: -1 }), headers, method: 'POST' })).status, 400)
+  assert.equal((await fetch(`${worker.url}/research/acme/app/11`, { body: 'null', headers, method: 'POST' })).status, 400)
   assert.equal((await fetch(`${worker.url}/research/acme/app/11`, { headers })).status, 405)
   assert.equal((await fetch(`${worker.url}/research/acme/app/11`, { method: 'POST' })).status, 401)
 

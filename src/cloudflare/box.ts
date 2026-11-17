@@ -249,9 +249,6 @@ export function boxMachine(box: Box, dir: string, sync: () => Promise<void>): Ma
   }
 }
 
-/** A machine on a clean checkout of a commit, with read access to the files that its commands write. */
-export type CleanBox = Machine & { read(path: string): Promise<Uint8Array> }
-
 // The base64 text of one chunk has 19,200 characters, so the output tail of a command always holds all of it.
 const readChunkBytes = 14_400
 
@@ -262,27 +259,20 @@ const readChunkBytes = 14_400
 const resolveFile = 'root=$(realpath .) && file=$(realpath -- "$1" 2>/dev/null) || exit 3; case "$file" in "$root"/*) ;; *) exit 4 ;; esac; test -f "$file" || exit 3'
 
 /**
- * Copies `tree`, which holds only the files of a commit, to the new directory `dir` of the machine, and runs the setup
- * there. Commands of the result run in `dir` without a sync. `read` gives the exact bytes of a file in `dir`, also
- * of a binary file, in base64 chunks.
+ * Copies `tree`, which holds only the files of a commit, to the new directory `dir` of the machine. Commands of the
+ * result run in `dir` without a sync. runDomainCommand runs the setup, so it does not run here. `read` gives the exact
+ * bytes of a file in `dir`, also of a binary file, in base64 chunks.
  */
 export async function cleanBox(
   box: Box,
   tree: FileSystem.FileSystem,
   dir: string,
-  setup: { command: string | undefined; timeoutMs: number },
   log: (line: string) => void,
-): Promise<CleanBox> {
+): Promise<Machine & { read(path: string): Promise<Uint8Array> }> {
   await box.start()
   const started = Date.now()
   const files = await syncTree(box, tree, dir, null)
   log(`sync ${dir}: full, ${files.size} files sent in ${Date.now() - started} ms`)
-  if (setup.command) {
-    const setupStarted = Date.now()
-    const result = await box.exec(['bash', '-c', setup.command], { cwd: dir, env: boxEnv, timeoutMs: setup.timeoutMs })
-    log(`setup ${dir}: ${result.exit_code === 0 ? 'pass' : 'fail'}, ${files.size} files in ${Date.now() - setupStarted} ms`)
-    if (result.exit_code !== 0) throw new Error(`the setup command failed: ${result.output.slice(-2000)}`)
-  }
   // Each command checks the path again, because a command of the run can replace a directory with a symlink.
   const readFile = async (path: string, script: string, args: string[]): Promise<string> => {
     const result = await box.exec(['bash', '-c', `${resolveFile}; ${script}`, 'bash', path, ...args], { cwd: dir, env: boxEnv, timeoutMs: 60_000 })

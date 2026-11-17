@@ -81,7 +81,7 @@ export class ResearchRuns extends Runs<ResearchRequest> {
           if (previous.exit_code !== 0) throw new Error(`the removal of clean checkout ${count - 1} failed: ${previous.output.slice(-2000)}`)
         }
         const tree = await commitTree({ ledger, run, sql }, commit)
-        return cleanBox(box, tree, `clean/${run}/${count}`, { command: config.setup, timeoutMs: setupTimeoutMs }, log)
+        return cleanBox(box, tree, `clean/${run}/${count}`, log)
       },
       config,
       credentials: credentialsFor(this.env, researchProviders(input.models)),

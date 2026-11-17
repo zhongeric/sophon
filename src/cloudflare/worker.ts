@@ -1,5 +1,5 @@
 import { DevelopmentRuns, type DevelopRequest } from './develop.ts'
-import { ResearchRuns, type ResearchRequest } from './research.ts'
+import { ResearchRuns } from './research.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
 import { sameSecret, verifySignature } from './github.ts'
@@ -56,12 +56,6 @@ function developOptions(source: { base?: unknown; hotfix?: unknown; full?: unkno
   }
 }
 
-/** The options of a research run, from the admin route's body or from the words after /research. */
-function researchOptions(source: { base?: unknown; parallel?: unknown }): Pick<ResearchRequest, 'base' | 'parallel'> {
-  const { base, parallel } = developOptions(source)
-  return { ...(base ? { base } : {}), ...(parallel ? { parallel } : {}) }
-}
-
 const commandOptions = (text: string): DevelopOptions =>
   developOptions({
     base: /--base\s+(\S+)/.exec(text)?.[1],
@@ -69,6 +63,13 @@ const commandOptions = (text: string): DevelopOptions =>
     hotfix: /--hotfix\b/.test(text),
     parallel: /--parallel\s+(\d+)/.exec(text)?.[1],
   })
+
+/** The JSON body of an admin start route. An empty body gives no options, and a body that is not an object gives 400. */
+async function bodyOf(request: Request): Promise<Record<string, unknown> | Response> {
+  const body: unknown = await request.json().catch(() => ({}))
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return new Response('the body must be a JSON object', { status: 400 })
+  return body as Record<string, unknown>
+}
 
 /** The cost budget of an admin start route. The comment commands and the labels do not take a budget. */
 function budgetOf(body: Record<string, unknown>): { budget?: number } | Response {
@@ -98,21 +99,25 @@ export default {
     const by = allowedUsers(env)[0] ?? owner
     if (kind === 'develop') {
       if (request.method !== 'POST' || action) return new Response('method not allowed', { status: 405 })
-      const options = (await request.json().catch(() => ({}))) as Record<string, unknown>
+      const options = await bodyOf(request)
+      if (options instanceof Response) return options
       const budget = budgetOf(options)
       if (budget instanceof Response) return budget
       return accepted(await issue(env, owner, repo, Number(number)).start({ by, issue: Number(number), owner, repo, ...developOptions(options), ...budget }))
     }
     if (kind === 'research') {
       if (request.method !== 'POST' || action) return new Response('method not allowed', { status: 405 })
-      const options = (await request.json().catch(() => ({}))) as Record<string, unknown>
+      const options = await bodyOf(request)
+      if (options instanceof Response) return options
       const budget = budgetOf(options)
       if (budget instanceof Response) return budget
-      return accepted(await research(env, owner, repo, Number(number)).start({ by, issue: Number(number), owner, repo, ...researchOptions(options), ...budget }))
+      const { base, parallel } = developOptions(options)
+      return accepted(await research(env, owner, repo, Number(number)).start({ by, issue: Number(number), owner, repo, base, parallel, ...budget }))
     }
     const pr = Number(number)
     if (request.method === 'POST' && !action) {
-      const options = (await request.json().catch(() => ({}))) as Record<string, unknown>
+      const options = await bodyOf(request)
+      if (options instanceof Response) return options
       const budget = budgetOf(options)
       if (budget instanceof Response) return budget
       return accepted(await pullRequest(env, owner, repo, pr).start({ by, full: options.full === true, owner, pr, repo, ship: options.ship === true, ...budget }))
@@ -145,9 +150,8 @@ type Payload = {
  * GitHub webhooks: `/review` and the agent-review label start a review run on a PR, `/develop` and the agent-develop
  * label start a development run on an issue, `/research` and the agent-research label start a research run on an issue,
  * and `/answer` and CI results (workflow runs, statuses) wake a paused run. An `/answer` on an issue wakes its
- * development run and its research run. A
- * closed PR prunes its factory/* head branch and its review fix branches. Other comment, issue and PR events of the App
- * bot do nothing, so that the posts of a run do not start or wake runs.
+ * development run and its research run. A closed PR prunes its factory/* head branch and its review fix branches. Other
+ * comment, issue and PR events of the App bot do nothing, so that the posts of a run do not start or wake runs.
  */
 async function webhook(request: Request, env: Env): Promise<Response> {
   const body = await request.text()
@@ -178,7 +182,10 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       const runs = issue(env, owner, repo, number)
       const researches = research(env, owner, repo, number)
       if (/^\/develop\b/.test(text)) return accepted(await runs.start({ by, issue: number, owner, repo, ...commandOptions(text) }))
-      if (/^\/research\b/.test(text)) return accepted(await researches.start({ by, issue: number, owner, repo, ...researchOptions(commandOptions(text)) }))
+      if (/^\/research\b/.test(text)) {
+        const { base, parallel } = commandOptions(text)
+        return accepted(await researches.start({ by, issue: number, owner, repo, base, parallel }))
+      }
       if (/^\/answer\b/.test(text)) {
         const [developed, researched] = await Promise.all([runs.resume(), researches.resume()])
         return accepted({ resumed: developed.resumed || researched.resumed })
