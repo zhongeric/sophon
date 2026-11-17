@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import type { SqlValue } from '../src/cloudflare/artifacts.ts'
-import { boxMachine, containerBox, SetupError, syncTree, syncWithSetup, type Box } from '../src/cloudflare/box.ts'
+import { artifactSizeLimit } from '../src/core/artifacts.ts'
+import { boxMachine, cleanBox, containerBox, SetupError, syncTree, syncWithSetup, type Box } from '../src/cloudflare/box.ts'
 import { reviewChecker } from '../src/cloudflare/checker.ts'
 import { createSyncTables, sqlSyncs, type SyncSql } from '../src/cloudflare/syncs.ts'
 import { commandChecker } from '../src/core/checks.ts'
@@ -277,4 +278,52 @@ test('exit code 137 before the time limit is a kill, not a timeout', async () =>
   const timedOut = await containerBox(localContainer(root, 124), { inactivityMs: 60_000, onStart: () => {} }).exec(['true'], { cwd: '', env: {}, timeoutMs: 60_000 })
   assert.equal(timedOut.exit_code, null)
   assert.match(timedOut.output, /killed after 60000 ms/)
+})
+
+test('a clean box copies only the tree, runs no setup, and runs its commands in the directory without a sync', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'factory-clean-'))
+  const commands: string[] = []
+  const lines: string[] = []
+  const tree = MemoryFileSystem.create({ files: { '/.git/HEAD': 'ref', '/a.txt': 'a', '/src/b.ts': 'b' } })
+  const box = await cleanBox(localBox(root, commands), tree, 'clean-1', (line) => lines.push(line))
+  const dir = join(root, 'clean-1')
+
+  assert.deepEqual(readdirSync(dir).sort(), ['a.txt', 'src'])
+  assert.equal(readFileSync(join(dir, 'src/b.ts'), 'utf8'), 'b')
+  assert.equal(lines.length, 1)
+  assert.match(lines[0] ?? '', /^sync clean-1: full, 2 files sent in \d+ ms$/)
+  commands.length = 0
+  assert.deepEqual(await box.run('cat a.txt && pwd -P', { env: [], timeoutMs: 60_000 }), { exit_code: 0, output: `a${realpathSync(dir)}\n` })
+  assert.deepEqual(commands, ['bash -c cat a.txt && pwd -P'])
+})
+
+test('a clean box reads the exact bytes of a file, and refuses a path outside its directory or a missing file', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'factory-clean-'))
+  const tree = MemoryFileSystem.create({ files: { '/a.txt': 'a' } })
+  const box = await cleanBox(localBox(root, []), tree, 'clean-1', () => {})
+  const dir = join(root, 'clean-1')
+  const binary = Uint8Array.from({ length: 256 }, (_, index) => index)
+  // Over two chunks, with every byte value, so that a wrong offset or a lost byte changes the result.
+  const large = Uint8Array.from({ length: 40_000 }, (_, index) => (index * 7 + (index >> 8)) % 256)
+  mkdirSync(join(dir, 'out'))
+  writeFileSync(join(dir, 'out/binary.bin'), binary)
+  writeFileSync(join(dir, 'out/large.bin'), large)
+  writeFileSync(join(dir, 'empty'), '')
+  writeFileSync(join(root, 'x'), 'outside')
+  symlinkSync(join(root, 'x'), join(dir, 'link'))
+  symlinkSync('out/binary.bin', join(dir, 'inside'))
+
+  assert.deepEqual(await box.read('out/binary.bin'), binary)
+  assert.deepEqual(await box.read('./out/large.bin'), large)
+  assert.deepEqual(await box.read('inside'), binary)
+  assert.deepEqual(await box.read('empty'), new Uint8Array())
+  await assert.rejects(box.read('../x'), /read \.\.\/x: the path is not relative to clean-1/)
+  await assert.rejects(box.read('out/../../x'), /not relative/)
+  await assert.rejects(box.read('/etc/passwd'), /read \/etc\/passwd: the path is not relative to clean-1/)
+  await assert.rejects(box.read('link'), /read link: the path resolves outside clean-1/)
+  await assert.rejects(box.read('out/missing.bin'), /read out\/missing\.bin: no such file in clean-1/)
+  await assert.rejects(box.read('out'), /read out: no such file/)
+  writeFileSync(join(dir, 'huge.bin'), '')
+  truncateSync(join(dir, 'huge.bin'), artifactSizeLimit + 1)
+  await assert.rejects(box.read('huge.bin'), new RegExp(`read huge.bin: the file has ${artifactSizeLimit + 1} bytes, over the limit`))
 })

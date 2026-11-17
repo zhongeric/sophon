@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { parseRepo, parseTarget, pruneOutcome, resumeOutcome } from '../src/node/remote.ts'
+import { parseRepo, parseTarget, pruneOutcome, remoteRequest, resumeOutcome } from '../src/node/remote.ts'
 
 test('a PR or an issue is owner/repo#number or its GitHub URL', () => {
   assert.deepEqual(parseTarget('acme/app#7'), { owner: 'acme', pr: 7, repo: 'app' })
@@ -68,4 +68,39 @@ test('prune exits 1 and prints the raw text when the route fails or the body is 
     '{"deleted":[],"kept":[],"failed":[{"name":"factory/a"}]}',
   ])
     assert.deepEqual(pruneOutcome({ ok: true, text }), { code: 1, text })
+})
+
+test('research posts the base, the parallel count and the budget to the research route of the issue', () => {
+  const request = remoteRequest('research', 'acme/app#45', { base: 'main', budget: '12.5', parallel: '3' })
+  assert.deepEqual(request, { body: '{"base":"main","parallel":3,"budget":12.5}', method: 'POST', path: '/research/acme/app/45' })
+  assert.deepEqual(JSON.parse(remoteRequest('research', 'https://github.com/acme/app/issues/45', {}).body ?? ''), {})
+})
+
+test('research refuses --hotfix, --full and --ship', () => {
+  for (const flag of ['hotfix', 'full', 'ship'] as const)
+    assert.throws(() => remoteRequest('research', 'acme/app#45', { [flag]: true }), { message: `research does not take --${flag}`, name: 'StopError' })
+})
+
+test('research refuses a --parallel of 0 and one that is not a number', () => {
+  for (const parallel of ['0', 'two']) assert.throws(() => remoteRequest('research', 'acme/app#45', { parallel }), /--parallel must be an integer of 1 or more/)
+})
+
+test('only start, develop and research take --budget', () => {
+  assert.throws(() => remoteRequest('status', 'acme/app#45', { budget: '5' }), /only start, develop and research take --budget/)
+  assert.equal(JSON.parse(remoteRequest('develop', 'acme/app#45', { budget: '5' }).body ?? '').budget, 5)
+  assert.equal(JSON.parse(remoteRequest('start', 'acme/app#7', { budget: '5' }).body ?? '').budget, 5)
+})
+
+test('the other commands keep their requests', () => {
+  assert.deepEqual(remoteRequest('develop', 'acme/app#45', { base: 'dev', hotfix: true, parallel: '2' }), {
+    body: '{"base":"dev","full":false,"hotfix":true,"parallel":2}',
+    method: 'POST',
+    path: '/develop/acme/app/45',
+  })
+  assert.deepEqual(remoteRequest('start', 'acme/app#7', { ship: true }), { body: '{"full":false,"ship":true}', method: 'POST', path: '/runs/acme/app/7' })
+  assert.deepEqual(remoteRequest('status', 'acme/app#7', {}), { method: 'GET', path: '/runs/acme/app/7' })
+  assert.deepEqual(remoteRequest('report', 'acme/app#7', {}), { method: 'GET', path: '/runs/acme/app/7/report' })
+  assert.deepEqual(remoteRequest('resume', 'acme/app#7', {}), { method: 'POST', path: '/runs/acme/app/7/resume' })
+  assert.deepEqual(remoteRequest('prune', 'acme/app', {}), { method: 'POST', path: '/prune/acme/app' })
+  assert.throws(() => remoteRequest('toString', 'acme/app#7', {}), /unknown command toString/)
 })

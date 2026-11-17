@@ -1,7 +1,7 @@
 # Spec: the research workflow
 
-Status: part 1 (stages 0 to 4) and part 2 (stages 5, 6, 9 and 11) of R1 are built on the local platform. Cloudflare
-comes later. Section 11 is the build plan.
+Status: R1 is built, on the local platform and on Cloudflare: part 1 (stages 0 to 4) and part 2 (stages 5, 6, 9
+and 11). Section 11 is the build plan.
 
 This spec defines a third workflow of agent-factory: the **research workflow**. A swarm of agents reads large public
 data, makes hypotheses, tests them, and reports a candidate or a calibrated null. The design is domain-neutral. A
@@ -194,8 +194,14 @@ as profile guides do today.
 
 ## 7. Platforms
 
-- **Cloudflare first.** One `ResearchRuns` object per program holds the ledger, the sessions and the artifacts. The
-  box is the run's container, as for development runs.
+- **Cloudflare first.** One `ResearchRuns` Durable Object for each program issue holds the ledger, the sessions and
+  the artifacts. The run ID is `research-<issue>-<stamp>`.
+  - The box is the build container of the object, as for development runs. The calibration and `reproduce` run in a
+    new clean checkout of the commit in the same container.
+  - The agent egress is an `EgressHost` over the artifacts of the object. Archive credentials come from Worker secrets.
+    A credential with the name of a host secret or of a Worker setting stops the run before the first fetch.
+  - Three start paths: a `/research` comment or the `agent-research` label on a notebook issue,
+    `POST /research/<owner>/<repo>/<issue>`, and `npm run remote -- research <issue>`.
 - **Local** runs the same workflow, for tests and for development of the workflow.
 - **Large sweeps** go to a larger container.
 - **No mirrors.** Runs fetch queries, cutouts and per-target data. A program never copies a whole archive.
@@ -249,7 +255,7 @@ as profile guides do today.
 | Phase | Scope | Exit |
 | --- | --- | --- |
 | R0 | The core changes of section 6.2, with the holdout lock for agents. | Each rail has tests. A scripted run fetches through the egress and cites an artifact. |
-| R1 | The research workflow on Cloudflare: stages 0 to 6, 9 and 11, per-target analysis, no sweep and no holdout test. Part 1 builds stages 0 to 4 locally, with the CLI `src/node/research.ts`. Part 2 builds stages 5, 6, 9 and 11 locally: the build, the calibration in two rounds at most, the vet, the dossier, `reproduce` on a clean checkout, and the dossier PR with one pass of the code review loop. | A notebook run recovers a known set blind, with a completeness curve, in a dossier PR. |
+| R1 | The research workflow on Cloudflare: stages 0 to 6, 9 and 11, per-target analysis, no sweep and no holdout test. Part 1 builds stages 0 to 4 locally, with the CLI `src/node/research.ts`. Part 2 builds stages 5, 6, 9 and 11 locally: the build, the calibration in two rounds at most, the vet, the dossier, `reproduce` on a clean checkout, and the dossier PR with one pass of the code review loop. Part 3 runs R1 on Cloudflare (section 7): `ResearchRuns`, the Worker egress and the three start paths. | A notebook run recovers a known set blind, with a completeness curve, in a dossier PR. |
 | R2 | The sweep, the screeners, the holdout test (stage 10) and the trial count. | A program over thousands of targets ends in a vetted top few or a calibrated null. |
 | R3 | Submission with a `/go`. | One submission that the user approved. |
 | R4 | Scout: the domain's feeds, the weekly digest and proposal issues. | Four weekly digests, and one proposal that the user takes. |

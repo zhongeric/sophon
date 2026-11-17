@@ -277,6 +277,8 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
     assert.match(await refused.text(), /budget must be a positive number/)
     const refusedDevelop = await fetch(`${worker.url}/develop/acme/app/5`, { body: JSON.stringify({ budget: 'abc' }), headers: admin, method: 'POST' })
     assert.equal(refusedDevelop.status, 400)
+    assert.equal((await fetch(`${worker.url}/develop/acme/app/5`, { body: 'null', headers: admin, method: 'POST' })).status, 400)
+    assert.equal((await fetch(`${worker.url}/runs/acme/app/7`, { body: 'null', headers: admin, method: 'POST' })).status, 400)
     for (const number of [5, 7]) {
       const status = (await (await fetch(`${worker.url}/runs/acme/app/${number}`, { headers: admin })).json()) as { runs: unknown[] }
       assert.deepEqual(status.runs, [])

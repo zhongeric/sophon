@@ -1,5 +1,6 @@
 import type { Machine } from '../core/checks.ts'
 import type { FileSystem } from 'nanocode-ts/bash'
+import { artifactSizeLimit } from '../core/artifacts.ts'
 import { tar, type TarEntry } from './tar.ts'
 
 /** The result of one command: its exit code, or null when the host killed it, and the end of its output. */
@@ -256,6 +257,67 @@ export function boxMachine(box: Box, dir: string, sync: () => Promise<void>): Ma
     async run(command, { timeoutMs }) {
       await sync()
       return box.exec(['bash', '-c', command], { cwd: dir, env: boxEnv, timeoutMs })
+    },
+  }
+}
+
+// The base64 text of one chunk has 19,200 characters, so the output tail of a command always holds all of it.
+const readChunkBytes = 14_400
+
+/**
+ * The shell code that resolves the path in $1 in the working directory. It exits 3 when there is no file, and 4 when
+ * the path, or a symlink in it, resolves outside the directory.
+ */
+const resolveFile = 'root=$(realpath .) && file=$(realpath -- "$1" 2>/dev/null) || exit 3; case "$file" in "$root"/*) ;; *) exit 4 ;; esac; test -f "$file" || exit 3'
+
+/**
+ * Copies `tree`, which holds only the files of a commit, to the new directory `dir` of the machine. Commands of the
+ * result run in `dir` without a sync. runDomainCommand runs the setup, so it does not run here. `read` gives the exact
+ * bytes of a file in `dir`, also of a binary file, in base64 chunks.
+ */
+export async function cleanBox(
+  box: Box,
+  tree: FileSystem.FileSystem,
+  dir: string,
+  log: (line: string) => void,
+): Promise<Machine & { read(path: string): Promise<Uint8Array> }> {
+  await box.start()
+  const started = Date.now()
+  const files = await syncTree(box, tree, dir, null)
+  log(`sync ${dir}: full, ${files.size} files sent in ${Date.now() - started} ms`)
+  // Each command checks the path again, because a command of the run can replace a directory with a symlink.
+  const readFile = async (path: string, script: string, args: string[]): Promise<string> => {
+    const result = await box.exec(['bash', '-c', `${resolveFile}; ${script}`, 'bash', path, ...args], { cwd: dir, env: boxEnv, timeoutMs: 60_000 })
+    if (result.exit_code === 3) throw new Error(`read ${path}: no such file in ${dir}`)
+    if (result.exit_code === 4) throw new Error(`read ${path}: the path resolves outside ${dir}`)
+    if (result.exit_code !== 0) throw new Error(`read ${path} failed: ${result.output.slice(-2000)}`)
+    return result.output
+  }
+  return {
+    run: (command, { timeoutMs }) => box.exec(['bash', '-c', command], { cwd: dir, env: boxEnv, timeoutMs }),
+    async read(path) {
+      let depth = 0
+      for (const part of path.split('/')) {
+        if (part === '..') depth -= 1
+        else if (part !== '' && part !== '.') depth += 1
+        if (depth < 0) break
+      }
+      if (path.startsWith('/') || depth < 0) throw new Error(`read ${path}: the path is not relative to ${dir}`)
+      // The output can hold other lines, for example warnings on stderr, so each value comes after a marker.
+      const sized = await readFile(path, 'printf "size=%s\\n" "$(wc -c < "$file")"', [])
+      const size = Number(/^size=\s*(\d+)\s*$/m.exec(sized)?.[1])
+      if (!Number.isSafeInteger(size)) throw new Error(`read ${path}: no size for the file in the output ${JSON.stringify(sized.slice(-300))}`)
+      if (size > artifactSizeLimit) throw new Error(`read ${path}: the file has ${size} bytes, over the limit of ${artifactSizeLimit} bytes`)
+      const bytes = new Uint8Array(size)
+      for (let offset = 0; offset < size; offset += readChunkBytes) {
+        const output = await readFile(path, 'printf "base64=%s\\n" "$(tail -c "+$2" -- "$file" | head -c "$3" | base64 | tr -d "\\n")"', [String(offset + 1), String(readChunkBytes)])
+        const text = /^base64=([A-Za-z0-9+/=]*)$/m.exec(output)?.[1]
+        if (text === undefined) throw new Error(`read ${path}: no bytes in the output ${JSON.stringify(output.slice(-300))}`)
+        const chunk = Uint8Array.from(atob(text), (char) => char.charCodeAt(0))
+        if (chunk.length !== Math.min(readChunkBytes, size - offset)) throw new Error(`read ${path}: the file changed while the host read it`)
+        bytes.set(chunk, offset)
+      }
+      return bytes
     },
   }
 }

@@ -7,6 +7,7 @@ import { StopError } from '../core/stop.ts'
 import { afterError, alarmBudgetMs, countRestart, initCounters, progressLedger } from './alarm.ts'
 import { containerBox, httpBox, type Box, type SyncStore } from './box.ts'
 import { githubComments } from './comments.ts'
+import type { WorkerSetting } from './egress.ts'
 import type { DevelopmentRuns } from './develop.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { githubAccess, type InstallationTokens } from './github-app.ts'
@@ -51,7 +52,13 @@ export type Env = {
   OPENAI_URL?: string
   /** A machine endpoint that replaces the build container of the runs, for local tests. */
   MACHINE_URL?: string
+  /** An endpoint that gets each request that the research egress approved, as /<host><path>, for local tests. */
+  EGRESS_URL?: string
 }
+
+/** The keys that are in only one of Env and workerSettings. The Worker typecheck fails on the line below when there is one. */
+type SettingGap = Exclude<keyof Env, WorkerSetting> | Exclude<WorkerSetting, keyof Env>
+export const sameSettings: [SettingGap] extends [never] ? true : SettingGap = true
 
 export type RunRow = { run: string; state: State; note: string; created: number; request: string }
 /** The result of `resume`: `state` is the state of the latest run before the call, or null when there is no run. */

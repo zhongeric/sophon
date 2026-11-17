@@ -3,6 +3,9 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { MemoryFileSystem, type FileSystem } from 'nanocode-ts/bash'
+import { checkoutCommit } from '../src/cloudflare/branches.ts'
+import { treeGit } from '../src/cloudflare/trees.ts'
 import { git, gitBranches, gitRepo, worktreePath } from '../src/node/git.ts'
 import { developRepo } from './support/develop.ts'
 
@@ -12,6 +15,8 @@ const hasBranch = async (repo: string, name: string) =>
     () => true,
     () => false,
   )
+const read = async (tree: FileSystem.FileSystem, path: string) => new TextDecoder().decode(await tree.read(path))
+const exists = async (tree: FileSystem.FileSystem, path: string) => Boolean(await tree.stat(path).catch(() => null))
 
 test('Node branches: deleteLocal removes the worktree and the branch, also outside the run directory', async () => {
   const { repo } = developRepo()
@@ -96,4 +101,26 @@ test('Node repo: release keeps the fix branch, a resumed run recreates the workt
   await resumed.deleteBranch()
   await git(repo, 'remote', 'remove', 'origin')
   await resumed.deleteBranch()
+})
+
+test('Cloudflare branches: checkoutCommit copies only the files of the commit, without the uncommitted files of the tree', async () => {
+  const from = MemoryFileSystem.create({ files: { '/kept.txt': 'one', '/gone.txt': 'tracked', '/dir/edit.txt': 'committed' } })
+  const tree = treeGit(from)
+  await tree('init', '-q')
+  await tree('add', '-A')
+  await tree('commit', '-q', '-m', 'one')
+  const commit = (await tree('rev-parse', 'HEAD')).trim()
+  await from.write('/later.txt', new TextEncoder().encode('later'))
+  await tree('add', '-A')
+  await tree('commit', '-q', '-m', 'two')
+  // The same size as the committed text, so that only the content tells the change.
+  await from.write('/dir/edit.txt', new TextEncoder().encode('work-copy'))
+  await from.remove('/gone.txt')
+  await from.write('/new.txt', new TextEncoder().encode('untracked'))
+  const to = MemoryFileSystem.create()
+  await checkoutCommit(from, to, commit)
+  assert.deepEqual([await read(to, '/kept.txt'), await read(to, '/gone.txt'), await read(to, '/dir/edit.txt')], ['one', 'tracked', 'committed'])
+  assert.deepEqual([await exists(to, '/later.txt'), await exists(to, '/new.txt')], [false, false])
+  // The source tree keeps its uncommitted work.
+  assert.equal(await read(from, '/dir/edit.txt'), 'work-copy')
 })

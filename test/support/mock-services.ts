@@ -15,7 +15,8 @@ type Pull = { head: string; title: string; body: string; draft: boolean; headRep
  * GitHub, Anthropic, OpenAI and a build machine on one local port, for the Cloudflare host under wrangler dev.
  * GitHub answers from a local repository: the Git Data API writes real objects and refs into it, so later
  * tarballs, compares and contents see the host's commits. PRs and issues share one number sequence, as on GitHub.
- * The machine runs each command in a directory of its own, in place of a container.
+ * The machine runs each command in a directory of its own, in place of a container. The egress route stands in for
+ * the hosts of a research notebook: it answers each page with `pages`.
  */
 export async function mockServices(
   repo: string,
@@ -29,6 +30,8 @@ export async function mockServices(
     issues?: Record<number, { title: string; body: string }>
     /** A GitHub App: its slug, whether it is installed on the repository, and the life of its installation tokens. */
     app?: { slug: string; installed: boolean; expiresInSeconds?: number }
+    /** The text of each page that the egress route answers, by path. */
+    pages?: (path: string) => string
   },
 ) {
   const git = (args: string[], input?: Buffer, env: Record<string, string> = {}) =>
@@ -63,6 +66,8 @@ export async function mockServices(
     merges: [] as { pr: number; method: string; sha: string; commit: string }[],
     /** The branches that the host deleted. Their entries stay in refs, so that fileAt still reads them. */
     deleted: [] as string[],
+    /** The requests that reached the egress route: the URL that the run fetched, and its x-api-key header. */
+    egress: [] as { url: string; key: string | null }[],
   }
   let next = Math.max(100, ...pulls.keys(), ...issues.keys())
   let ids = 0
@@ -185,6 +190,15 @@ export async function mockServices(
         if (typeof timeoutMs !== 'number') throw new Error(`${route}: timeoutMs must be a number`)
         const environment = Object.fromEntries(Object.entries(object(env, 'env')).map(([key, value]) => [key, string(value, `env.${key}`)]))
         return json(response, 200, await exec({ argv: strings(argv, 'argv'), cwd: string(cwd, 'cwd'), env: environment, stdin: stdin === null ? null : string(stdin, 'stdin'), timeoutMs }))
+      }
+      if (request.method === 'GET' && url.pathname.startsWith('/egress/')) {
+        const [host = '', ...rest] = url.pathname.slice('/egress/'.length).split('/')
+        const path = `/${rest.join('/')}`
+        const key = request.headers['x-api-key']
+        state.egress.push({ key: typeof key === 'string' ? key : null, url: `https://${host}${path}${url.search}` })
+        response.writeHead(200, { 'content-type': 'text/plain' })
+        response.end((options.pages ?? ((page: string) => `page ${page}`))(path))
+        return
       }
       if (route === 'POST /graphql') {
         const variables = input().variables
