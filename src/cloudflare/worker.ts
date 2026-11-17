@@ -1,4 +1,5 @@
 import { DevelopmentRuns, type DevelopRequest } from './develop.ts'
+import { ResearchRuns } from './research.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
 import { sameSecret, verifySignature } from './github.ts'
@@ -6,7 +7,7 @@ import { appBotLogin, githubAccess, type BotLogins, type InstallationTokens } fr
 import { sweepBranches } from './prune.ts'
 import { allowedUsers, PullRequestRuns, type Env } from './run.ts'
 
-export { DevelopmentRuns, PullRequestRuns }
+export { DevelopmentRuns, PullRequestRuns, ResearchRuns }
 
 const key = (owner: string, repo: string, number: number) => `${owner}/${repo}#${number}`.toLowerCase()
 const pullRequest = (env: Env, owner: string, repo: string, pr: number) => env.PULL_REQUESTS.get(env.PULL_REQUESTS.idFromName(key(owner, repo, pr)))
