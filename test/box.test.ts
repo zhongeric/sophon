@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -405,11 +407,14 @@ test('a container job keeps the result rules of a command and the last 20,000 ch
   const { box, root } = await containerJobs()
   await box.startJob('slow', ['sleep', '5'], { cwd: '', env: {}, timeoutMs: 1_000 })
   await box.startJob('killed', ['bash', '-c', 'kill -9 $$'], { cwd: '', env: {}, timeoutMs: 60_000 })
-  await box.startJob('long', ['bash', '-c', 'head -c 30000 /dev/zero | tr "\\0" a; printf end'], { cwd: '', env: {}, timeoutMs: 60_000 })
+  await box.startJob('long', ['bash', '-c', 'head -c 100000 /dev/zero | tr "\\0" a; printf end'], { cwd: '', env: {}, timeoutMs: 60_000 })
   assert.deepEqual(await jobResult(box, 'slow'), { exit_code: null, output: '\n[host] killed after 1000 ms' })
   const killed = await jobResult(box, 'killed')
   assert.equal(killed.exit_code, 137)
   assert.match(killed.output, /killed before its time limit/)
+  assert.deepEqual(await jobResult(box, 'long'), { exit_code: 0, output: `${'a'.repeat(19_997)}end` })
+  // The poll keeps only the bytes that it reads, and a poll again gives the same result.
+  assert.equal(statSync(join(root, 'jobs/long/output')).size, 80_000)
   assert.deepEqual(await jobResult(box, 'long'), { exit_code: 0, output: `${'a'.repeat(19_997)}end` })
 
   // timeout sends its SIGKILL 10 s after the limit, so the test writes the files of a 137 at the limit.
@@ -442,6 +447,9 @@ test('a kill stops the process group of a container job with its child, and the 
   }
   assert.equal(gone(), true)
   assert.deepEqual(state, { state: 'missing' })
+  assert.equal(existsSync(join(root, 'jobs/group')), false)
+  // A kill removes the job directory, so an ID can never name /jobs or its parent.
+  await assert.rejects(box.killJob('..'), /the job ID "\.\." is not a valid file name/)
 })
 
 test('a branch machine and its setup run their commands as wait-mode jobs', async () => {
@@ -491,5 +499,27 @@ test('the test machine runs jobs over HTTP with the same result rules, and kills
     )
   } finally {
     await mock.close()
+  }
+})
+
+test('the test machine refuses a poll or a command result that is not valid', async () => {
+  let answer: unknown = {}
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify(answer))
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const box = httpBox(`http://127.0.0.1:${(server.address() as AddressInfo).port}/machine`)
+    for (const invalid of [{}, null, { state: 'done' }, { result: { exit_code: '0', output: '' }, state: 'done' }, { result: { exit_code: 0 }, state: 'done' }]) {
+      answer = invalid
+      await assert.rejects(box.pollJob('job-1'), /answered without a job state/)
+    }
+    answer = { result: { exit_code: null, output: 'out' }, state: 'done' }
+    assert.deepEqual(await box.pollJob('job-1'), { result: { exit_code: null, output: 'out' }, state: 'done' })
+    answer = { exit_code: 1.5, output: '' }
+    await assert.rejects(box.exec(['true'], { cwd: '', env: {}, timeoutMs: 1_000 }), /answered without a command result/)
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
   }
 })

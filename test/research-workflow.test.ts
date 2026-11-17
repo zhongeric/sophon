@@ -49,6 +49,7 @@ test('research: each clean box is a new checkout at a new path, and only the las
     writeFileSync(join(tree, 'untracked'), 'output\n')
     // The local platform ignores the key: the same key two times also gives a new checkout.
     const box = await deps.cleanBox(commit, `reproduce.${commit}`)
+    assert.notEqual(box.id, first.id)
     const next = await box.run('pwd', { env: [], timeoutMs: 10_000 })
     assert.equal(next.exit_code, 0)
     // A new path, so that an output that depends on the path does not reproduce. The earlier checkout is gone.

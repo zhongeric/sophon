@@ -303,7 +303,7 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
       const tree = join(dir, `clean-${cleanCheckouts}`)
       if (existsSync(tree)) await git(options.repo, 'worktree', 'remove', '--force', tree)
       await git(options.repo, 'worktree', 'add', '--detach', tree, commit)
-      return { ...localMachine(tree), read: diskFileSystem(tree).read }
+      return { ...localMachine(tree), id: crypto.randomUUID(), read: diskFileSystem(tree).read }
     },
     async review({ runId, ask, head, full, pr, budget }) {
       const reviewSource = { repo: options.repo, base: input.base, head }

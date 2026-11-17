@@ -114,3 +114,40 @@ test('on Cloudflare, a domain command that runs longer than an alarm call pauses
   assert.equal(dirs[0], job[0]?.cwd)
   assert.deepEqual(dirs, [...new Set(dirs)], describe())
 })
+
+test('on Cloudflare, automatic retries keep the lost-job limit and an administrator error resume permits a new start', { timeout: 600_000 }, async () => {
+  const before = knownStarts().length
+  mock.state.loseJob = (argv) => argv.join(' ').includes('research/run.mjs known')
+  try {
+    const started = await (await fetch(`${worker.url}/research/acme/app/5`, { body: '{}', headers, method: 'POST' })).json() as { started: boolean }
+    assert.equal(started.started, true)
+    const stopped = await until(async () => {
+      await answer()
+      const latest = (await status(5)).runs[0]
+      return latest?.state === 'error' ? latest : undefined
+    }, 300_000, describe)
+    assert.match(stopped.note, /the machine lost the job .*research\/run\.mjs known.* 3 times/)
+    assert.equal(knownStarts().length - before, 3, describe())
+    await until(() => /attempt 3 failed/.test(worker.output()) ? true : undefined, 30_000, describe)
+
+    const body = '/answer recommended'
+    const wake = await sendWebhook(worker.url, secret, 'issue_comment', { action: 'created', comment: { body, user: { login: 'maintainer' } }, issue: issuePayload(5), repository })
+    assert.deepEqual(await wake.json(), { resumed: false })
+    assert.equal((await status(5)).runs[0]?.state, 'error')
+    assert.equal(knownStarts().length - before, 3)
+
+    mock.state.loseJob = () => false
+    const mark = mock.state.comments.length
+    const resumed = await fetch(`${worker.url}/runs/acme/app/5/resume`, { headers, method: 'POST' })
+    assert.deepEqual(await resumed.json(), { reason: 'started the run again from its ledger after the error', resumed: true, state: 'error' })
+    const result = await until(async () => {
+      await answer()
+      return mock.state.comments.slice(mark).find((entry) => entry.issue === 5 && entry.body.startsWith('# Research run:'))
+    }, 240_000, describe)
+    assert.match(result.body, /^# Research run: READY/, describe())
+    assert.equal((await status(5)).runs[0]?.state, 'passed')
+    assert.ok(knownStarts().length - before > 3)
+  } finally {
+    mock.state.loseJob = () => false
+  }
+})

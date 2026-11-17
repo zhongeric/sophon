@@ -23,7 +23,7 @@ export type ResearchConfig = {
   feeds?: string[]
 }
 
-export type ResearchTimeouts = { known?: number; inject?: number; evaluate?: number; reproduce?: number }
+export type ResearchTimeouts = Partial<Record<'known' | 'inject' | 'evaluate' | 'reproduce', number>>
 
 /**
  * The holdout file. `refuse` is the list of URL prefixes that the egress refuses to agents. Each prefix has the
@@ -149,7 +149,7 @@ function credentials(value: unknown, key: string, egress: string[], fail: Fail):
   return parsed
 }
 
-const timeoutKeys = ['known', 'inject', 'evaluate', 'reproduce'] as const
+const timeoutKeys: readonly (keyof ResearchTimeouts)[] = ['known', 'inject', 'evaluate', 'reproduce']
 
 function timeouts(value: unknown, key: string, fail: Fail): ResearchTimeouts {
   const entries = object(value, key, [...timeoutKeys], fail)

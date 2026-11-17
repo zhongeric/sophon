@@ -106,6 +106,7 @@ test('timeouts are optional positive integers of milliseconds for the domain com
   assert.deepEqual(parse(research({ timeouts: { inject: 60_000 } }))?.timeouts, { inject: 60_000 })
   assert.deepEqual(parse(research({ timeouts: {} }))?.timeouts, {})
   rejects(research({ timeouts: { sweep: 1_000 } }), 'research.timeouts.sweep', /not a known key/)
+  assert.deepEqual(parse(research({ timeouts: { evaluate: 1_000 } }))?.timeouts, { evaluate: 1_000 })
   for (const value of [0, -1, 1.5, '1000', null, Number.MAX_SAFE_INTEGER + 1])
     rejects(research({ timeouts: { known: value } }), 'research.timeouts.known', /must be a positive integer of milliseconds/)
   rejects(research({ timeouts: 60_000 }), 'research.timeouts', /must be an object/)

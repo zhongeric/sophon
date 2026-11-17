@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { PausedError } from '../src/core/questions.ts'
 import { research, type ResearchDeps } from '../src/core/workflows/research.ts'
 import { worktreePath } from '../src/node/git.ts'
 import { nodeResearch } from '../src/node/platform.ts'
@@ -273,6 +274,136 @@ for (const change of ['remove', 'replace'] as const) {
     assert.deepEqual(pulls.opened, [])
     assert.equal(refs(origin), 'refs/heads/main\n')
   })
+}
+
+test('research: a calibration replay after a pause on inject keeps the known outputs of the first pass', { timeout: 300_000 }, async () => {
+  const { repo, base } = notebook({ config: {
+    checks: { smoke: 'true' },
+    research: { ...researchConfig, commands: { ...researchConfig.commands, inject: `${researchConfig.commands.inject}; printf changed > out/hyp-001/known.txt` } },
+  } })
+  const input = researchInput(base, 'inject-pause')
+  const { channel } = memoryChannel({ pick: '/answer\nQ1: a' })
+  const pulls = fakePulls()
+  const deps = await nodeResearch({
+    channel,
+    credentials,
+    dispatch: scriptedDispatch(researchScript(), []),
+    env: { ARCHIVE_TOKEN: 'token-1' },
+    fetch: archive().fetch,
+    input,
+    log: () => {},
+    module,
+    prices,
+    pulls: pulls.pulls,
+    repo,
+    reviewChannel: async () => memoryChannel().channel,
+    runsDir: runsDir(),
+  })
+  // Like the Worker: the same step key gives the same checkout, and a replay gives the result of a finished command.
+  type Box = Awaited<ReturnType<ResearchDeps['cleanBox']>>
+  const boxes = new Map<string, Promise<Box>>()
+  const finished = new Map<string, Awaited<ReturnType<Box['run']>>>()
+  let paused = false
+  const cleanBox: ResearchDeps['cleanBox'] = async (commit, key) => {
+    const kept = boxes.get(key) ?? deps.cleanBox(commit, key)
+    boxes.set(key, kept)
+    const box = await kept
+    return {
+      ...box,
+      async run(command, options) {
+        const done = finished.get(`${key}:${command}`)
+        if (done) return done
+        const result = await box.run(command, options)
+        finished.set(`${key}:${command}`, result)
+        if (!paused && command.includes(' inject ')) {
+          paused = true
+          throw new PausedError('inject runs past the call deadline')
+        }
+        return result
+      },
+    }
+  }
+  await assert.rejects(research(input, { ...deps, cleanBox }), PausedError)
+  assert.equal(deps.ledger.get('step:calibrate.hyp-001.1'), undefined)
+
+  const result = await research(input, { ...deps, cleanBox })
+  assert.equal(result.status, 'ready', result.report)
+  const round = deps.ledger.get<{ result: { known: string[]; reason: string } }>('step:calibrate.hyp-001.1')?.result
+  assert.equal(round?.known.length, 2)
+  assert.match(round?.reason ?? '', /^the known recall 0\.5 is below the threshold 0\.9$/)
+})
+
+for (const change of ['stdout', 'remove', 'replace', 'restore'] as const) {
+  test(`research: a replacement checkout verifies known outputs again (${change})`, { timeout: 300_000 }, async () => {
+    await replacementCalibration(change)
+  })
+}
+
+async function replacementCalibration(change: 'stdout' | 'remove' | 'replace' | 'restore') {
+  const { repo, base } = notebook({ config: {
+    checks: { smoke: 'true' },
+    research: { ...researchConfig, commands: { ...researchConfig.commands, inject: `cat out/hyp-001/known.txt > /dev/null && ${researchConfig.commands.inject}` } },
+  } })
+  const input = researchInput(base, `inject-lost-box-${change}`)
+  const { channel } = memoryChannel({ pick: '/answer\nQ1: a' })
+  const deps = await nodeResearch({
+    channel,
+    credentials,
+    dispatch: scriptedDispatch(researchScript(), []),
+    env: { ARCHIVE_TOKEN: 'token-1' },
+    fetch: archive().fetch,
+    input,
+    log: () => {},
+    module,
+    prices,
+    pulls: fakePulls().pulls,
+    repo,
+    reviewChannel: async () => memoryChannel().channel,
+    runsDir: runsDir(),
+  })
+  let paused = false
+  const knownOutputs: string[] = []
+  const cleanBox: ResearchDeps['cleanBox'] = async (commit, key) => {
+    const box = await deps.cleanBox(commit, key)
+    return {
+      ...box,
+      async run(command, options) {
+        if (!paused && command.includes(' inject ')) {
+          paused = true
+          throw new PausedError('the machine stopped before inject finished')
+        }
+        const result = await box.run(command, options)
+        if (key === 'calibrate.hyp-001.1' && command.includes(' known ')) {
+          // Remove the checkout path so that replacement runs give identical stdout.
+          if (change !== 'stdout') result.output = result.output.split('\n').slice(1).join('\n')
+          knownOutputs.push(result.output)
+          if ((paused && (change === 'remove' || change === 'replace')) || (!paused && change === 'restore')) {
+            const alter = change === 'replace' ? 'printf changed > out/hyp-001/known.txt' : 'rm out/hyp-001/known.txt'
+            assert.equal((await box.run(alter, options)).exit_code, 0)
+          }
+        }
+        return result
+      },
+    }
+  }
+  await assert.rejects(research(input, { ...deps, cleanBox }), PausedError)
+  assert.equal(knownOutputs.length, 1)
+  assert.equal(deps.ledger.get('step:calibrate.hyp-001.1'), undefined)
+
+  const result = await research(input, { ...deps, cleanBox })
+  assert.equal(result.status, 'ready', result.report)
+  assert.equal(knownOutputs.length, 2)
+  if (change === 'stdout') assert.notEqual(knownOutputs[0], knownOutputs[1])
+  else assert.equal(knownOutputs[0], knownOutputs[1])
+  const round = deps.ledger.get<{ result: { known: string[]; reason: string } }>('step:calibrate.hyp-001.1')?.result
+  assert.ok(round)
+  if (change === 'remove' || change === 'replace') {
+    assert.match(round.reason, /known output out\/hyp-001\/known\.txt:/)
+    assert.match(round.reason, change === 'remove' ? /No such file or directory/ : /the file does not match SHA-256/)
+  } else assert.match(round.reason, /^the known recall 0\.5 is below the threshold 0\.9$/)
+  const kept = await deps.egress.artifacts.get(round.known[0] ?? '')
+  assert.ok(kept)
+  assert.equal(new TextDecoder().decode(kept), knownOutputs[1])
 }
 
 test('research: a review fix outside analysis/ fails the run and the PR stays draft', { timeout: 300_000 }, async () => {

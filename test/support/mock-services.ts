@@ -63,6 +63,8 @@ export async function mockServices(
     commands: [] as { argv: string[]; cwd: string }[],
     /** The jobs that the machine started, so that a test can count the starts of a command. */
     jobs: [] as { id: string; argv: string[]; cwd: string }[],
+    /** True for a command whose job the machine loses at start. */
+    loseJob: (_argv: string[]) => false,
     /** The HTTP status of the workflow-runs endpoint, so that a test can withhold the Actions permission. */
     ciStatus: 200,
     /** The PR merges that the host made, with the squash commit on main of each. */
@@ -174,6 +176,7 @@ export async function mockServices(
     if (jobs.has(body.id)) throw new Error(`the job ${body.id} started before`)
     state.jobs.push({ argv: body.argv, cwd: body.cwd, id: body.id })
     state.commands.push({ argv: body.argv, cwd: body.cwd })
+    if (state.loseJob(body.argv)) return
     const cwd = join(machineRoot, body.cwd)
     mkdirSync(cwd, { recursive: true })
     const started = Date.now()

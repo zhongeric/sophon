@@ -11,7 +11,7 @@ import type { WorkerSetting } from './egress.ts'
 import type { DevelopmentRuns } from './develop.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { githubAccess, type InstallationTokens } from './github-app.ts'
-import { hasOpenJobs, jobRunner, type JobRunner } from './jobs.ts'
+import { hasOpenJobs, jobRunner, resetJobStarts, type JobRunner } from './jobs.ts'
 import type { State } from './prune.ts'
 import type { ResearchRuns } from './research.ts'
 import type { PullRequestRuns } from './run.ts'
@@ -174,6 +174,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       const ledger = sqlLedger(this.ctx.storage.sql, latest.run)
       ledger.put('attempts', 0)
       ledger.put('restarts', 0)
+      resetJobStarts(ledger)
       this.setState(latest.run, 'queued', 'resumed after an error')
       reason = 'started the run again from its ledger after the error'
     } else if (state !== 'paused') return { reason: notResumed[state], resumed: false, state }

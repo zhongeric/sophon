@@ -134,8 +134,8 @@ export type ResearchDeps = {
   log(line: string): void
 }
 
-/** A clean checkout with read access to the output files of its commands. */
-type ResearchBox = Machine & { read(path: string): Promise<Uint8Array> }
+/** A clean checkout with read access to its output files. Its ID stays the same only when the checkout stays. */
+type ResearchBox = Machine & { id: string; read(path: string): Promise<Uint8Array> }
 
 /** A frozen prereg as the ledger records it. */
 export type Freeze = { hypothesis: string; version: number; path: string; sha256: string; commit: string }
@@ -723,11 +723,15 @@ async function calibrate(stages: Stages, analysis: Analysis): Promise<Calibratio
   const { deps, branch } = stages
   const { hypothesis, path } = analysis.freeze
   const round = analysis.calibrations.length + 1
-  const calibration = await step(deps.ledger, `calibrate.${hypothesis}.${round}`, async (): Promise<CalibrationRound> => {
+  const key = `calibrate.${hypothesis}.${round}`
+  const calibration = await step(deps.ledger, key, async (): Promise<CalibrationRound> => {
     const threshold = preregThreshold(new TextDecoder().decode(await branch.tree.read(`/${path}`)))
     const head = await branch.head()
-    const box = await deps.cleanBox(head, `calibrate.${hypothesis}.${round}`)
-    const known = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'known', path), hypothesis, round)
+    const box = await deps.cleanBox(head, key)
+    // A new copy runs known again. Reuse its snapshot only on that copy, because inject can change its files.
+    const knownRun = await runDomainCommand(deps.config, box, 'known', path)
+    const knownId = await artifactId(new TextEncoder().encode(JSON.stringify(knownRun)))
+    const known = await step(deps.ledger, `${key}.known.${box.id}.${knownId}`, async () => keepOutputs(deps, box, knownRun, hypothesis, round))
     const inject = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'inject', path), hypothesis, round)
     const verdict = calibrationVerdict(known.run, inject.run, threshold)
     return {
