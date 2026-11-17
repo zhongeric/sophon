@@ -103,6 +103,17 @@ test('an amendment needs the earlier version, a reason and the same hypothesis',
   await assert.rejects(freezePrereg({ ...prereg, hypothesis: 'hyp-003' }, { previous: first, reason: 'Other.' }), /^Error: an amendment must be for hyp-001, not hyp-003$/)
 })
 
+test('the version option sets the first version without an amendment section', async () => {
+  const prereg = checkPrereg(valid, options)
+  const frozen = await freezePrereg(prereg, {}, { version: 2 })
+  assert.equal(frozen.version, 2)
+  assert.equal(frozen.path, 'prereg/hyp-001-v2.md')
+  assert.match(frozen.markdown, /^# Prereg hyp-001 v2\n\nKnown recall: 0\.9\n\n## Hypothesis\n/)
+  assert.doesNotMatch(frozen.markdown, /Amendment/)
+  assert.equal(frozen.sha256, sha256(frozen.markdown))
+  for (const version of [0, 1.5, -1]) await assert.rejects(freezePrereg(prereg, {}, { version }), /^Error: the first version must be an integer of 1 or more$/)
+})
+
 test('the path helper finds paths under prereg/', () => {
   for (const path of ['prereg/x', './prereg/x', '/repo/prereg/x', '/prereg/x', 'prereg', 'prereg/a/../b.md', 'prereg//hyp-001-v1.md', '/../prereg/x', '/repo/../../prereg/x'])
     assert.equal(isPreregPath(path), true, path)

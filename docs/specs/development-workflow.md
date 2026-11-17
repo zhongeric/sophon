@@ -192,7 +192,10 @@ Each stage below lists who does the work, what the host enforces, and where the 
   again.
 - The PR body of a run with an issue says `Closes #<issue>`, thus GitHub closes the issue when the PR merges.
 - When GitHub refuses the merge, the PR stays ready, and the report gives the reason.
-- After a merge, the host deletes only the remote branch of the run, and the report gives the merge commit.
+- After a merge, the report gives the merge commit.
+- The host deletes the branches of a run. A task branch goes after its merge into the development branch. When the
+  run ends, the host deletes its merged, applied and stranded branches, and the report lists them. The branches of an
+  open PR, and of a run that can go on, stay. The `pull_request` closed webhook and the sweep delete the others.
 - Review runs never merge, because the host does not merge a PR of a person.
 
 ## 4. Profiles

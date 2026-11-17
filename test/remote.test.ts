@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { parseTarget, resumeOutcome } from '../src/node/remote.ts'
+import { parseRepo, parseTarget, pruneOutcome, resumeOutcome } from '../src/node/remote.ts'
 
 test('a PR or an issue is owner/repo#number or its GitHub URL', () => {
   assert.deepEqual(parseTarget('acme/app#7'), { owner: 'acme', pr: 7, repo: 'app' })
@@ -33,4 +33,39 @@ test('resume prints the raw text and takes the exit code from resumed when the s
   assert.deepEqual(resumeOutcome('{"resumed":true}'), { code: 0, text: '{"resumed":true}' })
   assert.deepEqual(resumeOutcome('{"resumed":false}'), { code: 1, text: '{"resumed":false}' })
   assert.deepEqual(resumeOutcome('{"reason":"x","resumed":true,"state":3}'), { code: 0, text: '{"reason":"x","resumed":true,"state":3}' })
+})
+
+test('a prune target is owner/repo or its GitHub URL', () => {
+  assert.deepEqual(parseRepo('acme/app'), { owner: 'acme', repo: 'app' })
+  assert.deepEqual(parseRepo('https://github.com/acme/my.app/'), { owner: 'acme', repo: 'my.app' })
+  assert.deepEqual(parseRepo('https://github.com/acme/app.git'), { owner: 'acme', repo: 'app' })
+  assert.throws(() => parseRepo('acme/app#7'), /not owner\/repo or a GitHub repository URL/)
+})
+
+test('prune prints each deleted, kept and failed branch, and exits 0 also with failed deletes', () => {
+  const body = JSON.stringify({
+    deleted: [{ name: 'factory/pr-7-1', rule: 'merged' }],
+    failed: [{ name: 'factory/dev-add', reason: 'HTTP 403: protected' }],
+    kept: [{ name: 'factory/pr-8-1', reason: 'open PR' }],
+  })
+  assert.deepEqual(pruneOutcome({ ok: true, text: body }), {
+    code: 0,
+    text: ['deleted factory/pr-7-1 (merged)', 'kept factory/pr-8-1: open PR', 'failed factory/dev-add: HTTP 403: protected'].join('\n'),
+  })
+  assert.deepEqual(pruneOutcome({ ok: true, text: '{"deleted":[],"kept":[],"failed":[]}' }), { code: 0, text: 'no factory/* branches' })
+})
+
+test('prune exits 1 and prints the raw text when the route fails or the body is not the prune result', () => {
+  assert.deepEqual(pruneOutcome({ ok: false, text: 'unauthorized' }), { code: 1, text: 'unauthorized' })
+  for (const text of [
+    'not json',
+    'null',
+    '{"deleted":[],"kept":[]}',
+    '{"deleted":[1],"kept":[],"failed":[]}',
+    '{"deleted":[{}],"kept":[],"failed":[]}',
+    '{"deleted":[{"name":"factory/a","rule":"kept"}],"kept":[],"failed":[]}',
+    '{"deleted":[],"kept":[{"name":7,"reason":"open PR"}],"failed":[]}',
+    '{"deleted":[],"kept":[],"failed":[{"name":"factory/a"}]}',
+  ])
+    assert.deepEqual(pruneOutcome({ ok: true, text }), { code: 1, text })
 })

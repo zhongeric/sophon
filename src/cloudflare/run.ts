@@ -11,6 +11,7 @@ import { baseConfig } from './config.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
 import { githubRepo, type PullRequest } from './repo.ts'
+import { githubSigning } from './signing.ts'
 import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs } from './runs.ts'
 import { sqlFiles, sqlLedger } from './storage.ts'
 
@@ -72,6 +73,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     const log = (line: string) => console.log(`[${request.owner}/${request.repo}#${request.pr} ${run}] ${line}`)
     const sql = Sql.create(this.ctx.storage)
     const repo = githubRepo({ branch, gh, ledger, log, pull, runId: run, sql })
+    const signing = githubSigning(gh, request.owner, request.repo)
     const result = await codeReviewLoop(input, {
       channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, pollMs: 0, waitMs: 0 }),
       checker: ciChecker({ branch, gh, ledger, pull, repo, timeoutMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000 }),
@@ -83,6 +85,8 @@ export class PullRequestRuns extends Runs<StartRequest> {
       module,
       prices,
       repo,
+      // The run also pushes its fixes to the publish branch, so the check also reads the rules of that branch.
+      signing: { apply: signing.apply, check: (branches) => signing.check([...branches, branch]) },
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
     return { passed: result.pass, summary: summary(run, result) }
@@ -103,6 +107,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
       allowedModels: allowedModelsFrom(this.env.ALLOWED_MODELS),
       ask: request.ask ?? `${view.title}\n\n${view.body ?? ''}`.trim(),
       config,
+      headRef: view.head.ref,
       models: mergeModels(overrides),
       pr: request.pr,
       runId: run,

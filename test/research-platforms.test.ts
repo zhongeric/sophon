@@ -107,7 +107,7 @@ test('on Cloudflare, the research domain comes from the base branch through the 
     await stops(baseResearch(gh, 'acme', 'app', 'main', { ...research, guides: 'research/feature-guides' }), 'research/feature-guides on main: the directory does not exist')
     await stops(baseResearch(gh, 'acme', 'app', 'main', { ...research, guides: 'research/holdout.json' }), 'research/holdout.json on main: the directory does not exist')
   } finally {
-    mock.close()
+    await mock.close()
     rmSync(repo, { force: true, recursive: true })
   }
 })

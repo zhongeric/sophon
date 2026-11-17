@@ -11,6 +11,7 @@ import {
   budgetGate,
   BudgetStop,
   checkPriced,
+  clearBudget,
   costOf,
   parseBudget,
   parsePrices,
@@ -165,6 +166,29 @@ test('without a budget or under it, the gate asks nothing', async () => {
   await gate().check()
   assert.equal(gate().spent(), 10)
   assert.equal(posted.length, 0)
+})
+
+test('clearBudget removes the limit without removing usage or reusing budget answers', async () => {
+  const { ledger, posted, replies, gate } = spentTen()
+  clearBudget(ledger)
+  assert.equal(resolveBudget(ledger, 10), 10)
+  await assert.rejects(gate().check(), PausedError)
+  const first = posted[0]
+  assert.ok(first)
+  replies[first.batch] = '/answer\nQ1: 12'
+
+  clearBudget(ledger)
+  clearBudget(ledger)
+  assert.equal(resolveBudget(ledger, undefined), undefined)
+  assert.equal(gate().limit(), undefined)
+  assert.equal(gate().spent(), 10)
+  await gate().check()
+  assert.equal(posted.length, 1)
+
+  assert.equal(resolveBudget(ledger, 10), 10)
+  await assert.rejects(gate().check(), PausedError)
+  assert.equal(posted.length, 2)
+  assert.notEqual(posted[1]?.batch, first.batch)
 })
 
 test('at the budget, concurrent checks post one question and pause; a higher number raises the budget', async () => {

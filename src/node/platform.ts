@@ -5,20 +5,25 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
-import { commandChecker, parseRepoConfig, readRepoConfig, requireChecks, resolveRepoConfig, type RepoConfig } from '../core/checks.ts'
-import type { AgentStore, Files, Guides, PullRequests } from '../core/platform.ts'
+import { commandChecker, parseRepoConfig, readRepoConfig, repoConfigFile, requireChecks, resolveRepoConfig, type RepoConfig } from '../core/checks.ts'
+import { runLock } from '../core/egress.ts'
+import type { AgentStore, Files, Guides, PullRequests, Signing } from '../core/platform.ts'
 import { profileDefaults, type RootFiles } from '../core/profiles.ts'
 import type { Credentials } from '../core/providers.ts'
+import type { SigningRecord } from '../core/signing.ts'
 import type { Channel } from '../core/questions.ts'
 import { loadResearchDomain, type ResearchConfig, type ResearchDomain, type ResearchFiles } from '../core/research.ts'
 import { StopError } from '../core/stop.ts'
 import type { Prices } from '../core/usage.ts'
 import { codeReviewLoop, type LoopDeps } from '../core/workflows/code-review-loop.ts'
 import type { DevelopDeps, DevelopInput } from '../core/workflows/develop.ts'
+import type { ResearchDeps, ResearchInput } from '../core/workflows/research.ts'
+import { nodeArtifacts } from './artifacts.ts'
 import { diskFileSystem, guideFileSystem } from './disk.ts'
-import { gitBranches, gitRepo, worktreePath, type GitSource } from './git.ts'
+import { gitBranches, gitRepo, gitTree, worktreePath, type GitCommits, type GitSource } from './git.ts'
 import { fileLedger } from './ledger.ts'
 import { localMachine } from './machine.ts'
+import { nodeSigning } from './signing.ts'
 
 export const agentsDir = fileURLToPath(new URL('../../agents/', import.meta.url))
 
@@ -49,6 +54,11 @@ export async function loadRepoConfig(repo: string, path?: string): Promise<RepoC
   if (path && !existsSync(path)) throw new StopError(`${path} does not exist`)
   const config = path ? resolveRepoConfig(await profileDefaults(root), parseRepoConfig(readFileSync(path, 'utf8'), path)) : await readRepoConfig(root, `in ${repo}`)
   requireChecks(config, repo)
+  return withHomeGuides(config)
+}
+
+/** A guide path that starts with ~/ is in the home directory. */
+function withHomeGuides(config: RepoConfig): RepoConfig {
   const guides = Object.entries(config.guides ?? {}).map(([name, guide]) => [name, guide.replace(/^~(?=\/)/, homedir())])
   return { ...config, guides: Object.fromEntries(guides) }
 }
@@ -142,19 +152,22 @@ export function dirFiles(dir: string): Files {
   }
 }
 
-export type NodeRun = Pick<LoopDeps, 'ledger' | 'repo' | 'checker' | 'files' | 'store' | 'guides'> & { dir: string }
+export type NodeRun = Pick<LoopDeps, 'ledger' | 'repo' | 'checker' | 'signing' | 'files' | 'store' | 'guides'> & { dir: string }
 
 /** The platform of one run on this machine: runs/<id>/ holds the ledger, the worktree, the journals and the report. */
 export async function nodeRun(options: { runsDir: string; runId: string; source: GitSource; config: RepoConfig }): Promise<NodeRun> {
   const dir = resolve(options.runsDir, options.runId)
   mkdirSync(dir, { recursive: true })
   const tree = join(dir, 'tree')
-  const repo = gitRepo(options.source, tree, `factory/${options.runId}`)
+  // The signing step sets the commit mode, and the repository reads it at each commit.
+  const commits: GitCommits = { unsigned: false }
+  const repo = gitRepo(options.source, tree, `factory/${options.runId}`, commits)
   return {
     dir,
     ledger: fileLedger(join(dir, 'state.json')),
     repo,
     checker: commandChecker(repo, options.config, localMachine(tree)),
+    signing: nodeSigning(options.source.repo, commits),
     files: dirFiles(dir),
     store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
     guides: await nodeGuides(options.config),
@@ -188,6 +201,10 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
   const dir = resolve(options.runsDir, input.runId)
   const branchesDir = join(dir, 'branches')
   mkdirSync(branchesDir, { recursive: true })
+  const commits: GitCommits = { unsigned: false }
+  const signing = nodeSigning(options.repo, commits)
+  // The answer for the development branch. Each review pass of that branch uses it and does not call GitHub again.
+  let recorded: SigningRecord | undefined
   const host = { credentials: options.credentials, dispatch: options.dispatch, log: options.log, module: options.module, prices: options.prices }
   return {
     ...host,
@@ -197,18 +214,83 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
     store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
     guides: await nodeGuides(input.config),
     channel: options.channel,
-    branches: gitBranches(options.repo, branchesDir),
+    branches: gitBranches(options.repo, branchesDir, commits),
+    signing: {
+      check: signing.check,
+      async apply(record) {
+        recorded = record
+        await signing.apply(record)
+      },
+    },
     pulls: options.pulls,
     checker: (branch) => commandChecker(branch, input.config, localMachine(worktreePath(branchesDir, branch.name))),
-    async review({ runId, ask, head, full, pr, budget }) {
+    async review({ runId, ask, head, branch, full, pr, budget }) {
       const source = { repo: options.repo, base: input.base, head }
       const run = await nodeRun({ config: input.config, runId, runsDir: options.runsDir, source })
       run.ledger.put('git', source)
-      const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}), ...(budget !== undefined ? { budgetOverride: budget } : {}), stopAtBudget: true }
+      const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, headRef: branch, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}), ...(budget !== undefined ? { budgetOverride: budget } : {}), stopAtBudget: true }
       // The pass runs again after a raise with a new remaining budget, so the budget is an override, not the recorded value.
       // At the budget, the pass stops without a question, and the development run asks with the run totals.
-      return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr) })
+      const passSigning: Signing = { apply: run.signing.apply, check: async (branches) => recorded ?? run.signing.check(branches) }
+      return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr), signing: passSigning })
     },
     ci: options.ci,
+  }
+}
+
+export type NodeResearchOptions = {
+  runsDir: string
+  /** The notebook working copy. The run reads its base commit and commits the frozen preregs on a branch of its own. */
+  repo: string
+  input: ResearchInput
+  channel: Channel
+  credentials: Credentials
+  module: WebAssembly.Module
+  dispatch?: Contracts.RuntimeOptions['dispatch']
+  prices?: Prices
+  /** Where the egress finds the secrets of the research config. Default: process.env. */
+  env?: Record<string, string | undefined>
+  /** Replaces the global fetch of the egress, for tests. */
+  fetch?: typeof fetch
+  log(line: string): void
+}
+
+/**
+ * The platform of one research run on this machine: runs/<id>/ holds the ledger, the journals, the artifacts, the
+ * report and the branch worktrees. The config, the holdout, the checklist and the guides come from the base commit,
+ * never from the working copy, so an uncommitted change cannot move the holdout.
+ */
+export async function nodeResearch(options: NodeResearchOptions): Promise<ResearchDeps & { dir: string }> {
+  const { input } = options
+  const dir = resolve(options.runsDir, input.runId)
+  const branchesDir = join(dir, 'branches')
+  mkdirSync(branchesDir, { recursive: true })
+  const source = `at ${input.baseRef}`
+  const base = gitTree(options.repo, input.base)
+  const config = await readRepoConfig(base.root, source)
+  if (!config.research) throw new StopError(`${repoConfigFile} ${source} has no research field`)
+  const domain = await loadResearchDomain(config.research, base.files, source)
+  const ledger = fileLedger(join(dir, 'state.json'))
+  const env = options.env ?? process.env
+  return {
+    dir,
+    module: options.module,
+    ledger,
+    files: dirFiles(dir),
+    store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
+    guides: await nodeGuides(withHomeGuides(config)),
+    credentials: options.credentials,
+    dispatch: options.dispatch,
+    prices: options.prices,
+    channel: options.channel,
+    branches: gitBranches(options.repo, branchesDir),
+    domain,
+    egress: {
+      artifacts: nodeArtifacts(dir),
+      lock: runLock(ledger, domain.holdout.refuse),
+      secret: (name) => env[name],
+      ...(options.fetch ? { fetch: options.fetch } : {}),
+    },
+    log: options.log,
   }
 }

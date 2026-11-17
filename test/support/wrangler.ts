@@ -1,11 +1,70 @@
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { createHmac } from 'node:crypto'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const startupMs = 90_000
+const graceMs = 5_000
+
+/** Sends a signal to the process group of `pid`. False when no process of the group is left. */
+function signalGroup(pid: number, signal: NodeJS.Signals | 0): boolean {
+  try {
+    process.kill(-pid, signal)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
+    throw error
+  }
+}
+
+/**
+ * True while a process of the group of `pid` runs. A zombie does not count: in a container whose init reaps no
+ * orphans, a zombie stays in the group, and it holds no handle. Without /proc, each zombie counts.
+ */
+export function groupAlive(pid: number): boolean {
+  if (!signalGroup(pid, 0)) return false
+  let entries: string[]
+  try {
+    entries = readdirSync('/proc')
+  } catch {
+    return true
+  }
+  return entries.some((entry) => {
+    if (!/^\d+$/.test(entry)) return false
+    try {
+      const stat = readFileSync(`/proc/${entry}/stat`, 'utf8')
+      // The fields after the command name: state, ppid, pgrp.
+      const [state, , group] = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+      return Number(group) === pid && state !== 'Z'
+    } catch {
+      return false
+    }
+  })
+}
+
+/**
+ * Ends the process group of a detached child: SIGTERM, then SIGKILL after `graceMs`. Resolves when no process of the
+ * group runs, or after the SIGKILL wait, and closes the pipes of the child.
+ */
+export async function stopGroup(child: ChildProcess, graceMs: number): Promise<void> {
+  try {
+    if (child.pid === undefined) return
+    for (const signal of ['SIGTERM', 'SIGKILL'] as const) {
+      if (!groupAlive(child.pid)) return
+      signalGroup(child.pid, signal)
+      const deadline = Date.now() + graceMs
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        if (!groupAlive(child.pid)) return
+      }
+    }
+  } finally {
+    child.stdout?.destroy()
+    child.stderr?.destroy()
+  }
+}
 
 async function freePort(): Promise<number> {
   const server = createServer()
@@ -27,28 +86,32 @@ export async function startWorker(vars: Record<string, string>, options: { conta
   for (const name of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NODE_USE_ENV_PROXY']) delete env[name]
   const child = spawn('npx', args, { cwd: new URL('../../', import.meta.url).pathname, detached: true, env, stdio: ['ignore', 'pipe', 'pipe'] })
   let output = ''
+  let timer: NodeJS.Timeout | undefined
   const ready = new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`wrangler dev did not start:\n${output}`)), startupMs)
+    timer = setTimeout(() => reject(new Error(`wrangler dev did not start:\n${output}`)), startupMs)
     const watch = (chunk: Buffer) => {
       output += chunk.toString()
-      if (output.includes('Ready on')) {
-        clearTimeout(timer)
-        resolve()
-      }
+      if (output.includes('Ready on')) resolve()
     }
     child.stdout.on('data', watch)
     child.stderr.on('data', watch)
+    child.on('error', reject)
     child.on('exit', (code) => reject(new Error(`wrangler dev exited with ${code}:\n${output}`)))
   })
-  await ready
+  try {
+    await ready
+  } catch (error) {
+    await stopGroup(child, graceMs)
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
+  let stopping: Promise<void> | undefined
   return {
     url: `http://127.0.0.1:${port}`,
     output: () => output,
-    stop: () => {
-      try {
-        process.kill(-child.pid!, 'SIGTERM')
-      } catch {}
-    },
+    /** Resolves when the whole wrangler dev process group exited. A second call gives the same promise. */
+    stop: () => (stopping ??= stopGroup(child, graceMs)),
   }
 }
 

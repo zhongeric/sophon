@@ -6,11 +6,23 @@ import { hostSecrets } from './secrets.ts'
 /** A header that the host adds for one host. `secret` is the name of a host secret, never its value. */
 export type EgressCredential = { header: string; secret: string }
 
-/** The network access of one agent. `credentials` are keyed by host name. */
-export type Egress = { hosts: string[]; web_search: boolean; max_bytes?: number; credentials?: Record<string, EgressCredential> }
+/**
+ * The network access of one agent. `credentials` are keyed by host name. `max_bytes` is the cap of a response body.
+ * `max_request_bytes` is the cap of a request: the URL, the headers of the agent and the body.
+ */
+export type Egress = {
+  hosts: string[]
+  web_search: boolean
+  max_bytes?: number
+  max_request_bytes?: number
+  credentials?: Record<string, EgressCredential>
+}
 
 /** The default cap of a response body: 8 MiB. */
 const defaultResponseLimit = 8 * 1024 * 1024
+
+/** The default cap of a request: 8 KiB. A small cap limits the data that an agent can send in one request. */
+const defaultRequestLimit = 8 * 1024
 
 /** URL prefixes that the egress refuses until the host unlocks them. Only the host can unlock. */
 export type RunLock = { locked(url: string): boolean; pending(): string[]; unlock(pattern: string): void }
@@ -84,9 +96,11 @@ const validHeaderValue = (value: string) => !/[\0\r\n]|[^\u0000-\u00ff]/.test(va
 
 /** Refuses a spec that the host must not run. The messages name secrets, never their values. */
 export function checkEgress(egress: Egress, host: EgressHost): void {
-  const max = egress.max_bytes
-  if (max !== undefined && (!Number.isInteger(max) || max <= 0 || max > artifactSizeLimit))
-    throw new Error(`egress: max_bytes ${max} is not an integer from 1 to ${artifactSizeLimit}`)
+  for (const field of ['max_bytes', 'max_request_bytes'] as const) {
+    const max = egress[field]
+    if (max !== undefined && (!Number.isInteger(max) || max <= 0 || max > artifactSizeLimit))
+      throw new Error(`egress: ${field} ${max} is not an integer from 1 to ${artifactSizeLimit}`)
+  }
   for (const name of egress.hosts) if (!isPlainHost(name)) throw new Error(`egress: ${JSON.stringify(name)} is not a plain host name`)
   const hosts = new Set(egress.hosts.map(hostName))
   for (const [name, credential] of Object.entries(egress.credentials ?? {})) {
@@ -151,6 +165,19 @@ function refusedAddress(name: string): boolean {
   return false
 }
 
+/**
+ * The UTF-8 bytes of the URL, of each header name and value of the agent, and of the body. The credential headers
+ * of the host do not count, so a long secret does not refuse a request.
+ */
+function requestSize(url: URL, headers: Headers, body: Uint8Array | undefined): number {
+  const encoder = new TextEncoder()
+  let size = encoder.encode(url.href).length + (body?.length ?? 0)
+  headers.forEach((value, name) => {
+    size += encoder.encode(name).length + encoder.encode(value).length
+  })
+  return size
+}
+
 const urlOf = (input: Parameters<typeof fetch>[0]) => (typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
 
 /** The body, or a refusal when its size is over the cap. A body of exactly the cap is accepted. */
@@ -199,6 +226,7 @@ export function egressFetch(agent: string, egress: Egress, host: EgressHost, log
   const hosts = new Set(egress.hosts.map(hostName))
   const credentials = new Map(Object.entries(egress.credentials ?? {}).map(([name, credential]) => [hostName(name), credential]))
   const cap = egress.max_bytes ?? defaultResponseLimit
+  const requestCap = egress.max_request_bytes ?? defaultRequestLimit
   const send = host.fetch ?? fetch
 
   /** The reason to refuse a URL, or null when the URL passes. */
@@ -260,7 +288,12 @@ export function egressFetch(agent: string, egress: Egress, host: EgressHost, log
         sent.set(credential.header, secret)
         return sent
       }
-      const hop = (url: URL) => send(url.href, { method, headers: hopHeaders(url), body, redirect: 'manual', signal: request.signal })
+      // Each hop has a different URL, so each hop gets the size check.
+      const hop = (url: URL) => {
+        const size = requestSize(url, headers, body)
+        if (size > requestCap) throw refused(`size: the request of ${size} bytes is over the cap of ${requestCap} bytes`)
+        return send(url.href, { method, headers: hopHeaders(url), body, redirect: 'manual', signal: request.signal })
+      }
 
       let url = first
       let response = await hop(url)

@@ -8,7 +8,7 @@ import type { Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError, type Channel } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget, parsePrices } from '../core/usage.ts'
-import { allowedModelsFrom, codeReviewLoop, defaultModels, mergeModels, providersOf, type LoopInput, type LoopModels } from '../core/workflows/code-review-loop.ts'
+import { allowedModelsFrom, codeReviewLoop, defaultModels, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
 import { credential } from './credentials.ts'
 import { git, type GitSource } from './git.ts'
@@ -111,8 +111,17 @@ async function main(): Promise<number> {
   }
   console.log(`${result.pass ? 'PASS' : 'FAIL'}: ${join(run.dir, 'report.md')}`)
   for (const criterion of result.criteria) console.log(`  [${criterion.ok ? 'x' : ' '}] ${criterion.name}`)
-  console.log(`Fixes are on ${result.branch}. Apply them with: git -C ${source.repo} merge --ff-only ${result.branch}`)
+  console.log(branchLine(result, source.repo))
   return result.pass ? 0 : 1
+}
+
+const deleteRules = { applied: 'applied by --ship', merged: 'the PR merged', stranded: 'the PR closed without a merge' }
+
+/** Where the fixes are. A deleted fix branch has nothing left to apply, so the line gives the rule instead. */
+export function branchLine(result: Pick<LoopResult, 'branch' | 'pruned'>, repo: string): string {
+  const deleted = result.pruned?.deleted.find((entry) => entry.name === result.branch)
+  if (deleted) return `Deleted ${result.branch}: ${deleteRules[deleted.rule]}.`
+  return `Fixes are on ${result.branch}. Apply them with: git -C ${repo} merge --ff-only ${result.branch}`
 }
 
 export function resumeInput(runsDir: string, runId: string): { input: LoopInput; source: GitSource } {
@@ -136,6 +145,7 @@ async function newInput(values: Values): Promise<{ input: LoopInput; source: Git
   if (values['ask-file']) ask = readFileSync(String(values['ask-file']), 'utf8')
   let ship: LoopInput['ship']
   let prNumber: number | undefined
+  let headRef: string | undefined
   if (values.pr) {
     const pr = Number(values.pr)
     const { stdout } = await exec('gh', ['pr', 'view', String(pr), '--json', 'title,body,baseRefName,headRefName,headRefOid'], { cwd: repo })
@@ -145,6 +155,7 @@ async function newInput(values: Values): Promise<{ input: LoopInput; source: Git
     head = view.headRefOid
     ask ??= `${view.title}\n\n${view.body}`
     prNumber = pr
+    headRef = view.headRefName
     if (values.ship) ship = { pr, headRef: view.headRefName }
   } else if (values.ship) throw new StopError('--ship needs --pr')
   if (!base) throw new StopError('give --pr or --base')
@@ -160,6 +171,7 @@ async function newInput(values: Values): Promise<{ input: LoopInput; source: Git
     source: `${repo} ${base}..${head}`,
     ...(values.stack ? { stack: String(values.stack) } : {}),
     ...(prNumber ? { pr: prNumber } : {}),
+    ...(headRef ? { headRef } : {}),
     ...(ship ? { ship } : {}),
     ...(values.full ? { full: true } : {}),
   }
