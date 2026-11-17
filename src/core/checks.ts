@@ -215,30 +215,28 @@ export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine)
     for (const test of tests) results.push(await run(`test ${test}`, command.replace('{test}', quote(test))))
     return results
   }
-  return {
-    async checks(changed, options = {}) {
-      const failed = await setup()
-      if (failed) return [failed]
-      const results: CheckResult[] = []
-      for (const [name, check] of Object.entries(config.checks)) {
-        const { command, files } = typeof check === 'string' ? { command: check, files: undefined } : check
-        if (!command.includes('{files}')) {
-          results.push(await run(name, command))
-          continue
-        }
-        const matching: string[] = []
-        for (const path of changed) if ((files ? new RegExp(files).test(path) : true) && (await exists(repo, path))) matching.push(path)
-        if (matching.length === 0) results.push({ name, command, status: 'skipped', exit_code: null, output: 'no changed files match' })
-        else results.push(await run(name, command.replace('{files}', matching.map(quote).join(' '))))
+  const checks: Checker['checks'] = async (changed, options = {}) => {
+    const failed = await setup()
+    if (failed) return [failed]
+    const results: CheckResult[] = []
+    for (const [name, check] of Object.entries(config.checks)) {
+      const { command, files } = typeof check === 'string' ? { command: check, files: undefined } : check
+      if (!command.includes('{files}')) {
+        results.push(await run(name, command))
+        continue
       }
-      if (options.tests === false) return results
-      const tests = await targetedTests(repo, config, changed)
-      if (tests.length === 0) results.push({ name: 'tests', command: config.tests?.command ?? '', status: 'skipped', exit_code: null, output: 'no targeted tests' })
-      else results.push(...(await runTests(tests)))
-      return results
-    },
-    tests: config.tests ? runTests : null,
+      const matching: string[] = []
+      for (const path of changed) if ((files ? new RegExp(files).test(path) : true) && (await exists(repo, path))) matching.push(path)
+      if (matching.length === 0) results.push({ name, command, status: 'skipped', exit_code: null, output: 'no changed files match' })
+      else results.push(await run(name, command.replace('{files}', matching.map(quote).join(' '))))
+    }
+    if (options.tests === false) return results
+    const tests = await targetedTests(repo, config, changed)
+    if (tests.length === 0) results.push({ name: 'tests', command: config.tests?.command ?? '', status: 'skipped', exit_code: null, output: 'no targeted tests' })
+    else results.push(...(await runTests(tests)))
+    return results
   }
+  return { checks, tests: config.tests ? runTests : null, agentChecks: (changed) => checks(changed, { tests: false }) }
 }
 
 export const runTestsTool: Contracts.HostTool = {
@@ -266,3 +264,20 @@ export async function callRunTests(repo: Pick<Repo, 'committedFiles'>, config: R
   if (tests.length === 0 || refused.length > 0) throw new Error(`not committed test files: ${refused.join(', ') || '(none given)'}`)
   return (await run(tests)).map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-toolOutputTailChars) }))
 }
+
+const checkOutputTailChars = 4_000
+
+/** The run_checks tool of an editing agent. `files` names the files that it checks, and `more` ends the description. */
+export const runChecksTool = (files: string, more = ''): Contracts.HostTool => ({
+  name: 'run_checks',
+  description: `Run the repository's configured checks (for example typecheck, lint, build) on ${files}, on the real machine. It runs no tests. Returns each status and the end of its output.${more}`,
+  parameters: { type: 'object', properties: {}, additionalProperties: false },
+})
+
+/** The result of run_checks for an agent: each status and the end of its output. */
+export const checkTails = (results: CheckResult[]) =>
+  results.map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-checkOutputTailChars) }))
+
+/** The failed checks or tests in the refusal of a submit: the name, the exit code and the end of the output of each. */
+export const failureText = (failed: CheckResult[]): string[] =>
+  failed.map(({ name, exit_code, output }) => `--- ${name} (exit code ${exit_code ?? 'none'}) ---\n${output.slice(-checkOutputTailChars)}`)

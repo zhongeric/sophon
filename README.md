@@ -86,8 +86,8 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
 - `answerers` limits who can answer questions. `research` configures a research notebook. Its `known`, `inject` and
   `reproduce` commands print a JSON last line ([spec, section 6.3](docs/specs/research-workflow.md#63-the-domain-in-the-notebook)).
 - Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
-  file that no test imports gets the test files that have its base name as a word. A builder's `run_checks` runs
-  only the checks. The targeted tests run one time, when the builder submits its build log.
+  file that no test imports gets the test files that have its base name as a word. The `run_checks` of builders,
+  patch agents and light agents runs only the checks. Their targeted tests run one time, when they submit their log.
 - `merge` (`"squash"`, `"merge"` or `"rebase"`) is the standing permission for the host to merge a ready development
   PR with that method. Without it, the host does not merge.
 
@@ -118,12 +118,12 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 
 ## Cloudflare
 
-You need Workers Paid, Containers for development and research runs, and Docker on the machine that deploys. When
-you set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`, the Worker calls GitHub as that GitHub App. The key must be
-PKCS#8 (`openssl pkcs8 -topk8 -nocrypt`). Without them, the Worker uses `GITHUB_TOKEN`, a fine-grained token with
-read and write access to Contents, Pull requests and Issues, and read access to Actions and Commit statuses. Each
-target repository needs CI on pull requests and on pushes to `factory/**`. Fork PRs are refused, because that CI
-would run fork code with the repository secrets.
+You need Workers Paid, Containers for development runs, research runs and review runs whose config has tests, and
+Docker on the machine that deploys. When you set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`, the Worker calls
+GitHub as that GitHub App. The key must be PKCS#8 (`openssl pkcs8 -topk8 -nocrypt`). Without them, the Worker uses
+`GITHUB_TOKEN`, a fine-grained token with read and write access to Contents, Pull requests and Issues, and read access
+to Actions and Commit statuses. Each target repository needs CI on pull requests and on pushes to `factory/**`. Fork
+PRs are refused, because that CI would run fork code with the repository secrets.
 
 ```bash
 npx wrangler deploy
@@ -157,8 +157,8 @@ checks the webhook of each repository with `GITHUB_WEBHOOK_SECRET`. Use the even
 requests, Workflow runs and Statuses. The Worker ignores the comment, issue and PR events of its own bot.
 
 A Durable Object holds the ledger, the repository tree and the agent sessions of each run. Alarms drive the run and
-resume it after a crash. Development and research runs run their commands in a Cloudflare Container that has no
-secrets. Commits and pushes go through the GitHub API.
+resume it after a crash. Development and research runs run their commands, and review runs with tests run their
+tests, in a Cloudflare Container that has no secrets. Commits and pushes go through the GitHub API.
 The object keeps the sync state of each container directory in SQL, so after a restart the next sync sends only the
 changed files and does not run the setup again.
 A development PR says `Closes #<issue>`.
@@ -170,7 +170,7 @@ agents/            the guidelines of each role, with profiles/ for each stack an
 src/core/          the workflows, the rules and the agent host, with no platform code
 src/node/          the local CLIs
 src/cloudflare/    the Worker and the Durable Objects
-containers/build/  the build image of development runs
+containers/build/  the build image of development and review runs
 docs/specs/        the designs and their decisions
 ```
 

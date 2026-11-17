@@ -50,7 +50,7 @@ export type Env = {
   GITHUB_API_URL?: string
   ANTHROPIC_URL?: string
   OPENAI_URL?: string
-  /** A machine endpoint that replaces the development run's container, for local tests. */
+  /** A machine endpoint that replaces the build container of the runs, for local tests. */
   MACHINE_URL?: string
   /** An endpoint that gets each request that the research egress approved, as /<host><path>, for local tests. */
   EGRESS_URL?: string
@@ -127,6 +127,13 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
   protected abstract announcement(run: string, request: Request): string
   /** Runs the work, or resumes it from the ledger. Returns whether it passed, and the comment for the end of the run. */
   protected abstract execute(run: string, request: Request, ledger: Ledger, gh: GitHub, comments: Comments): Promise<{ passed: boolean; summary: string }>
+
+  /** The build machine of this object: MACHINE_URL in local tests, else the object's Cloudflare Container. */
+  protected box(syncs: SyncStore): Box {
+    if (this.env.MACHINE_URL) return httpBox(this.env.MACHINE_URL)
+    if (!this.ctx.container) throw new StopError('this Worker has no container for builds: add the containers section of wrangler.jsonc and deploy again')
+    return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => syncs.clear() })
+  }
 
   async start(request: Request): Promise<{ run: string; started: boolean }> {
     const active = this.active()
@@ -221,13 +228,6 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     }
     if (next === null) await this.ctx.storage.deleteAlarm()
     else await this.ctx.storage.setAlarm(next)
-  }
-
-  /** The machine of the run's commands: the MACHINE_URL endpoint, else the object's Cloudflare Container. */
-  protected box(syncs: SyncStore): Box {
-    if (this.env.MACHINE_URL) return httpBox(this.env.MACHINE_URL)
-    if (!this.ctx.container) throw new StopError('this Worker has no container for builds: add the containers section of wrangler.jsonc and deploy again')
-    return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => syncs.clear() })
   }
 
   protected active(): RunRow | undefined {

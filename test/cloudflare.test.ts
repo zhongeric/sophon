@@ -23,6 +23,8 @@ const vars = (mock: { url: string }) => ({
   OPENAI_URL: `${mock.url}/v1`,
   PAUSE_POLL_SECONDS: '2',
 })
+/** The vars with the mock machine, for review runs whose config has tests: they run the tests on a build machine. */
+const withMachine = (mock: { url: string }) => ({ ...vars(mock), MACHINE_URL: `${mock.url}/machine` })
 /** Starts the Worker, and closes the mock when wrangler dev does not start. */
 async function startFor(mock: { close: () => Promise<void> }, ...args: Parameters<typeof startWorker>) {
   try {
@@ -94,7 +96,7 @@ test('on Cloudflare, development collects a stopped review before a budget raise
 test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, pushes the fixes, and the close of the PR prunes them', { timeout: 240_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
-  const worker = await startFor(mock, vars(mock))
+  const worker = await startFor(mock, withMachine(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 120)))}\nrequests: ${mock.state.requests.slice(-15).join(', ')}\nworker:\n${worker.output().slice(-3000)}`
   try {
     assert.equal((await sendWebhook(worker.url, null, 'issue_comment', comment('maintainer', '/review'))).status, 401)
@@ -122,9 +124,11 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
     assert.deepEqual(providers, new Set(['codex']))
     const report = await (await fetch(`${worker.url}/runs/acme/app/7/report`, { headers: { authorization: 'Bearer admin' } })).text()
     assert.match(report, /Step 1 findings: host=0, minimize=1, rules=0, bugs=1, anti-slop=0/)
-    // Review runs on Cloudflare have no test runner: the agents that run tests elsewhere hear that CI runs them.
+    // The config has tests, so the run tests on the build machine: the agents that run tests get run_tests, not the text that CI runs them.
     const told = (role: string) => mock.state.turns.some((turn) => turn.role === role && turn.request.includes('This run has no run_tests tool'))
-    assert.deepEqual([told('patch'), told('bugs'), told('minimize')], [true, true, false])
+    const offered = (role: string) => mock.state.turns.some((turn) => turn.role === role && turn.request.includes('Run specific test files of /repo'))
+    assert.deepEqual([told('patch'), told('bugs'), told('minimize')], [false, false, false])
+    assert.deepEqual([offered('patch'), offered('bugs')], [true, true])
 
     // The sweep keeps the fix branch while the PR is open. The close of the PR prunes it, but never the head branch outside factory/.
     const fixes = `factory/${started.run}`
@@ -153,6 +157,46 @@ test('on Cloudflare, a fork PR stops before any work, because its fixes would ru
     assert.match(stopped.body, /fork PRs are not supported/)
     assert.equal(mock.state.turns.length, 0)
     assert.equal(mock.state.refs.size, 0)
+  } finally {
+    await worker.stop()
+    await mock.close()
+  }
+})
+
+test('on Cloudflare, a /review patch agent that breaks a test gets the failing output at its log, fixes the cause, and the host accepts the log', { timeout: 180_000 }, async () => {
+  const repo = fixtureRepo()
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ breakFirst: true, runQuestion: true, tests: true }) })
+  const worker = await startFor(mock, withMachine(mock))
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
+  try {
+    const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })).json()) as { run: string }
+    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 150_000, describe)
+    assert.match(done.body, /agent-factory: PASS/, done.body)
+    assert.equal(mock.fileAt(`refs/heads/factory/${started.run}`, 'src/math.ts'), fixed)
+    const output = mock.state.turns.filter((turn) => turn.role === 'patch' && turn.output).map((turn) => turn.output).join('\n')
+    assert.match(output, /refused: .*the targeted tests of your edits failed \(test\/add\.test\.ts, test\/sub\.test\.ts\)/)
+    assert.match(output, /3 !== 2/)
+    assert.doesNotMatch(output, /FAILING PATCH ACCEPTED/)
+    assert.match(output, /checks: syntax=skipped smoke=pass/)
+    // The gate ran the targeted tests on the machine, in the directory of the review run.
+    const gate = mock.state.commands.filter((entry) => entry.cwd === `review/${started.run}` && entry.argv.join(' ').includes("--test 'test/add.test.ts' 'test/sub.test.ts'"))
+    assert.ok(gate.length >= 2, JSON.stringify(mock.state.commands.map((entry) => [entry.cwd, entry.argv.join(' ').slice(0, 120)])))
+  } finally {
+    await worker.stop()
+    await mock.close()
+  }
+})
+
+test('on Cloudflare, a review whose config has tests stops before any work when the Worker has no container and no machine', { timeout: 120_000 }, async () => {
+  const repo = fixtureRepo()
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  const worker = await startFor(mock, vars(mock))
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
+  try {
+    await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })
+    const stopped = await until(() => mock.state.comments.find((entry) => entry.body.includes('stopped run')), 60_000, describe)
+    assert.match(stopped.body, /this Worker has no container for builds: add the containers section of wrangler\.jsonc and deploy again/)
+    assert.equal(mock.state.turns.length, 0)
   } finally {
     await worker.stop()
     await mock.close()
@@ -222,7 +266,7 @@ test('on Cloudflare, the App webhook secret replaces the webhook secret, and com
 test('on Cloudflare, the admin route starts a run, and the run picks up the answer without the webhook', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
-  const worker = await startFor(mock, vars(mock))
+  const worker = await startFor(mock, withMachine(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 120)))}`
   const admin = { authorization: 'Bearer admin', 'content-type': 'application/json' }
   try {
@@ -263,7 +307,7 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
 test('on Cloudflare, a docs and tests only change takes the light loop, with host findings from the virtual git diff', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo({ light: true })
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
-  const worker = await startFor(mock, vars(mock))
+  const worker = await startFor(mock, withMachine(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
   try {
     const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })).json()) as { run: string }
@@ -316,7 +360,7 @@ test('on Cloudflare, deleted source files and the old paths of renamed source fi
       return { cell: 'await tools.submit_findings({ findings: [] })' }
     },
   })
-  const worker = await startFor(mock, vars(mock))
+  const worker = await startFor(mock, withMachine(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
   try {
     await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })
@@ -339,7 +383,7 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
   // The open question is a run question, so the run asks nothing on the PR (D11).
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ runQuestion: true, tests: false }) })
   mock.state.ciStatus = 403
-  const worker = await startFor(mock, vars(mock))
+  const worker = await startFor(mock, withMachine(mock))
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}`
   const admin = { authorization: 'Bearer admin' }
   const modelCalls = () => mock.state.requests.filter((route) => route.startsWith('POST /v1/')).length
