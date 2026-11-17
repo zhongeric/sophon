@@ -355,7 +355,9 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
   const mock = await mockServices(repo, { botLogin: 'factory-bot', issues, name: 'app', owner: 'acme', script: developScript({ reviewFix: true }) })
   // FACTORY_CONTAINERS=1 runs the build machine as a real local container (it needs Docker). Else the mock is the machine.
   const containers = process.env.FACTORY_CONTAINERS === '1'
-  const worker = await startWorker(containers ? vars(mock) : { ...vars(mock), MACHINE_URL: `${mock.url}/machine` }, { containers })
+  // A budget of 2 s makes each alarm call stop at a safe point, so the run passes across several alarm calls (D12).
+  const budget = { ...vars(mock), ALARM_BUDGET_SECONDS: '2' }
+  const worker = await startWorker(containers ? budget : { ...budget, MACHINE_URL: `${mock.url}/machine` }, { containers })
   const on = (number: number) => mock.state.comments.filter((entry) => entry.issue === number)
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 160)]))}\nworker:\n${worker.output().slice(-4000)}`
   try {
@@ -365,6 +367,7 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     // The intake agent raised no user question, so the run takes its recommendations and does not ask on the issue (D11).
     const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
     assert.match(done.body, /^# Development run: READY/, done.body)
+    assert.match(done.body, /^- Alarm calls: [1-9]\d* planned stops?, \d+ crash restarts?$/m, done.body)
     assert.ok(!on(5).some((entry) => entry.body.includes('agent-factory:questions')), describe())
     assert.match(done.body, /## Decisions the run made\n\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\*/)
     const [number, pull] = [...mock.state.pulls].find(([, entry]) => entry.head === 'factory/dev-add-sub-mul')!

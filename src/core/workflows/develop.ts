@@ -3,6 +3,7 @@ import type { CiJob } from '../ci.ts'
 import type { MergeMethod, RepoConfig } from '../checks.ts'
 import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
+import { alarmLines, settleAll } from '../planned-stop.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
 import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeResult, PullRequests } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
@@ -180,7 +181,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const finish: Finish = async (status, criteria, note, resumable = false, merge = null) => {
     const limit = budget.limit()
     const usage = usageSection([...usageOf(ledger).agents, ...spentPasses().map(reviewRow)], prices, limit === undefined ? undefined : { limit, spent: budget.spent() })
-    const report = renderReport(state, status, criteria, note, decisions(ledger), usage)
+    const report = renderReport(state, status, criteria, note, decisions(ledger), usage, alarmLines(ledger))
     deps.files.write('report.md', report)
     // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
     if (state.pr && ledger.get('commented') !== report) {
@@ -230,7 +231,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const scheduled = waves(planned.tasks, input.parallel ?? defaultParallel)
   for (const [index, wave] of scheduled.entries()) {
     const from = await step(ledger, `wave.${index}`, () => dev.head())
-    const logs = await Promise.all(
+    const logs = await settleAll(
       wave.map((task) =>
         step(ledger, `build.${task.id}`, async () => {
           const branch = await branches.branch(taskBranch(task), from)
@@ -565,7 +566,7 @@ function reviewRow(review: Review, index: number): UsageRow {
   return { step: `review.${index + 1}`, model: 'review loop', tokens: usage.tokens, usd: usage.usd, unpriced: usage.unpriced }
 }
 
-function renderReport(state: ReportState, status: DevelopStatus, criteria: Criterion[], note: string, answers: Answer[], usage: string[]): string {
+function renderReport(state: ReportState, status: DevelopStatus, criteria: Criterion[], note: string, answers: Answer[], usage: string[], alarms: string[]): string {
   const triage = (report: string) => /^- Triage: (.*)$/m.exec(report)?.[1] ?? ''
   const failed = criteria.filter((criterion) => !criterion.ok)
   const criterionLine = (criterion: Criterion) => `- [${criterion.ok ? 'x' : ' '}] ${criterion.name}: ${criterion.detail}`
@@ -583,6 +584,7 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
     ...(state.intake ? [`- Title: ${state.intake.title}`] : []),
     ...(state.route ? [`- Route: ${state.route.spec ? 'spec, then plan' : 'plan'}, ${state.route.passes} review loop ${state.route.passes === 1 ? 'pass' : 'passes'}. ${state.intake?.reason ?? ''}`] : []),
     ...(state.branch ? [`- Branch: ${state.branch}${state.head ? ` at ${state.head.slice(0, 12)}` : ''}`] : []),
+    ...alarms,
     '',
     ...(criteria.length > 0 ? ['## Criteria', '', ...criteria.map(criterionLine), ''] : []),
     ...(state.plan ? ['## Plan', '', state.plan.smallest_change, ''] : []),

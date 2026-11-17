@@ -3,6 +3,7 @@ import type { CheckResult, RepoConfig } from '../checks.ts'
 import { assignIds, type Finding } from '../findings.ts'
 import { acceptRejection, findingQuestion, gate, rejectionQuestion, settle, type GateResult } from '../gate.ts'
 import { step, type Ledger } from '../ledger.ts'
+import { alarmLines, settleAll } from '../planned-stop.ts'
 import type { AgentStore, Checker, Files, Frozen, Guides, Repo } from '../platform.ts'
 import { isLight, profilesById, staticFindings, triage, triageLine, type Triage } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
@@ -249,7 +250,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
       questions.post('ask', list),
     )
     // The bugs review is the slowest track: on a large diff, the host splits it across reviewers.
-    const step1 = await Promise.all(
+    const step1 = await settleAll(
       step1Roles.map((id) =>
         step(ledger, `step1.${id}`, () => (id === 'bugs' ? splitReview : review)(context, `step1.${id}`, reviewRoles[id], input.models.step1[id], step1Range, '')),
       ),
@@ -268,7 +269,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     if (patch1.changed) {
       const range = { from: frozen.head, to: patch1.after }
       const note = 'This is the step 2 pass. The diff is the patch that the step 1 patch agent applied, not the original change.'
-      const late = await Promise.all(
+      const late = await settleAll(
         (['late-minimize', 'late-rules'] as const).map((id) =>
           step(ledger, `step2.${id}`, () => review(context, `step2.${id}`, reviewRoles[id], input.models.step2[id], range, note)),
         ),
@@ -339,7 +340,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     const usageReport = usage()
     const note = `The run ${error.message}. Reason: cost budget.`
     const steps = ['- The run stopped at the cost budget before the steps finished.']
-    const report = renderReport({ input, frozen, current, pass: false, criteria, triage: triaged, steps, checks: null, verdict: null, decisions: decisions(ledger), usage: usageReport.lines, note })
+    const report = renderReport({ input, frozen, current, pass: false, criteria, triage: triaged, steps, checks: null, verdict: null, decisions: decisions(ledger), usage: usageReport.lines, alarms: alarmLines(ledger), note })
     deps.files.write('report.md', report)
     ledger.put('result', { pass: false, criteria, final: current, usage: usageReport.run, stopped: true })
     return { pass: false, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: true }
@@ -355,7 +356,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   }
 
   const usageReport = usage()
-  const report = renderReport({ input, frozen, current, pass, criteria, triage: triaged, steps, checks, verdict, decisions: decisions(ledger), usage: usageReport.lines, note: null })
+  const report = renderReport({ input, frozen, current, pass, criteria, triage: triaged, steps, checks, verdict, decisions: decisions(ledger), usage: usageReport.lines, alarms: alarmLines(ledger), note: null })
   deps.files.write('report.md', report)
   ledger.put('result', { pass, criteria, final: current, usage: usageReport.run, stopped: false })
   return { pass, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: false }
@@ -440,6 +441,8 @@ type ReportInput = {
   verdict: Verdict | null
   decisions: Answer[]
   usage: string[]
+  /** The counters of the alarm calls, or no line on the local platform. */
+  alarms: string[]
   note: string | null
 }
 
@@ -452,6 +455,7 @@ function renderReport(run: ReportInput): string {
     `- Reviewed: ${short(run.frozen.base)}..${short(run.frozen.head)}`,
     `- Fixes: branch ${run.frozen.branch} at ${short(run.current)} (${run.frozen.location})`,
     `- Triage: \`${triageLine(run.triage)}\``,
+    ...run.alarms,
     '',
     ...(run.note ? [run.note, ''] : []),
     '## Criteria',
