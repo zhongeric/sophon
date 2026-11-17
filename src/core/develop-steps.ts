@@ -1,7 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { runTurn, submitOnce, type AgentHost, type AgentSpec, type HostTools } from './agent.ts'
-import { callRunTests, isProtected, protectedEntries, runTestsTool, targetedTests, type RepoConfig } from './checks.ts'
+import { callRunTests, checkTails, failureText, isProtected, protectedEntries, runChecksTool, runTestsTool, targetedTests, type RepoConfig } from './checks.ts'
 import { checkIntake, checkPlan, checkSpec, inScope, submitIntake, submitPlan, submitSpec, type Intake, type Plan, type Spec } from './plan.ts'
 import type { Branch, Checker, Guides } from './platform.ts'
 import { staticFindings, type Profile } from './profiles.ts'
@@ -19,8 +19,6 @@ export type DevelopContext = {
   /** The ask, verbatim. */
   ask: string
 }
-
-const toolOutputTailChars = 4_000
 
 function agent(context: DevelopContext, id: string, role: Role, model: ModelChoice, workspace: Contracts.WorkspaceHost, tools: HostTools): AgentSpec {
   return { id, ...model, instructions: instructions(role, { read: context.guides.read, stackGuides: context.stackGuides }), tools, workspace, subagents: role.subagents }
@@ -89,14 +87,6 @@ const checkpointTool: Contracts.HostTool = {
     'Commit your changes. The host first checks that every changed path is in the files of the task, the lines that you added against the static rules of the stack, and the paths against the paths that no change may commit. ' +
     'It refuses the commit and lists each problem when one fails. Fix them and call again. A new test file runs with run_tests only after a checkpoint.',
   parameters: { type: 'object', properties: { message: { type: 'string', description: 'What this commit does, in a few words' } }, required: ['message'], additionalProperties: false },
-}
-
-const runChecksTool: Contracts.HostTool = {
-  name: 'run_checks',
-  description:
-    "Run the repository's configured checks (for example typecheck, lint, build) on the files that the work changed, on the real machine. It runs no tests. Returns each status and the end of its output. " +
-    'The targeted tests run when you submit. While you work, use run_tests for the test files.',
-  parameters: { type: 'object', properties: {}, additionalProperties: false },
 }
 
 const submitBuildLog: Contracts.HostTool = {
@@ -173,11 +163,10 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       },
     },
     run_checks: {
-      definition: runChecksTool,
+      definition: runChecksTool('the files that the work changed', ' The targeted tests run when you submit. While you work, use run_tests for the test files.'),
       async call() {
         const changed = [...new Set([...(await branch.changedFiles(task.base, await branch.head())), ...(await branch.pending()).changed])]
-        const results = await checker.checks(changed, { tests: false })
-        return results.map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-toolOutputTailChars) }))
+        return checkTails(await checker.checks(changed, { tests: false }))
       },
     },
     ...(context.config.tests && checker.tests
@@ -206,7 +195,7 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       throw new Error(
         [
           `${cause}. Fix the cause, checkpoint and submit again. When you cannot fix it, submit with the reason in blocked.`,
-          ...failed.map(({ name, exit_code, output }) => `--- ${name} (exit code ${exit_code ?? 'none'}) ---\n${output.slice(-toolOutputTailChars)}`),
+          ...failureText(failed),
         ].join('\n'),
       )
     }),

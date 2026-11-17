@@ -112,7 +112,7 @@ const openQuestion = {
 export const script = scriptFor({ tests: true })
 
 /**
- * The scripted agents. Without `tests`, as on Cloudflare where CI runs the tests, no agent calls run_tests or run_checks.
+ * The scripted agents. Without `tests`, no agent calls run_tests or run_checks.
  * `holdBug` marks the bug as the user's decision. `rejectBug` makes the patch agent reject it. `runQuestion` makes the
  * open question a run question, so that the run does not ask the user. `breakFirst` makes the patch agent submit a sub
  * that fails test/sub.test.ts, then write the fix and submit again.

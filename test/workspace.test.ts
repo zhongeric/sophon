@@ -6,7 +6,7 @@ import { test } from 'node:test'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import { hostFetch, type AgentHost } from '../src/core/agent.ts'
 import { runLock } from '../src/core/egress.ts'
-import { allowFiles, createWorkspace, guard, readOnly, recordEdits } from '../src/core/workspace.ts'
+import { allowFiles, createWorkspace, fileHash, guard, readOnly, recordEdits } from '../src/core/workspace.ts'
 import { diskFileSystem } from '../src/node/disk.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { sqliteStore } from '../src/node/platform.ts'
@@ -46,6 +46,25 @@ test('paths cannot leave the tree through symlinks, and .git is hidden', async (
   assert.doesNotMatch((await run(workspace, 'ls -a')).stdout, /\.git/)
   await assert.rejects(workspace.write('/repo/escape/secret', 'x'), /EACCES/)
   assert.equal(readFileSync(join(root, 'escape/secret'), 'utf8'), 'key')
+})
+
+test('disk lstat reads the final link but refuses hidden paths and parents outside the tree', async () => {
+  const root = tree()
+  writeFileSync(join(root, '.git/config'), '[core]\n')
+  symlinkSync('src', join(root, 'linked'))
+  symlinkSync('missing', join(root, 'dangling'))
+  symlinkSync('.git', join(root, 'gitlink'))
+  const fs = diskFileSystem(root)
+  for (const path of ['/linked', '/dangling', '/escape', '/gitlink']) {
+    assert.equal((await fs.lstat?.(path))?.kind, 'symlink', path)
+  }
+  assert.equal((await fs.lstat?.('/'))?.kind, 'directory')
+  assert.equal((await fs.lstat?.('/linked/a.ts'))?.kind, 'file')
+  for (const path of ['/escape/secret', '/.git', '/.git/config', '/gitlink/config', '/missing']) {
+    assert.equal(await fs.lstat?.(path), null, path)
+  }
+  await assert.rejects(fs.read('/escape/secret'), /EACCES/)
+  await assert.rejects(fs.read('/gitlink/config'), /ENOENT/)
 })
 
 test('writes never go through symlinks, so links cannot reach protected paths, .git, or outside the tree', async () => {
@@ -101,6 +120,126 @@ test('an edit record keeps each written, removed and renamed path in the ledger,
   await run(await open(), 'mv docs/c.md docs/d.md')
   assert.deepEqual(ledger.get('edits:patch'), ['src/a.ts', 'src/b.ts', 'docs/c.md', 'docs/d.md'])
 })
+
+test('an edit record keeps each file of a renamed or removed directory, so that the gate finds their tests', async () => {
+  const fs = MemoryFileSystem.create({ files: { '/src/old/a.ts': 'a', '/src/old/sub/b.ts': 'b', '/lib/c.ts': 'c', '/lib/d.ts': 'd' } })
+  const ledger = fileLedger(join(mkdtempSync(join(tmpdir(), 'factory-edits-')), 'state.json'))
+  const repo = recordEdits(guard(fs), ledger, 'edits:patch')
+  await repo.rename('/src/old', '/src/new')
+  assert.deepEqual([...(ledger.get<string[]>('edits:patch') ?? [])].sort(), ['src/new/a.ts', 'src/new/sub/b.ts', 'src/old/a.ts', 'src/old/sub/b.ts'])
+
+  await run(await createWorkspace({ repo, review: {} }), 'rm -r lib')
+  assert.equal(await fs.stat('/lib/c.ts'), null)
+  assert.deepEqual(
+    [...(ledger.get<string[]>('edits:patch') ?? [])].sort(),
+    ['lib/c.ts', 'lib/d.ts', 'src/new/a.ts', 'src/new/sub/b.ts', 'src/old/a.ts', 'src/old/sub/b.ts'],
+  )
+})
+
+test('an edit record keeps the first hashes of both directory rename paths, including absent destination children', async () => {
+  const fs = MemoryFileSystem.create({ files: { '/src/old/a.ts': 'a', '/src/old/sub/b.ts': 'b' } })
+  const ledger = fileLedger(join(mkdtempSync(join(tmpdir(), 'factory-edits-')), 'state.json'))
+  const repo = recordEdits(guard(fs), ledger, 'edits:patch', 'originals:patch')
+  const originals = {
+    'src/old/a.ts': await fileHash(fs, '/src/old/a.ts'),
+    'src/new/a.ts': null,
+    'src/old/sub/b.ts': await fileHash(fs, '/src/old/sub/b.ts'),
+    'src/new/sub/b.ts': null,
+  }
+  await repo.rename('/src/old', '/src/new')
+  assert.deepEqual(ledger.get('originals:patch'), originals)
+  await repo.rename('/src/new', '/src/old')
+  assert.deepEqual(ledger.get('originals:patch'), originals)
+  for (const [path, hash] of Object.entries(originals)) assert.equal(await fileHash(fs, `/${path}`), hash)
+})
+
+test('an edit record keeps concurrent first hashes without another file read, also after a resume', async () => {
+  const fs = MemoryFileSystem.create({ files: { '/src/a.ts': 'a', '/src/b.ts': 'b' } })
+  const reads: string[] = []
+  const counted = {
+    ...fs,
+    read: async (path: string) => {
+      reads.push(path)
+      return fs.read(path)
+    },
+  }
+  const ledger = fileLedger(join(mkdtempSync(join(tmpdir(), 'factory-edits-')), 'state.json'))
+  const open = () => recordEdits(guard(counted), ledger, 'edits:patch', 'originals:patch')
+  const a = await fileHash(fs, '/src/a.ts')
+  const b = await fileHash(fs, '/src/b.ts')
+  await Promise.all([open().write('/src/a.ts', new TextEncoder().encode('x')), open().write('/src/b.ts', new TextEncoder().encode('z'))])
+  await open().write('/src/a.ts', new TextEncoder().encode('y'))
+  await open().write('/src/new.ts', new TextEncoder().encode('new'))
+  await open().write('/src/new.ts', new TextEncoder().encode('changed'))
+  await open().remove('/src')
+  assert.deepEqual(reads.sort(), ['/src/a.ts', '/src/b.ts'])
+  assert.deepEqual(ledger.get('originals:patch'), { 'src/a.ts': a, 'src/new.ts': null, 'src/b.ts': b })
+})
+
+test('an edit record removes a directory without following parent or external symlinks', async () => {
+  const fs = MemoryFileSystem.create({ files: { '/src/a.ts': 'a', '/outside/secret': 'secret' } })
+  await fs.symlink('..', '/src/parent')
+  await fs.symlink('/outside', '/src/external')
+  const reads: string[] = []
+  const counted = {
+    ...fs,
+    read: async (path: string) => {
+      reads.push(path)
+      return fs.read(path)
+    },
+  }
+  const ledger = fileLedger(join(mkdtempSync(join(tmpdir(), 'factory-edits-')), 'state.json'))
+  const repo = recordEdits(guard(counted), ledger, 'edits:patch', 'originals:patch')
+  await repo.remove('/src')
+  assert.deepEqual(reads, ['/src/a.ts'])
+  assert.deepEqual([...(ledger.get<string[]>('edits:patch') ?? [])].sort(), ['src/a.ts', 'src/external', 'src/parent'])
+  assert.equal(await fs.stat('/src'), null)
+  assert.equal(new TextDecoder().decode(await fs.read('/outside/secret')), 'secret')
+})
+
+for (const operation of ['rename', 'remove']) {
+  test(`a disk edit record stops at parent and sibling symlinks during directory ${operation}`, async () => {
+    const root = tree()
+    mkdirSync(join(root, 'sibling'))
+    writeFileSync(join(root, 'sibling/other.ts'), 'other')
+    symlinkSync('..', join(root, 'src/parent'))
+    symlinkSync('../sibling', join(root, 'src/sibling'))
+    const fs = diskFileSystem(root)
+    const reads: string[] = []
+    const counted = {
+      ...fs,
+      list: async (path: string) => {
+        assert.equal(path, '/src')
+        return fs.list(path)
+      },
+      read: async (path: string) => {
+        reads.push(path)
+        return fs.read(path)
+      },
+    }
+    const ledger = fileLedger(join(mkdtempSync(join(tmpdir(), 'factory-edits-')), 'state.json'))
+    const repo = recordEdits(counted, ledger, 'edits:patch', 'originals:patch')
+    const paths = ['src/a.ts', 'src/parent', 'src/sibling']
+    const originals: Record<string, string | null> = {}
+    for (const path of paths) originals[path] = await fileHash(fs, `/${path}`)
+    if (operation === 'rename') {
+      for (const path of paths) originals[path.replace('src/', 'dest/')] = null
+      await repo.rename('/src', '/dest')
+    } else {
+      await repo.remove('/src')
+    }
+    assert.deepEqual(reads, ['/src/a.ts'])
+    assert.deepEqual([...(ledger.get<string[]>('edits:patch') ?? [])].sort(), Object.keys(originals).sort())
+    assert.deepEqual(ledger.get('originals:patch'), originals)
+    assert.equal(await fs.stat('/src'), null)
+    assert.equal(readFileSync(join(root, 'sibling/other.ts'), 'utf8'), 'other')
+    if (operation === 'rename') {
+      assert.equal(readFileSync(join(root, 'dest/a.ts'), 'utf8'), 'export const a = 1\n')
+      assert.equal((await fs.lstat?.('/dest/parent'))?.kind, 'symlink')
+      assert.equal((await fs.lstat?.('/dest/sibling'))?.kind, 'symlink')
+    }
+  })
+}
 
 test('a shell with a layout fetch sends curl through that fetch, and a shell without it refuses', async () => {
   const fetched: string[] = []

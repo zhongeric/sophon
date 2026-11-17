@@ -264,3 +264,20 @@ export async function callRunTests(repo: Pick<Repo, 'committedFiles'>, config: R
   if (tests.length === 0 || refused.length > 0) throw new Error(`not committed test files: ${refused.join(', ') || '(none given)'}`)
   return (await run(tests)).map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-toolOutputTailChars) }))
 }
+
+const checkOutputTailChars = 4_000
+
+/** The run_checks tool of an editing agent. `files` names the files that it checks, and `more` ends the description. */
+export const runChecksTool = (files: string, more = ''): Contracts.HostTool => ({
+  name: 'run_checks',
+  description: `Run the repository's configured checks (for example typecheck, lint, build) on ${files}, on the real machine. It runs no tests. Returns each status and the end of its output.${more}`,
+  parameters: { type: 'object', properties: {}, additionalProperties: false },
+})
+
+/** The result of run_checks for an agent: each status and the end of its output. */
+export const checkTails = (results: CheckResult[]) =>
+  results.map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-checkOutputTailChars) }))
+
+/** The failed checks or tests in the refusal of a submit: the name, the exit code and the end of the output of each. */
+export const failureText = (failed: CheckResult[]): string[] =>
+  failed.map(({ name, exit_code, output }) => `--- ${name} (exit code ${exit_code ?? 'none'}) ---\n${output.slice(-checkOutputTailChars)}`)

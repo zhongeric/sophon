@@ -97,10 +97,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     return { passed: result.pass, summary: summary(run, result) }
   }
 
-  /**
-   * The checker of a run whose config has tests: CI, with the tests and the agent checks on the build machine. The review
-   * tree has a directory of its own, because the runs of all objects share one MACHINE_URL machine.
-   */
+  /** The review tree has a directory of its own, because the runs of all objects share one MACHINE_URL machine. */
   private machineChecker(run: string, repo: GitHubRepo, config: RepoConfig, ci: Checker, log: (line: string) => void): Checker {
     const syncs = sqlSyncs(this.ctx.storage.sql, run)
     const box = this.box(syncs)

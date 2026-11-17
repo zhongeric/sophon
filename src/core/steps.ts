@@ -1,7 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { runTurn, submitOnce, type AgentHost, type AgentSpec, type HostTools } from './agent.ts'
-import { callRunTests, isProtected, runTestsTool, targetedTests, type RepoConfig } from './checks.ts'
+import { callRunTests, checkTails, failureText, isProtected, runChecksTool, runTestsTool, targetedTests, type RepoConfig } from './checks.ts'
 import { assignIds, checkFindings, parseLocation, submitFindings, type Finding } from './findings.ts'
 import { step } from './ledger.ts'
 import { settleAll } from './planned-stop.ts'
@@ -9,7 +9,7 @@ import type { Checker, Frozen, Guides, Repo } from './platform.ts'
 import { checkQuestions, decisionsFile, decisionsLine, submitQuestions, type Question } from './questions.ts'
 import { instructions, reviewRoles, type ModelChoice, type Role } from './roles.ts'
 import { bugsShards, diffFiles, diffOf, fileOwners, patchGroups, type PatchGroup } from './split.ts'
-import { allowFiles, createWorkspace, guard, readOnly, recordEdits } from './workspace.ts'
+import { allowFiles, createWorkspace, fileHash, guard, readOnly, recordEdits } from './workspace.ts'
 
 /** What every step of one review run shares. */
 export type RunContext = {
@@ -150,14 +150,23 @@ export type PatchOutcome<Log extends PatchLog = PatchLog> = {
   note?: string
 }
 
-const toolOutputTailChars = 4_000
 const editsKey = (id: string) => `edits:${id}`
+const originalsKey = (id: string) => `originals:${id}`
 const untestedKey = (id: string) => `untested:${id}`
 
 const setupFailedNote = 'targeted tests did not run: the setup failed'
 
-/** The writable tree of one editing agent, which records the paths that the agent changes. */
-const editTree = (context: RunContext, id: string, tree: FileSystem.FileSystem) => recordEdits(tree, context.host.ledger, editsKey(id))
+/** The writable tree of one editing agent, which records the paths that the agent changes and their first content. */
+const editTree = (context: RunContext, id: string, tree: FileSystem.FileSystem) => recordEdits(tree, context.host.ledger, editsKey(id), originalsKey(id))
+
+/** The recorded edits of an agent whose content is not the content before its first change. */
+async function netEdits(context: RunContext, id: string): Promise<string[]> {
+  const kept = context.host.ledger.get<Record<string, string | null>>(originalsKey(id)) ?? {}
+  const paths: string[] = []
+  for (const path of context.host.ledger.get<string[]>(editsKey(id)) ?? [])
+    if (!(path in kept) || (await fileHash(context.repo.tree, `/${path}`)) !== kept[path]) paths.push(path)
+  return paths
+}
 
 /** The recorded edits of an agent that still exist in the tree. */
 async function existingEdits(context: RunContext, id: string): Promise<string[]> {
@@ -166,24 +175,17 @@ async function existingEdits(context: RunContext, id: string): Promise<string[]>
   return paths
 }
 
-const runChecksTool: Contracts.HostTool = {
-  name: 'run_checks',
-  description:
-    "Run the repository's configured checks (for example typecheck, lint, build) on the files that the change and your edits changed, on the real machine. It runs no tests. Returns each status and the end of its output.",
-  parameters: { type: 'object', properties: {}, additionalProperties: false },
-}
-
 /** run_checks for an editing agent: the files changed since the freeze base, and the edits of the agent. */
 function checkTools(context: RunContext, id: string): HostTools {
   const run = context.agentChecks
   if (!run) return {}
   return {
     run_checks: {
-      definition: runChecksTool,
+      definition: runChecksTool('the files that the change and your edits changed'),
       async call() {
         const { repo, frozen } = context
         const changed = [...new Set([...(await repo.changedFiles(frozen.base, await repo.head())), ...(await existingEdits(context, id))])]
-        return (await run(changed)).map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-toolOutputTailChars) }))
+        return checkTails(await run(changed))
       },
     },
   }
@@ -192,20 +194,18 @@ function checkTools(context: RunContext, id: string): HostTools {
 const gated = (context: RunContext) => context.tests !== null && Boolean(context.config.tests)
 const gateText = 'When you submit, the host runs the targeted tests of the files that you changed, and refuses the log while one fails.'
 
-/** The submit tool of an editing agent, with the gate in its description when the gate runs. */
-const gateTool = (context: RunContext, definition: Contracts.HostTool): Contracts.HostTool =>
-  gated(context) ? { ...definition, description: `${definition.description} ${gateText}` } : definition
-
 /**
  * The gate at the submit of an editing agent: the targeted tests of only the files that this agent changed, also its
- * new test files. A failure refuses the log. A failed setup runs no test, so the host accepts the log and records the note.
+ * new test files. A reverted edit does not count. A failure refuses the log. A failed setup runs no test, so the host
+ * accepts the log and records the note.
  */
 async function testGate(context: RunContext, id: string): Promise<void> {
   const { tests, config } = context
-  const edits = context.host.ledger.get<string[]>(editsKey(id)) ?? []
+  const edits = await netEdits(context, id)
   if (!tests || !config.tests || edits.length === 0) return
   const pattern = new RegExp(config.tests.pattern)
-  const added = (await existingEdits(context, id)).filter((path) => pattern.test(path))
+  const added: string[] = []
+  for (const path of edits) if (pattern.test(path) && (await context.repo.tree.stat(`/${path}`)) !== null) added.push(path)
   const targeted = [...new Set([...(await targetedTests(context.repo, config, edits)), ...added])]
   if (targeted.length === 0) return
   const failed = (await tests(targeted)).filter((result) => result.status !== 'pass')
@@ -217,7 +217,7 @@ async function testGate(context: RunContext, id: string): Promise<void> {
   throw new Error(
     [
       `the targeted tests of your edits failed (${targeted.join(', ')}). Fix the cause and submit again. When you cannot fix it, revert your edit and list the finding in skipped with the reason.`,
-      ...failed.map(({ name, exit_code, output }) => `--- ${name} (exit code ${exit_code ?? 'none'}) ---\n${output.slice(-toolOutputTailChars)}`),
+      ...failureText(failed),
     ].join('\n'),
   )
 }
@@ -372,8 +372,8 @@ async function patchTurn<Log extends PatchLog = PatchLog>(
   const tools = {
     ...checkTools(context, id),
     ...(mode.kind === 'share'
-      ? submitOnce(context.host, `output:${id}`, gateTool(context, submitSharePatchLog), (input) => submit(input, true))
-      : submitOnce(context.host, `output:${id}`, gateTool(context, submitPatchLog), (input) => submit(input, false))),
+      ? submitOnce(context.host, `output:${id}`, submitSharePatchLog, (input) => submit(input, true))
+      : submitOnce(context.host, `output:${id}`, submitPatchLog, (input) => submit(input, false))),
   }
   const prompt = [
     ...patchIntro(mode, findings.map((finding) => finding.id).join(', ')),
@@ -466,7 +466,7 @@ export async function light(
   const workspace = await createWorkspace({ repo: editTree(context, id, repo), review, guides: context.guides.mounts })
   const tools = {
     ...checkTools(context, id),
-    ...submitOnce(context.host, `output:${id}`, gateTool(context, submitLightLog), async (input) => {
+    ...submitOnce(context.host, `output:${id}`, submitLightLog, async (input) => {
       const log = checkPatchLog(input, options.kept) as LightLog
       if (!Array.isArray(log.fixes) || log.fixes.some((fix) => typeof fix?.location !== 'string' || typeof fix.change !== 'string'))
         throw new Error('fixes must be an array of { location, change }')

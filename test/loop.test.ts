@@ -99,7 +99,6 @@ test('the host refuses a patch log while a targeted test fails, and accepts it a
   assert.match(output, /--- tests \(exit code 1\) ---/)
   assert.match(output, /3 !== 2/)
   assert.doesNotMatch(output, /FAILING PATCH ACCEPTED/)
-  // run_checks runs the configured checks without tests.
   assert.match(output, /checks: syntax=skipped smoke=pass/)
   assert.ok(turns.some((turn) => turn.role === 'patch' && turn.request.includes('the host runs the targeted tests of the files that you changed')))
   assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 \(sub returns a - b\); skipped: min-001 \(inlining adds nothing\)$/m)
@@ -123,6 +122,52 @@ test('a patch agent that changed no files submits without a gate run', async () 
   // Only the run_tests call of the bugs reviewer reaches the test runner.
   assert.deepEqual(calls, [['test/sub.test.ts']])
   assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(callers depend on the sum\); min-001 \(inlining adds nothing\)$/m)
+})
+
+test('a patch agent that reverts its edit after a refusal, because the targeted test fails at the base, can skip the finding', async () => {
+  const { calls, checker } = testCalls()
+  const base = fixed.replace('a - b', 'a + b')
+  const revert: Script = (turn) =>
+    turn.role === 'patch' && turn.output === null
+      ? {
+          cell: [
+            `await tools.Write({ file_path: '/repo/src/math.ts', content: ${JSON.stringify(`// sub\n${base}`)} })`,
+            `try { await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'commented sub' }], skipped: [{ id: 'min-001', reason: 'inlining adds nothing' }] }); text('FAILING PATCH ACCEPTED') } catch (error) { text('refused: ' + error) }`,
+            `await tools.Write({ file_path: '/repo/src/math.ts', content: ${JSON.stringify(base)} })`,
+            `await tools.submit_patch_log({ applied: [], skipped: [{ id: 'bugs-001', reason: 'test/sub.test.ts fails at the base' }, { id: 'min-001', reason: 'inlining adds nothing' }] })`,
+          ].join('\n'),
+        }
+      : script(turn)
+  const turns: Turn[] = []
+  const result = await runLoop(fixtureRepo(), 'revert', runsDir(), { checker, dispatch: scriptedDispatch(revert, turns) })
+
+  assert.match(patchOutput(turns), /refused: .*the targeted tests of your edits failed \(test\/add\.test\.ts, test\/sub\.test\.ts\)/)
+  assert.doesNotMatch(patchOutput(turns), /FAILING PATCH ACCEPTED/)
+  // The bugs reviewer and the first submit reach the test runner. The reverted edit does not count at the second submit.
+  assert.deepEqual(calls, [['test/sub.test.ts'], ['test/add.test.ts', 'test/sub.test.ts']])
+  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(test\/sub\.test\.ts fails at the base\); min-001 \(inlining adds nothing\)$/m)
+})
+
+test('a patch agent that reverses a directory rename after a failed test can skip without another gate run', async () => {
+  const { calls, checker } = testCalls()
+  const revert: Script = (turn) =>
+    turn.role === 'patch' && turn.output === null
+      ? {
+          cell: [
+            `text(JSON.stringify(await tools.Bash({ command: 'mv src moved' })))`,
+            `try { await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'moved src' }], skipped: [{ id: 'min-001', reason: 'inlining adds nothing' }] }); text('FAILING PATCH ACCEPTED') } catch (error) { text('refused: ' + error) }`,
+            `text(JSON.stringify(await tools.Bash({ command: 'mv moved src' })))`,
+            `await tools.submit_patch_log({ applied: [], skipped: [{ id: 'bugs-001', reason: 'test/sub.test.ts fails at the base' }, { id: 'min-001', reason: 'inlining adds nothing' }] })`,
+          ].join('\n'),
+        }
+      : script(turn)
+  const turns: Turn[] = []
+  const result = await runLoop(fixtureRepo(), 'revert-directory', runsDir(), { checker, dispatch: scriptedDispatch(revert, turns) })
+
+  assert.match(patchOutput(turns), /refused: .*the targeted tests of your edits failed \(test\/add\.test\.ts, test\/sub\.test\.ts\)/)
+  assert.doesNotMatch(patchOutput(turns), /FAILING PATCH ACCEPTED/)
+  assert.deepEqual(calls, [['test/sub.test.ts'], ['test/add.test.ts', 'test/sub.test.ts']])
+  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(test\/sub\.test\.ts fails at the base\); min-001 \(inlining adds nothing\)$/m)
 })
 
 const hasBranch = (repo: string, name: string) => {

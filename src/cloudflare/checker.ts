@@ -42,9 +42,8 @@ export function ciChecker(options: { gh: GitHub; pull: PullRequest; repo: GitHub
 }
 
 /**
- * The checker of a review run whose config has tests: the final checks stay CI, and the tests and the checks of the
- * agents run on the build machine. A failed setup there gives a failed result named setup, so that the gate of an
- * editing agent accepts its log with the report note.
+ * The checker of a review run whose config has tests. The final checks use CI. The tests and the agent checks use the
+ * build machine. A failed setup there gives a failed result named setup, so the gate accepts the log with a report note.
  */
 export function reviewChecker(ci: Checker, machine: Checker): Checker {
   const settle = async (run: () => Promise<CheckResult[]>): Promise<CheckResult[]> => {
@@ -56,9 +55,10 @@ export function reviewChecker(ci: Checker, machine: Checker): Checker {
     }
   }
   const { tests, agentChecks } = machine
+  if (!tests || !agentChecks) throw new Error('the machine checker of a review run needs tests and agent checks')
   return {
     checks: ci.checks,
-    tests: tests && ((paths) => settle(() => tests(paths))),
-    ...(agentChecks ? { agentChecks: (changed: string[]) => settle(() => agentChecks(changed)) } : {}),
+    tests: (paths) => settle(() => tests(paths)),
+    agentChecks: (changed) => settle(() => agentChecks(changed)),
   }
 }
