@@ -39,7 +39,10 @@ function localContainer(root: string) {
       const command = argv.slice(4)
       const cwd = join(root, options.cwd)
       const input = options.stdin ? Buffer.from(await new Response(options.stdin).arrayBuffer()) : undefined
-      const result = existsSync(cwd) ? spawnSync(command[0]!, command.slice(1), { cwd, env: options.env, input }) : { status: 1, stdout: '', stderr: `no directory ${options.cwd}` }
+      // A user other than root cannot read /root/.bashrc, and bash reads it when its stdin is a socket. Thus HOME is the
+      // root of this container, which has no .bashrc.
+      const env = { ...options.env, HOME: root }
+      const result = existsSync(cwd) ? spawnSync(command[0]!, command.slice(1), { cwd, env, input }) : { status: 1, stdout: '', stderr: `no directory ${options.cwd}` }
       return { stdout: new Blob([`${result.stdout}${result.stderr}`]).stream(), exitCode: Promise.resolve(result.status ?? 1) }
     },
   }
