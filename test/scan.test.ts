@@ -46,7 +46,7 @@ const quick: Unit = { argv: ['true'], inputs: [], timeoutMs: 60_000 }
 
 test('a scan box starts its container with no network, and its inactivity timeout covers the time limit of the job', async () => {
   const { container, slot } = slotFixture()
-  const limit = 2 * 60 * 60_000
+  const limit = maxUnitMs
   await slot.start({ argv: ['bash', '-c', 'cat in.txt; printf " %s %s" "$NUMBA_CACHE_DIR" "$NUMBA_CPU_NAME"'], inputs: [{ data: encode('in'), path: 'in.txt' }], timeoutMs: limit })
   assert.deepEqual(container.starts, [{ enableInternet: false }])
   // The start of the job renews the timeout with the new time limit, and no poll comes before the end of the job.

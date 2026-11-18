@@ -10,7 +10,8 @@ export type SlotState = { name: string; job: string; timeoutMs: number }
 /** The state of one slot, kept outside the machine. */
 export type SlotStore = { read(): SlotState | null; save(state: SlotState): void }
 
-export const maxUnitMs = 6 * 60 * 60_000
+/** At most the rollout grace period of the scan boxes in wrangler.jsonc, so that a deploy does not stop a running unit. */
+export const maxUnitMs = 60 * 60_000
 
 /** The margin of the inactivity timeout after the time limit of the last job. */
 const idleMs = 10 * 60_000
