@@ -126,14 +126,17 @@ const checkJobId = (id: string) => {
   if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(id)) throw new Error(`the job ID ${JSON.stringify(id)} is not a valid file name`)
 }
 
-/** The run's Cloudflare Container. It starts on the first command and stops after `inactivityMs` without one. */
-export function containerBox(container: ContainerHandle, options: { inactivityMs: number; onStart(): void }): Box {
+/**
+ * The run's Cloudflare Container. It starts on the first command and stops after `inactivityMs` without one. A function
+ * gives the timeout again at each call, for a caller whose timeout depends on its running job.
+ */
+export function containerBox(container: ContainerHandle, options: { inactivityMs: number | (() => number); onStart(): void; enableInternet?: boolean }): Box {
   const ready = async () => {
     if (!container.running) {
       options.onStart()
-      container.start({ enableInternet: true, entrypoint: ['sleep', 'infinity'], env: boxEnv })
+      container.start({ enableInternet: options.enableInternet ?? true, entrypoint: ['sleep', 'infinity'], env: boxEnv })
     }
-    await container.setInactivityTimeout(options.inactivityMs)
+    await container.setInactivityTimeout(typeof options.inactivityMs === 'number' ? options.inactivityMs : options.inactivityMs())
   }
   const exec: Box['exec'] = async (argv, { cwd, env, stdin, timeoutMs }) => {
     await ready()
@@ -423,6 +426,43 @@ const readChunkBytes = 14_400
 const resolveFile = 'root=$(realpath .) && file=$(realpath -- "$1" 2>/dev/null) || exit 3; case "$file" in "$root"/*) ;; *) exit 4 ;; esac; test -f "$file" || exit 3'
 
 /**
+ * The exact bytes of a file in the directory `dir` of the machine, also of a binary file, in base64 chunks. Refuses a
+ * path outside `dir`, also through a symlink, a missing file, and a file over artifactSizeLimit.
+ */
+export async function readBoxFile(box: Box, dir: string, path: string): Promise<Uint8Array> {
+  let depth = 0
+  for (const part of path.split('/')) {
+    if (part === '..') depth -= 1
+    else if (part !== '' && part !== '.') depth += 1
+    if (depth < 0) break
+  }
+  if (path.startsWith('/') || depth < 0) throw new Error(`read ${path}: the path is not relative to ${dir}`)
+  // Each command checks the path again, because a command of the run can replace a directory with a symlink.
+  const readFile = async (script: string, args: string[]): Promise<string> => {
+    const result = await box.exec(['bash', '-c', `${resolveFile}; ${script}`, 'bash', path, ...args], { cwd: dir, env: boxEnv, timeoutMs: 60_000 })
+    if (result.exit_code === 3) throw new Error(`read ${path}: no such file in ${dir}`)
+    if (result.exit_code === 4) throw new Error(`read ${path}: the path resolves outside ${dir}`)
+    if (result.exit_code !== 0) throw new Error(`read ${path} failed: ${result.output.slice(-2000)}`)
+    return result.output
+  }
+  // The output can hold other lines, for example warnings on stderr, so each value comes after a marker.
+  const sized = await readFile('printf "size=%s\\n" "$(wc -c < "$file")"', [])
+  const size = Number(/^size=\s*(\d+)\s*$/m.exec(sized)?.[1])
+  if (!Number.isSafeInteger(size)) throw new Error(`read ${path}: no size for the file in the output ${JSON.stringify(sized.slice(-300))}`)
+  if (size > artifactSizeLimit) throw new Error(`read ${path}: the file has ${size} bytes, over the limit of ${artifactSizeLimit} bytes`)
+  const bytes = new Uint8Array(size)
+  for (let offset = 0; offset < size; offset += readChunkBytes) {
+    const output = await readFile('printf "base64=%s\\n" "$(tail -c "+$2" -- "$file" | head -c "$3" | base64 | tr -d "\\n")"', [String(offset + 1), String(readChunkBytes)])
+    const text = /^base64=([A-Za-z0-9+/=]*)$/m.exec(output)?.[1]
+    if (text === undefined) throw new Error(`read ${path}: no bytes in the output ${JSON.stringify(output.slice(-300))}`)
+    const chunk = Uint8Array.from(atob(text), (char) => char.charCodeAt(0))
+    if (chunk.length !== Math.min(readChunkBytes, size - offset)) throw new Error(`read ${path}: the file changed while the host read it`)
+    bytes.set(chunk, offset)
+  }
+  return bytes
+}
+
+/**
  * The jobs of a clean box across alarm calls: the runner and the ledger of the run, the step key of the caller, and
  * the end of the call for the pause.
  */
@@ -464,14 +504,6 @@ export async function cleanBox(
       jobs.ledger.put(ledgerKey, sync)
     }
   }
-  // Each command checks the path again, because a command of the run can replace a directory with a symlink.
-  const readFile = async (path: string, script: string, args: string[]): Promise<string> => {
-    const result = await box.exec(['bash', '-c', `${resolveFile}; ${script}`, 'bash', path, ...args], { cwd: dir, env: boxEnv, timeoutMs: 60_000 })
-    if (result.exit_code === 3) throw new Error(`read ${path}: no such file in ${dir}`)
-    if (result.exit_code === 4) throw new Error(`read ${path}: the path resolves outside ${dir}`)
-    if (result.exit_code !== 0) throw new Error(`read ${path} failed: ${result.output.slice(-2000)}`)
-    return result.output
-  }
   return {
     id: sync || crypto.randomUUID(),
     run(command, { timeoutMs }) {
@@ -479,29 +511,6 @@ export async function cleanBox(
       if (!jobs) return box.exec(['bash', '-c', command], options)
       return jobs.runner.pause(`${dir}@${sync}:${command}`, ['bash', '-c', command], { ...options, deadline: jobs.deadline })
     },
-    async read(path) {
-      let depth = 0
-      for (const part of path.split('/')) {
-        if (part === '..') depth -= 1
-        else if (part !== '' && part !== '.') depth += 1
-        if (depth < 0) break
-      }
-      if (path.startsWith('/') || depth < 0) throw new Error(`read ${path}: the path is not relative to ${dir}`)
-      // The output can hold other lines, for example warnings on stderr, so each value comes after a marker.
-      const sized = await readFile(path, 'printf "size=%s\\n" "$(wc -c < "$file")"', [])
-      const size = Number(/^size=\s*(\d+)\s*$/m.exec(sized)?.[1])
-      if (!Number.isSafeInteger(size)) throw new Error(`read ${path}: no size for the file in the output ${JSON.stringify(sized.slice(-300))}`)
-      if (size > artifactSizeLimit) throw new Error(`read ${path}: the file has ${size} bytes, over the limit of ${artifactSizeLimit} bytes`)
-      const bytes = new Uint8Array(size)
-      for (let offset = 0; offset < size; offset += readChunkBytes) {
-        const output = await readFile(path, 'printf "base64=%s\\n" "$(tail -c "+$2" -- "$file" | head -c "$3" | base64 | tr -d "\\n")"', [String(offset + 1), String(readChunkBytes)])
-        const text = /^base64=([A-Za-z0-9+/=]*)$/m.exec(output)?.[1]
-        if (text === undefined) throw new Error(`read ${path}: no bytes in the output ${JSON.stringify(output.slice(-300))}`)
-        const chunk = Uint8Array.from(atob(text), (char) => char.charCodeAt(0))
-        if (chunk.length !== Math.min(readChunkBytes, size - offset)) throw new Error(`read ${path}: the file changed while the host read it`)
-        bytes.set(chunk, offset)
-      }
-      return bytes
-    },
+    read: (path) => readBoxFile(box, dir, path),
   }
 }

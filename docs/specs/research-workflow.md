@@ -205,7 +205,9 @@ as profile guides do today.
   - Three start paths: a `/research` comment or the `agent-research` label on a notebook issue,
     `POST /research/<owner>/<repo>/<issue>`, and `npm run remote -- research <issue>`.
 - **Local** runs the same workflow, for tests and for development of the workflow.
-- **Large sweeps** go to a larger container.
+- **Large sweeps** go to scan boxes: one small container with no network for each slot of a pool, in the Durable
+  Object `ScanBoxes`. The sweep does not use them yet.
+  - **TLS pass time on a scan box** (one pass of the droplet example): TO FILL IN AFTER DEPLOY.
 - **No mirrors.** Runs fetch queries, cutouts and per-target data. A program never copies a whole archive.
 
 ## 8. Trust boundary
@@ -248,7 +250,7 @@ as profile guides do today.
 | RG5 | Many trials in one program | The host counts each trial. The dossier reports the count. |
 | RG6 | Submission to outside bodies | A later workflow with a `/go` for an exact scope. |
 | RG7 | New developments: papers, alerts and data releases | Scout (section 3), in phase R4. A proposal becomes a program only when the user labels it. |
-| RG8 | Large sweeps on a rented machine | Not in R0. Large sweeps use a larger container. A remote box for a rented machine is a later change. |
+| RG8 | Large sweeps on a rented machine | Not in R0. Large sweeps use scan boxes (section 7). The sweep sends units to them in a later change. A remote box for a rented machine is a later change. |
 | RG9 | Programs in one notebook share the holdout | After the first outcome, the holdout is not blind to later programs. The dossier reports the count of holdout tests across the notebook. |
 | RG10 | Web search and the holdout | Web search runs at the provider, so the lock cannot refuse the holdout to it, and the egress does not log it (RD9). The report says that the holdout lock does not bind web search. |
 
