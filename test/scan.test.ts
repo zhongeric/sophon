@@ -1,52 +1,25 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, truncateSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, truncateSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { containerBox, type Box, type BoxResult } from '../src/cloudflare/box.ts'
 import { maxUnitMs, scanSlot, slotInactivityMs, type SlotState, type SlotStore, type Unit } from '../src/cloudflare/scan-slot.ts'
 import { artifactSizeLimit } from '../src/core/artifacts.ts'
+import { localContainer } from './support/container.ts'
 
 const encode = (value: string) => new TextEncoder().encode(value)
 const decode = (value: Uint8Array) => new TextDecoder().decode(value)
 
+function gate() {
+  let open = () => {}
+  const wait = new Promise<void>((resolve) => { open = resolve })
+  return { open, wait }
+}
+
 function memoryStore(initial: SlotState | null = null): SlotStore {
   let state = initial
   return { read: () => state, save: (next) => void (state = next) }
-}
-
-/**
- * A container whose root is a local directory. It comes back empty when it starts, as a stopped Cloudflare Container
- * does, and it keeps its start options and each inactivity timeout.
- */
-function localContainer(root: string) {
-  const container = {
-    running: false,
-    starts: [] as { enableInternet: boolean }[],
-    timeouts: [] as number[],
-    start(options: { enableInternet: boolean; entrypoint: string[]; env: Record<string, string> }) {
-      rmSync(root, { force: true, recursive: true })
-      mkdirSync(root, { recursive: true })
-      container.starts.push({ enableInternet: options.enableInternet })
-      container.running = true
-    },
-    async setInactivityTimeout(durationMs: number) {
-      container.timeouts.push(durationMs)
-    },
-    async exec(argv: string[], options: { cwd: string; env: Record<string, string>; stdin?: ReadableStream }) {
-      // The box wraps each command in timeout -k 10 <seconds>.
-      const command = argv.slice(4)
-      const cwd = join(root, options.cwd)
-      const input = options.stdin ? Buffer.from(await new Response(options.stdin).arrayBuffer()) : undefined
-      // A user other than root cannot read /root/.bashrc, and bash reads it when its stdin is a socket. Thus HOME is the
-      // root of this container, which has no .bashrc.
-      const env = { ...options.env, HOME: root }
-      const result = existsSync(cwd) ? spawnSync(command[0]!, command.slice(1), { cwd, env, input }) : { status: 1, stdout: '', stderr: `no directory ${options.cwd}` }
-      return { stdout: new Blob([`${result.stdout}${result.stderr}`]).stream(), exitCode: Promise.resolve(result.status ?? 1) }
-    },
-  }
-  return container
 }
 
 /** A scan slot over a local container, with the inactivity timeout of a scan box. */
@@ -55,7 +28,7 @@ function slotFixture() {
   const container = localContainer(root)
   const store = memoryStore()
   const box = containerBox(container, { enableInternet: false, inactivityMs: () => slotInactivityMs(store.read()), onStart: () => {} })
-  return { container, dir: join(root, 'scan/pool-1/slot-1'), root, slot: scanSlot(box, store, 'pool-1/slot-1'), store }
+  return { box, container, dir: join(root, 'scan/pool-1/slot-1'), root, slot: scanSlot(box, store, 'pool-1/slot-1'), store }
 }
 
 /** Polls the job of the last unit until it ends, for at most 10 s. */
@@ -74,11 +47,11 @@ const quick: Unit = { argv: ['true'], inputs: [], timeoutMs: 60_000 }
 test('a scan box starts its container with no network, and its inactivity timeout covers the time limit of the job', async () => {
   const { container, slot } = slotFixture()
   const limit = 2 * 60 * 60_000
-  await slot.start({ argv: ['bash', '-c', 'cat in.txt; printf " %s" "$NUMBA_CACHE_DIR"'], inputs: [{ data: encode('in'), path: 'in.txt' }], timeoutMs: limit })
+  await slot.start({ argv: ['bash', '-c', 'cat in.txt; printf " %s %s" "$NUMBA_CACHE_DIR" "$NUMBA_CPU_NAME"'], inputs: [{ data: encode('in'), path: 'in.txt' }], timeoutMs: limit })
   assert.deepEqual(container.starts, [{ enableInternet: false }])
   // The start of the job renews the timeout with the new time limit, and no poll comes before the end of the job.
   assert.ok((container.timeouts.at(-1) ?? 0) > limit, String(container.timeouts))
-  assert.deepEqual(await finished(slot), { exit_code: 0, output: 'in /opt/numba-cache' })
+  assert.deepEqual(await finished(slot), { exit_code: 0, output: 'in /opt/numba-cache generic' })
 
   // A build box keeps the network and its fixed timeout.
   const build = localContainer(mkdtempSync(join(tmpdir(), 'factory-scan-')))
@@ -97,6 +70,90 @@ test('a scan box refuses a second unit while the job of its last unit runs', asy
   assert.notEqual(next.job, job)
   assert.equal((await finished(slot)).exit_code, 0)
 })
+
+test('a scan box refuses a second unit while the first unit starts', async () => {
+  const { box, store } = slotFixture()
+  // Two objects of one slot share the store, as two RPC calls to one Durable Object do.
+  const [first, second] = [scanSlot(box, store, 'pool-1/slot-1'), scanSlot(box, store, 'pool-1/slot-1')]
+  const unit = { ...quick, argv: ['sleep', '30'] }
+  const results = await Promise.allSettled([first.start(unit), second.start(unit)])
+  const refused = results.filter((result) => result.status === 'rejected')
+  assert.equal(refused.length, 1)
+  assert.match(String(refused[0]?.reason), /the slot pool-1\/slot-1 already starts a unit/)
+  assert.deepEqual(await first.poll(), { state: 'running' })
+  await first.kill()
+  assert.notEqual((await first.poll()).state, 'running')
+})
+
+for (const failStart of [false, true]) {
+  test(`a kill waits for pgid and cleanup when the pending start ${failStart ? 'fails' : 'succeeds'}`, async () => {
+    const entered = gate()
+    const publish = gate()
+    const cleaning = gate()
+    const cleaned = gate()
+    let directory = false
+    let pgid = false
+    let running = false
+    let starts = 0
+    const kills: string[] = []
+    const box: Box = {
+      async start() {},
+      async exec() { return { exit_code: 0, output: '' } },
+      async startJob() {
+        starts++
+        directory = true
+        pgid = false
+        running = true
+        entered.open()
+        // The command runs before the wrapper publishes its process groups.
+        await publish.wait
+        if (!directory) throw new Error('the job directory disappeared before pgid')
+        pgid = true
+        if (failStart && starts === 1) throw new Error('startup failed')
+      },
+      async pollJob() { return { state: directory && pgid && running ? 'running' : 'missing' } },
+      async killJob(id) {
+        kills.push(id)
+        cleaning.open()
+        await cleaned.wait
+        if (pgid) running = false
+        directory = false
+      },
+    }
+    const store = memoryStore()
+    const first = scanSlot(box, store, 'pool-1/slot-1')
+    const second = scanSlot(box, store, 'pool-1/slot-1')
+    const started = first.start(quick)
+    const result = failStart ? assert.rejects(started, /startup failed/) : started
+    await entered.wait
+    let killDone = false
+    const killed = second.kill().then(() => { killDone = true })
+    const settled = Promise.all([result, killed])
+    try {
+      await assert.rejects(second.start(quick), /already starts a unit/)
+      assert.deepEqual(kills, [])
+      assert.equal(killDone, false)
+      publish.open()
+      await cleaning.wait
+      assert.equal(pgid, true)
+      assert.equal(running, true)
+      assert.equal(killDone, false)
+      await assert.rejects(second.start(quick), /already starts a unit/)
+      cleaned.open()
+      await settled
+      assert.deepEqual(kills, [store.read()?.job])
+      assert.equal(running, false)
+      assert.deepEqual(await second.poll(), { state: 'missing' })
+      await second.start(quick)
+      await second.kill()
+      assert.equal(running, false)
+    } finally {
+      publish.open()
+      cleaned.open()
+      await Promise.allSettled([settled])
+    }
+  })
+}
 
 test('each unit starts in a clean unit directory, and the slot keeps only the outputs of its last unit', async () => {
   const { dir, root, slot } = slotFixture()

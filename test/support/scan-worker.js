@@ -16,10 +16,6 @@ export default {
         return Response.json(await box.start(body.name, { argv: body.argv, inputs, timeoutMs: body.timeoutMs }))
       }
       if (method === 'poll') return Response.json(await box.poll(body.name))
-      if (method === 'kill') {
-        await box.kill(body.name)
-        return Response.json({})
-      }
       if (method === 'read') return new Response(await box.read(body.name, body.path))
       return new Response(`no route ${method}`, { status: 404 })
     } catch (error) {

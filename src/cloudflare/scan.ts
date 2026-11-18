@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers'
-import { containerBox, httpBox, type Box, type JobState } from './box.ts'
+import { containerBox, httpBox, type JobState } from './box.ts'
 import type { Env } from './runs.ts'
 import { scanSlot, slotInactivityMs, type SlotState, type SlotStore, type Unit } from './scan-slot.ts'
 
@@ -28,13 +28,9 @@ export class ScanBoxes extends DurableObject<Env> {
   /** The slot over MACHINE_URL in local tests, else over the container of this object, with no network. */
   private slot(name: string) {
     const store = sqlSlotStore(this.ctx.storage.sql)
-    return scanSlot(this.box(store), store, name)
-  }
-
-  private box(store: SlotStore): Box {
-    if (this.env.MACHINE_URL) return httpBox(this.env.MACHINE_URL)
+    if (this.env.MACHINE_URL) return scanSlot(httpBox(this.env.MACHINE_URL), store, name)
     if (!this.ctx.container) throw new Error('this Worker has no container for scan boxes: add the ScanBoxes container of wrangler.jsonc and deploy again')
-    return containerBox(this.ctx.container, { enableInternet: false, inactivityMs: () => slotInactivityMs(store.read()), onStart: () => {} })
+    return scanSlot(containerBox(this.ctx.container, { enableInternet: false, inactivityMs: () => slotInactivityMs(store.read()), onStart: () => {} }), store, name)
   }
 
   start(name: string, unit: Unit): Promise<{ job: string }> {

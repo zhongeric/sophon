@@ -2,8 +2,9 @@
 # The image holds the research packages and a warm numba cache, so that a unit needs no install and no download.
 FROM --platform=linux/amd64 python:3.11-slim-bookworm
 
-# Scan box commands get the same NUMBA_CACHE_DIR (src/cloudflare/scan-slot.ts).
-ENV NUMBA_CACHE_DIR=/opt/numba-cache
+# Scan box commands get the same NUMBA_CACHE_DIR and NUMBA_CPU_NAME (src/cloudflare/scan-slot.ts). The cache key holds
+# the CPU name, so the generic CPU lets a host with a different CPU use the cache of the build.
+ENV NUMBA_CACHE_DIR=/opt/numba-cache NUMBA_CPU_NAME=generic
 
 # gcc builds batman-package (a transitleastsquares dependency) when pip finds no wheel. The image does not keep it.
 RUN apt-get update \
@@ -25,7 +26,6 @@ RUN mkdir -p /root/.astropy/config \
 
 # Compile the numba functions of wotan and transitleastsquares into the cache, on a small synthetic light curve.
 RUN python <<'EOF'
-import lightkurve
 import numpy as np
 from transitleastsquares import transitleastsquares
 from wotan import flatten

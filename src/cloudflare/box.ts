@@ -128,8 +128,7 @@ const checkJobId = (id: string) => {
 
 /**
  * The run's Cloudflare Container. It starts on the first command and stops after `inactivityMs` without one. A function
- * gives the timeout again at each call, for a caller whose timeout depends on its running job. `enableInternet` is true
- * when the caller does not give it.
+ * gives the timeout again at each call, for a caller whose timeout depends on its running job.
  */
 export function containerBox(container: ContainerHandle, options: { inactivityMs: number | (() => number); onStart(): void; enableInternet?: boolean }): Box {
   const ready = async () => {
