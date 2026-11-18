@@ -15,6 +15,7 @@ import { hasOpenJobs, jobRunner, resetJobStarts, type JobRunner } from './jobs.t
 import type { State } from './prune.ts'
 import type { ResearchRuns } from './research.ts'
 import type { PullRequestRuns } from './run.ts'
+import type { ScanBoxes } from './scan.ts'
 import { createTables, sqlFiles, sqlLedger } from './storage.ts'
 import { sqlSyncs } from './syncs.ts'
 
@@ -22,6 +23,7 @@ export type Env = {
   PULL_REQUESTS: DurableObjectNamespace<PullRequestRuns>
   DEVELOPMENT_RUNS: DurableObjectNamespace<DevelopmentRuns>
   RESEARCH_RUNS: DurableObjectNamespace<ResearchRuns>
+  SCAN_BOXES: DurableObjectNamespace<ScanBoxes>
   /** The token of the runs when the GitHub App secrets are not set. */
   GITHUB_TOKEN?: string
   /** With GITHUB_APP_PRIVATE_KEY, runs call GitHub as the App. */

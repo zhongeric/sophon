@@ -9,13 +9,15 @@
     "bindings": [
       { "class_name": "PullRequestRuns", "name": "PULL_REQUESTS" },
       { "class_name": "DevelopmentRuns", "name": "DEVELOPMENT_RUNS" },
-      { "class_name": "ResearchRuns", "name": "RESEARCH_RUNS" }
+      { "class_name": "ResearchRuns", "name": "RESEARCH_RUNS" },
+      { "class_name": "ScanBoxes", "name": "SCAN_BOXES" }
     ]
   },
   "migrations": [
     { "new_sqlite_classes": ["PullRequestRuns"], "tag": "v1" },
     { "new_sqlite_classes": ["DevelopmentRuns"], "tag": "v2" },
-    { "new_sqlite_classes": ["ResearchRuns"], "tag": "v3" }
+    { "new_sqlite_classes": ["ResearchRuns"], "tag": "v3" },
+    { "new_sqlite_classes": ["ScanBoxes"], "tag": "v4" }
   ],
   // One build container for each development run, each research run (the domain commands) and each review run whose
   // config has tests. Setup, checks, tests and commands run there, never beside a secret. standard-4 is 4 vCPU and
@@ -23,7 +25,16 @@
   "containers": [
     { "class_name": "DevelopmentRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 10 },
     { "class_name": "ResearchRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 5 },
-    { "class_name": "PullRequestRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 10 }
+    { "class_name": "PullRequestRuns", "image": "./containers/build/Dockerfile", "instance_type": "standard-4", "max_instances": 10 },
+    // A scan box runs one search unit with no network (#84). A TLS thread uses about 64 MB, so 4 GiB is enough for
+    // 4 vCPU. A rollout waits up to one hour before it stops a box that runs a unit.
+    {
+      "class_name": "ScanBoxes",
+      "image": "./containers/scan/Dockerfile",
+      "instance_type": { "vcpu": 4, "memory_mib": 4096, "disk_mb": 8000 },
+      "max_instances": 64,
+      "rollout_active_grace_period": 3600
+    }
   ],
   "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
   // The STE dictionary is optional: when agents/guides/ste holds it, it is a module of its own (src/cloudflare/guides.ts).
