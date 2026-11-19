@@ -27,6 +27,7 @@ export const researchConfig = {
     known: 'node research/run.mjs known {prereg}',
     inject: 'node research/run.mjs inject {prereg}',
     evaluate: 'node research/run.mjs evaluate {prereg}',
+    analyze: 'node research/run.mjs analyze {prereg}',
     reproduce: 'node research/run.mjs reproduce {prereg}',
   },
   credentials: { 'archive.example.org': { header: 'x-api-key', secret: 'ARCHIVE_TOKEN' } },
@@ -35,6 +36,8 @@ export const researchConfig = {
 /**
  * The domain commands of the notebook. It finds analysis/<id>/ from the prereg file name, writes the rows of
  * analysis/<id>/analyze.mjs to out/<id>/, and prints its working directory, then the last-line JSON with their SHA-256.
+ * analyze gives no output when the module exports analyzes = false. READS gives the reads of known and inject, as a
+ * comma list. With OMIT_ANALYSIS, reproduce does not give the analysis output.
  */
 export const runScript = `import { createHash } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
@@ -51,10 +54,12 @@ const output = (name) => {
   writeFileSync(path, analysis.rows(name))
   return { [path]: sha(analysis.rows(name)) }
 }
+const reads = process.env.READS ? { reads: process.env.READS.split(',') } : {}
 console.log(command + ' of ' + id + ' in ' + process.cwd())
-if (command === 'known') console.log(JSON.stringify({ recall: analysis.recall, outputs: output('known') }))
-else if (command === 'inject') console.log(JSON.stringify({ outputs: output('inject') }))
-else console.log(JSON.stringify({ outputs: { ...output('known'), ...output('inject') } }))
+if (command === 'known') console.log(JSON.stringify({ recall: analysis.recall, outputs: output('known'), ...reads }))
+else if (command === 'inject') console.log(JSON.stringify({ outputs: output('inject'), ...reads }))
+else if (command === 'analyze') console.log(JSON.stringify({ outputs: analysis.analyzes === false ? {} : output('analysis') }))
+else console.log(JSON.stringify({ outputs: { ...output('known'), ...output('inject'), ...(process.env.OMIT_ANALYSIS ? {} : output('analysis')) } }))
 `
 
 export const prices: Prices = {
@@ -154,22 +159,34 @@ function surveyCell(lens: string, quotes: string[], parallel = false): string {
 
 /**
  * analysis/<id>/analyze.mjs with its known recall. With `unstable`, the rows include the working directory, so a
- * reproduction on a clean checkout gives other hashes.
+ * reproduction on a clean checkout gives other hashes. Without `analyzes`, analyze gives no output.
  */
-const analysisModule = (recall: number, unstable: boolean) =>
-  [`export const recall = ${recall}`, `export const rows = (command) => command + ' rows'${unstable ? " + ' in ' + process.cwd()" : ''}`, ''].join('\n')
+const analysisModule = (recall: number, unstable: boolean, analyzes: boolean) =>
+  [
+    `export const recall = ${recall}`,
+    `export const rows = (command) => command + ' rows'${unstable ? " + ' in ' + process.cwd()" : ''}`,
+    ...(analyzes ? [] : ['export const analyzes = false']),
+    '',
+  ].join('\n')
+
+/** The turn of the builder: the first build, or a fix turn after a failed calibration or analysis. */
+type BuilderTurn = 'build' | 'calibration' | 'analysis'
 
 /**
- * The builder: its first turn writes the analysis with a known recall of 0.5, under the threshold 0.9. Its fix turn
- * shows the calibration failure, and writes a recall of 0.95, or 0.6 with `lowRecall`.
+ * The builder: its first turn writes the analysis with a known recall of 0.5, under the threshold 0.9. Its calibration
+ * fix turn shows the calibration failure, and writes a recall of 0.95, or 0.6 with `lowRecall`. With `analysisFix`, that
+ * analysis gives no output, and the analysis fix turn shows the analysis failure and writes a recall of 0.96 with an
+ * analysis output. With `noAnalysis`, no turn gives an analysis output.
  */
-function builderCell(id: string, fix: boolean, options: ResearchScriptOptions): string {
+function builderCell(id: string, turn: BuilderTurn, options: ResearchScriptOptions): string {
   if (options.blockBuilder) return submit('submit_build_log', { summary: 'not built', changes: [], tests: [], blocked: 'the analysis needs a catalog that is not in the notebook' })
   const path = `/repo/analysis/${id}/analyze.mjs`
-  const recall = fix ? (options.lowRecall ? 0.6 : 0.95) : 0.5
+  // The analysis fix gives another recall, so that its file always changes.
+  const recall = turn === 'build' ? 0.5 : turn === 'analysis' ? 0.96 : options.lowRecall ? 0.6 : 0.95
+  const analyzes = !options.noAnalysis && (turn === 'analysis' || !options.analysisFix)
   return [
-    ...(fix ? [`text(await tools.Read({ file_path: '/review/calibration-failure.txt' }))`, `await tools.Read({ file_path: '${path}' })`] : []),
-    `await tools.Write({ file_path: '${path}', content: ${JSON.stringify(analysisModule(recall, options.unstable ?? false))} })`,
+    ...(turn === 'build' ? [] : [`text(await tools.Read({ file_path: '/review/${turn}-failure.txt' }))`, `await tools.Read({ file_path: '${path}' })`]),
+    `await tools.Write({ file_path: '${path}', content: ${JSON.stringify(analysisModule(recall, options.unstable ?? false, analyzes))} })`,
     `await tools.checkpoint({ message: 'recall ${recall}' })`,
     submit('submit_build_log', { summary: `analysis with recall ${recall}`, changes: [{ path: `analysis/${id}/analyze.mjs`, why: 'the analysis' }], tests: [], blocked: '' }),
   ].join('\n')
@@ -184,17 +201,20 @@ const analystCell = (id: string, twoObjections: boolean) =>
     submit('submit_responses', { addressed: [], conceded: (twoObjections ? ['obj-001', 'obj-002'] : ['obj-001']).map((id) => ({ id, reason: 'The known set is small.' })) }),
   ].join('\n')
 
+/** Reads the measurement file of the inject command and the output file of the analysis. */
 const readMeasurement = [
   `const calibration = JSON.stringify(await tools.Read({ file_path: '/review/calibration.md' }))`,
   `const inject = /Output file [^:]+inject.txt: artifact:([0-9a-f]{64})/.exec(calibration)[1]`,
+  `const analyzed = /Analysis output file [^:]+analysis.txt: artifact:([0-9a-f]{64})/.exec(calibration)[1]`,
   `text(await tools.Read({ file_path: '/artifacts/' + inject }))`,
+  `text(await tools.Read({ file_path: '/artifacts/' + analyzed }))`,
 ].join('\n')
 
-/** The writer cites the measurement file of the inject command. */
+/** The writer cites the measurement file of the inject command and the output file of the analysis. */
 const writerCell = () =>
   [
     readMeasurement,
-    `await tools.submit_dossier({ outcome: 'null', summary: 'No quiet dwarf galaxies over the calibrated null.', claims: [{ statement: 'The inject command produced measurement rows.', location: 'artifact:' + inject, evidence: 'inject rows' }], checklist: [{ item: 'Check the known set', status: 'not_tested' }, { item: 'Check the holdout', status: 'not_tested' }], completeness: [inject], false_positives: [inject], coverage: 'The deep fields only.', trials: 1, reproduce: 'node research/run.mjs reproduce' })`,
+    `await tools.submit_dossier({ outcome: 'null', summary: 'No quiet dwarf galaxies over the calibrated null.', claims: [{ statement: 'The inject command produced measurement rows.', location: 'artifact:' + inject, evidence: 'inject rows' }, { statement: 'The analysis produced its rows.', location: 'artifact:' + analyzed, evidence: 'analysis rows' }], checklist: [{ item: 'Check the known set', status: 'not_tested' }, { item: 'Check the holdout', status: 'not_tested' }], completeness: [inject, analyzed], false_positives: [inject], coverage: 'The deep fields only.', trials: 1, reproduce: 'node research/run.mjs reproduce' })`,
     `text('submitted')`,
   ].join('\n')
 
@@ -219,6 +239,10 @@ export type ResearchScriptOptions = {
   lowRecall?: boolean
   /** The rows of the analysis include the working directory. */
   unstable?: boolean
+  /** The analysis of the calibration fix gives no output, and the analysis fix turn of the builder fixes it. */
+  analysisFix?: boolean
+  /** No analysis gives an output. */
+  noAnalysis?: boolean
   twoObjections?: boolean
 }
 
@@ -251,11 +275,14 @@ export function researchScript(options: ResearchScriptOptions = {}): Script {
       return { cell: submit('submit_prereg', { hypothesis: id, sections, known_recall: 0.9 }) }
     }
     const id = /(?:analysis|round \d+) of (hyp-\d+)/.exec(turn.request)?.[1] ?? 'unknown'
-    if (turn.role === 'builder') return { cell: builderCell(id, turn.request.includes('Calibration round 1 of'), options) }
+    if (turn.role === 'builder') {
+      const kind = turn.request.includes('Analysis round 1 of') ? 'analysis' : turn.request.includes('Calibration round 1 of') ? 'calibration' : 'build'
+      return { cell: builderCell(id, kind, options) }
+    }
     if (turn.role === 'skeptic') return {
       cell: [
         readMeasurement,
-        `await tools.submit_objections({ objections: ${JSON.stringify(options.twoObjections ? [objection(id), { ...objection(id), title: 'Check the measurement rows' }] : [objection(id)])}.map(objection => ({ ...objection, location: 'artifact:' + inject, evidence: 'inject rows' })) })`,
+        `await tools.submit_objections({ objections: ${JSON.stringify(options.twoObjections ? [objection(id), { ...objection(id), title: 'Check the measurement rows' }] : [objection(id)])}.map(objection => ({ ...objection, location: 'artifact:' + analyzed, evidence: 'analysis rows' })) })`,
       ].join('\n'),
     }
     if (turn.role === 'late-skeptic') return { cell: submit('submit_objections', { objections: [] }) }
