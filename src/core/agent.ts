@@ -24,6 +24,8 @@ export type AgentSpec = {
   subagents?: Role['subagents']
   /** The network access of the agent. Without it, the agent is offline. */
   egress?: Egress
+  /** The turn time of the role: runTurn starts a turn only when the call has this much time left (D12). */
+  turnMs?: number
 }
 
 export type AgentHost = {
@@ -183,7 +185,7 @@ export async function runTurn<T>(
 ): Promise<T> {
   const recorded = host.ledger.get<T>(turn.key)
   if (recorded !== undefined) return recorded
-  host.ledger.safePoint?.()
+  host.ledger.safePoint?.(spec.turnMs)
   await host.beforeTurn?.()
   const retriesKey = `retries:${spec.id}:${turn.request}`
   const retries = host.ledger.get<number>(retriesKey) ?? 0
@@ -195,7 +197,8 @@ export async function runTurn<T>(
       return await agent.ask(id, text)
     } finally {
       const used = Date.now() - started
-      if (used > longTurnMs) host.log(`${spec.id}: warning: turn ${id} took ${Math.round(used / 1000)} s, more than ${longTurnMs / 60_000} minutes`)
+      if (spec.turnMs !== undefined && used > spec.turnMs)
+        host.log(`${spec.id}: warning: turn ${id} took ${Math.round(used / 1000)} s, more than the turn time of ${Math.round(spec.turnMs / 1000)} s`)
     }
   }
   let failed = false
@@ -207,7 +210,7 @@ export async function runTurn<T>(
       // The first turn keeps the nudge request ID of earlier runs, so that their journals resume.
       const nudge = request === 'task' ? 'nudge' : `${request}-nudge`
       // The nudge is a new agent turn, so the safe point and the budget check apply to it too.
-      host.ledger.safePoint?.()
+      host.ledger.safePoint?.(spec.turnMs)
       await host.beforeTurn?.()
       failed = (await ask(nudge, `You ended the turn without calling ${tool}. Call tools.${tool} now.`)).status === 'failed'
     }
@@ -219,9 +222,6 @@ export async function runTurn<T>(
   if (output === undefined) throw new Error(`${spec.id} did not call ${tool}`)
   return output
 }
-
-/** A turn that takes longer than this can pass the wall-time limit of a Cloudflare alarm call, so the host logs a warning. */
-const longTurnMs = 7 * 60_000
 
 /** The start of the prompt that asks again after a failed turn. The failed turn can have stopped before any work. */
 const retryNote = 'Your last turn stopped with an error before it finished. Here is the task again. Keep the work that you already did in this session.'

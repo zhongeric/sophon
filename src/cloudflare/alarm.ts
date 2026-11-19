@@ -9,8 +9,11 @@ const maxAttempts = 3
 export const maxRestarts = 5
 const retryMs = 60_000
 const defaultPauseSeconds = 60
-/** The wall time of one alarm call before its planned stop, when ALARM_BUDGET_SECONDS does not say (D12). */
-const defaultBudgetSeconds = 480
+/**
+ * The wall time that one alarm call plans for, when ALARM_BUDGET_SECONDS does not say (D12). Cloudflare stops the call
+ * at 900 s. The rest is for the model request and the submit that are in flight at the end of the budget.
+ */
+export const defaultBudgetSeconds = 780
 
 /** ALARM_BUDGET_SECONDS in ms. A value that is not a number above 0 gives the default. */
 export function alarmBudgetMs(value: string | undefined): number {

@@ -48,6 +48,7 @@ function spec(context: RunContext, id: string, role: Role, model: ModelChoice, w
     instructions: role.tests && !tests.run_tests ? `${base}\n\n${noTestRunner}` : base,
     tools: { ...tools, ...tests },
     workspace,
+    turnMs: role.turnMs,
   }
 }
 

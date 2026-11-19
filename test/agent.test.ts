@@ -245,7 +245,7 @@ test('the budget check also runs before the nudge turn, so a first turn that rea
   assert.equal(host.ledger.get('retries:note:task'), undefined)
 })
 
-test('a turn longer than 7 minutes logs a warning, and a short turn logs none', async (t) => {
+test('a turn longer than the turn time of its spec logs a warning, and a short turn logs none', async (t) => {
   const run = resumeSetup()
   const lines: string[] = []
   // Each model request moves the clock of the host 8 minutes forward.
@@ -258,14 +258,14 @@ test('a turn longer than 7 minutes logs a warning, and a short turn logs none', 
     return scripted(...args)
   }
   const host: AgentHost = { ...run.host(slow), log: (line) => lines.push(line) }
-  assert.deepEqual(await runTurn(host, await run.spec(host), 'Write a note.', 'submit_note'), { note: 'done' })
+  assert.deepEqual(await runTurn(host, { ...(await run.spec(host)), turnMs: 7 * 60_000 }, 'Write a note.', 'submit_note'), { note: 'done' })
   assert.equal(lines.filter((line) => /warning/.test(line)).length, 1)
-  assert.match(lines.find((line) => /warning/.test(line))!, /^note: warning: turn task took \d+ s, more than 7 minutes$/)
+  assert.match(lines.find((line) => /warning/.test(line))!, /^note: warning: turn task took \d+ s, more than the turn time of 420 s$/)
 
   const quick = resumeSetup()
   const quickLines: string[] = []
   const fast: AgentHost = { ...quick.host(scripted), log: (line) => quickLines.push(line) }
-  await runTurn(fast, await quick.spec(fast), 'Write a note.', 'submit_note')
+  await runTurn(fast, { ...(await quick.spec(fast)), turnMs: 7 * 60_000 }, 'Write a note.', 'submit_note')
   assert.deepEqual(quickLines.filter((line) => /warning/.test(line)), [])
 })
 

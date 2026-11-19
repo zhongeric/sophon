@@ -155,6 +155,50 @@ test('settleAll gives the results in order, and a real error wins over a Planned
   assert.equal(done, true)
 })
 
+test('a safe point stops before work that does not fit in the time that is left, and timeLeft gives that time', () => {
+  let now = 8_000
+  const budget = callBudget(memoryLedger(), { budgetMs: 10_000, startedAt: 0, now: () => now })
+  // Before the call has new work, a turn starts also when it does not fit (D12).
+  assert.doesNotThrow(() => budget.safePoint?.(5_000))
+  budget.put('step:first', { result: 1 })
+  assert.equal(budget.timeLeft?.(), 2_000)
+  assert.doesNotThrow(() => budget.safePoint?.())
+  assert.doesNotThrow(() => budget.safePoint?.(1_999))
+  assert.throws(
+    () => budget.safePoint?.(2_000),
+    (error: unknown) => error instanceof PlannedStop && error.message === 'the call used 8 s of its budget of 10 s, and the next turn can take 2 s',
+  )
+  now = 10_500
+  assert.equal(budget.timeLeft?.(), -500)
+  assert.throws(() => budget.safePoint?.(), PlannedStop)
+})
+
+test('runTurn starts a turn only when the turn time of its spec fits in the time that the call has left', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'factory-turn-time-'))
+  const turns: Turn[] = []
+  const host: AgentHost = {
+    module,
+    store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
+    ledger: callBudget(fileLedger(join(dir, 'state.json')), { budgetMs: 10_000, startedAt: 0, now: () => 5_000 }),
+    credentials,
+    dispatch: scriptedDispatch((turn) => (turn.output === null ? { cell: "await tools.submit_note({ note: 'done' }); text('submitted')" } : { text: 'done' }), turns),
+    log: () => {},
+  }
+  host.ledger.put('step:earlier', { result: 1 })
+  const spec = async (id: string, turnMs: number): Promise<AgentSpec> => ({
+    id,
+    provider: 'claude',
+    model: 'claude-opus-5-5',
+    instructions: `Agent role: ${id}`,
+    workspace: await createWorkspace({ repo: MemoryFileSystem.create(), review: {} }),
+    tools: submitOnce(host, `output:${id}`, submitNote, async (input) => input),
+    turnMs,
+  })
+  await assert.rejects(runTurn(host, await spec('long', 6_000), 'Write a note.', 'submit_note'), /the next turn can take 6 s/)
+  assert.equal(turns.length, 0)
+  assert.deepEqual(await runTurn(host, await spec('short', 4_000), 'Write a note.', 'submit_note'), { note: 'done' })
+})
+
 test('alarmLines renders the counters, and gives no line without them', () => {
   const ledger = memoryLedger()
   assert.deepEqual(alarmLines(ledger), [])

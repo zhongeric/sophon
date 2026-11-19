@@ -26,7 +26,10 @@ export type JobRunner = {
    * job again when the machine does not have it. Throws a PausedError at `deadline`, so that a later call polls the job.
    */
   pause(key: string, argv: string[], options: JobOptions & { deadline: number }): Promise<BoxResult>
-  /** Starts a new job and waits for its end in this call, with no deadline. */
+  /**
+   * Starts a new job and waits for its end in this call. With the deadline of the runner, the job ends by then, and no job
+   * starts when less than a second is left.
+   */
   wait(argv: string[], options: JobOptions): Promise<BoxResult>
   /** Kills the open wait-mode jobs of earlier calls. Call it before an agent turn can run again. */
   killStale(): Promise<void>
@@ -46,6 +49,8 @@ const startsKey = (ledger: Ledger, cwd: string, argv: string[]) => {
 }
 const maxPauseStarts = 3
 const firstPollMs = 250
+/** The shortest timeout of a wait-mode job. With less time left in the call, the job does not start. */
+const minWaitMs = 1_000
 
 /** Resets lost-job retries for an administrator error resume, not for automatic alarm retries. */
 export function resetJobStarts(ledger: Ledger): void {
@@ -55,12 +60,17 @@ export function resetJobStarts(ledger: Ledger): void {
 /** True when the ledger has a job that is not done or killed, so that the end of a run needs the machine only then. */
 export const hasOpenJobs = (ledger: Ledger): boolean => (ledger.get<string[]>(openKey) ?? []).length > 0
 
-/** The jobs of one alarm call on `box`, in the ledger of the run. `now` and `sleep` are for tests. */
+/**
+ * The jobs of one alarm call on `box`, in the ledger of the run. `deadline` is the end of the call budget: the command
+ * of a turn ends by then, so that the agent has time to submit before Cloudflare stops the call (D12). `now` and
+ * `sleep` are for tests.
+ */
 export function jobRunner(
   box: Box,
   ledger: Ledger,
-  options: { now?: () => number; sleep?: (ms: number) => Promise<void>; pollMs?: number } = {},
+  options: { deadline?: number; now?: () => number; sleep?: (ms: number) => Promise<void>; pollMs?: number } = {},
 ): JobRunner {
+  const deadline = options.deadline
   const now = options.now ?? Date.now
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   const pollMs = options.pollMs ?? 5_000
@@ -133,7 +143,9 @@ export function jobRunner(
       }
     },
     async wait(argv, options) {
-      const record = await start(argv, 'wait', options)
+      const left = deadline === undefined ? Infinity : deadline - now()
+      if (left < minWaitMs) return { exit_code: null, output: '[host] not started: the alarm call has no time left for this command' }
+      const record = await start(argv, 'wait', { ...options, timeoutMs: Math.min(options.timeoutMs, left) })
       const interval = backoff()
       for (;;) {
         await sleep(interval())

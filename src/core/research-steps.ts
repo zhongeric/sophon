@@ -125,7 +125,7 @@ async function agent(
   const domainGuides = Object.keys(context.domain.guides)
     .sort()
     .map((name) => context.domain.guides[name]!.trim())
-  return { id, ...model, instructions: [roleText, ...domainGuides].join('\n\n'), tools, workspace, ...(egress ? { egress } : {}) }
+  return { id, ...model, instructions: [roleText, ...domainGuides].join('\n\n'), tools, workspace, turnMs: role.turnMs, ...(egress ? { egress } : {}) }
 }
 
 /** The input lines that every prompt starts with. */

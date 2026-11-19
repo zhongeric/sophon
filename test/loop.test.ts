@@ -365,8 +365,9 @@ test('a planned stop in step 1 ends the call only after the questions agent sett
   const input = await loopInput(repo, 'stop')
   const run = await nodeRun({ config: input.config, runId: 'stop', runsDir: runsDir(), source: gitSource(repo) })
   const reviewed = () => ['minimize', 'rules', 'bugs', 'anti-slop'].every((id) => run.ledger.get(`step:step1.${id}`) !== undefined)
-  // The budget is spent when the step 1 reviewers finished, so the step 1 host check stops the run.
-  const ledger = callBudget(run.ledger, { budgetMs: 1000, startedAt: 0, now: () => (reviewed() ? 5000 : 0) })
+  // Each turn of step 1 fits in the budget until the step 1 reviewers finished. Then the budget is spent, so the step 1
+  // host check stops the run.
+  const ledger = callBudget(run.ledger, { budgetMs: 600_000, startedAt: 0, now: () => (reviewed() ? 700_000 : 0) })
   const scripted = scriptedDispatch(scriptFor({ tests: false }), [])
   // The questions agent answers only after the reviewers finished.
   const dispatch: Contracts.RuntimeOptions['dispatch'] = async (request, signal, timing) => {

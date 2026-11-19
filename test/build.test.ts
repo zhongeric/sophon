@@ -13,12 +13,13 @@ import { fileLedger } from '../src/node/ledger.ts'
 import { loadRepoConfig, sqliteStore } from '../src/node/platform.ts'
 import { developRepo } from './support/develop.ts'
 import { credentials, module } from './support/fixture.ts'
-import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
+import { scriptedDispatch, type Script, type Turn } from './support/scripted-model.ts'
 
 const changedMath = 'export function add(a: number, b: number): number {\n  return b + a\n}\n'
 const write = `await tools.Write({ file_path: '/repo/src/math.ts', content: ${JSON.stringify(changedMath)} })`
 const checkpoint = `await tools.checkpoint({ message: 'swap' })`
-const log = (blocked = '') => `await tools.submit_build_log(${JSON.stringify({ summary: 'add', changes: [{ path: 'src/math.ts', why: 'add' }], tests: [], blocked })})`
+const log = (blocked = '', remaining?: string) =>
+  `await tools.submit_build_log(${JSON.stringify({ summary: 'add', changes: [{ path: 'src/math.ts', why: 'add' }], tests: [], blocked, ...(remaining === undefined ? {} : { remaining }) })})`
 const trySubmit = `try { ${log()}; text('LOG ACCEPTED') } catch (error) { text('submit refused: ' + error) }`
 
 /** A machine that answers each command from `answer` and keeps the commands. */
@@ -52,8 +53,11 @@ function recorded(inner: Checker) {
   return { calls, checker }
 }
 
-/** One builder turn of build() on a new git branch of developRepo, with a scripted model and the checks on `machine`. */
-async function buildWith(options: { cell: string; machine: Machine; config?: Record<string, unknown> }) {
+/**
+ * One build() on a new git branch of developRepo, with a scripted model and the checks on `machine`. Without `script`,
+ * the model runs `cell` at the start of each turn. `timeLeft` is the time that the alarm call has left.
+ */
+async function buildWith(options: { cell: string; machine: Machine; config?: Record<string, unknown>; script?: Script; timeLeft?: () => number }) {
   const { repo } = developRepo(options.config)
   const dir = mkdtempSync(join(tmpdir(), 'factory-build-'))
   const config = await loadRepoConfig(repo)
@@ -64,9 +68,9 @@ async function buildWith(options: { cell: string; machine: Machine; config?: Rec
   const host: AgentHost = {
     module,
     store: sqliteStore(join(dir, 'agents.sqlite'), join(dir, 'agents')),
-    ledger: fileLedger(join(dir, 'state.json')),
+    ledger: { ...fileLedger(join(dir, 'state.json')), ...(options.timeLeft ? { timeLeft: options.timeLeft } : {}) },
     credentials,
-    dispatch: scriptedDispatch((turn) => (turn.output === null ? { cell: options.cell } : { text: 'done' }), turns),
+    dispatch: scriptedDispatch(options.script ?? ((turn) => (turn.output === null ? { cell: options.cell } : { text: 'done' })), turns),
     log: () => {},
   }
   const context: DevelopContext = { host, config, guides: { read: () => '', mounts: {} }, stackGuides: [], ask: 'Change add.' }
@@ -84,7 +88,7 @@ async function buildWith(options: { cell: string; machine: Machine; config?: Rec
     label: 'agent-factory: add',
   })
   const output = turns.map((turn) => turn.output ?? '').join('\n')
-  return { calls, output, result }
+  return { calls, host, output, result, turns }
 }
 
 const pass = { exit_code: 0, output: 'ok' }
@@ -147,5 +151,53 @@ test('build: a blocked log runs no tests', { timeout: 60_000 }, async () => {
   assert.equal(result.blocked, 'add needs a decision')
   assert.deepEqual(calls.checks, [])
   assert.deepEqual(calls.tests, [])
+  assert.deepEqual(commands, [])
+})
+
+test('build: with less than a minute left in the call, the tools run no command, and a new turn of the session continues the task', { timeout: 60_000 }, async () => {
+  const { commands, machine } = fakeMachine(() => pass)
+  let left = 30_000
+  const first = [write, checkpoint, `try { await tools.run_checks({}) } catch (error) { text('checks refused: ' + error) }`, log('', 'run the checks, then submit')].join('\n')
+  // The second turn has the full call: the host runs the targeted tests at its submit.
+  const script: Script = (turn) => {
+    if (turn.output !== null) return { text: 'done' }
+    if (!/What is left: run the checks, then submit/.test(turn.request)) return { cell: first }
+    left = 600_000
+    return { cell: trySubmit }
+  }
+  const { calls, host, output, result, turns } = await buildWith({ cell: '', machine, script, timeLeft: () => left })
+
+  assert.match(output, /checks refused: Error: the alarm call of this run has 30 s left, so this turn runs no more commands\. Call submit_build_log now, with what is left to do in remaining\./)
+  assert.match(output, /LOG ACCEPTED/)
+  assert.deepEqual(calls.checks, [])
+  assert.deepEqual(calls.tests, [['test/add.test.ts']])
+  assert.equal(commands.length, 1)
+  assert.equal(host.ledger.get<{ remaining: string }>('output:build.add')?.remaining, 'run the checks, then submit')
+  assert.equal(result.remaining, undefined)
+  assert.equal(result.blocked, '')
+  // The second turn is in the same session: its request has the prompt of the first turn.
+  const second = turns.find((turn) => /What is left:/.test(turn.request))!
+  assert.match(second.request, /Build task add\./)
+})
+
+test('build: remaining is refused while the call has time, also on a platform without call limits', { timeout: 60_000 }, async () => {
+  const { machine } = fakeMachine(() => pass)
+  const cell = [write, checkpoint, `try { ${log('', 'more work')} } catch (error) { text('remaining refused: ' + error) }`, trySubmit].join('\n')
+  for (const timeLeft of [undefined, () => 600_000]) {
+    const { output, result } = await buildWith({ cell, machine, ...(timeLeft ? { timeLeft } : {}) })
+    assert.match(output, /remaining refused: Error: remaining is only for a turn whose alarm call has no time left/)
+    assert.match(output, /LOG ACCEPTED/)
+    assert.equal(result.remaining, undefined)
+  }
+})
+
+test('build: a task that is out of time at the end of each of its 4 turns is blocked, with what is left', { timeout: 60_000 }, async () => {
+  const { commands, machine } = fakeMachine(() => pass)
+  const cell = [`try { await tools.checkpoint({ message: 'x' }) } catch {}`, write, log('', 'finish add')].join('\n')
+  const { result, turns } = await buildWith({ cell, machine, timeLeft: () => 10_000 })
+
+  assert.equal(turns.filter((turn) => turn.output === null).length, 4)
+  assert.equal(result.blocked, 'the task did not finish in 4 turns. What is left: finish add')
+  assert.equal(result.remaining, '')
   assert.deepEqual(commands, [])
 })

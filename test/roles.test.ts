@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { defaultBudgetSeconds } from '../src/cloudflare/alarm.ts'
 import { profiles } from '../src/core/profiles.ts'
 import { developRoles, guideFiles, researchRoles, reviewRoles, type Role } from '../src/core/roles.ts'
 
@@ -10,6 +11,15 @@ const ids = (table: Record<string, Role>, pick: (role: Role) => boolean) => Obje
 test('in each table, each key is the id of its role', () => {
   for (const [name, table] of Object.entries(tables)) {
     for (const [key, role] of Object.entries(table)) assert.equal(role.id, key, `${name}.${key}`)
+  }
+})
+
+test('each turn time is at least a minute, and fits in a call of the default budget with a minute to spare (D12)', () => {
+  for (const [name, table] of Object.entries(tables)) {
+    for (const role of Object.values(table)) {
+      assert.ok(role.turnMs >= 60_000, `${name}.${role.id}`)
+      assert.ok(role.turnMs <= defaultBudgetSeconds * 1_000 - 60_000, `${name}.${role.id}`)
+    }
   }
 })
 

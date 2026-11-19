@@ -222,3 +222,31 @@ test('a clean box keeps its directory when the ledger and the marker agree, and 
   assert.equal(fake.events.filter((event) => event === 'start clean/1 bash -c make').length, 2)
   assert.match(lines.at(-1) ?? '', /^sync clean\/1: full, 1 files sent in \d+ ms$/)
 })
+
+test('a wait job ends by the deadline of the runner, and no job starts with less than a second left', async () => {
+  const ledger = memoryLedger()
+  const fake = fakeBox(ledger)
+  const timeouts: number[] = []
+  const box: Box = {
+    ...fake.box,
+    async startJob(id, argv, options) {
+      timeouts.push(options.timeoutMs)
+      await fake.box.startJob(id, argv, options)
+    },
+  }
+  const { options, time } = clock()
+  time.now = 100_000
+  time.after = () => {
+    for (const id of fake.states.keys()) fake.states.set(id, { result: done, state: 'done' })
+  }
+  const runner = jobRunner(box, ledger, { ...options, deadline: 130_000 })
+  const wait = { cwd: 'work/a', env: {}, timeoutMs: 600_000 }
+  assert.deepEqual(await runner.wait(make, wait), done)
+  assert.deepEqual(timeouts, [30_000])
+  time.now = 129_500
+  assert.deepEqual(await runner.wait(make, wait), { exit_code: null, output: '[host] not started: the alarm call has no time left for this command' })
+  assert.deepEqual(timeouts, [30_000])
+  // Without a deadline, the job keeps its own timeout.
+  assert.deepEqual(await jobRunner(box, ledger, options).wait(make, wait), done)
+  assert.deepEqual(timeouts, [30_000, 600_000])
+})
