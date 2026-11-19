@@ -9,7 +9,7 @@ export type DomainOutputs = Record<string, string>
 
 /**
  * The last line of a domain command. Only known gives a recall. Only known and inject give reads: the path prefixes that
- * they read, with no leading slash. reads is null when the command does not give it.
+ * they read, in the form of git paths (readsPrefix). reads is null when the command does not give it.
  */
 export type DomainJson = { recall: number | null; outputs: DomainOutputs; reads: string[] | null }
 
@@ -24,7 +24,7 @@ export type Calibration = { recall: number | null; threshold: number; outputs: D
   | { pass: false; reason: string; tail: string }
 )
 
-export type Analysis = { outputs: DomainOutputs } & ({ pass: true } | { pass: false; reason: string; tail: string })
+export type AnalysisVerdict = { outputs: DomainOutputs } & ({ pass: true } | { pass: false; reason: string; tail: string })
 
 export type HashMismatch = { path: string; expected: string; actual: string }
 
@@ -42,6 +42,23 @@ const setups = new WeakMap<Machine, () => Promise<{ exit_code: number | null; ou
 
 const exitProblem = (what: string, exitCode: number | null) =>
   exitCode === null ? `${what} did not finish: it timed out or the host stopped it` : `${what} exited with code ${exitCode}`
+
+/**
+ * A reads prefix in the form of git paths, so that needsRecalibration can compare it with changed paths: no leading
+ * slash and no empty, . or .. segments. It is null when it is not a string, is the repository root, or is outside it.
+ */
+function readsPrefix(item: unknown): string | null {
+  if (typeof item !== 'string') return null
+  const parts = item.trim().split('/')
+  const segments: string[] = []
+  for (const part of parts) {
+    if (part === '' || part === '.') continue
+    if (part !== '..') segments.push(part)
+    else if (segments.pop() === undefined) return null
+  }
+  if (segments.length === 0) return null
+  return ['', '.', '..'].includes(parts.at(-1)!) ? `${segments.join('/')}/` : segments.join('/')
+}
 
 /** Parses the last non-empty line of the output by the contract of the command, or gives the problem. */
 function parseDomainOutput(name: DomainCommand, output: string): { json: DomainJson; problem: null } | { json: null; problem: string } {
@@ -62,9 +79,10 @@ function parseDomainOutput(name: DomainCommand, output: string): { json: DomainJ
   }
   let reads: string[] | null = null
   if ((name === 'known' || name === 'inject') && value.reads !== undefined) {
-    const items = Array.isArray(value.reads) ? value.reads.map((item: unknown) => (typeof item === 'string' ? item.trim().replace(/^\/+/, '') : '')) : []
-    if (!Array.isArray(value.reads) || items.includes('')) problems.push('reads must be a list of non-empty path prefixes')
-    else reads = items
+    const items: (string | null)[] = Array.isArray(value.reads) ? value.reads.map(readsPrefix) : [null]
+    const prefixes = items.filter((item): item is string => item !== null)
+    if (prefixes.length < items.length) problems.push('reads must be a list of non-empty path prefixes in the repository')
+    else reads = prefixes
   }
   const outputs: DomainOutputs = {}
   if (!isObject(value.outputs)) problems.push('outputs must be an object of path to SHA-256 hex')
@@ -84,15 +102,17 @@ export function analyzeCommand(research: ResearchConfig, hypothesis: string): st
 }
 
 /**
- * Runs one domain command of the notebook for one frozen prereg on a machine. analyze needs the hypothesis ID. The environment is that of the checks. The
+ * Runs one domain command of the notebook for one frozen prereg on a machine. analyze also takes the hypothesis ID. The environment is that of the checks. The
  * timeout is that of research.timeouts for the command, else that of the checks. The setup of the config runs before the first command on each machine, and a failed setup fails the command.
  */
-export async function runDomainCommand(config: RepoConfig, machine: Machine, name: DomainCommand, preregPath: string, hypothesis?: string): Promise<DomainRun> {
+export async function runDomainCommand(
+  config: RepoConfig,
+  machine: Machine,
+  ...args: [name: Exclude<DomainCommand, 'analyze'>, preregPath: string] | [name: 'analyze', preregPath: string, hypothesis: string]
+): Promise<DomainRun> {
   if (!config.research) throw new Error('the notebook has no research config')
-  let template: string
-  if (name !== 'analyze') template = config.research.commands[name]
-  else if (hypothesis !== undefined) template = analyzeCommand(config.research, hypothesis)
-  else throw new Error('the analyze command needs the hypothesis ID')
+  const [name, preregPath] = args
+  const template = args[0] === 'analyze' ? analyzeCommand(config.research, args[2]) : config.research.commands[args[0]]
   const command = template.replaceAll('{prereg}', quote(preregPath))
   const options = commandOptions(config)
   let setup = setups.get(machine)
@@ -141,7 +161,7 @@ export function calibrationVerdict(known: DomainRun, inject: DomainRun, threshol
  * The verdict of one analysis: it passes when analyze gives valid JSON with at least one output, and no output path is a
  * calibration output with a different hash.
  */
-export function analysisVerdict(run: DomainRun, calibrationOutputs: DomainOutputs): Analysis {
+export function analysisVerdict(run: DomainRun, calibrationOutputs: DomainOutputs): AnalysisVerdict {
   if (run.problem !== null) return { pass: false, outputs: {}, reason: run.problem, tail: tails([run]) }
   const outputs = run.json.outputs
   if (Object.keys(outputs).length === 0) return { pass: false, outputs, reason: 'analyze gives no output', tail: tails([run]) }

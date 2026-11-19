@@ -188,7 +188,12 @@ function builderCell(id: string, turn: BuilderTurn, options: ResearchScriptOptio
     ...(turn === 'build' ? [] : [`text(await tools.Read({ file_path: '/review/${turn}-failure.txt' }))`, `await tools.Read({ file_path: '${path}' })`]),
     `await tools.Write({ file_path: '${path}', content: ${JSON.stringify(analysisModule(recall, options.unstable ?? false, analyzes))} })`,
     `await tools.checkpoint({ message: 'recall ${recall}' })`,
-    submit('submit_build_log', { summary: `analysis with recall ${recall}`, changes: [{ path: `analysis/${id}/analyze.mjs`, why: 'the analysis' }], tests: [], blocked: '' }),
+    submit('submit_build_log', {
+      summary: `analysis with recall ${recall}`,
+      changes: [{ path: `analysis/${id}/analyze.mjs`, why: 'the analysis' }],
+      tests: [],
+      blocked: '',
+    }),
   ].join('\n')
 }
 

@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { memoryChannel } from './support/fixture.ts'
 import { notebook, researchConfig, researchInput, researchScript, runResearch, type ResearchScriptOptions } from './support/research.ts'
-import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
+import { scriptedDispatch, type Script, type Turn } from './support/scripted-model.ts'
 
 const refs = (origin: string) => execFileSync('git', ['--git-dir', origin, 'for-each-ref', '--format=%(refname)']).toString()
 const builderTurns = (turns: Turn[]) => turns.filter((turn) => turn.role === 'builder' && turn.output === null)
@@ -17,14 +17,14 @@ const builderOutput = (turns: Turn[]) =>
     .join('\n')
 
 /** One run with the pick of hyp-001 only. `commands` replaces domain commands of the notebook config. */
-async function analysisRun(runId: string, options: ResearchScriptOptions = {}, commands: Partial<typeof researchConfig.commands> = {}) {
+async function analysisRun(runId: string, options: ResearchScriptOptions = {}, commands: Partial<typeof researchConfig.commands> = {}, script: Script = researchScript(options)) {
   const config = { checks: { smoke: 'true' }, research: { ...researchConfig, commands: { ...researchConfig.commands, ...commands } } }
   const { repo, origin, base } = notebook({ config })
   const turns: Turn[] = []
   const { channel } = memoryChannel({ pick: '/answer\nQ1: a' })
   const run = await runResearch(repo, mkdtempSync(join(tmpdir(), 'factory-research-runs-')), researchInput(base, runId), {
     channel,
-    dispatch: scriptedDispatch(researchScript(options), turns),
+    dispatch: scriptedDispatch(script, turns),
   })
   return { ...run, origin, turns }
 }
@@ -44,6 +44,52 @@ test('research: a first analysis with no output goes back to the builder one tim
   // known and inject give no reads, so the fix ran the calibration again before the analysis.
   assert.equal(deps.ledger.get<{ result: { pass: boolean } }>('step:calibrate.hyp-001.3')?.result.pass, true)
 })
+
+for (const [path, again] of [['search.py', false], ['analyze.mjs', true]] as const) {
+  test(`research: an analysis fix compares reads of ${path} with the changed file`, { timeout: 300_000 }, async () => {
+    const reads = (command: string) => `READS=research/,analysis/hyp-001/${path} ${command}`
+    const { result, deps } = await analysisRun(`fix-${path}`, { analysisFix: true }, { known: reads(researchConfig.commands.known), inject: reads(researchConfig.commands.inject) })
+    assert.equal(result.status, 'ready', result.report)
+    assert.equal(deps.ledger.get<{ result: boolean }>('step:recalibrate.hyp-001.analysis-fix-1')?.result, again)
+    const calibration = deps.ledger.get<{ result: { head: string; pass: boolean } }>('step:calibrate.hyp-001.3')?.result
+    if (again) {
+      const fixed = deps.ledger.get<{ result: { head: string } }>('step:analysis.hyp-001.2')?.result
+      assert.equal(calibration?.pass, true)
+      assert.equal(calibration?.head, fixed?.head)
+    } else {
+      // The analyst changes the directory later, so only that change runs the calibration again.
+      const committed = deps.ledger.get<{ result: string }>('step:commit.hyp-001.1')?.result
+      assert.ok(committed)
+      assert.equal(calibration?.head, committed)
+    }
+  })
+}
+
+for (const operation of ['remove', 'rename'] as const) {
+  test(`research: an analysis fix recalibrates after it ${operation}s a declared input`, { timeout: 300_000 }, async () => {
+    const options = { analysisFix: true }
+    const base = researchScript(options)
+    const path = 'analysis/hyp-001/model.json'
+    const script: Script = (turn) => {
+      const reply = base(turn)
+      if (turn.role !== 'builder' || !('cell' in reply)) return reply
+      const fix = turn.request.includes('Analysis round 1 of')
+      const edit = fix
+        ? `await tools.Read({ file_path: '/repo/${path}' })\nawait tools.Bash({ command: '${operation === 'remove' ? 'rm' : 'mv'} /repo/${path}${operation === 'rename' ? ' /repo/analysis/hyp-001/renamed.json' : ''}' })`
+        : turn.request.includes('Build the analysis') ? `await tools.Write({ file_path: '/repo/${path}', content: '{}' })` : ''
+      const changes = [path, ...(fix && operation === 'rename' ? ['analysis/hyp-001/renamed.json'] : [])].map((path) => ({ path, why: 'the model input' }))
+      return { cell: reply.cell.replace('await tools.checkpoint(', `${edit}\nawait tools.checkpoint(`).replace('"changes":[', `"changes":[${changes.map((change) => JSON.stringify(change)).join(',')},`) }
+    }
+    const reads = (command: string) => `READS=${path} ${command}`
+    const { result, deps } = await analysisRun(`fix-${operation}`, options, { known: reads(researchConfig.commands.known), inject: reads(researchConfig.commands.inject) }, script)
+    assert.equal(result.status, 'ready', result.report)
+    assert.equal(deps.ledger.get<{ result: boolean }>('step:recalibrate.hyp-001.analysis-fix-1')?.result, true)
+    const analyzed = deps.ledger.get<{ result: { head: string } }>('step:analysis.hyp-001.2')?.result
+    const calibrated = deps.ledger.get<{ result: { head: string; pass: boolean } }>('step:calibrate.hyp-001.3')?.result
+    assert.equal(calibrated?.pass, true)
+    assert.equal(calibrated?.head, analyzed?.head)
+  })
+}
 
 test('research: an analysis that fails two times blocks the run before the push', { timeout: 300_000 }, async () => {
   const { result, origin, pulls, turns } = await analysisRun('a2', { noAnalysis: true })

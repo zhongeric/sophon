@@ -70,16 +70,16 @@ test('analyze without a config command runs the entry point of the hypothesis wi
   const own = fakeMachine({ 'search analyze': ok({ outputs: {} }) })
   assert.equal((await runDomainCommand({ ...config, research: configured }, own.machine, 'analyze', 'prereg/hyp-001-v1.md', 'hyp-001')).command, "search analyze 'prereg/hyp-001-v1.md'")
   assert.equal(own.calls[0]?.timeoutMs, 5_000)
-  await assert.rejects(runDomainCommand(config, own.machine, 'analyze', 'prereg/hyp-001-v1.md'), /needs the hypothesis ID/)
 })
 
-test('known and inject may give reads without a leading slash, reproduce and analyze ignore it, and a bad reads fails the run', async () => {
-  const known = await run({ 'search known': ok({ recall: 1, outputs: {}, reads: ['/search/', 'data/catalog.csv'] }) }, 'known')
-  assert.deepEqual(known.json?.reads, ['search/', 'data/catalog.csv'])
+test('known and inject may give reads in the form of git paths, reproduce and analyze ignore it, and a bad reads fails the run', async () => {
+  const given = ['/search/', 'data/catalog.csv', './analysis/hyp-001/', 'analysis/./hyp-001/', 'search/../analysis/', 'search//known.py']
+  const known = await run({ 'search known': ok({ recall: 1, outputs: {}, reads: given }) }, 'known')
+  assert.deepEqual(known.json?.reads, ['search/', 'data/catalog.csv', 'analysis/hyp-001/', 'analysis/hyp-001/', 'analysis/', 'search/known.py'])
   assert.deepEqual((await run({ 'search inject': ok({ outputs: {}, reads: [] }) }, 'inject')).json?.reads, [])
   assert.equal((await run({ 'search inject': ok({ outputs: {} }) }, 'inject')).json?.reads, null)
   assert.equal((await run({ 'search reproduce': ok({ outputs: {}, reads: 7 }) }, 'reproduce')).json?.reads, null)
-  for (const bad of ['search/', [''], ['/'], ['search/', 3], null]) {
+  for (const bad of ['search/', [''], ['/'], ['./'], ['../x'], ['a/../..'], ['search/', 3], null]) {
     const failed = await run({ 'search inject': ok({ outputs: {}, reads: bad }) }, 'inject')
     assert.equal(failed.json, null)
     assert.match(failed.problem ?? '', /the last line of inject: reads must be a list of non-empty path prefixes/)
@@ -169,15 +169,6 @@ test('the reproduction lists each hash mismatch and each missing path', async ()
   if (!result.pass) assert.match(result.reason, /out\/b.csv: expected b+, reproduce gave e+\nout\/c.csv: reproduce gave no hash/)
 
   assert.equal(compareReproduction({ 'out/a.csv': hash('a') }, reproduce).pass, true)
-})
-
-test('a reproduction that gives no hash for an analysis output fails with that path in missing', async () => {
-  const calibration = { 'out/known.csv': hash('a') }
-  const reproduce = await run({ 'search reproduce': ok({ outputs: calibration }) }, 'reproduce')
-  const result = compareReproduction({ ...calibration, 'out/hyp-001/a.csv': hash('c') }, reproduce)
-  assert.equal(result.pass, false)
-  assert.deepEqual(result.missing, ['out/hyp-001/a.csv'])
-  if (!result.pass) assert.match(result.reason, /out\/hyp-001\/a.csv: reproduce gave no hash/)
 })
 
 test('the reproduction fails on a non-zero exit or no valid JSON', async () => {

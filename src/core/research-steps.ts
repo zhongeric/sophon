@@ -290,7 +290,7 @@ export type FrozenRef = { hypothesis: string; path: string }
 /** The calibration that the host gives the vet agents: the gate numbers and the artifact IDs of the command outputs. */
 export type CalibrationSummary = { round: number; recall: number; threshold: number; known: string[]; inject: string[]; outputs: Record<string, string> }
 
-/** The analysis that the host gives the vet agents and the writer: the artifact ID of the analyze output, and each output file with its hash, which is its artifact ID. */
+/** The analysis that the host gives the vet agents and the writer. `command` is the artifact ID of the analyze output. `outputs` maps each output path to its artifact ID. */
 export type AnalysisSummary = { round: number; command: string; outputs: Record<string, string> }
 
 /** A failed calibration or analysis round, for the fix turn of the builder. `tail` is the end of the command output. */
@@ -423,7 +423,6 @@ export async function buildAnalysis(context: ResearchContext, task: AnalysisTask
     `- The notebook: /repo, ${branchNotebook}. You can write only in ${analysisDir(hypothesis)}, so a changed search goes there and not in the domain package. prereg/ and dossier/ are protected.`,
     `- After your build, the host runs these domain commands with {prereg} as ${path}: known (${known}) and inject (${inject}).`,
     '  The last line of each output is JSON. known gives {"recall": <0 to 1>, "outputs": {"<path>": "<sha256>"}}, inject gives {"outputs": {...}}.',
-    '  known and inject can also give "reads": ["<path prefix>", ...], the files that they read. Without reads, a change of the analysis runs the calibration again.',
     `- After the calibration passes, the host runs analyze (${analyzeCommand(context.domain.config, hypothesis)}) on a new clean checkout.`,
     '  Its last line gives {"outputs": {"<path>": "<sha256>"}} with at least one output file.',
     '',

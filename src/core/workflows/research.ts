@@ -38,7 +38,6 @@ import {
   skeptic,
   survey,
   writeDossier,
-  type AnalysisSummary,
   type BuildFailure,
   type CalibrationSummary,
   type HeldAnswer,
@@ -592,17 +591,16 @@ async function analyze(stages: Stages, analysis: Analysis): Promise<End> {
     if (!calibration.pass) return { status: 'blocked', note: `${calibrationLine(hypothesis, calibration)}. ${notPushed}` }
   }
   // The analysis on a new clean checkout. A failed first analysis goes back to the builder one time, apart from the
-  // calibration rounds. The calibration runs again only when the fix changed a file that known or inject reads.
+  // calibration rounds. The calibration runs again when reads are missing or match the fix paths.
   let analyzed = await runAnalysis(stages, analysis)
   if (!analyzed.pass) {
+    const { reads } = finalCalibration(analysis)
     const fixed = await build(`build.${hypothesis}.analysis-fix-1`, { step: 'analysis', round: analyzed.round, reason: analyzed.reason, tail: analyzed.tail })
     if (fixed) return fixed
-    const from = analyzed.head
     // A step, so that a resume takes the same decision after the branch moved on.
-    const again = await step(ledger, `recalibrate.${hypothesis}.analysis-fix-1`, async () => {
-      const { reads } = finalCalibration(analysis)
-      return needsRecalibration(reads.known, reads.inject, await branch.changedFiles(from, await branch.head()))
-    })
+    const again = await step(ledger, `recalibrate.${hypothesis}.analysis-fix-1`, async () =>
+      needsRecalibration(reads.known, reads.inject, await branch.touchedFiles(analyzed.head, await branch.head())),
+    )
     if (again) {
       calibration = await calibrate(stages, analysis)
       if (!calibration.pass) return { status: 'blocked', note: `${calibrationLine(hypothesis, calibration)} after the analysis fix. ${notPushed}` }
@@ -727,15 +725,11 @@ const finalCalibration = (analysis: Analysis): CalibrationRound => analysis.cali
 /** The last analysis run. As with the calibration, the stages give it to an agent only after it passed. */
 const finalAnalysis = (analysis: Analysis): AnalysisRun => analysis.runs.at(-1)!
 
-const analysisSummary = (run: AnalysisRun): AnalysisSummary => ({ round: run.round, command: run.command, outputs: run.outputs })
-
 /** What each vet agent and the writer read of one hypothesis. */
-const vetTask = (branch: Branch, analysis: Analysis) => ({
-  branch,
-  prereg: analysis.freeze,
-  calibration: summary(finalCalibration(analysis)),
-  analysis: analysisSummary(finalAnalysis(analysis)),
-})
+const vetTask = (branch: Branch, analysis: Analysis) => {
+  const { round, command, outputs } = finalAnalysis(analysis)
+  return { branch, prereg: analysis.freeze, calibration: summary(finalCalibration(analysis)), analysis: { round, command, outputs } }
+}
 
 const oneLine = (text: string) => text.trim().replace(/\s*\n\s*/g, '; ')
 

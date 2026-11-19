@@ -167,6 +167,7 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
       tree: mkdirAll(tree),
       head,
       changedFiles: async (from, to) => existing(await git('diff', '--name-status', `${localOf(from)}..${localOf(to)}`)),
+      touchedFiles: async (from, to) => [...new Set(nameStatus(await git('diff', '--name-status', `${localOf(from)}..${localOf(to)}`)).map(([, path]) => path))],
       committedFiles: async () => (await git('ls-files')).split('\n').filter(Boolean),
       async pending() {
         // Staging shows new files in the diff. The reset after it keeps run_tests to committed files.
