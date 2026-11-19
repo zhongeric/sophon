@@ -183,6 +183,7 @@ function gitBranch(tree: string, name: string, commits: GitCommits): Branch {
     tree: diskFileSystem(tree),
     head: () => currentCommit(tree),
     changedFiles: (from, to) => changedFiles(tree, from, to),
+    touchedFiles: (from, to) => touchedFiles(tree, from, to),
     committedFiles: () => trackedFiles(tree),
     async pending() {
       // Staging shows new files in the diff. The reset after it keeps the index as it was, so run_tests still sees only committed files.

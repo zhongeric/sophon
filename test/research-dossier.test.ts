@@ -80,7 +80,7 @@ test('research: build, calibration with a fix round, vet, dossier, reproduction,
 
   // Each domain command output is in the run store with its command line as the source. The store keeps equal outputs one time.
   const commands = (await deps.egress.artifacts.list()).filter(({ meta }) => meta.labels?.hypothesis === 'hyp-001')
-  assert.deepEqual(new Set(commands.map(({ meta }) => meta.labels?.command)), new Set(['known', 'inject', 'reproduce']))
+  assert.deepEqual(new Set(commands.map(({ meta }) => meta.labels?.command)), new Set(['known', 'inject', 'analyze', 'reproduce']))
   for (const { meta } of commands) assert.deepEqual(meta.source, { command: `node research/run.mjs ${meta.labels?.command} 'prereg/hyp-001-v2.md'` })
   // The reproduction ran on a clean checkout, not in the worktree of the run branch, and matched the calibration.
   const reproduce = commands.find(({ meta }) => meta.labels?.command === 'reproduce')
@@ -89,6 +89,14 @@ test('research: build, calibration with a fix round, vet, dossier, reproduction,
   assert.ok(cwd)
   assert.notEqual(cwd, worktreePath(join(deps.dir, 'branches'), branch))
   assert.match(result.report, /Reproduction at [0-9a-f]{12} \(output artifact [0-9a-f]{64}\): PASS/)
+  // The analysis ran on a clean checkout too. Without reads, the analyst change ran the calibration again, then the analysis.
+  const analyzed = commands.find(({ meta }) => meta.labels?.command === 'analyze' && meta.labels.path === undefined)
+  const analyzeCwd = /analyze of hyp-001 in (.+)/.exec(new TextDecoder().decode((await deps.egress.artifacts.get(analyzed?.id ?? '')) ?? new Uint8Array()))?.[1]
+  assert.ok(analyzeCwd)
+  assert.notEqual(analyzeCwd, worktreePath(join(deps.dir, 'branches'), branch))
+  assert.ok(deps.ledger.get('step:calibrate.hyp-001.3'))
+  assert.ok(deps.ledger.get('step:analysis.hyp-001.2'))
+  assert.match(result.report, /Analysis round 2 at [0-9a-f]{12}: PASS, analyze output [0-9a-f]{64}, output files [0-9a-f]{64}/)
 
   // The pushed branch has the analysis, the analyst note and the dossier.
   const show = (path: string) => execFileSync('git', ['--git-dir', origin, 'show', `${branch}:${path}`]).toString()
@@ -101,6 +109,16 @@ test('research: build, calibration with a fix round, vet, dossier, reproduction,
   assert.match(show('dossier/hyp-001.md'), new RegExp(`artifact:${measurement.id}: "inject rows"`))
   assert.match(outputs(turns, 'skeptic'), /inject rows/)
   assert.match(outputs(turns, 'writer'), /inject rows/)
+  // The skeptic, the writer and the dossier cite the analysis output.
+  const analysisFile = commands.find(({ meta }) => meta.labels?.path === 'out/hyp-001/analysis.txt')
+  assert.ok(analysisFile)
+  assert.equal(analysisFile.meta.labels?.command, 'analyze')
+  assert.equal(new TextDecoder().decode(await deps.egress.artifacts.get(analysisFile.id) ?? new Uint8Array()), 'analysis rows')
+  assert.match(outputs(turns, 'skeptic'), /analysis rows/)
+  assert.match(outputs(turns, 'writer'), /analysis rows/)
+  assert.match(result.report, new RegExp(`output files ${analysisFile.id}`))
+  assert.match(show('dossier/hyp-001.md'), new RegExp(`## Analysis outputs\n\n- out/hyp-001/analysis\\.txt: artifact:${analysisFile.id}`))
+  assert.match(show('dossier/hyp-001.md'), new RegExp(`artifact:${analysisFile.id}: "analysis rows"`))
   // The output files of the domain commands stay out of the run branch.
   assert.doesNotMatch(execFileSync('git', ['--git-dir', origin, 'ls-tree', '-r', '--name-only', branch]).toString(), /^out\//m)
 

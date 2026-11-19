@@ -18,6 +18,21 @@ const hasBranch = async (repo: string, name: string) =>
 const read = async (tree: FileSystem.FileSystem, path: string) => new TextDecoder().decode(await tree.read(path))
 const exists = async (tree: FileSystem.FileSystem, path: string) => Boolean(await tree.stat(path).catch(() => null))
 
+test('Node branches: touchedFiles includes deletions and both paths of a rename', async () => {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  const branch = await gitBranches(repo, dir).branch('factory/touched', 'main')
+  await branch.tree.write('/old.txt', new TextEncoder().encode('renamed input\n'))
+  await branch.tree.write('/removed.txt', new TextEncoder().encode('deleted input\n'))
+  await branch.commit('inputs')
+  const before = await branch.head()
+  const tree = worktreePath(dir, branch.name)
+  await git(tree, 'mv', 'old.txt', 'new.txt')
+  await git(tree, 'rm', 'removed.txt')
+  await branch.commit('fix')
+  assert.deepEqual((await branch.touchedFiles(before, await branch.head())).sort(), ['new.txt', 'old.txt', 'removed.txt'])
+})
+
 test('Node branches: deleteLocal removes the worktree and the branch, also outside the run directory', async () => {
   const { repo } = developRepo()
   const dir = runsDir()

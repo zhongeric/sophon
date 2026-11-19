@@ -102,9 +102,10 @@ test('on Cloudflare, /research runs the research workflow on an issue and opens 
   const dossier = [...mock.state.pulls.values()].find((pull) => pull.head.startsWith(`factory/research-${started.run}`))
   assert.ok(dossier, describe())
   assert.equal((await status(5)).runs[0]?.state, 'passed')
-  // The calibration and the reproduction ran on clean checkouts, each in a new directory.
+  // The calibration, the analysis and the reproduction ran on clean checkouts, each in a new directory.
   const domainDirs = new Set(mock.state.commands.filter((command) => command.argv.join(' ').includes('research/run.mjs')).map((command) => command.cwd))
   assert.ok(domainDirs.size > 1 && [...domainDirs].every((dir) => dir.startsWith(`clean/${started.run}/`)), JSON.stringify([...domainDirs]))
+  assert.ok(mock.state.commands.some((command) => command.argv.join(' ').includes('research/run.mjs analyze')), describe())
   // The surveyors fetched the archive through the egress, with the key from the Worker secret, and never the holdout.
   assert.ok(mock.state.egress.length > 0, describe())
   assert.ok(mock.state.egress.every((entry) => entry.key === 'archive-token'), JSON.stringify(mock.state.egress))

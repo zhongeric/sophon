@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { Machine, RepoConfig } from '../src/core/checks.ts'
 import { freezePrereg } from '../src/core/prereg.ts'
-import { calibrationVerdict, compareReproduction, preregThreshold, runDomainCommand } from '../src/core/research-commands.ts'
+import { analysisVerdict, analyzeCommand, calibrationVerdict, compareReproduction, needsRecalibration, preregThreshold, runDomainCommand } from '../src/core/research-commands.ts'
 import type { ResearchConfig } from '../src/core/research.ts'
 
 const hash = (char: string) => char.repeat(64)
@@ -53,7 +53,37 @@ test('the command gets the quoted prereg path, the check environment without hos
   assert.ok(!calls[0]?.env.includes('GITHUB_TOKEN'))
   assert.equal(calls[0]?.timeoutMs, 5_000)
   assert.equal(result.problem, null)
-  assert.deepEqual(result.json, { recall: 1, outputs: {} })
+  assert.deepEqual(result.json, { recall: 1, outputs: {}, reads: null })
+})
+
+test('analyze without a config command runs the entry point of the hypothesis with the quoted prereg and the analyze timeout', async () => {
+  const { machine, calls } = fakeMachine({ 'make setup': { exit_code: 0, output: '' }, 'python': ok({ outputs: { 'out/hyp-001/a.csv': hash('c') } }) })
+  const withTimeouts = { ...config, setup: 'make setup', research: { ...research, timeouts: { analyze: 900_000 } } }
+  const result = await runDomainCommand(withTimeouts, machine, 'analyze', "prereg/it's.md", 'hyp-001')
+  assert.equal(analyzeCommand(research, 'hyp-001'), "python 'analysis/hyp-001/analyze.py' {prereg}")
+  assert.equal(result.command, "python 'analysis/hyp-001/analyze.py' 'prereg/it'\\''s.md'")
+  assert.deepEqual(calls.map(({ command, timeoutMs }) => [command, timeoutMs]), [['make setup', 5_000], [result.command, 900_000]])
+  assert.deepEqual(result.json, { recall: null, outputs: { 'out/hyp-001/a.csv': hash('c') }, reads: null })
+
+  const configured = { ...research, commands: { ...research.commands, analyze: 'search analyze {prereg}' } }
+  assert.equal(analyzeCommand(configured, 'hyp-001'), 'search analyze {prereg}')
+  const own = fakeMachine({ 'search analyze': ok({ outputs: {} }) })
+  assert.equal((await runDomainCommand({ ...config, research: configured }, own.machine, 'analyze', 'prereg/hyp-001-v1.md', 'hyp-001')).command, "search analyze 'prereg/hyp-001-v1.md'")
+  assert.equal(own.calls[0]?.timeoutMs, 5_000)
+})
+
+test('known and inject may give reads in the form of git paths, reproduce and analyze ignore it, and a bad reads fails the run', async () => {
+  const given = ['/search/', 'data/catalog.csv', './analysis/hyp-001/', 'analysis/./hyp-001/', 'search/../analysis/', 'search//known.py']
+  const known = await run({ 'search known': ok({ recall: 1, outputs: {}, reads: given }) }, 'known')
+  assert.deepEqual(known.json?.reads, ['search/', 'data/catalog.csv', 'analysis/hyp-001/', 'analysis/hyp-001/', 'analysis/', 'search/known.py'])
+  assert.deepEqual((await run({ 'search inject': ok({ outputs: {}, reads: [] }) }, 'inject')).json?.reads, [])
+  assert.equal((await run({ 'search inject': ok({ outputs: {} }) }, 'inject')).json?.reads, null)
+  assert.equal((await run({ 'search reproduce': ok({ outputs: {}, reads: 7 }) }, 'reproduce')).json?.reads, null)
+  for (const bad of ['search/', [''], ['/'], ['./'], ['../x'], ['a/../..'], ['search/', 3], null]) {
+    const failed = await run({ 'search inject': ok({ outputs: {}, reads: bad }) }, 'inject')
+    assert.equal(failed.json, null)
+    assert.match(failed.problem ?? '', /the last line of inject: reads must be a list of non-empty path prefixes/)
+  }
 })
 
 test('a domain command takes its own timeout from research.timeouts, and the setup and other commands keep the config timeout', async () => {
@@ -153,6 +183,42 @@ test('the reproduction fails on a non-zero exit or no valid JSON', async () => {
     assert.match(result.reason, reason)
     assert.match(result.tail, new RegExp(reply.output))
   }
+})
+
+const analyze = (reply: Reply) => runDomainCommand(config, fakeMachine({ python: reply }).machine, 'analyze', 'prereg/hyp-001-v1.md', 'hyp-001')
+
+test('an analysis with outputs passes, and a same hash as a calibration output is no conflict', async () => {
+  const outputs = { 'out/known.csv': hash('a'), 'out/hyp-001/a.csv': hash('c') }
+  assert.deepEqual(analysisVerdict(await analyze(ok({ outputs })), { 'out/known.csv': hash('a') }), { pass: true, outputs })
+})
+
+test('a failed analyze, no output and a conflict with a calibration hash each fail the analysis with the tail', async () => {
+  const cases: [Reply, RegExp][] = [
+    [{ exit_code: 1, output: 'Traceback: analyze broke' }, /analyze exited with code 1/],
+    [{ exit_code: null, output: 'slow analyze\n[host] killed after 5000 ms' }, /analyze did not finish/],
+    [{ exit_code: 0, output: 'table written\n' }, /the last line of analyze is not JSON/],
+    [ok({ outputs: {} }, 'nothing to write\n'), /analyze gives no output/],
+    [ok({ outputs: { 'out/known.csv': hash('e') } }, 'rewrote known\n'), /different hashes for out\/known.csv/],
+  ]
+  for (const [reply, reason] of cases) {
+    const verdict = analysisVerdict(await analyze(reply), { 'out/known.csv': hash('a') })
+    assert.equal(verdict.pass, false)
+    if (verdict.pass) continue
+    assert.match(verdict.reason, reason)
+    assert.ok(verdict.tail.includes(reply.output.trim().split('\n')[0]!), verdict.tail)
+  }
+})
+
+test('a calibration runs again when a reads list is missing or a prefix matches the changed files', () => {
+  const dir = ['analysis/hyp-001/']
+  assert.equal(needsRecalibration(null, ['search/'], dir), true)
+  assert.equal(needsRecalibration(['search/'], null, dir), true)
+  assert.equal(needsRecalibration(['search/', 'data/'], ['search/inject.py', 'analysis/hyp-002/'], dir), false)
+  assert.equal(needsRecalibration([], [], dir), false)
+  assert.equal(needsRecalibration(['analysis/'], ['search/'], dir), true)
+  assert.equal(needsRecalibration(['search/'], ['analysis/hyp-001/x.py'], dir), true)
+  assert.equal(needsRecalibration(['search/'], [], ['analysis/hyp-001/a.py', 'search/known.py']), true)
+  assert.equal(needsRecalibration(['search/'], [], ['analysis/hyp-001/a.py']), false)
 })
 
 test('the threshold comes from the frozen prereg markdown', async () => {
