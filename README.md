@@ -83,8 +83,8 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
   runs one command for each test file.
 - `protect` lists paths that agents cannot write. A `*` matches inside one path segment.
 - `env` lists extra environment variables for the checks. `guides` mounts reference material at `/guides/<name>`.
-- `answerers` limits who can answer questions. `research` configures a research notebook. Its `known`, `inject` and
-  `reproduce` commands print a JSON last line, and `research.timeouts` gives each command a timeout in ms
+- `answerers` limits who can answer questions. `research` configures a research notebook. Its `known`, `inject`,
+  `analyze` and `reproduce` commands print a JSON last line, and `research.timeouts` gives each command a timeout in ms
   ([spec, section 6.3](docs/specs/research-workflow.md#63-the-domain-in-the-notebook)).
 - Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
   file that no test imports gets the test files that have its base name as a word. The `run_checks` of builders,

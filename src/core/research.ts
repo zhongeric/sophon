@@ -15,7 +15,8 @@ export type ResearchConfig = {
   guides: string
   checklist: string
   prereg_sections: string[]
-  commands: { known: string; inject: string; evaluate: string; reproduce: string; sweep?: string }
+  /** analyze is optional: without it, the host runs the fixed entry point of analyzeCommand in research-commands.ts. */
+  commands: { known: string; inject: string; evaluate: string; reproduce: string; analyze?: string; sweep?: string }
   credentials?: Record<string, ResearchCredential>
   /** The timeout in ms of each domain command. A missing key takes the timeout of the checks. */
   timeouts?: ResearchTimeouts
@@ -23,7 +24,7 @@ export type ResearchConfig = {
   feeds?: string[]
 }
 
-export type ResearchTimeouts = Partial<Record<'known' | 'inject' | 'evaluate' | 'reproduce', number>>
+export type ResearchTimeouts = Partial<Record<'known' | 'inject' | 'evaluate' | 'reproduce' | 'analyze', number>>
 
 /**
  * The holdout file. `refuse` is the list of URL prefixes that the egress refuses to agents. Each prefix has the
@@ -149,7 +150,7 @@ function credentials(value: unknown, key: string, egress: string[], fail: Fail):
   return parsed
 }
 
-const timeoutKeys: readonly (keyof ResearchTimeouts)[] = ['known', 'inject', 'evaluate', 'reproduce']
+const timeoutKeys: readonly (keyof ResearchTimeouts)[] = ['known', 'inject', 'evaluate', 'reproduce', 'analyze']
 
 function timeouts(value: unknown, key: string, fail: Fail): ResearchTimeouts {
   const entries = object(value, key, [...timeoutKeys], fail)
@@ -170,7 +171,7 @@ export function parseResearchConfig(value: unknown, source: string): ResearchCon
   const research = object(value, 'research', researchKeys, fail)
   const egress = egressList(research.egress, 'research.egress', fail)
   const lenses = object(research.lenses, 'research.lenses', ['survey', 'skeptic'], fail)
-  const commands = object(research.commands, 'research.commands', ['known', 'inject', 'evaluate', 'reproduce', 'sweep'], fail)
+  const commands = object(research.commands, 'research.commands', ['known', 'inject', 'evaluate', 'reproduce', 'analyze', 'sweep'], fail)
   const prereg = ['prereg']
   const config: ResearchConfig = {
     egress,
@@ -186,6 +187,7 @@ export function parseResearchConfig(value: unknown, source: string): ResearchCon
       reproduce: command(commands.reproduce, 'research.commands.reproduce', prereg, fail),
     },
   }
+  if (commands.analyze !== undefined) config.commands.analyze = command(commands.analyze, 'research.commands.analyze', prereg, fail)
   if (commands.sweep !== undefined) config.commands.sweep = command(commands.sweep, 'research.commands.sweep', [...prereg, 'partition'], fail)
   if (research.credentials !== undefined) config.credentials = credentials(research.credentials, 'research.credentials', egress, fail)
   if (research.timeouts !== undefined) config.timeouts = timeouts(research.timeouts, 'research.timeouts', fail)

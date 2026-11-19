@@ -62,13 +62,13 @@ The principles of the development workflow hold. These follow from them.
 | 2 Hypotheses | step 1 reviewers | generators on different model families and lenses | Schema: statement, why past work missed it, data, test, kill criterion, cost. The host merges duplicates by their data and test. |
 | 3 Pick | gate, held findings | the user | No spend on a hypothesis that the user did not pick. |
 | 4 Prereg | plan (one planner, D7) | one preregistrar | The core sections and the domain's sections. The host commits `prereg/<hypothesis>-v<n>.md`, records its hash, and protects the path. A change is a new version with a reason. |
-| 5 Build | build | builder, on a branch of the notebook | Writes only `analysis/<id>/`. Checkpoints and static rules as today. |
-| 6 Calibrate | done-looks-like | host | Runs the domain's `known` and `inject` commands on the search partition. Recall under the prereg threshold goes back to the builder, in two rounds at most. After the second round, the host stops with a blocker and asks the user. |
+| 5 Build | build | builder, on a branch of the notebook | Writes only `analysis/<id>/`, so a prereg puts a changed search there, not in the domain's package. Checkpoints and static rules as today. |
+| 6 Calibrate | done-looks-like | host | Runs the domain's `known` and `inject` commands on the search partition. Recall under the prereg threshold goes back to the builder, in two rounds at most. After the second round, the host stops with a blocker and asks the user. After a calibration passes, the host runs `analyze` on a new clean checkout of the calibrated commit, as a detached job. A failed analysis goes back to the builder one time, in a round of its own, then the host stops with a blocker. |
 | 7 Sweep | none | host, on the box | Runs the domain's `sweep` command at the frozen commit in a bounded pool. Each partition is a ledger step. Results go to artifacts. |
 | 8 Screen | light reviewer | screeners on a cheap model, in batches | Each label cites an artifact. One screener labels each batch. A `not sure` label goes to a second screener on the other family. |
-| 9 Vet | full review loop | skeptic tracks. Then the analyst answers, as the patch agent does. Then late skeptics on the other family | Context-free skeptics. The evidence check on artifacts. The analyst lists every objection as addressed or conceded. A conceded critical or high objection goes to the user. The domain's checks are host findings. |
+| 9 Vet | full review loop | skeptic tracks. Then the analyst answers, as the patch agent does. Then late skeptics on the other family | Context-free skeptics. The evidence check on artifacts. The analyst lists every objection as addressed or conceded. A conceded critical or high objection goes to the user. The domain's checks are host findings. The skeptics, the analyst and the writer get the analysis outputs as artifacts. After analyst changes, the host runs the analysis again. A failure stops the run with a blocker. |
 | 10 Holdout | none | host | The egress refuses the holdout to agents from the start of the run. It refuses the holdout to box commands only after RG1. The host permits only `evaluate` in stage 10 and `reproduce` in stage 11 to read the holdout. In this stage, the host runs the domain's `evaluate` command on the holdout, with the frozen prereg. Its output is the outcome: recovered, inconsistent, excluded or insufficient. |
-| 11 Dossier | ready PR | writer, then the code review loop on the analysis code | Each number cites an artifact. Each item of the domain's checklist has a status: ruled out, open or not tested. Coverage and completeness. The host runs the domain's `reproduce` command on a clean box and compares the hashes. |
+| 11 Dossier | ready PR | writer, then the code review loop on the analysis code | Each number cites an artifact. Each item of the domain's checklist has a status: ruled out, open or not tested. Coverage and completeness. After review fixes, the analysis runs again. A failed analysis or a changed analysis hash fails the run, and the PR stays a draft. The host runs the domain's `reproduce` command on a clean box and compares the hashes of the calibration and of the analysis. |
 
 ### Scout
 
@@ -149,11 +149,12 @@ reads it from the base branch, so a run cannot change its own rails.
     "commands": {
       "known": "python -m search.known {prereg}",
       "inject": "python -m search.inject {prereg}",
+      "analyze": "python -m search.analyze {prereg}",
       "sweep": "python -m search.sweep {prereg} {partition}",
       "evaluate": "python -m search.evaluate {prereg}",
       "reproduce": "python -m search.reproduce {prereg}"
     },
-    "timeouts": { "known": 7200000, "reproduce": 7200000 },
+    "timeouts": { "known": 7200000, "analyze": 3600000, "reproduce": 7200000 },
     "feeds": ["https://export.arxiv.org/rss/astro-ph"]
   }
 }
@@ -166,19 +167,26 @@ The prereg section "Holdout" refers to this file and does not define the holdout
 The host takes the command strings from the base branch. It replaces `{prereg}` with the quoted path of the frozen
 prereg. `{partition}` identifies the current data partition. `feeds` are the sources of scout (section 3).
 `timeouts` gives the timeout in ms of each domain command. A missing key takes `timeout_ms`, else 30 minutes.
+`analyze` is optional. Without it, the host runs `python analysis/<id>/analyze.py {prereg}`, where `<id>` is the hypothesis.
 
 The last line of a command output that is not empty is a JSON object:
 
 | Command | Last line |
 | --- | --- |
-| `known` | `{"recall": <number 0..1>, "outputs": {"<path>": "<sha256 hex>"}}` |
-| `inject`, `reproduce` | `{"outputs": {"<path>": "<sha256 hex>"}}` |
+| `known` | `{"recall": <number 0..1>, "outputs": {"<path>": "<sha256 hex>"}, "reads": ["<path prefix>"]}` |
+| `inject` | `{"outputs": {"<path>": "<sha256 hex>"}, "reads": ["<path prefix>"]}` |
+| `analyze`, `reproduce` | `{"outputs": {"<path>": "<sha256 hex>"}}` |
 
 - The calibration passes only when the `known` recall is equal to or more than the `known_recall` of the prereg. The
   `inject` outputs are the artifacts for completeness and false positives.
+- `reads` is optional: the path prefixes that the command reads. When both lists exist and do not match the changed
+  paths, the host does not run the calibration again (stages 6 and 9).
 - A non-zero exit, a timeout, or a last line that is not a JSON object of this shape is a failed round. The failure
   text gives the end of the output.
-- `reproduce` on a clean checkout must give the same hashes as the calibration.
+- An analysis also fails when its `outputs` is empty, or when it gives a calibration output path with a different hash.
+  `analyze` does not read the holdout.
+- `reproduce` on a clean checkout must give the same hashes as the calibration and the analysis. A missing hash is a
+  failure.
 
 agent-factory holds the roles and their generic guides (`agents/research/*.md`). The domain's guides add to them,
 as profile guides do today.
@@ -198,14 +206,16 @@ as profile guides do today.
 
 - **Cloudflare first.** One `ResearchRuns` Durable Object for each program issue holds the ledger, the sessions and
   the artifacts. The run ID is `research-<issue>-<stamp>`.
-  - The box is the build container of the object, as for development runs. The calibration and `reproduce` run in a
-    new clean checkout of the commit in the same container.
+  - The box is the build container of the object, as for development runs. The calibration, the analysis and `reproduce`
+    run in a new clean checkout of the commit in the same container.
   - The agent egress is an `EgressHost` over the artifacts of the object. Archive credentials come from Worker secrets.
     A credential with the name of a host secret or of a Worker setting stops the run before the first fetch.
   - Three start paths: a `/research` comment or the `agent-research` label on a notebook issue,
     `POST /research/<owner>/<repo>/<issue>`, and `npm run remote -- research <issue>`.
 - **Local** runs the same workflow, for tests and for development of the workflow.
-- **Large sweeps** go to a larger container.
+- **Large sweeps** go to scan boxes: one small container with no network for each slot of a pool, in the Durable
+  Object `ScanBoxes`. The sweep does not use them yet.
+  - **TLS pass time on a scan box** (one pass of the droplet example): TO FILL IN AFTER DEPLOY.
 - **No mirrors.** Runs fetch queries, cutouts and per-target data. A program never copies a whole archive.
 
 ## 8. Trust boundary
@@ -248,7 +258,7 @@ as profile guides do today.
 | RG5 | Many trials in one program | The host counts each trial. The dossier reports the count. |
 | RG6 | Submission to outside bodies | A later workflow with a `/go` for an exact scope. |
 | RG7 | New developments: papers, alerts and data releases | Scout (section 3), in phase R4. A proposal becomes a program only when the user labels it. |
-| RG8 | Large sweeps on a rented machine | Not in R0. Large sweeps use a larger container. A remote box for a rented machine is a later change. |
+| RG8 | Large sweeps on a rented machine | Not in R0. Large sweeps use scan boxes (section 7). The sweep sends units to them in a later change. A remote box for a rented machine is a later change. |
 | RG9 | Programs in one notebook share the holdout | After the first outcome, the holdout is not blind to later programs. The dossier reports the count of holdout tests across the notebook. |
 | RG10 | Web search and the holdout | Web search runs at the provider, so the lock cannot refuse the holdout to it, and the egress does not log it (RD9). The report says that the holdout lock does not bind web search. |
 

@@ -17,6 +17,7 @@ import { createSyncTables, sqlSyncs, type SyncSql } from '../src/cloudflare/sync
 import { commandChecker } from '../src/core/checks.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import type { Checker } from '../src/core/platform.ts'
+import { localContainer } from './support/container.ts'
 import { mockServices } from './support/mock-services.ts'
 
 /** Durable Object SQL over node:sqlite. A new store over the same database is a new object after a restart. */
@@ -106,34 +107,6 @@ test('a sync copies the whole tree without .git, then only what changed or went 
     ['changed', false, 'new', 'installed'],
   )
 })
-
-/**
- * A container whose root is a local directory. It comes back empty when it starts, as a stopped Cloudflare Container
- * does. `renewals` counts the calls that renew its inactivity timeout.
- */
-function localContainer(root: string, exitCode?: number) {
-  const container = {
-    running: false,
-    renewals: 0,
-    start() {
-      rmSync(root, { force: true, recursive: true })
-      mkdirSync(root, { recursive: true })
-      container.running = true
-    },
-    async setInactivityTimeout() {
-      container.renewals += 1
-    },
-    async exec(argv: string[], options: { cwd: string; stdin?: ReadableStream }) {
-      // The box wraps each command in timeout -k 10 <seconds>.
-      const command = argv.slice(4)
-      const cwd = join(root, options.cwd)
-      const input = options.stdin ? Buffer.from(await new Response(options.stdin).arrayBuffer()) : undefined
-      const result = existsSync(cwd) ? spawnSync(command[0]!, command.slice(1), { cwd, input }) : { status: 1, stdout: '', stderr: `no directory ${options.cwd}` }
-      return { stdout: new Blob([`${result.stdout}${result.stderr}`]).stream(), exitCode: Promise.resolve(exitCode ?? result.status ?? 1) }
-    },
-  }
-  return container
-}
 
 test('a sync after the container stopped copies all of the tree and runs the setup again', async () => {
   const root = mkdtempSync(join(tmpdir(), 'factory-container-'))
@@ -395,9 +368,9 @@ test('a container job runs detached in its directory, and each poll renews the i
   const { box, container, root } = await containerJobs()
   mkdirSync(join(root, 'work/x'), { recursive: true })
   await box.startJob('job-1', ['bash', '-c', 'echo out; echo err >&2; pwd -P; exit 3'], { cwd: 'work/x', env: {}, timeoutMs: 60_000 })
-  const renewals = container.renewals
+  const renewals = container.timeouts.length
   assert.deepEqual(await jobResult(box, 'job-1'), { exit_code: 3, output: `out\nerr\n${realpathSync(join(root, 'work/x'))}\n` })
-  assert.ok(container.renewals > renewals)
+  assert.ok(container.timeouts.length > renewals)
   // The output and the exit code are in the job directory, not in the work directory.
   assert.deepEqual(readdirSync(join(root, 'work/x')), [])
   assert.deepEqual(readdirSync(join(root, 'jobs/job-1')).sort(), ['exit', 'limit', 'output', 'pgid', 'started'])

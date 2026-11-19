@@ -98,15 +98,24 @@ test('commands need known, inject, evaluate and reproduce, and use only {prereg}
   rejects(commands({ known: 'run {Prereg}' }), 'research.commands.known', /placeholder \{Prereg\}/)
 })
 
+test('analyze is an optional command that uses only {prereg}', () => {
+  assert.equal('analyze' in (parse(example)?.commands ?? {}), false)
+  assert.equal(parse(commands({ analyze: 'python -m search.analyze {prereg}' }))?.commands.analyze, 'python -m search.analyze {prereg}')
+  rejects(commands({ analyze: '' }), 'research.commands.analyze', /non-empty string/)
+  rejects(commands({ analyze: 'run {prereg} {partition}' }), 'research.commands.analyze', /placeholder \{partition\}, but only \{prereg\} are permitted/)
+})
+
 test('timeouts are optional positive integers of milliseconds for the domain commands', () => {
   const { timeouts: _, ...without } = example
   assert.equal('timeouts' in (parse(without) ?? {}), false)
-  const all = { known: 1, inject: 2, evaluate: 3, reproduce: 4 }
+  const all = { known: 1, inject: 2, evaluate: 3, reproduce: 4, analyze: 5 }
   assert.deepEqual(parse(research({ timeouts: all }))?.timeouts, all)
   assert.deepEqual(parse(research({ timeouts: { inject: 60_000 } }))?.timeouts, { inject: 60_000 })
   assert.deepEqual(parse(research({ timeouts: {} }))?.timeouts, {})
   rejects(research({ timeouts: { sweep: 1_000 } }), 'research.timeouts.sweep', /not a known key/)
   assert.deepEqual(parse(research({ timeouts: { evaluate: 1_000 } }))?.timeouts, { evaluate: 1_000 })
+  assert.deepEqual(parse(research({ timeouts: { analyze: 600_000 } }))?.timeouts, { analyze: 600_000 })
+  rejects(research({ timeouts: { analyze: 0 } }), 'research.timeouts.analyze', /must be a positive integer of milliseconds/)
   for (const value of [0, -1, 1.5, '1000', null, Number.MAX_SAFE_INTEGER + 1])
     rejects(research({ timeouts: { known: value } }), 'research.timeouts.known', /must be a positive integer of milliseconds/)
   rejects(research({ timeouts: 60_000 }), 'research.timeouts', /must be an object/)

@@ -38,6 +38,8 @@ export type Branch = {
   readonly tree: FileSystem.FileSystem
   head(): Promise<string>
   changedFiles(from: string, to: string): Promise<string[]>
+  /** Every path that the change touches, including deleted files and the old path of each rename. */
+  touchedFiles(from: string, to: string): Promise<string[]>
   committedFiles(): Promise<string[]>
   /** The uncommitted changes against the last commit, new files included: their diff, the paths that exist after them, and the deleted paths. */
   pending(): Promise<{ diff: string; changed: string[]; removed: string[] }>
