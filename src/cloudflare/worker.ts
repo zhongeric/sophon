@@ -5,6 +5,7 @@ import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
 import { sameSecret, verifySignature } from './github.ts'
 import { appBotLogin, githubAccess, type BotLogins, type InstallationTokens } from './github-app.ts'
+import { openApi } from './openapi.ts'
 import { sweepBranches } from './prune.ts'
 import { allowedUsers, PullRequestRuns, type Env } from './run.ts'
 
@@ -87,6 +88,8 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
     if (request.method === 'POST' && url.pathname === '/github/webhook') return webhook(request, env)
+    // The description has no data, and a tool reads it before it has the token.
+    if (request.method === 'GET' && url.pathname === '/openapi.json') return Response.json(openApi(url.origin))
     const route = /^\/(runs|develop|research)\/([^/]+)\/([^/]+)\/(\d+)(?:\/(report|resume))?$/.exec(url.pathname)
     const pruneRoute = /^\/prune\/([^/]+)\/([^/]+)$/.exec(url.pathname)
     if (!route && !pruneRoute) return new Response('agent-factory', { status: url.pathname === '/' ? 200 : 404 })
