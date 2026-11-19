@@ -304,6 +304,30 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
   }
 })
 
+test('on Cloudflare, /openapi.json needs no token, has the origin of the Worker, and names only routes that the Worker answers', { timeout: 120_000 }, async () => {
+  const worker = await startWorker({ ADMIN_TOKEN: 'admin' })
+  try {
+    const response = await fetch(`${worker.url}/openapi.json`)
+    assert.equal(response.status, 200)
+    const spec = (await response.json()) as { servers: { url: string }[]; paths: Record<string, Record<string, unknown>> }
+    assert.deepEqual(spec.servers, [{ url: worker.url }])
+    const operations = Object.entries(spec.paths).flatMap(([path, item]) =>
+      Object.keys(item)
+        .filter((key) => key !== 'parameters')
+        .map((method) => ({ method: method.toUpperCase(), path: path.replace('{owner}', 'acme').replace('{repo}', 'app').replace('{number}', '7') })),
+    )
+    assert.equal(operations.length, 6)
+    for (const { method, path } of operations) {
+      // A body that is not a JSON object stops a start route before it starts a run.
+      const init = { headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, method, ...(method === 'POST' ? { body: '[]' } : {}) }
+      const { status } = await fetch(`${worker.url}${path}`, init)
+      assert.ok(status !== 404 && status !== 405, `${method} ${path} answered ${status}`)
+    }
+  } finally {
+    await worker.stop()
+  }
+})
+
 test('on Cloudflare, a docs and tests only change takes the light loop, with host findings from the virtual git diff', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo({ light: true })
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })

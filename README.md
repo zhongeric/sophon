@@ -138,7 +138,7 @@ as a secret to use budgets. The `secret` of a research credential is the name of
 `npx wrangler secret put <NAME>`. It cannot be a host secret or a Worker setting.
 
 `npm run remote` starts and follows runs. It reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from
-`.secrets/cloudflare.env`.
+`.secrets/cloudflare.env`. For other tools, `https://<worker>/openapi.json` describes the same routes.
 
 ```bash
 npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full, --budget)
