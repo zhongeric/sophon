@@ -138,7 +138,8 @@ export default {
 
 type Payload = {
   action?: string
-  repository: { full_name: string }
+  /** Absent in the events of the App itself, for example ping and installation. */
+  repository?: { full_name: string }
   sender?: { login: string }
   issue?: { number: number; pull_request?: unknown }
   comment?: { body: string; user: { login: string } }
@@ -163,6 +164,7 @@ async function webhook(request: Request, env: Env): Promise<Response> {
   if (!secret || !(await verifySignature(secret, body, request.headers.get('x-hub-signature-256')))) return new Response('bad signature', { status: 401 })
   const event = request.headers.get('x-github-event')
   const payload = JSON.parse(body) as Payload
+  if (!payload.repository) return accepted({ ignored: event })
   const [owner = '', repo = ''] = payload.repository.full_name.split('/')
   const allowed = (login: string | undefined) => allowedUsers(env).some((user) => user.toLowerCase() === login?.toLowerCase())
   // Only a sender that ends with [bot] makes the GET /app request, so human and CI deliveries cost no request.
