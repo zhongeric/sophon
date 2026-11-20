@@ -13,6 +13,7 @@ import { ciChecker, reviewChecker } from './checker.ts'
 import { baseConfig } from './config.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
+import { loopChoices, type PreflightNeeds } from './preflight.ts'
 import { githubRepo, type GitHubRepo, type PullRequest } from './repo.ts'
 import { githubSigning } from './signing.ts'
 import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs, type Call, type RunMachine } from './runs.ts'
@@ -97,23 +98,43 @@ export class PullRequestRuns extends Runs<StartRequest> {
     return { passed: result.pass, summary: summary(run, result) }
   }
 
-  /** The run's input. The checks and rails come from the base branch, so a PR cannot change its own. */
-  private async input(run: string, request: StartRequest, gh: GitHub): Promise<LoopInput> {
-    const api = `/repos/${request.owner}/${request.repo}`
+  /** The base config, when it is not recorded, says whether the run tests on the build container. A fork PR stops here. */
+  protected async preflightNeeds(request: StartRequest, ledger: Ledger, gh: GitHub | undefined): Promise<PreflightNeeds> {
+    const recorded = ledger.get<LoopInput>('input')
+    const models = loopChoices(recorded ? mergeModels(recorded.models) : this.models())
+    if (!gh) return { ciBase: null, container: recorded ? Boolean(recorded.config.tests) || hasCi(recorded.config) : false, models }
+    const view = await this.pull(request, gh)
+    const config = recorded?.config ?? (await baseConfig(gh, request.owner, request.repo, view.base.ref))
+    // A review with ci runs it on the build container and reads no GitHub CI (D15).
+    return { ciBase: hasCi(config) ? null : view.base.ref, container: Boolean(config.tests) || hasCi(config), models }
+  }
+
+  /** The models of a new run: the defaults with the MODELS overrides. */
+  private models(): LoopModels {
+    return mergeModels(this.env.MODELS ? (JSON.parse(this.env.MODELS) as Partial<LoopModels>) : {})
+  }
+
+  /** The PR. A fork PR stops the run. */
+  private async pull(request: StartRequest, gh: GitHub) {
     type Side = { ref: string; repo: { full_name: string } | null }
-    const view = await gh.json<{ title: string; body: string | null; base: Side; head: Side }>('GET', `${api}/pulls/${request.pr}`)
+    const view = await gh.json<{ title: string; body: string | null; base: Side; head: Side }>('GET', `/repos/${request.owner}/${request.repo}/pulls/${request.pr}`)
     if (view.head.repo?.full_name.toLowerCase() !== view.base.repo?.full_name.toLowerCase())
       throw new StopError(
         'fork PRs are not supported: the fixes would go to a branch of this repository, where push CI runs the fork code with the repository secrets',
       )
+    return view
+  }
+
+  /** The run's input. The checks and rails come from the base branch, so a PR cannot change its own. */
+  private async input(run: string, request: StartRequest, gh: GitHub): Promise<LoopInput> {
+    const view = await this.pull(request, gh)
     const config = await baseConfig(gh, request.owner, request.repo, view.base.ref)
-    const overrides = this.env.MODELS ? (JSON.parse(this.env.MODELS) as Partial<LoopModels>) : {}
     return {
       allowedModels: allowedModelsFrom(this.env.ALLOWED_MODELS),
       ask: request.ask ?? `${view.title}\n\n${view.body ?? ''}`.trim(),
       config,
       headRef: view.head.ref,
-      models: mergeModels(overrides),
+      models: this.models(),
       pr: request.pr,
       runId: run,
       source: `${request.owner}/${request.repo}#${request.pr}`,
