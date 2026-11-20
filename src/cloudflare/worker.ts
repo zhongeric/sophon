@@ -3,13 +3,13 @@ import { ResearchRuns } from './research.ts'
 import { ScanBoxes } from './scan.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
-import { sameSecret, verifySignature } from './github.ts'
+import { sameSecret, verifySignature, type GitHub } from './github.ts'
 import { appBotLogin, githubAccess, githubApp, type BotLogins, type InstallationTokens } from './github-app.ts'
 import { workLabels, type WorkKind } from './labels.ts'
 import { openApi } from './openapi.ts'
 import { sweepBranches } from './prune.ts'
 import { allowedUsers, PullRequestRuns, type Env } from './run.ts'
-import { missingAppSecrets, sweepWork, type WorkItem } from './work-sweep.ts'
+import { sweepWork, type WorkItem } from './work-sweep.ts'
 
 export { DevelopmentRuns, PullRequestRuns, ResearchRuns, ScanBoxes }
 
@@ -21,9 +21,9 @@ const accepted = (body: unknown) => Response.json(body, { status: 202 })
 /** The installation tokens of the sweeps in this isolate. The runs keep their own. */
 const tokens: InstallationTokens = new Map()
 
-/** Prunes the factory/* branches of owner/repo, or with `only` the branches that it selects. */
-async function prune(env: Env, owner: string, repo: string, only?: (name: string) => boolean) {
-  const { gh } = await githubAccess(env, owner, repo, tokens)
+/** Prunes the factory/* branches of owner/repo, or with `only` the branches that it selects. `client` is a client that the caller has for the repository. */
+async function prune(env: Env, owner: string, repo: string, only?: (name: string) => boolean, client?: GitHub) {
+  const gh = client ?? (await githubAccess(env, owner, repo, tokens)).gh
   return sweepBranches({
     gh,
     lookup: (kind, number, run) => (kind === 'review' ? pullRequest(env, owner, repo, number) : issue(env, owner, repo, number)).runState(run),
@@ -37,11 +37,16 @@ const botLogins: BotLogins = new Map()
 /** True after the cron logged the missing App secrets in this isolate. */
 let missingLogged = false
 
-/** Starts the run of a work label, from the webhook or the work sweep. A label gives no options, and its review does not ship. */
-function startLabeled(env: Env, kind: WorkKind, { by, number, owner, repo }: WorkItem) {
-  if (kind === 'review') return pullRequest(env, owner, repo, number).start({ by, owner, pr: number, repo, ship: false })
-  if (kind === 'develop') return issue(env, owner, repo, number).start({ by, issue: number, owner, repo })
-  return research(env, owner, repo, number).start({ by, issue: number, owner, repo })
+/** The object of each work kind for an issue or a PR. */
+const objectOf = { review: pullRequest, develop: issue, research } satisfies Record<WorkKind, unknown>
+
+/**
+ * Starts the run of a work label, from the webhook or the work sweep. A label gives no options, and its review does not
+ * ship. With `once`, the object refuses when it has a run in any state.
+ */
+function startLabeled(env: Env, kind: WorkKind, { by, number, owner, repo }: WorkItem, once = false) {
+  if (kind === 'review') return pullRequest(env, owner, repo, number).start({ by, owner, pr: number, repo, ship: false }, { once })
+  return objectOf[kind](env, owner, repo, number).start({ by, issue: number, owner, repo }, { once })
 }
 
 /**
@@ -98,23 +103,24 @@ function budgetOf(body: Record<string, unknown>): { budget?: number } | Response
 export default {
   // The cron trigger of wrangler.jsonc calls this every 5 minutes for the work sweep of D18.
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    const missing = missingAppSecrets(env)
-    if (missing) {
-      if (!missingLogged) console.error(missing)
+    let clients: ReturnType<typeof githubApp>
+    try {
+      clients = githubApp(env, tokens)
+    } catch (error) {
+      if (!(error instanceof StopError)) throw error
+      if (!missingLogged) console.error(`the work sweep does nothing: ${error.message}`)
       missingLogged = true
       return
     }
-    const { app, installation } = githubApp(env, tokens)
-    const objectOf = (kind: WorkKind, owner: string, repo: string, number: number) =>
-      kind === 'review' ? pullRequest(env, owner, repo, number) : kind === 'develop' ? issue(env, owner, repo, number) : research(env, owner, repo, number)
+    const { app, installation } = clients
     await sweepWork({
       allowed: allowedUsers(env),
       app,
-      hasRun: async (kind, owner, repo, number) => (await objectOf(kind, owner, repo, number).status()).runs.length > 0,
+      hasRun: async (kind, owner, repo, number) => (await objectOf[kind](env, owner, repo, number).status()).runs.length > 0,
       installation,
       log: (line) => console.log(line),
-      prune: (owner, repo) => prune(env, owner, repo),
-      start: (kind, item) => startLabeled(env, kind, item),
+      prune: (owner, repo, gh) => prune(env, owner, repo, undefined, gh),
+      start: (kind, item) => startLabeled(env, kind, item, true),
     })
   },
   async fetch(request: Request, env: Env): Promise<Response> {

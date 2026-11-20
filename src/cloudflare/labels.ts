@@ -14,9 +14,9 @@ const labelColor = '5319e7'
 
 /**
  * Adds the label `name` to issue or PR `number`, and makes the label first when the repository has no such label.
- * It never throws: on an error it gives the error to `log` and returns false.
+ * It never throws: on an error it gives the error to `log`.
  */
-export async function addLabel(options: { gh: GitHub; owner: string; repo: string; number: number; name: string; log: (error: unknown) => void }): Promise<boolean> {
+export async function addLabel(options: { gh: GitHub; owner: string; repo: string; number: number; name: string; log: (error: unknown) => void }): Promise<void> {
   const { gh, name } = options
   const api = `/repos/${options.owner}/${options.repo}`
   try {
@@ -32,9 +32,7 @@ export async function addLabel(options: { gh: GitHub; owner: string; repo: strin
       }
     }
     await gh.json('POST', `${api}/issues/${options.number}/labels`, { labels: [name] })
-    return true
   } catch (error) {
     options.log(error)
-    return false
   }
 }

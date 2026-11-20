@@ -156,8 +156,12 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => syncs.clear() })
   }
 
-  async start(request: Request): Promise<{ run: string; started: boolean }> {
-    const active = this.active()
+  /**
+   * Starts a run unless one is active. With `once`, also refuses when this object has a run in any state: the work
+   * sweep never starts a run again (D13 restarts runs). The check and the insert are in one call, so no start comes between.
+   */
+  async start(request: Request, options: { once?: boolean } = {}): Promise<{ run: string; started: boolean }> {
+    const active = options.once ? this.ctx.storage.sql.exec<RunRow>('select * from factory_runs order by created desc limit 1').toArray()[0] : this.active()
     if (active) return { run: active.run, started: false }
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
     const run = this.runName(request, stamp)
