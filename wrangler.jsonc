@@ -41,6 +41,8 @@
   "base_dir": "agents/guides",
   "find_additional_modules": true,
   "limits": { "cpu_ms": 300000 },
+  // The sweep of D18 starts labeled work that no webhook delivery started.
+  "triggers": { "crons": ["*/5 * * * *"] },
   "observability": { "enabled": true }
   // Set with: npx wrangler secret put <NAME>
   // GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, ANTHROPIC_API_KEY, OPENAI_API_KEY, ADMIN_TOKEN, and ALLOWED_USERS: the GitHub

@@ -85,6 +85,8 @@ function budgetOf(body: Record<string, unknown>): { budget?: number } | Response
 }
 
 export default {
+  // The cron trigger of wrangler.jsonc calls this. The sweep of D18 is not built yet.
+  async scheduled(): Promise<void> {},
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
     if (request.method === 'POST' && url.pathname === '/github/webhook') return webhook(request, env)
