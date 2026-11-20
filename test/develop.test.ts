@@ -13,14 +13,14 @@ import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { nodeDevelop } from '../src/node/platform.ts'
-import { developInput, developScript, developRepo, fakePulls, mergeCommit, plan, runDevelop, scopeQuestion, sources } from './support/develop.ts'
+import { developInput, developScript, developRepo, fakePulls, mergeCommit, pauseAtCi, plan, runDevelop, scopeQuestion, scriptedReview, sources } from './support/develop.ts'
 import { credentials, memoryChannel, module, withoutKey } from './support/fixture.ts'
 import { probeNetwork, scriptedDispatch, webSearch, type Turn } from './support/scripted-model.ts'
 import { visible, visibleLines, visibleWords } from './support/visible.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
 
-test('develop: intake, plan, parallel builders on their own branches, draft PR, a CI fix, the review loop, a ready PR', { timeout: 120_000 }, async () => {
+test('develop: intake, plan, parallel builders on their own branches, draft PR, a CI repair, the review loop, a ready PR', { timeout: 120_000 }, async () => {
   const { repo, origin } = developRepo()
   const turns: Turn[] = []
   const { channel, posted } = memoryChannel()
@@ -43,9 +43,9 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.ok(!turns.some((turn) => webSearch.test(turn.request)))
 
   // sub and mul built in the same wave, the tests after both. Each builder could write only its own files.
-  const builds = turns.filter((turn) => turn.role === 'builder' && turn.output === null).map((turn) => /Build task ([a-z]+)|Fix the CI failure/.exec(turn.request)?.[1] ?? 'ci-fix')
+  const builds = turns.filter((turn) => turn.role === 'builder' && turn.output === null).map((turn) => /Build task ([a-z]+)|Repair round/.exec(turn.request)?.[1] ?? 'repair')
   assert.deepEqual(builds.slice(0, 2).sort(), ['mul', 'sub'])
-  assert.deepEqual(builds.slice(2), ['tests', 'ci-fix'])
+  assert.deepEqual(builds.slice(2), ['tests', 'repair'])
   const outputs = turns.filter((turn) => turn.role === 'builder' && turn.output).map((turn) => turn.output).join('\n')
   assert.match(outputs, /scope refused: .*EACCES/)
   assert.match(outputs, /checkpoint refused:.*test\/run.log:1: Remove test\/run.log from the change/)
@@ -54,7 +54,7 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.match(outputs, /submit refused: .*the targeted tests failed \(test\/ops\.test\.ts\).*--- tests \(exit code 1\) ---.*sub and mul/)
   assert.doesNotMatch(outputs, /FAILING LOG ACCEPTED/)
 
-  // The PR is the run's branch, pushed without force. The first CI was red, the fix made it green.
+  // The PR is the run's branch, pushed without force. The first CI was red, the repair made it green.
   const show = (path: string) => execFileSync('git', ['--git-dir', origin, 'show', `factory/dev-add-sub-mul:${path}`]).toString()
   assert.deepEqual([show('src/sub.ts'), show('src/mul.ts'), show('test/ops.test.ts')], [sources.sub, sources.mul, sources.test(6)])
   assert.throws(() => execFileSync('git', ['--git-dir', origin, 'cat-file', '-e', 'factory/dev-add-sub-mul:test/run.log'], { stdio: 'pipe' }))
@@ -200,19 +200,115 @@ test('develop: a merge whose branch delete fails keeps the run merged and notes 
   assert.doesNotMatch(result.report, /deleted factory\/dev-add-sub-mul/)
 })
 
-test('develop: a run that fails a criterion with the merge permission does not merge', { timeout: 120_000 }, async () => {
-  const { repo } = developRepo(undefined, { merge: 'squash' })
-  // CI is green on the build, the review loop fixes the test, and CI is red on the final head.
-  const github = fakePulls([true, false])
-  const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript({ reviewFix: true }), []), pulls: github.pulls, runId: 'failed' })
-  assert.equal(result.status, 'failed', result.report)
-  assert.match(result.report, /^- \[ \] CI green on the head/m)
+/** The rounds of the repair turns, in order. A repair turn is the first request of a turn with a repair prompt. */
+const repairRounds = (turns: Turn[]) =>
+  turns.filter((turn) => turn.role === 'builder' && turn.output === null).flatMap((turn) => [...turn.request.matchAll(/Repair round (\d+) of/g)].at(-1)?.[1] ?? [])
+/** What the fixer read in /review/repair.txt, in order. */
+const repairTexts = (turns: Turn[]) => turns.filter((turn) => turn.role === 'builder' && turn.output?.includes('repair.txt: ')).map((turn) => turn.output ?? '')
+
+test('develop: CI red two times gets two repair rounds, then a review pass, and a resume in the middle repeats no round', { timeout: 240_000 }, async () => {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  const github = fakePulls([false, false, true])
+  // The run pauses at the CI of the first repair.
+  const first: Turn[] = []
+  await assert.rejects(runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), first), pulls: pauseAtCi(github.pulls, 2), runId: 'red-ci' }), PausedError)
+  assert.deepEqual(repairRounds(first), ['1'])
+  assert.ok(!first.some((turn) => turn.role === 'intent'))
+  assert.match(repairTexts(first)[0] ?? '', /# CI failed on [0-9a-f]{12}.*- CI \(pull_request\): https:\/\/ci\.example\//s)
+
+  const second: Turn[] = []
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), second), pulls: github.pulls, runId: 'red-ci' })
+  assert.equal(result.status, 'ready', result.report)
+  // The resumed run did not repeat the build or round 1. No review pass ran while CI was red.
+  assert.deepEqual(repairRounds(second), ['2'])
+  assert.ok(!second.some((turn) => /Build task/.test(turn.request)))
+  assert.ok(second.some((turn) => turn.role === 'intent'))
+  assert.equal(github.state.shas.length, 3)
+  const ledger = fileLedger(join(dir, 'red-ci', 'state.json'))
+  for (const key of ['step:repair.1', 'step:repair.2', 'ci:ci.repair.1', 'ci:ci.repair.2', 'step:review.1']) assert.ok(ledger.get(key), key)
+  for (const key of ['step:repair.3', 'step:review.2']) assert.equal(ledger.get(key), undefined, key)
+  assert.match(result.report, /^- Round 1, CI: CI \(pull_request\) failed on [0-9a-f]{12}\. repair 1: mul\(2, 3\) is 6$/m)
+  assert.match(result.report, /^- Round 2, CI: CI \(pull_request\) failed on [0-9a-f]{12}\. repair 2: mul\(2, 3\) is 6$/m)
+  assert.match(result.report, /^- \[x\] Review loop PASS on the head, at least 1 pass: pass 1: PASS$/m)
   assert.ok(visibleLines(result.report).length <= 10, result.report)
-  assert.match(visible(result.report), /^- \[ \] CI green on the head/m)
+})
+
+test('develop: a failed intent check gets a repair round and a second review pass, and a resume in the middle repeats no round', { timeout: 240_000 }, async () => {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  const github = fakePulls([true])
+  const requests: ReviewRequest[] = []
+  const intentGap = { name: 'Intent reviewer affirms the original ask', ok: false, detail: 'no test checks mul(2, 3)' }
+  const review = scriptedReview([[intentGap], []], requests)
+  // The run pauses at the CI of the repair, after review pass 1 and repair round 1.
+  const first: Turn[] = []
+  await assert.rejects(runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), first), pulls: pauseAtCi(github.pulls, 2), review, runId: 'intent' }), PausedError)
+  assert.deepEqual(repairRounds(first), ['1'])
+  assert.deepEqual(requests.map((request) => request.runId), ['intent-review-1'])
+  const read = repairTexts(first)[0] ?? ''
+  assert.match(read, /# Review pass 1 failed on [0-9a-f]{12}.*- Intent reviewer affirms the original ask: no test checks mul\(2, 3\)/s)
+  assert.doesNotMatch(read, /Checks green/)
+  assert.ok(!first.some((turn) => turn.role === 'builder' && /The CI logs: \/review\/ci-failure\.txt/.test(turn.request)))
+
+  const second: Turn[] = []
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), second), pulls: github.pulls, review, runId: 'intent' })
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(repairRounds(second), [])
+  // The second pass reviewed the head of the repair.
+  assert.deepEqual(requests.map((request) => request.runId), ['intent-review-1', 'intent-review-2'])
+  assert.notEqual(requests[1]!.head, requests[0]!.head)
+  assert.equal(requests[1]!.head, github.state.shas.at(-1))
+  const ledger = fileLedger(join(dir, 'intent', 'state.json'))
+  for (const key of ['step:repair.1', 'ci:ci.repair.1', 'step:review.2']) assert.ok(ledger.get(key), key)
+  for (const key of ['step:repair.2', 'ci:ci.repair.2']) assert.equal(ledger.get(key), undefined, key)
+  assert.match(result.report, /^- \[x\] Review loop PASS on the head, at least 1 pass: pass 1: FAIL, pass 2: PASS$/m)
+  assert.match(result.report, /^- Round 1, review pass 1: failed: Intent reviewer affirms the original ask\. repair 1: mul\(2, 3\) is 6$/m)
+  assert.deepEqual(github.state.ready, [9])
+})
+
+test('develop: a review that fails 6 times ends failed after 5 repair rounds, does not merge, and a resume starts no round 6', { timeout: 300_000 }, async () => {
+  const { repo } = developRepo(undefined, { merge: 'squash' })
+  const dir = runsDir()
+  const github = fakePulls([true])
+  const requests: ReviewRequest[] = []
+  const failing = (pass: number) => [{ name: 'Checks green', ok: false, detail: `failed: tests (pass ${pass})` }]
+  const review = scriptedReview([1, 2, 3, 4, 5, 6].map(failing), requests)
+  // The run pauses at the CI of repair round 3.
+  const first: Turn[] = []
+  await assert.rejects(runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), first), pulls: pauseAtCi(github.pulls, 4), review, runId: 'failing' }), PausedError)
+  assert.deepEqual(repairRounds(first), ['1', '2', '3'])
+  assert.equal(requests.length, 3)
+
+  const second: Turn[] = []
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), second), pulls: github.pulls, review, runId: 'failing' })
+  assert.equal(result.status, 'failed', result.report)
+  assert.deepEqual(repairRounds(second), ['4', '5'])
+  assert.deepEqual(requests.map((request) => request.runId), [1, 2, 3, 4, 5, 6].map((pass) => `failing-review-${pass}`))
+  assert.match(repairTexts(second)[1] ?? '', /- Checks green: failed: tests \(pass 5\)/)
+  const ledger = fileLedger(join(dir, 'failing', 'state.json'))
+  for (const key of ['step:repair.5', 'ci:ci.repair.5', 'step:review.6']) assert.ok(ledger.get(key), key)
+  for (const key of ['step:repair.6', 'ci:ci.repair.6', 'step:review.7']) assert.equal(ledger.get(key), undefined, key)
+  assert.match(result.report, /^The run used its 5 repair rounds\. The last cause: review pass 6, failed: Checks green\. The PR stays draft\.$/m)
+  assert.match(result.report, /^- Round 5, review pass 5: failed: Checks green\. repair 5: mul\(2, 3\) is 6$/m)
+  assert.doesNotMatch(result.report, /^- Round 6/m)
+  // A failed run with the merge permission is not ready and does not merge.
+  assert.ok(visibleLines(result.report).length <= 10, result.report)
+  assert.match(visible(result.report), /^- \[ \] Review loop PASS on the head, at least 1 pass: pass 1: FAIL, .*pass 6: FAIL$/m)
   assert.doesNotMatch(visible(result.report), /^- \[x\]/m)
   assert.deepEqual(github.state.merges, [])
   assert.deepEqual(github.state.ready, [])
   assert.equal(result.merge, null)
+
+  // A resume after the end starts no round 6 and runs no review pass.
+  const third: Turn[] = []
+  const again = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), third), pulls: github.pulls, review, runId: 'failing' })
+  assert.equal(again.status, 'failed', again.report)
+  assert.equal(again.report, result.report)
+  assert.ok(!third.some((turn) => turn.role === 'builder'))
+  assert.equal(requests.length, 6)
+  assert.equal(fileLedger(join(dir, 'failing', 'state.json')).get('step:repair.6'), undefined)
+  assert.deepEqual(github.state.merges, [])
 })
 
 test('develop: a user question of the intake agent pauses the run, and the run resumes without asking again or repeating the intake', { timeout: 120_000 }, async () => {

@@ -142,8 +142,8 @@ Each stage below lists who does the work, what the host enforces, and where the 
   - Forbidden committed paths (`out/`, `cache/`, logs, broadcast dumps) fail the checkpoint.
   - Profile static rules run on every checkpoint (section 4.3). A violation goes back to the builder as a tool error.
   - No secrets in the builder's environment. The same allowlist as the checks applies.
-- **CI:** the host pushes the branch, opens the PR as draft, and watches CI. A red CI goes back to a builder with the
-  failure logs, inside a budget of two rounds (P5, G6). With one task, that is the same builder session. With
+- **CI:** the host pushes the branch, opens the PR as draft, and watches CI. A red CI goes to the fixer session with the
+  failure logs, inside the repair budget (P5, G6, D14). With one task, the fixer is the same builder session. With
   several tasks, one fixer session gets the union of their files. The host reports only the PR or a blocker.
 
 ### Split
@@ -389,7 +389,7 @@ Each decision records a conflict between two rules, and the choice.
 | P2 | Platform | Phase 1 runs on the local platform. |
 | P3 | Branch and PR | The work goes to `factory/dev-<slug>` from the base. The host opens a draft PR through `gh`. |
 | P4 | Larger changes | The intake agent recommends a spec stage and one or two review passes, with a reason. These route questions are `run` level, so the run uses both recommendations (D11). |
-| P5 | CI-fix budget | Two rounds, then a blocker. |
+| P5 | Repair budget | One budget of 5 repair rounds for all causes (CI failures and failed review passes), then the run ends failed (D14). |
 | P6 | Models | Intake, spec, planner and builders on Opus 5.5. |
 | P7 | Static rules | They gate each builder checkpoint, and they are host findings in the review loop. |
 | P8 | Gaps | The defaults in section 9 apply. |
@@ -405,7 +405,7 @@ No rule covers these yet. Each default applies until the user replaces it.
 | G3 | Backend conventions: API shape, errors, logging, config, migrations | Follow the repo. Validate external input at the boundary. Additive migrations first. |
 | G4 | A security path for code that is not Solidity | Dependency and secret scans as host checks in the `typescript` profile. A focused security track in the review loop for auth and data paths. |
 | G5 | Frontend and backend deploys | Out of scope until the deploy workflow. The PR is the end of this workflow. |
-| G6 | Budgets: CI-fix rounds, review rounds, cost | Two CI-fix rounds, then a blocker. The pass count from triage, then FAIL. Built: the ledger records the tokens of each agent and of the run, and each report has a Usage section with the estimated USD from `MODEL_PRICES`. An optional cost budget per run (`--budget`, or `budget` of the admin routes) is a soft limit. At the budget, the host posts one notice with the spend, the budget and the three most expensive steps, and the run continues. At two times the budget, the run pauses with one question: raise the budget or stop. The recommendation is a raise to two times the spend, so a hotfix run raises it without a question and posts a notice. Each raise starts a new budget with the same two steps. A nested review pass gets 2 x budget - spend, and stops there without a question. A stop ends a review run with FAIL and a development run as stopped, with the reason "cost budget". |
+| G6 | Budgets: repair rounds, cost | One budget of 5 repair rounds for all causes. After a repair from a review pass or the final CI, a new review pass runs. After 5 rounds, FAIL with the last cause (D14). Built: the ledger records the tokens of each agent and of the run, and each report has a Usage section with the estimated USD from `MODEL_PRICES`. An optional cost budget per run (`--budget`, or `budget` of the admin routes) is a soft limit. At the budget, the host posts one notice with the spend, the budget and the three most expensive steps, and the run continues. At two times the budget, the run pauses with one question: raise the budget or stop. The recommendation is a raise to two times the spend, so a hotfix run raises it without a question and posts a notice. Each raise starts a new budget with the same two steps. A nested review pass gets 2 x budget - spend, and stops there without a question. A stop ends a review run with FAIL and a development run as stopped, with the reason "cost budget". |
 | G7 | Where the frozen package and notes live | The PR description, written by the host, plus the run ledger. |
 | G8 | Mixed-stack monorepos | Profiles match per package. Each package's strictest policy applies to its files. |
 | G9 | Docs, config and CI changes | `docs` and `ci-infra` profiles (section 4.4). |
