@@ -180,6 +180,19 @@ test('research: a Drop answer at the approval removes the hypothesis without a f
   assert.match(result.report, /Dropped at the approval: hyp-003/)
 })
 
+test('research: with the standing answers of the notebook, the run confirms, picks and approves the recommendations and posts no question', { timeout: 120_000 }, async () => {
+  const { repo, base } = notebook({ config: { checks: { smoke: 'true' }, questions: 'recommended', research: researchConfig } })
+  const { channel, posted } = memoryChannel({ intake: null, pick: null, 'approve.1': null })
+  const { result } = await runResearch(repo, runsDir(), researchInput(base, 'standing'), { channel, dispatch: scriptedDispatch(blocked, []) })
+
+  assert.equal(result.status, 'blocked', result.report)
+  assert.deepEqual(posted, [])
+  assert.deepEqual(
+    result.frozen.map((entry) => entry.path),
+    ['prereg/hyp-001-v2.md'],
+  )
+})
+
 test('research: a fresh run creates the next version when the base has an identical prereg', { timeout: 120_000 }, async () => {
   const { repo } = notebook()
   const previous = await freezePrereg({

@@ -308,6 +308,8 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     stoppedReview: null,
   }
   const spentPasses = () => [...state.reviews, ...(state.stoppedReview ? [state.stoppedReview] : [])]
+  // The standing answers of the notebook take every recommendation (D11).
+  const recommend = deps.config.questions === 'recommended'
   // The review pass keeps its usage in its own ledger, so its rows count here as extra rows.
   const budget = budgetGate({
     channel: deps.channel,
@@ -315,6 +317,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     ledger,
     log: deps.log,
     prices,
+    recommend,
     runId: input.runId,
   })
   // A resume without --budget must not apply the override again, so the recorded input does not keep it.
@@ -336,7 +339,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     program: input.program,
     tree: await deps.branches.view(input.base),
   }
-  const questions = asker(ledger, deps.channel, input.runId, deps.log)
+  const questions = asker(ledger, deps.channel, input.runId, deps.log, { recommend })
   const ask = async (batch: string, list: Question[]): Promise<Answer[]> => {
     await questions.post(batch, list)
     return questions.wait(batch)
@@ -346,6 +349,8 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     for (let round = 2; ; round++) {
       const parsed = parse(answer)
       if ('value' in parsed) return parsed.value
+      // Asking again would give the same recommendation.
+      if (recommend) throw new StopError(`the recommendation of ${batch} is not a valid answer: ${parsed.error}`)
       deps.log(`the answer ${JSON.stringify(answer)} (${batch}): ${parsed.error}, asking again`)
       const [again] = await ask(`${batch}.${round}`, [{ ...question, id: 'Q1', why: `${parsed.error}.\n${question.why}` }])
       answer = again?.answer ?? ''

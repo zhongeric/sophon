@@ -254,6 +254,17 @@ test('develop: a hotfix takes the recommendation of every question, and marks on
   assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\* \(recommended\)\n\n## Decisions the run made\n\n- Write a spec before the plan\?/)
 })
 
+test('develop: with the standing answers of the repository, the run takes every recommendation and posts no question', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const { channel, posted } = memoryChannel({ intake: null })
+  const base = await developInput(repo, 'standing')
+  const input = { ...base, config: { ...base.config, questions: 'recommended' as const } }
+  const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(developScript({ askScope: true, blockSub: true }), []), input, pulls: fakePulls().pulls, runId: 'standing' })
+  assert.equal(result.status, 'blocked', result.report)
+  assert.deepEqual(posted, [])
+  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)/)
+})
+
 test('develop: CI that another branch ran on the same commit does not count until the push gets CI of its own', { timeout: 120_000 }, async () => {
   const { repo } = developRepo()
   const github = fakePulls([false, true], { stale: true })
@@ -631,8 +642,8 @@ test('develop: a hotfix run raises the budget at twice the budget with a notice,
   assert.equal(result.status, 'ready', result.report)
   assert.equal(posted.filter((entry) => entry.batch.startsWith('budget.')).length, 0)
   // The development agents passed twice the first budget, and the stopped pass passed twice the raised budget.
-  assert.match(notices.find((text) => /hotfix run/.test(text)) ?? '', /^The run spent about \$0\.0\d{3} of its budget of \$0\.0100\. This is a hotfix run, so the host raised the budget to \$0\.0\d{3}, and the run continues\./)
-  assert.match(notices.at(-1) ?? '', /^The run spent about \$10\d\.\d{2} of its budget of \$[\d.]+\. This is a hotfix run, so the host raised the budget to \$20\d\.\d{2}, and the run continues\. The most expensive steps: review\.1 \$100\.00, /)
+  assert.match(notices.find((text) => /takes every recommendation/.test(text)) ?? '', /^The run spent about \$0\.0\d{3} of its budget of \$0\.0100\. The run takes every recommendation, so the host raised the budget to \$0\.0\d{3}, and the run continues\./)
+  assert.match(notices.at(-1) ?? '', /^The run spent about \$10\d\.\d{2} of its budget of \$[\d.]+\. The run takes every recommendation, so the host raised the budget to \$20\d\.\d{2}, and the run continues\. The most expensive steps: review\.1 \$100\.00, /)
   assert.equal(requests.length, 2)
   assert.equal(requests[1]!.runId, requests[0]!.runId)
   assert.ok(requests[1]!.budget! > 300, String(requests[1]!.budget))

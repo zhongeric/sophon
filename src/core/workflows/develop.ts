@@ -150,6 +150,8 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   // What the report shows. Each stage fills its part.
   const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, signing: null, head: null, pr: null, built: [], fixes: [], cis: [], reviews: [], stoppedReview: null }
   const spentPasses = () => [...state.reviews, ...(state.stoppedReview ? [state.stoppedReview] : [])]
+  // A hotfix, or the standing answers of the repository, takes every recommendation (D11).
+  const recommend = input.hotfix === true || input.config.questions === 'recommended'
   // The review passes keep their usage in their own ledgers, so their rows count here as extra spend.
   const budget = budgetGate({
     channel: deps.channel,
@@ -157,7 +159,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     ledger,
     log: deps.log,
     prices,
-    recommend: input.hotfix === true,
+    recommend,
     runId: input.runId,
   })
   // A resume without --budget must not apply the override again, so the recorded input does not keep it.
@@ -175,9 +177,8 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     stackGuides: [...new Set(active.flatMap((profile) => profile.guides))],
     ask: input.ask,
   }
-  const questions = asker(ledger, deps.channel, input.runId, deps.log)
+  const questions = asker(ledger, deps.channel, input.runId, deps.log, { recommend })
   const ask = async (batch: string, list: Question[]): Promise<Answer[]> => {
-    if (input.hotfix) return questions.recommend(batch, list)
     await questions.post(batch, list)
     return questions.wait(batch)
   }
@@ -413,8 +414,8 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     {
       name: 'Ask confirmed',
       ok: true,
-      detail: input.hotfix
-        ? 'hotfix: the host took every recommendation'
+      detail: recommend
+        ? `${input.hotfix ? 'hotfix' : 'standing answers'}: the host took every recommendation`
         : intakeAnswers.some((answer) => answer.decidedBy !== 'run')
           ? 'you answered the intake questions'
           : 'the run took the recommendations of the intake agent (D11)',
