@@ -210,6 +210,39 @@ test('on Cloudflare, a review whose config has tests fails the preflight when th
   }
 })
 
+test('on Cloudflare, development and research runs fail the preflight with one comment each: the development run checks CI on the default branch', { timeout: 120_000 }, async () => {
+  const mock = await mockServices(fixtureRepo(), { botLogin: 'factory-bot', name: 'app', owner: 'acme', script: scriptFor({ tests: false }) })
+  const worker = await startFor(mock, vars(mock))
+  const admin = { authorization: 'Bearer admin' }
+  const on = (issue: number) => mock.state.comments.filter((entry) => entry.issue === issue)
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 300)]))}\nworker:\n${worker.output().slice(-3000)}`
+  const failed = async (kind: string, issue: number) => {
+    await fetch(`${worker.url}/${kind}/acme/app/${issue}`, { body: '{}', headers: admin, method: 'POST' })
+    const stopped = await until(() => on(issue).find((entry) => entry.body.includes('did not start run')), 60_000, describe)
+    assert.equal(on(issue).length, 1, describe())
+    assert.equal(mock.state.turns.length, 0, describe())
+    const status = (await (await fetch(`${worker.url}/runs/acme/app/${issue}`, { headers: admin })).json()) as { runs: { state: string; note: string }[] }
+    assert.equal(status.runs[0]?.state, 'error')
+    assert.match(status.runs[0]?.note ?? '', /^the preflight found failed checks: /)
+    return stopped.body
+  }
+  try {
+    mock.state.workflows = false
+    const developed = await failed('develop', 5)
+    assert.match(developed, /^agent-factory did not start run `dev-5-[^`]+`: the preflight found failed checks\./)
+    assert.match(developed, /- \*\*CI workflow\*\*: main has no workflow file in \.github\/workflows/)
+    assert.match(developed, /- \*\*Build container\*\*: this Worker has no container for builds/)
+    const researched = await failed('research', 9)
+    assert.match(researched, /^agent-factory did not start run `research-9-[^`]+`: the preflight found failed checks\./)
+    assert.match(researched, /- \*\*Build container\*\*: this Worker has no container for builds/)
+    assert.doesNotMatch(researched, /CI workflow|Provider key|GitHub access/)
+    assert.deepEqual(new Set(mock.state.probes.map((probe) => probe.provider)), new Set(['claude', 'codex']))
+  } finally {
+    await worker.stop()
+    await mock.close()
+  }
+})
+
 test('on Cloudflare, with the GitHub App secrets, a repository without the App stops the run before any work, with the install link in the note', { timeout: 120_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { app: { installed: false, slug: 'sophon-factory' }, botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })

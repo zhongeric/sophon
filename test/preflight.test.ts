@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { checkProviders, failedChecksText, probeOutputTokens, probeProvider } from '../src/core/preflight.ts'
-import { apiKeyCredential, type Provider } from '../src/core/providers.ts'
+import { apiKeyCredential, MissingCredentialError, type Provider } from '../src/core/providers.ts'
 
 type Sent = { url: string; headers: [string, string][]; body: Record<string, unknown> }
 
@@ -22,6 +22,8 @@ const probe = (reply: Response, provider: Provider = 'claude') => {
 }
 
 test('a 200 passes, and the request has the model and the smallest output limit', async () => {
+  assert.equal(probeOutputTokens.claude, 1)
+  assert.equal(probeOutputTokens.codex, 16)
   const fake = fakeFetch(() => new Response('{}'))
   assert.deepEqual(await probeProvider('claude', claude, 'claude-x', { fetch: fake.fetch }), { failed: null, transient: null })
   assert.deepEqual(await probeProvider('codex', codex, 'gpt-x', { fetch: fake.fetch }), { failed: null, transient: null })
@@ -31,18 +33,23 @@ test('a 200 passes, and the request has the model and the smallest output limit'
   assert.deepEqual(first?.headers, [['x-api-key', 'k'], ['content-type', 'application/json'], ['anthropic-version', '2023-06-01']])
   assert.equal(second?.url, 'https://api.openai.com/v1/responses')
   assert.deepEqual(second?.body, { model: 'gpt-x', input: 'ping', max_output_tokens: probeOutputTokens.codex })
-  assert.equal(probeOutputTokens.claude, 1)
-  assert.equal(probeOutputTokens.codex, 16)
 })
 
-test('a missing key fails without a request', async () => {
+test('a missing key fails without a request, with the message of the credential and the fix of the caller', async () => {
   const fake = fakeFetch(() => new Response('{}'))
-  const result = await checkProviders([{ provider: 'codex', model: 'gpt-x' }], (provider) => apiKeyCredential(provider, undefined), { fetch: fake.fetch })
+  const result = await checkProviders([{ provider: 'codex', model: 'gpt-x' }], (provider) => apiKeyCredential(provider, undefined), {
+    fetch: fake.fetch,
+    missingKeyFix: (key, provider) => `set ${key} for ${provider}`,
+  })
   assert.deepEqual(result, {
-    failed: [{ check: 'Provider key (codex)', problem: 'OPENAI_API_KEY is not set', fix: 'set OPENAI_API_KEY as a Worker secret' }],
+    failed: [{ check: 'Provider key (codex)', problem: 'Codex models need OPENAI_API_KEY', fix: 'set OPENAI_API_KEY for codex' }],
     transient: [],
   })
   assert.equal(fake.sent.length, 0)
+  const plan = await checkProviders([{ provider: 'claude', model: 'm' }], () => {
+    throw new MissingCredentialError('no Claude login in /home; run nc and /login claude')
+  })
+  assert.deepEqual(plan.failed, [{ check: 'Provider key (claude)', problem: 'no Claude login in /home; run nc and /login claude', fix: 'set ANTHROPIC_API_KEY' }])
 })
 
 test('other errors of the credential propagate', async () => {
@@ -56,6 +63,7 @@ test('a refused key, an unknown model, no credit and an exhausted quota fail wit
     [new Response('{"error":"model not found"}', { status: 404 }), 'claude', /HTTP 404 \(\{"error":"model not found"\}\)/],
     [new Response('{"error":{"message":"Your credit balance is too low"}}', { status: 400 }), 'claude', /no credit or quota \(HTTP 400.*credit balance/],
     [new Response('{"error":{"code":"insufficient_quota"}}', { status: 429 }), 'codex', /no credit or quota \(HTTP 429.*insufficient_quota/],
+    [new Response('{"error":{"code":"billing_hard_limit_reached"}}', { status: 400 }), 'codex', /no credit or quota \(HTTP 400.*billing_hard_limit_reached/],
   ]
   for (const [reply, provider, problem] of cases) {
     const { failed, transient } = await probe(reply, provider)
@@ -72,6 +80,12 @@ test('a plain 429, a 5xx, a thrown error and a timeout are transient', async () 
     const { failed, transient } = await probe(new Response('busy', { status }))
     assert.equal(failed, null)
     assert.match(transient ?? '', new RegExp(`HTTP ${status}`))
+  }
+  for (const message of ['Request quota exceeded', 'See billing for rate limits']) {
+    const body = JSON.stringify({ error: { type: 'requests', message } })
+    const { failed, transient } = await probe(new Response(body, { status: 429 }), 'codex')
+    assert.equal(failed, null)
+    assert.match(transient ?? '', /HTTP 429/)
   }
   const thrown = fakeFetch(() => { throw new TypeError('fetch failed') })
   const network = await probeProvider('claude', claude, 'm', { fetch: thrown.fetch })

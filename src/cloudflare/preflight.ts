@@ -72,7 +72,7 @@ export async function preflight(options: PreflightOptions): Promise<{ gh: GitHub
       else transient.push(`CI workflow: ${reason(error)}`)
     }
   }
-  const providers = await checkProviders(needs.models, options.credential)
+  const providers = await checkProviders(needs.models, options.credential, { missingKeyFix: (key) => `set ${key} as a Worker secret` })
   failed.push(...providers.failed)
   transient.push(...providers.transient)
   if (failed.length > 0) throw new PreflightFailed(failed, access?.gh)

@@ -120,7 +120,7 @@ export function answerersOf(env: Env, configured: string[] | undefined): string[
   return (configured ?? allowed).filter((login) => allowed.includes(login.toLowerCase()))
 }
 
-export function credentialFor(env: Env, provider: Provider): Credential {
+function credentialFor(env: Env, provider: Provider): Credential {
   return provider === 'claude' ? apiKeyCredential('claude', env.ANTHROPIC_API_KEY, env.ANTHROPIC_URL) : apiKeyCredential('codex', env.OPENAI_API_KEY, env.OPENAI_URL)
 }
 
@@ -182,7 +182,6 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     const ledger = sqlLedger(this.ctx.storage.sql, latest.run)
     let reason = 'woke the paused run'
     if (state === 'queued' && options.afterError && (ledger.get<number>(restartAtKey) ?? 0) > Date.now()) {
-      ledger.put(preflightKey, false)
       reason = 'started the run again from its ledger after the error'
     } else if (state === 'error' && options.afterError) {
       ledger.put(preflightKey, false)
@@ -265,7 +264,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       if (error instanceof PreflightFailed) {
         // A failed prerequisite does not fix itself, so the run waits for the admin resume without a D13 restart (D17).
         this.setState(row.run, 'error', error.message)
-        const text = `agent-factory did not start run \`${row.run}\`: the preflight found failed checks.\n\n${failedChecksText(error.failed)}\n\nAfter you fix them, continue the run with \`npm run remote -- resume ${target}\`.`
+        const text = `agent-factory did not start run \`${row.run}\`: the preflight found failed checks.\n\n<details><summary>Failed checks</summary>\n\n${failedChecksText(error.failed)}\n\n</details>\n\nAfter you fix them, continue the run with \`npm run remote -- resume ${target}\`.`
         if (error.gh) await githubComments(error.gh, request.owner, request.repo, this.number(request)).post(text).catch(() => undefined)
       } else {
         const outcome = afterError(ledger, error, { now: Date.now(), pauseSeconds: this.env.PAUSE_POLL_SECONDS })

@@ -40,7 +40,8 @@ async function failedPreflight(mock: Mock, worker: Worker, pr: number): Promise<
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 300)]))}\nworker:\n${worker.output().slice(-3000)}`
   await fetch(`${worker.url}/runs/acme/app/${pr}`, { body: '{}', headers: admin, method: 'POST' })
   const failed = await until(() => on().find((entry) => entry.body.includes('did not start run')), 60_000, describe)
-  assert.match(failed.body, new RegExp(`^agent-factory did not start run \`pr-${pr}-[^\`]+\`: the preflight found failed checks\\.`))
+  assert.match(failed.body, new RegExp(`^agent-factory did not start run \`pr-${pr}-[^\`]+\`: the preflight found failed checks\\.\n\n<details><summary>Failed checks</summary>\n\n- \\*\\*`))
+  assert.match(failed.body, /\n\n<\/details>\n\nAfter you fix them/)
   assert.match(failed.body, new RegExp(`After you fix them, continue the run with \`npm run remote -- resume acme/app#${pr}\`\\.$`))
   assert.equal(on().length, 1, describe())
   assert.equal(mock.state.turns.length, 0, describe())
@@ -55,7 +56,7 @@ test('on Cloudflare, a run without ANTHROPIC_API_KEY fails the preflight with on
   const worker = await startFor(mock, Object.fromEntries(Object.entries(vars(mock)).filter(([name]) => name !== 'ANTHROPIC_API_KEY')))
   try {
     const body = await failedPreflight(mock, worker, 7)
-    assert.match(body, /- \*\*Provider key \(claude\)\*\*: ANTHROPIC_API_KEY is not set\. Fix: set ANTHROPIC_API_KEY as a Worker secret/)
+    assert.match(body, /- \*\*Provider key \(claude\)\*\*: Claude models need ANTHROPIC_API_KEY\. Fix: set ANTHROPIC_API_KEY as a Worker secret/)
     assert.deepEqual(mock.state.probes.map((probe) => probe.provider), ['codex'])
   } finally {
     await worker.stop()

@@ -14,6 +14,24 @@ export const probeOutputTokens: Record<Provider, number> = { claude: 1, codex: 1
 
 const keyNames: Record<Provider, string> = { claude: 'ANTHROPIC_API_KEY', codex: 'OPENAI_API_KEY' }
 
+const openaiQuotaCodes = new Set(['insufficient_quota', 'billing_hard_limit_reached', 'billing_not_active'])
+
+/**
+ * Reads the structured error of the reply, not its free text: the message of a plain OpenAI rate
+ * limit can contain "billing" or "quota", and that 429 is transient.
+ */
+function noCredit(provider: Provider, status: number, text: string): boolean {
+  let error: { code?: unknown; type?: unknown; message?: unknown } | undefined
+  try {
+    error = (JSON.parse(text) as { error?: typeof error }).error
+  } catch {
+    return false
+  }
+  if (typeof error !== 'object' || error === null) return false
+  if (provider === 'claude') return status === 400 && typeof error.message === 'string' && /credit balance/i.test(error.message)
+  return (status === 400 || status === 429) && [error.code, error.type].some((value) => typeof value === 'string' && openaiQuotaCodes.has(value))
+}
+
 export function failedChecksText(failed: FailedCheck[]): string {
   return failed.map(({ check, problem, fix }) => `- **${check}**: ${problem}. Fix: ${fix}`).join('\n')
 }
@@ -57,22 +75,25 @@ export async function probeProvider(
   }
   const excerpt = text.replace(/\s+/g, ' ').trim().slice(0, 200)
   const failed = (problem: string) => ({
-    failed: { check: checkName(provider), problem, fix: `check ${keyNames[provider]} and the credit or quota of its account` },
+    failed: { check: `Provider key (${provider})`, problem, fix: `check ${keyNames[provider]} and the credit or quota of its account` },
     transient: null,
   })
   if (status === 401 || status === 403) return failed(`${provider} refused the key (HTTP ${status})`)
-  if ((status === 400 || status === 429) && /quota|credit|billing/i.test(text))
+  if (noCredit(provider, status, text))
     return failed(`the ${provider} account has no credit or quota (HTTP ${status}: ${excerpt})`)
   if (status === 408 || status === 429 || status >= 500)
     return { failed: null, transient: `the ${provider} probe of ${model} got HTTP ${status}: ${excerpt}` }
   return failed(`the ${provider} probe of ${model} got HTTP ${status} (${excerpt})`)
 }
 
-/** Probes each provider of `models` at the same time, with its first model (D17). A missing key gets no request. */
+/**
+ * Probes each provider of `models` at the same time, with its first model (D17). A missing key gets no request.
+ * `missingKeyFix` gives the fix for a missing key, because only the caller knows where the key comes from.
+ */
 export async function checkProviders(
   models: ModelChoice[],
   credential: (provider: Provider) => Credential,
-  options: ProbeOptions = {},
+  options: ProbeOptions & { missingKeyFix?: (key: string, provider: Provider) => string } = {},
 ): Promise<{ failed: FailedCheck[]; transient: string[] }> {
   const first = new Map<Provider, string>()
   for (const choice of models) if (!first.has(choice.provider)) first.set(choice.provider, choice.model)
@@ -84,7 +105,8 @@ export async function checkProviders(
       } catch (error) {
         if (!(error instanceof MissingCredentialError)) throw error
         const key = keyNames[provider]
-        return { failed: { check: checkName(provider), problem: `${key} is not set`, fix: `set ${key} as a Worker secret` }, transient: null }
+        const fix = options.missingKeyFix?.(key, provider) ?? `set ${key}`
+        return { failed: { check: `Provider key (${provider})`, problem: error.message, fix }, transient: null }
       }
       return probeProvider(provider, signer, model, options)
     }),
@@ -93,8 +115,4 @@ export async function checkProviders(
     failed: results.flatMap(({ failed }) => (failed ? [failed] : [])),
     transient: results.flatMap(({ transient }) => (transient ? [transient] : [])),
   }
-}
-
-function checkName(provider: Provider): string {
-  return `Provider key (${provider})`
 }
