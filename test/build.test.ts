@@ -34,10 +34,11 @@ function fakeMachine(answer: (command: string) => { exit_code: number | null; ou
   return { commands, machine }
 }
 
-/** Keeps the options of each checks() call and the files of each tests() call. */
+/** Keeps the options of each checks() call and the files of each tests() and ci() call. */
 function recorded(inner: Checker) {
-  const calls = { checks: [] as ({ tests?: boolean } | undefined)[], tests: [] as string[][] }
+  const calls = { checks: [] as ({ tests?: boolean } | undefined)[], tests: [] as string[][], ci: [] as string[][] }
   const run = inner.tests
+  const ci = inner.ci
   const checker: Checker = {
     checks(changed, options) {
       calls.checks.push(options)
@@ -49,6 +50,14 @@ function recorded(inner: Checker) {
           return run(tests)
         }
       : null,
+    ...(ci
+      ? {
+          ci: (changed: string[]) => {
+            calls.ci.push(changed)
+            return ci(changed)
+          },
+        }
+      : {}),
   }
   return { calls, checker }
 }
@@ -123,6 +132,33 @@ test('build: submit refuses the log when a targeted test fails, with the end of 
   assert.doesNotMatch(output, /START OF OUTPUT/)
   assert.match(output, /LOG ACCEPTED/)
   assert.deepEqual(calls.tests, [['test/add.test.ts'], ['test/add.test.ts']])
+  assert.equal(result.blocked, '')
+})
+
+test('build: submit runs ci after the targeted tests, and refuses the log while a ci command fails, with the end of its output', { timeout: 60_000 }, async () => {
+  let runs = 0
+  const { commands, machine } = fakeMachine((command) => {
+    if (command !== 'npm run lint') return pass
+    runs++
+    return runs === 1 ? { exit_code: 1, output: `START OF OUTPUT ${'x'.repeat(6_000)} src/math.ts:2 operands swapped` } : pass
+  })
+  const config = {
+    stack: 'TypeScript',
+    checks: { smoke: 'node -e "process.exit(0)"' },
+    tests: { pattern: '\\.test\\.ts$', command: 'env -u NODE_TEST_CONTEXT node --test {tests}' },
+    ci: { lint: 'npm run lint', docs: { command: 'markdownlint {files}', files: '\\.md$' } },
+  }
+  const cell = [write, checkpoint, trySubmit, trySubmit].join('\n')
+  const { calls, output, result } = await buildWith({ cell, machine, config })
+
+  assert.match(output, /submit refused: .*the ci commands failed \(ci lint\)\. Fix the cause, checkpoint and submit again.*--- ci lint \(exit code 1\) ---.*src\/math\.ts:2 operands swapped/)
+  assert.doesNotMatch(output, /START OF OUTPUT/)
+  assert.match(output, /LOG ACCEPTED/)
+  assert.deepEqual(calls.tests, [['test/add.test.ts'], ['test/add.test.ts']])
+  assert.deepEqual(calls.ci, [['src/math.ts'], ['src/math.ts']])
+  assert.equal(commands.length, 4)
+  assert.match(commands[0]!, /node --test 'test\/add\.test\.ts'$/)
+  assert.equal(commands[1], 'npm run lint')
   assert.equal(result.blocked, '')
 })
 

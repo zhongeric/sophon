@@ -89,6 +89,8 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
 - Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
   file that no test imports gets the test files that have its base name as a word. The `run_checks` of builders,
   patch agents and light agents runs only the checks. Their targeted tests run one time, when they submit their log.
+- `ci` has the form of `checks`. Its commands run at each submit of an editing agent, after the targeted tests, and
+  as the final checks of a review run. On Cloudflare, they replace GitHub CI for a review run.
 - `merge` (`"squash"`, `"merge"` or `"rebase"`) is the standing permission for the host to merge a ready development
   PR with that method. Without it, the host does not merge.
 - `questions: "recommended"` is the standing answer to every question of a run: the host takes the recommendation, also

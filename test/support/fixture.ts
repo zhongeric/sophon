@@ -39,9 +39,9 @@ export function withoutKey(repo: string): void {
 /**
  * A repository whose feature branch adds a sub() that adds, with a test that catches it. With `light`, a Foundry
  * repository whose feature branch only changes docs and a test, with a Latin abbreviation and a vague test name.
- * The repository has no usable key, so its own commits are unsigned.
+ * The repository has no usable key, so its own commits are unsigned. `config` replaces fields of the base config.
  */
-export function fixtureRepo(options: { light?: boolean } = {}): string {
+export function fixtureRepo(options: { light?: boolean; config?: Record<string, unknown> } = {}): string {
   const repo = mkdtempSync(join(tmpdir(), 'factory-repo-'))
   const run = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' })
   const write = (path: string, content: string) => {
@@ -64,6 +64,7 @@ export function fixtureRepo(options: { light?: boolean } = {}): string {
       stack: 'TypeScript',
       checks: { syntax: { command: 'node --check {files}', files: '\\.js$' }, smoke: 'node -e "process.exit(0)"' },
       tests: { pattern: '\\.test\\.ts$', command: 'env -u NODE_TEST_CONTEXT node --test {tests}' },
+      ...options.config,
     }),
   )
   if (options.light) write('foundry.toml', '[profile.default]\nsolc = "0.8.28"\n')

@@ -190,16 +190,78 @@ test('on Cloudflare, a /review patch agent that breaks a test gets the failing o
   }
 })
 
-test('on Cloudflare, a review whose config has tests stops before any work when the Worker has no container and no machine', { timeout: 120_000 }, async () => {
+test('on Cloudflare, a /review whose config has ci runs ci on the machine as its final checks and reads no GitHub CI (D15)', { timeout: 180_000 }, async () => {
+  const command = 'env -u NODE_TEST_CONTEXT node --test test/add.test.ts test/sub.test.ts'
+  // The config has ci and no tests, so the ci alone gets the build machine.
+  const repo = fixtureRepo({ config: { ci: { fixture: command }, tests: null } })
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ runQuestion: true, tests: false }) })
+  const worker = await startFor(mock, withMachine(mock))
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
+  try {
+    const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })).json()) as { run: string }
+    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 150_000, describe)
+    assert.match(done.body, /agent-factory: PASS/, done.body)
+    assert.equal(mock.fileAt(`refs/heads/factory/${started.run}`, 'src/math.ts'), fixed)
+    // The patch gate and the final checks ran ci on the machine, in the directory of the review run.
+    const ci = mock.state.commands.filter((entry) => entry.cwd === `review/${started.run}` && entry.argv.join(' ').includes(command))
+    assert.ok(ci.length >= 2, JSON.stringify(mock.state.commands.map((entry) => [entry.cwd, entry.argv.join(' ').slice(0, 120)])))
+    assert.deepEqual(mock.state.requests.filter((route) => route.includes('/actions/runs') || route.endsWith('/status')), [])
+  } finally {
+    await worker.stop()
+    await mock.close()
+  }
+})
+
+test('on Cloudflare, a review whose config has tests fails the preflight when the Worker has no container and no machine', { timeout: 120_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
   const worker = await startFor(mock, vars(mock))
+  const admin = { authorization: 'Bearer admin' }
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
   try {
-    await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })
-    const stopped = await until(() => mock.state.comments.find((entry) => entry.body.includes('stopped run')), 60_000, describe)
-    assert.match(stopped.body, /this Worker has no container for builds: add the containers section of wrangler\.jsonc and deploy again/)
+    await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: admin, method: 'POST' })
+    const stopped = await until(() => mock.state.comments.find((entry) => entry.body.includes('did not start run')), 60_000, describe)
+    assert.match(stopped.body, /^agent-factory did not start run `pr-7-[^`]+`: the preflight found failed checks\./)
+    assert.match(stopped.body, /- \*\*Build container\*\*: this Worker has no container for builds\. Fix: add the containers section of wrangler\.jsonc and deploy again/)
+    assert.match(stopped.body, /continue the run with `npm run remote -- resume acme\/app#7`\.$/)
+    assert.equal(mock.state.comments.length, 1, describe())
     assert.equal(mock.state.turns.length, 0)
+    const status = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin })).json()) as { runs: { state: string; note: string }[] }
+    assert.equal(status.runs[0]?.state, 'error')
+    assert.match(status.runs[0]?.note ?? '', /Build container/)
+  } finally {
+    await worker.stop()
+    await mock.close()
+  }
+})
+
+test('on Cloudflare, development and research runs fail the preflight with one comment each: the development run checks CI on the default branch', { timeout: 120_000 }, async () => {
+  const mock = await mockServices(fixtureRepo(), { botLogin: 'factory-bot', name: 'app', owner: 'acme', script: scriptFor({ tests: false }) })
+  const worker = await startFor(mock, vars(mock))
+  const admin = { authorization: 'Bearer admin' }
+  const on = (issue: number) => mock.state.comments.filter((entry) => entry.issue === issue)
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 300)]))}\nworker:\n${worker.output().slice(-3000)}`
+  const failed = async (kind: string, issue: number) => {
+    await fetch(`${worker.url}/${kind}/acme/app/${issue}`, { body: '{}', headers: admin, method: 'POST' })
+    const stopped = await until(() => on(issue).find((entry) => entry.body.includes('did not start run')), 60_000, describe)
+    assert.equal(on(issue).length, 1, describe())
+    assert.equal(mock.state.turns.length, 0, describe())
+    const status = (await (await fetch(`${worker.url}/runs/acme/app/${issue}`, { headers: admin })).json()) as { runs: { state: string; note: string }[] }
+    assert.equal(status.runs[0]?.state, 'error')
+    assert.match(status.runs[0]?.note ?? '', /^the preflight found failed checks: /)
+    return stopped.body
+  }
+  try {
+    mock.state.workflows = false
+    const developed = await failed('develop', 5)
+    assert.match(developed, /^agent-factory did not start run `dev-5-[^`]+`: the preflight found failed checks\./)
+    assert.match(developed, /- \*\*CI workflow\*\*: main has no workflow file in \.github\/workflows/)
+    assert.match(developed, /- \*\*Build container\*\*: this Worker has no container for builds/)
+    const researched = await failed('research', 9)
+    assert.match(researched, /^agent-factory did not start run `research-9-[^`]+`: the preflight found failed checks\./)
+    assert.match(researched, /- \*\*Build container\*\*: this Worker has no container for builds/)
+    assert.doesNotMatch(researched, /CI workflow|Provider key|GitHub access/)
+    assert.deepEqual(new Set(mock.state.probes.map((probe) => probe.provider)), new Set(['claude', 'codex']))
   } finally {
     await worker.stop()
     await mock.close()
@@ -220,7 +282,9 @@ test('on Cloudflare, with the GitHub App secrets, a repository without the App s
       return status.runs[0]?.state === 'error' ? status.runs[0] : undefined
     }, 60_000, describe)
     assert.match(stopped.note, /https:\/\/github\.com\/apps\/sophon-factory\/installations\/new/)
+    assert.match(stopped.note, /GitHub access.*Fix: install the GitHub App on acme\/app/)
     assert.equal(mock.state.comments.length, 0)
+    assert.equal(mock.state.turns.length, 0)
     assert.equal(mock.state.requests.filter((route) => route.startsWith('POST /v1/')).length, 0)
     const lookup = mock.state.authorizations.find((entry) => entry.route === 'GET /repos/acme/app/installation')
     assert.match(lookup?.authorization ?? '', /^Bearer [\w-]+\.[\w-]+\.[\w-]+$/)

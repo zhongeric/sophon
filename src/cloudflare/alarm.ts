@@ -17,6 +17,8 @@ const errorRestartMs = 30 * 60_000
 const errorRestartsKey = 'error-restarts'
 /** The time of the next restart after an error, so that the admin resume can start the waiting run at once. */
 export const restartAtKey = 'restart-at'
+/** True when the preflight passed after the last start, admin resume or D13 restart of the run (D17). */
+export const preflightKey = 'preflight-passed'
 /**
  * The wall time that one alarm call plans for, when ALARM_BUDGET_SECONDS does not say (D12). Cloudflare stops the call
  * at 900 s. The rest is for the model request and the submit that are in flight at the end of the budget.
@@ -86,6 +88,7 @@ export function afterError(ledger: Ledger, error: unknown, options: { now: numbe
   const next = options.now + errorRestartMs
   ledger.put(errorRestartsKey, restart)
   ledger.put(restartAtKey, next)
+  ledger.put(preflightKey, false)
   ledger.put('attempts', 0)
   ledger.put('restarts', 0)
   resetJobStarts(ledger)

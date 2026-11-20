@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
-import { callRunTests, commandChecker, isProtected, protectedEntries, targetedTests, type RepoConfig } from '../src/core/checks.ts'
+import { callRunTests, commandChecker, commandOptions, isProtected, protectedEntries, targetedTests, type Machine, type RepoConfig } from '../src/core/checks.ts'
 import { gitRepo } from '../src/node/git.ts'
 import { localMachine, runCommand } from '../src/node/machine.ts'
 import { loadRepoConfig } from '../src/node/platform.ts'
@@ -178,6 +178,41 @@ test('checks with tests off run no test command, and checks by default run the t
   assert.ok(checker.agentChecks)
   assert.deepEqual((await checker.agentChecks(['src/math.ts'])).map(({ name }) => name), ['typecheck'])
   assert.deepEqual(commands, ['npm run check'])
+})
+
+test('ci runs only with ci commands: with the check options, after the targeted tests, and not with tests off', async () => {
+  const repo = memoryTree({ 'src/math.ts': 'export {}\n', 'test/math.test.ts': "import { add } from '../src/math.ts'\n" })
+  const calls: { command: string; options: { env: string[]; timeoutMs: number } }[] = []
+  const machine = (setupExit = 0): Machine => ({
+    async run(command, options) {
+      calls.push({ command, options })
+      return { exit_code: command === 'npm ci' ? setupExit : command === 'npm run lint' ? 1 : 0, output: '' }
+    },
+  })
+  const config: RepoConfig = { ...tsConfig, checks: { typecheck: 'npm run check' }, setup: 'npm ci', env: ['ETH_RPC_URL'], timeout_ms: 5_000 }
+  const names = (results: { name: string }[]) => results.map(({ name }) => name)
+
+  const without = commandChecker(repo, config, machine())
+  assert.equal('ci' in without, false)
+  assert.equal('ci' in commandChecker(repo, { ...config, ci: {} }, machine()), false)
+  assert.deepEqual(names(await without.checks(['src/math.ts'])), ['typecheck', 'tests'])
+
+  const ci = { typecheck: 'npm run build', lint: 'npm run lint', format: { command: 'prettier --check {files}', files: '\\.md$' } }
+  const checker = commandChecker(repo, { ...config, ci }, machine())
+  calls.length = 0
+  assert.ok(checker.ci)
+  assert.deepEqual(
+    (await checker.ci(['src/math.ts'])).map(({ name, status }) => [name, status]),
+    [['ci typecheck', 'pass'], ['ci lint', 'fail'], ['ci format', 'skipped']],
+  )
+  assert.deepEqual(calls.map(({ command }) => command), ['npm ci', 'npm run build', 'npm run lint'])
+  for (const { options } of calls) assert.deepEqual(options, commandOptions(config))
+  assert.deepEqual(names(await checker.checks(['src/math.ts'])), ['typecheck', 'tests', 'ci typecheck', 'ci lint', 'ci format'])
+  assert.deepEqual(names(await checker.checks(['src/math.ts'], { tests: false })), ['typecheck'])
+  assert.deepEqual(names(await checker.agentChecks!(['src/math.ts'])), ['typecheck'])
+
+  const broken = commandChecker(repo, { ...config, ci }, machine(1))
+  assert.deepEqual((await broken.ci!(['src/math.ts'])).map(({ name, status }) => [name, status]), [['setup', 'fail']])
 })
 
 test('the config file and its protect entries are protected', () => {

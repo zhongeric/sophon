@@ -5,12 +5,27 @@ import type { AddressInfo } from 'node:net'
 import { constants, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { commandResult, type BoxResult, type JobState } from '../../src/cloudflare/box.ts'
+import { probeOutputTokens } from '../../src/core/preflight.ts'
+import type { Provider } from '../../src/core/providers.ts'
 import { scriptedDispatch, type Script, type Turn } from './scripted-model.ts'
 
 export type MockComment = { id: number; issue: number; user: { login: string }; body: string; created_at: string; updated_at: string; html_url: string }
 type TreeEntry = { path: string; mode: string; type: string; sha: string | null }
 /** `merged` is the merge commit, after the host merged the PR. `closed` is a PR closed without a merge. */
 type Pull = { head: string; title: string; body: string; draft: boolean; headRepo?: string; merged?: string; closed?: boolean }
+
+/** The provider probe of the preflight in a request, or null: a request without a stream, with the probe output limit (D17). */
+function probeOf(route: string, body: Buffer): { provider: Provider; model: string } | null {
+  if (route !== 'POST /v1/messages' && route !== 'POST /v1/responses') return null
+  let fields: { model?: unknown; max_tokens?: unknown; max_output_tokens?: unknown; stream?: unknown }
+  try {
+    fields = JSON.parse(body.toString()) as typeof fields
+  } catch {
+    return null
+  }
+  const [provider, limit] = route === 'POST /v1/messages' ? (['claude', fields.max_tokens] as const) : (['codex', fields.max_output_tokens] as const)
+  return limit === probeOutputTokens[provider] && !fields.stream ? { model: String(fields.model), provider } : null
+}
 
 /**
  * GitHub, Anthropic, OpenAI and a build machine on one local port, for the Cloudflare host under wrangler dev.
@@ -77,6 +92,15 @@ export async function mockServices(
     repoLabels: new Set<string>(),
     /** The labels of each issue or PR, by number. */
     labels: new Map<number, string[]>(),
+    /** The provider probes of the preflight. They are not in requests or turns, so that the counts of model calls stay. */
+    probes: [] as { provider: Provider; model: string }[],
+    /** The answer to the probes of each provider, so that a test can make a provider refuse its key. */
+    probeReply: {
+      claude: { status: 200, body: { content: [], id: 'msg_probe', model: 'probe', role: 'assistant', type: 'message' } },
+      codex: { status: 200, body: { id: 'resp_probe', object: 'response', output: [], status: 'completed' } },
+    } as Record<Provider, { status: number; body: unknown }>,
+    /** False makes the listing of .github/workflows 404. True lists ci.yml when the repository has no such directory. */
+    workflows: true,
   }
   let next = Math.max(100, ...pulls.keys(), ...issues.keys())
   let ids = 0
@@ -225,6 +249,12 @@ export async function mockServices(
       if (!Array.isArray(value)) throw new Error(`${route}: ${name} must be an array`)
       return value.map((item, index) => string(item, `${name}[${index}]`))
     }
+    const probe = probeOf(route, body)
+    if (probe) {
+      state.probes.push(probe)
+      const reply = state.probeReply[probe.provider]
+      return json(response, reply.status, reply.body)
+    }
     state.requests.push(route)
     state.authorizations.push({ authorization: request.headers.authorization ?? '', route })
     try {
@@ -349,6 +379,9 @@ export async function mockServices(
         const path = decodeURIComponent(url.pathname.slice(`${api}/contents/`.length))
         const ref = url.searchParams.get('ref')!
         const listing = text(['ls-tree', ref, '--', path])
+        // The fixture repositories have no workflow files, and the Node tests share them, so the mock lists one.
+        if (path === '.github/workflows' && !state.workflows) return json(response, 404, { message: 'Not Found' })
+        if (path === '.github/workflows' && !listing) return json(response, 200, [{ name: 'ci.yml', path: '.github/workflows/ci.yml', type: 'file' }])
         if (!listing) return json(response, 404, { message: 'Not Found' })
         // A directory gives the array of its entries, as on GitHub.
         if (request.headers.accept !== 'application/vnd.github.raw' && listing.split(/\s/)[1] === 'tree') return json(response, 200, entriesAt(ref, path))
