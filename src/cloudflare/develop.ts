@@ -78,8 +78,8 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       signing: githubSigning(gh, owner, repo),
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
-    // A run that waits for the user, for example for CI, stops on an error, so that the admin resume starts it again from its ledger.
-    if (result.resume) throw new StopError(result.resume)
+    // A run that waits for the user, for example for CI, stops on an error, so that a restart starts it again from its ledger (D13).
+    if (result.resume) throw new StopError(result.resume, { transient: true })
     return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
   }
 

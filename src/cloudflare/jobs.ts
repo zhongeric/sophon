@@ -52,7 +52,7 @@ const firstPollMs = 250
 /** The shortest timeout of a wait-mode job. With less time left in the call, the job does not start. */
 const minWaitMs = 1_000
 
-/** Resets lost-job retries for an administrator error resume, not for automatic alarm retries. */
+/** Resets lost-job retries for a restart after an error, by the administrator or by the host (D13), not for the retries of one attempt. */
 export function resetJobStarts(ledger: Ledger): void {
   ledger.put(retryBudgetKey, (ledger.get<number>(retryBudgetKey) ?? 0) + 1)
 }
