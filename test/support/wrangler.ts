@@ -74,15 +74,30 @@ async function freePort(): Promise<number> {
   return port
 }
 
+type WorkerOptions = { containers?: boolean; persistTo?: string; entry?: string }
+
+/** The starts of wrangler dev on new ports: a test file that runs at the same time can take a free port before wrangler binds it. */
+const portTries = 3
+
 /**
  * The real Worker under wrangler dev, in local mode, with `vars` as its bindings and a fresh Durable Object store.
  * Without `containers`, a test gives the Worker a machine over HTTP (MACHINE_URL), so that it needs no Docker.
  * `persistTo` of an earlier Worker starts the Worker again on the same Durable Object store. `entry` is a Worker script,
  * relative to the repository, in place of `main` of wrangler.jsonc.
  */
-export async function startWorker(vars: Record<string, string>, options: { containers?: boolean; persistTo?: string; entry?: string } = {}) {
-  const port = await freePort()
+export async function startWorker(vars: Record<string, string>, options: WorkerOptions = {}) {
   const persistTo = options.persistTo ?? mkdtempSync(join(tmpdir(), 'factory-do-'))
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await spawnWorker(vars, options, persistTo)
+    } catch (error) {
+      if (attempt >= portTries || !(error instanceof Error) || !error.message.includes('Address already in use')) throw error
+    }
+  }
+}
+
+async function spawnWorker(vars: Record<string, string>, options: WorkerOptions, persistTo: string) {
+  const port = await freePort()
   const args = ['wrangler', 'dev', ...(options.entry ? [options.entry] : []), '--local', `--enable-containers=${options.containers === true}`, '--port', String(port), '--inspector-port', String(await freePort()), '--persist-to', persistTo]
   for (const [name, value] of Object.entries(vars)) args.push('--var', `${name}:${value}`)
   const env: NodeJS.ProcessEnv = { ...process.env, WRANGLER_SEND_METRICS: 'false', NO_COLOR: '1' }
