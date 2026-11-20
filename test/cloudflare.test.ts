@@ -187,6 +187,28 @@ test('on Cloudflare, a /review patch agent that breaks a test gets the failing o
   }
 })
 
+test('on Cloudflare, a /review whose config has ci runs ci on the machine as its final checks and reads no GitHub CI (D15)', { timeout: 180_000 }, async () => {
+  const command = 'env -u NODE_TEST_CONTEXT node --test test/add.test.ts test/sub.test.ts'
+  // The config has ci and no tests, so the ci alone gets the build machine.
+  const repo = fixtureRepo({ config: { ci: { fixture: command }, tests: null } })
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ runQuestion: true, tests: false }) })
+  const worker = await startFor(mock, withMachine(mock))
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
+  try {
+    const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })).json()) as { run: string }
+    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 150_000, describe)
+    assert.match(done.body, /agent-factory: PASS/, done.body)
+    assert.equal(mock.fileAt(`refs/heads/factory/${started.run}`, 'src/math.ts'), fixed)
+    // The patch gate and the final checks ran ci on the machine, in the directory of the review run.
+    const ci = mock.state.commands.filter((entry) => entry.cwd === `review/${started.run}` && entry.argv.join(' ').includes(command))
+    assert.ok(ci.length >= 2, JSON.stringify(mock.state.commands.map((entry) => [entry.cwd, entry.argv.join(' ').slice(0, 120)])))
+    assert.deepEqual(mock.state.requests.filter((route) => route.includes('/actions/runs') || route.endsWith('/status')), [])
+  } finally {
+    await worker.stop()
+    await mock.close()
+  }
+})
+
 test('on Cloudflare, a review whose config has tests fails the preflight when the Worker has no container and no machine', { timeout: 120_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })

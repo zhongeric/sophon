@@ -198,6 +198,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     guides: deps.guides,
     tests: deps.checker.tests,
     agentChecks: deps.checker.agentChecks,
+    ci: deps.checker.ci,
   }
   deps.log(`froze ${frozen.head.slice(0, 12)} over base ${frozen.base.slice(0, 12)}: ${touched.length} files, ${frozen.location}`)
   deps.log(triageLine(triaged))

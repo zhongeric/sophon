@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { baseConfig } from '../src/cloudflare/config.ts'
 import { github } from '../src/cloudflare/github.ts'
-import { parseRepoConfig, requireChecks, resolveRepoConfig } from '../src/core/checks.ts'
+import { hasCi, parseRepoConfig, requireChecks, resolveRepoConfig } from '../src/core/checks.ts'
 import { profileDefaults, type RootFiles } from '../src/core/profiles.ts'
 import { loadRepoConfig } from '../src/node/platform.ts'
 
@@ -173,6 +173,25 @@ test('the questions field is the standing answer of the runs: only "recommended"
   assert.equal('questions' in parseRepoConfig(manifest({}), 'test'), false)
   for (const questions of [null, true, 'ask', 'Recommended'])
     assert.throws(() => parseRepoConfig(manifest({ questions }), '.agent-factory.json'), { message: '.agent-factory.json: questions must be "recommended"' }, String(questions))
+})
+
+test('the ci field is an object of named commands or null, and a config without it has no ci', () => {
+  const ci = { lint: 'npm run lint', build: { command: 'tsc {files}', files: '\\.ts$' } }
+  assert.deepEqual(parseRepoConfig(manifest({ ci }), 'test').ci, ci)
+  assert.equal(parseRepoConfig(manifest({ ci: null }), 'test').ci, null)
+  for (const value of ['npm test', 3, ['npm test']])
+    assert.throws(() => parseRepoConfig(manifest({ ci: value }), '.agent-factory.json'), { message: '.agent-factory.json: ci must be an object of named commands' }, String(value))
+  for (const [entry, value] of [['build', null], ['build', 3], ['build', {}], ['build', { command: 3 }], ['build', { command: 'tsc {files}', files: 3 }], ['build', ['npm test']]] as const)
+    assert.throws(
+      () => parseRepoConfig(manifest({ ci: { lint: 'npm run lint', [entry]: value } }), '.agent-factory.json'),
+      { message: `.agent-factory.json: ci.${entry} must be a command string or { command, files? } with strings` },
+      JSON.stringify(value),
+    )
+  const resolved = resolveRepoConfig(foundry, parseRepoConfig(manifest({}), 'test'))
+  assert.equal('ci' in resolved, false)
+  assert.equal(hasCi(resolved), false)
+  assert.equal(hasCi(resolveRepoConfig(foundry, { ci: {} })), false)
+  assert.equal(hasCi(resolveRepoConfig(foundry, { ci })), true)
 })
 
 test('locally, a repository without .agent-factory.json gets the defaults of its working copy, and needs at least one check', async () => {

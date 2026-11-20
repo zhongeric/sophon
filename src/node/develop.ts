@@ -25,8 +25,9 @@ const pausedExitCode = 3
 const usage = `Usage: npm run develop -- --ask <text> [options]
 
 Develops an ask into a ready PR: intake and your confirmation, a spec for a larger change, a plan, builders
-for its tasks, a draft PR, CI with two fix rounds, the code review loop, and CI again. The PR becomes ready
-only when every criterion holds. When ${repoConfigFile} has "merge", the host then merges the PR. Else you merge.
+for its tasks, a draft PR, CI, the code review loop, and up to 5 repair rounds for a red CI or a failed pass.
+The PR becomes ready only when every criterion holds. When ${repoConfigFile} has "merge", the host then merges
+the PR. Else you merge.
 
 Options:
   --repo <path>          Repository (default: current directory). It needs an origin on GitHub. ${repoConfigFile} is optional:

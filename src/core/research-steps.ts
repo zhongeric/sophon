@@ -435,7 +435,8 @@ export async function buildAnalysis(context: ResearchContext, task: AnalysisTask
     branch: task.branch,
     scope: [analysisDir(hypothesis)],
     active: task.active,
-    checker: task.checker,
+    // The analysis build has no ci gate: its builder can write only analysis/<id>/.
+    checker: { ...task.checker, ci: undefined },
     base: task.base,
     review,
     prompt,
