@@ -4,7 +4,7 @@ import type { Ledger } from '../src/core/ledger.ts'
 import { crashRestartsKey, PlannedStop, plannedStopsKey } from '../src/core/planned-stop.ts'
 import { PausedError } from '../src/core/questions.ts'
 import { StopError } from '../src/core/stop.ts'
-import { afterError, alarmBudgetMs, countRestart, initCounters, maxErrorRestarts, maxRestarts, progressLedger, restartAtKey } from '../src/cloudflare/alarm.ts'
+import { afterError, alarmBudgetMs, countRestart, initCounters, maxErrorRestarts, maxRestarts, preflightKey, progressLedger, restartAtKey } from '../src/cloudflare/alarm.ts'
 import { GitHubError } from '../src/cloudflare/github.ts'
 
 function memoryLedger(): Ledger {
@@ -76,6 +76,18 @@ test('an error after three attempts, or a crash loop, starts the run again from 
   // A finished step is progress, so the next error gets new restarts.
   ledger.put('step:calibrate', { ok: true })
   assert.equal(afterError(ledger, new StopError('the run waits for CI', { transient: true }), options).restart, 1)
+})
+
+test('a D13 restart clears the preflight flag, so that the restart runs the preflight again, and a planned stop or a pause keeps it (D17)', () => {
+  const ledger = progressLedger(memoryLedger())
+  ledger.put(preflightKey, true)
+  afterError(ledger, new PlannedStop('stop'), options)
+  afterError(ledger, new PausedError('waiting for CI'), options)
+  afterError(ledger, new Error('flaky'), options)
+  assert.equal(ledger.get(preflightKey), true)
+  afterError(ledger, new Error('flaky'), options)
+  assert.equal(afterError(ledger, new Error('flaky'), options).restart, 1)
+  assert.equal(ledger.get(preflightKey), false)
 })
 
 test('a crash adds to restarts and crash-restarts, and stops past maxRestarts', () => {

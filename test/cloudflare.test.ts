@@ -187,16 +187,23 @@ test('on Cloudflare, a /review patch agent that breaks a test gets the failing o
   }
 })
 
-test('on Cloudflare, a review whose config has tests stops before any work when the Worker has no container and no machine', { timeout: 120_000 }, async () => {
+test('on Cloudflare, a review whose config has tests fails the preflight when the Worker has no container and no machine', { timeout: 120_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
   const worker = await startFor(mock, vars(mock))
+  const admin = { authorization: 'Bearer admin' }
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
   try {
-    await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })
-    const stopped = await until(() => mock.state.comments.find((entry) => entry.body.includes('stopped run')), 60_000, describe)
-    assert.match(stopped.body, /this Worker has no container for builds: add the containers section of wrangler\.jsonc and deploy again/)
+    await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: admin, method: 'POST' })
+    const stopped = await until(() => mock.state.comments.find((entry) => entry.body.includes('did not start run')), 60_000, describe)
+    assert.match(stopped.body, /^agent-factory did not start run `pr-7-[^`]+`: the preflight found failed checks\./)
+    assert.match(stopped.body, /- \*\*Build container\*\*: this Worker has no container for builds\. Fix: add the containers section of wrangler\.jsonc and deploy again/)
+    assert.match(stopped.body, /continue the run with `npm run remote -- resume acme\/app#7`\.$/)
+    assert.equal(mock.state.comments.length, 1, describe())
     assert.equal(mock.state.turns.length, 0)
+    const status = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin })).json()) as { runs: { state: string; note: string }[] }
+    assert.equal(status.runs[0]?.state, 'error')
+    assert.match(status.runs[0]?.note ?? '', /Build container/)
   } finally {
     await worker.stop()
     await mock.close()
@@ -217,7 +224,9 @@ test('on Cloudflare, with the GitHub App secrets, a repository without the App s
       return status.runs[0]?.state === 'error' ? status.runs[0] : undefined
     }, 60_000, describe)
     assert.match(stopped.note, /https:\/\/github\.com\/apps\/sophon-factory\/installations\/new/)
+    assert.match(stopped.note, /GitHub access.*Fix: install the GitHub App on acme\/app/)
     assert.equal(mock.state.comments.length, 0)
+    assert.equal(mock.state.turns.length, 0)
     assert.equal(mock.state.requests.filter((route) => route.startsWith('POST /v1/')).length, 0)
     const lookup = mock.state.authorizations.find((entry) => entry.route === 'GET /repos/acme/app/installation')
     assert.match(lookup?.authorization ?? '', /^Bearer [\w-]+\.[\w-]+\.[\w-]+$/)
