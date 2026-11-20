@@ -4,7 +4,7 @@ import { callBudget, PlannedStop } from '../core/planned-stop.ts'
 import { apiKeyCredential, type Credentials, type Provider } from '../core/providers.ts'
 import type { Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { afterError, alarmBudgetMs, countRestart, initCounters, progressLedger } from './alarm.ts'
+import { afterError, alarmBudgetMs, countRestart, initCounters, progressLedger, restartAtKey } from './alarm.ts'
 import { containerBox, httpBox, type Box, type SyncStore } from './box.ts'
 import { githubComments } from './comments.ts'
 import type { WorkerSetting } from './egress.ts'
@@ -165,15 +165,18 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
 
   /**
    * Wakes a paused run, for example after an answer or a CI result. With \`afterError\`, also restarts a run that
-   * stopped on an error, from its ledger, once the cause is fixed. Only the admin route passes it.
+   * stopped on an error, from its ledger, once the cause is fixed, or a run that waits for its restart (D13). Only the
+   * admin route passes it.
    */
   async resume(options: { afterError?: boolean } = {}): Promise<ResumeResult> {
     const latest = this.ctx.storage.sql.exec<RunRow>('select * from factory_runs order by created desc limit 1').toArray()[0]
     if (!latest) return { reason: 'there is no run. Start a run first', resumed: false, state: null }
     const { state } = latest
+    const ledger = sqlLedger(this.ctx.storage.sql, latest.run)
     let reason = 'woke the paused run'
-    if (state === 'error' && options.afterError) {
-      const ledger = sqlLedger(this.ctx.storage.sql, latest.run)
+    if (state === 'queued' && options.afterError && (ledger.get<number>(restartAtKey) ?? 0) > Date.now()) {
+      reason = 'started the run again from its ledger after the error'
+    } else if (state === 'error' && options.afterError) {
       ledger.put('attempts', 0)
       ledger.put('restarts', 0)
       resetJobStarts(ledger)
@@ -238,12 +241,12 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       if (outcome.attempts !== null) console.error(`[${row.run}] attempt ${outcome.attempts} failed`, error)
       this.setState(row.run, outcome.state, outcome.note)
       next = outcome.next
-      if (outcome.state === 'error') {
+      if (outcome.state === 'error' || outcome.restart !== null) {
         await this.killJobs(row.run, ledger, call)
         const hint = error instanceof GitHubError ? (app ? ' Check the permissions of the GitHub App.' : ' Check the permissions of GITHUB_TOKEN.') : ''
-        await comments
-          ?.post(`agent-factory stopped run \`${row.run}\`: ${outcome.note}${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${target}\`.`)
-          .catch(() => undefined)
+        // A run that starts again by itself needs nothing from the user (D13).
+        const ask = outcome.restart !== null ? '' : `${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${target}\`.`
+        await comments?.post(`agent-factory stopped run \`${row.run}\`: ${sentence(outcome.note)}${ask}`).catch(() => undefined)
       }
     } finally {
       clearInterval(heartbeat)
@@ -293,6 +296,9 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     this.ctx.storage.sql.exec('update factory_runs set state = ?, note = ? where run = ?', state, note, run)
   }
 }
+
+/** The text with a full stop at its end. */
+const sentence = (text: string) => (/[.!?]$/.test(text) ? text : `${text}.`)
 
 /** Runs `post` one time per run, even when the run resumes. */
 async function once(ledger: Ledger, key: string, post: () => Promise<unknown>): Promise<void> {
