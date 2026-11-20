@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../../src/core/ci.ts'
 import type { MergeMethod } from '../../src/core/checks.ts'
@@ -44,6 +44,24 @@ export function developRepo(config?: Record<string, unknown>, options: { merge?:
   run('remote', 'add', 'origin', origin)
   run('push', '-q', 'origin', 'main')
   return { repo, origin }
+}
+
+/** Pushes a commit with `files` to main on origin, as when another PR merges while a run works. Returns its commit ID. */
+export function pushBase(origin: string, files: Record<string, string>): string {
+  const clone = join(mkdtempSync(join(tmpdir(), 'factory-base-')), 'clone')
+  execFileSync('git', ['clone', '-q', origin, clone], { stdio: 'pipe' })
+  const run = (...args: string[]) => execFileSync('git', args, { cwd: clone, stdio: 'pipe' }).toString().trim()
+  run('config', 'user.email', 'other@example.com')
+  run('config', 'user.name', 'Other')
+  run('config', 'commit.gpgsign', 'false')
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(dirname(join(clone, path)), { recursive: true })
+    writeFileSync(join(clone, path), content)
+  }
+  run('add', '-A')
+  run('commit', '-q', '-m', 'the base moves')
+  run('push', '-q', 'origin', 'HEAD:main')
+  return run('rev-parse', 'HEAD')
 }
 
 export const sources = {
@@ -96,9 +114,10 @@ const wrongProduct = {
  * fails, so the builder submits a test of sub only. The fixer of each repair round shows /review/repair.txt, adds mul to
  * the test, and writes its round to test/rounds.txt, so that each round makes a commit. Reviewers find nothing, unless
  * `reviewFix`: then the bugs reviewer finds the missing mul test and the patch agent adds it.
- * With `askScope`, the intake agent raises one user question about the scope.
+ * With `askScope`, the intake agent raises one user question about the scope. The fixer of a base merge conflict shows
+ * /review/repair.txt, writes the files of `resolved` without conflict markers, checkpoints and submits.
  */
-export function developScript(options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean } = {}): Script {
+export function developScript(options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean; resolved?: Record<string, string> } = {}): Script {
   return ({ role, output, request }) => {
     if (output !== null) return { text: 'done' }
     switch (role) {
@@ -118,6 +137,18 @@ export function developScript(options: { blockSub?: boolean; reviewFix?: boolean
       case 'builder': {
         // The session of the fixer keeps the prompts of the earlier rounds, so the last prompt gives the round.
         const round = [...request.matchAll(/Repair round (\d+) of/g)].at(-1)?.[1]
+        if (round && /conflict markers/.test(request.slice(request.lastIndexOf('Repair round')))) {
+          const summary = `repair ${round}: the conflicts of the base merge are resolved`
+          const resolved = Object.entries(options.resolved ?? {})
+          return {
+            cell: [
+              `text('repair.txt: ' + await tools.Read({ file_path: '/review/repair.txt' }))`,
+              ...resolved.map(([path, content]) => `await tools.Write({ file_path: '/repo/${path}', content: ${JSON.stringify(content)} })`),
+              `await tools.checkpoint({ message: 'resolve the conflicts' })`,
+              `await tools.submit_build_log(${JSON.stringify({ summary, changes: resolved.map(([path]) => ({ path, why: summary })), tests: [], blocked: '' })})`,
+            ].join('\n'),
+          }
+        }
         if (round) {
           const summary = `repair ${round}: mul(2, 3) is 6`
           const changes = ['test/ops.test.ts', 'test/rounds.txt'].map((path) => ({ path, why: summary }))

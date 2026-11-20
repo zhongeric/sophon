@@ -5,7 +5,7 @@ import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } fr
 import { step, type Ledger } from '../ledger.ts'
 import { alarmLines, settleAll } from '../planned-stop.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
-import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeResult, PullRequests, Signing } from '../platform.ts'
+import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeRefusal, PullRequests, Signing } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
 import { branchesSection, pruneBranches, reasonOf, type BranchFacts, type BranchRun, type PruneResult } from '../prune.ts'
 import type { Credentials, Provider } from '../providers.ts'
@@ -50,8 +50,11 @@ export type DevelopInput = {
   issue?: number
 }
 
-/** `budget` is what remains up to twice the development budget, so that the review loop stops where the development gate pauses. `branch` is the PR head branch. */
-export type ReviewRequest = { runId: string; ask: string; head: string; branch: string; full: boolean; pr: number; budget?: number }
+/**
+ * `budget` is what remains up to twice the development budget, so that the review loop stops where the development gate
+ * pauses. `branch` is the PR head branch. `base` is the current merge base of the change (D16). Default: the base of the input.
+ */
+export type ReviewRequest = { runId: string; ask: string; head: string; branch: string; full: boolean; pr: number; budget?: number; base?: string }
 
 /** What the platform supplies. */
 export type DevelopDeps = {
@@ -94,6 +97,10 @@ export type DevelopResult = {
 
 /** Repair rounds of a run: one budget for all causes, CI failures and failed review passes. Then the run fails (D14, G6). */
 const repairRounds = 5
+/** Base merges of a run: the checks before ready and before the merge, and the retries after a 'stale' refusal, share them (D16). */
+const baseMergeLimit = 3
+/** Merge tries of a run. Each try after a 'stale' refusal comes after a base check (D16). */
+const mergeTryLimit = 3
 /** How long CI can take to start for a push of a commit that already has finished CI. */
 const ciGraceMs = 3 * 60_000
 /** The most that GitHub's clock and the host's clock can differ. */
@@ -106,10 +113,17 @@ type Review = { pass: boolean; head: string; final: string; branch: string; repo
 /**
  * The cause of a repair round. `from` is 'CI' or 'review pass N', `short` is one line for the prompt and the report,
  * `text` is /review/repair.txt, `logs` is /review/ci-failure.txt when CI failed, and `report` is
- * /review/review-report.md when a review pass failed.
+ * /review/review-report.md when a review pass failed. `conflicts` are the files that conflict in a base merge.
  */
-type Cause = { from: string; short: string; text: string; logs: string | null; report: string | null }
+type Cause = { from: string; short: string; text: string; logs: string | null; report: string | null; conflicts?: string[] }
 type Repair = { round: number; cause: Cause; log: BuildLog }
+type BasePoint = 'ready' | 'merge'
+/** The result of a base merge, and `change`: the paths of the change before it, from the merge base to the head. */
+type BaseMerge = { files: string[]; conflicts: string[]; change: string[] }
+/** A base check (D16). `merge` is null when the base did not move or the run used its base merges. */
+type BaseCheck = { point: BasePoint; base: string; moved: boolean; merge: BaseMerge | null }
+/** A merge try as the ledger records it. A refusal of a ledger from before D16 has no kind. */
+type RecordedMerge = { merged: true; sha: string } | { merged: false; reason: string; kind?: MergeRefusal }
 
 /** The providers of every model that a development run uses: the development roles and the review loop. */
 export function developProviders(models: DevelopInput['models']): Set<Provider> {
@@ -126,7 +140,8 @@ export function checkDevelopModels(models: DevelopModels, allowed = defaultAllow
  * intake and the confirmation of the ask, a spec for a larger change, one plan, builders for the plan's tasks (in
  * parallel when their files do not overlap, each on its own branch), a draft PR, CI, the code review loop, CI again,
  * and a ready PR only when every criterion holds. A red CI or a failed review pass gets a repair round inside one
- * budget, and a new review pass reviews the fixes (D14). Every step is in the ledger, so the same run ID
+ * budget, and a new review pass reviews the fixes (D14). Before the ready step and the merge, the host merges a base
+ * that moved (D16). Every step is in the ledger, so the same run ID
  * resumes after a pause or a crash without repeating finished steps. When the user stops the run at the cost budget, the
  * run ends as stopped with its report.
  */
@@ -156,7 +171,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const { ledger, branches, pulls } = deps
   const models = input.models.develop
   // What the report shows. Each stage fills its part.
-  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, signing: null, head: null, pr: null, built: [], repairs: [], cis: [], reviews: [], stoppedReview: null }
+  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, signing: null, head: null, pr: null, built: [], repairs: [], cis: [], reviews: [], stoppedReview: null, baseMerges: [], mergeTries: [] }
   const spentPasses = () => [...state.reviews, ...(state.stoppedReview ? [state.stoppedReview] : [])]
   // A hotfix, or the standing answers of the repository, takes every recommendation (D11).
   const recommend = input.hotfix === true || input.config.questions === 'recommended'
@@ -326,13 +341,17 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   }
 
   // Draft PR and CI. CI and the review loop see the pushed commit.
-  const publish = async () => {
-    const local = await dev.head()
-    const sha = await step(ledger, `push.${local}`, async () => {
-      const at = Date.now()
-      const pushed = await branches.push(dev)
-      ledger.put(`pushed-at:${pushed}`, at)
-      return pushed
+  // `point` names the push in the run. A resume gets the head of each push from the ledger, not the local head, which a
+  // later base merge moved.
+  // A resolved base merge can keep the local head but still need a push to create its merge commit.
+  const publish = async (point: string) => {
+    const sha = await step(ledger, `head.${point}`, async () => {
+      return step(ledger, `push.${point}`, async () => {
+        const at = Date.now()
+        const pushed = await branches.push(dev)
+        ledger.put(`pushed-at:${pushed}`, at)
+        return pushed
+      })
     })
     state.head = sha
     return sha
@@ -342,7 +361,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     state.cis.push(result)
     return result
   }
-  const pushed = await publish()
+  const pushed = await publish('build')
   state.pr = await step(ledger, 'pr', () => pulls.open({ head: branchName, title: intook.title, body: prBody(input, decisions(ledger), planText, planned.smallest_change) }))
   const fixer = planned.tasks.length === 1 ? `build.${planned.tasks[0]!.id}` : 'ci-fix'
 
@@ -350,7 +369,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   // A pass gets the budget up to twice the run budget and stops there without a question. That stop is not a finished
   // step: the budget gate of this run then asks with the run totals, or raises the budget in a hotfix run.
   // After a raise, or on a resume with a higher budget, the same pass runs again with the new remaining budget.
-  const reviewPass = async (pass: number, at: string): Promise<Review> => {
+  const reviewPass = async (pass: number, at: string, base: string): Promise<Review> => {
     const stoppedKey = `review-stopped.${pass}`
     const review = await step(ledger, `review.${pass}`, async (): Promise<Review> => {
       state.stoppedReview = ledger.get<Review>(stoppedKey) ?? null
@@ -360,7 +379,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         // already counts the spend of its stopped attempt, so that spend is not taken from the remaining budget.
         const limit = budget.limit()
         const remaining = limit === undefined ? {} : { budget: 2 * limit - budget.spent() + (state.stoppedReview?.usage?.usd ?? 0) }
-        const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, branch: branchName, full: input.full === true, pr: state.pr!.number, ...remaining })
+        const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, base, branch: branchName, full: input.full === true, pr: state.pr!.number, ...remaining })
         const failed = loop.criteria.filter((criterion) => !criterion.ok)
         const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage, failed }
         if (!loop.stopped) return result
@@ -390,36 +409,16 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   let head = pushed
   // The CI of the last checked commit. It checks the head only when its sha is the head.
   let ci = await waitCi('ci.build.0', head)
-  // True when a repair came after the last review pass, so that its fixes need a new pass.
-  let repaired = false
+  // Why the head needs a new review pass, or null: a repair or a base merge after the last pass.
+  let unreviewed: string | null = null
   // The cause that remains when the budget is used.
   let unrepaired: Cause | null = null
-  for (;;) {
-    if (ci.state === 'none') return finish('blocked', [], noCi(ci.sha), true)
-    let cause: Cause
-    if (ci.state === 'fail') cause = ciCause(ci)
-    else if (state.reviews.length < routed.passes || state.reviews.at(-1)?.pass !== true || repaired) {
-      const pass = state.reviews.length + 1
-      const review = await reviewPass(pass, head)
-      repaired = false
-      if (review.final !== review.head) {
-        await step(ledger, `merge.review.${pass}`, async () => {
-          await dev.merge(review.final, `agent-factory: review loop fixes, pass ${pass} (${input.runId})`)
-          return dev.head()
-        })
-        head = await publish()
-      }
-      if (review.pass) continue
-      cause = reviewCause(pass, review)
-    } else if (ci.sha !== head) {
-      // 7 and 8. CI on the head after the last PASS.
-      ci = await waitCi(`ci.final.${state.reviews.length}`, head)
-      continue
-    } else break
-    if (state.repairs.length === repairRounds) {
-      unrepaired = cause
-      break
-    }
+  // The start of the files of the change: the merge base with the base branch, which a base merge moves (D16).
+  let mergeBase = input.base
+  const taskFiles = [...new Set(planned.tasks.flatMap((task) => task.files))]
+
+  // One round of the repair budget. A base merge with a conflict also gives the fixer the files that conflict.
+  const repair = async (cause: Cause, merge?: BaseMerge): Promise<BuildLog> => {
     const round = state.repairs.length + 1
     const log = await step(ledger, `repair.${round}`, () =>
       build(context, {
@@ -427,10 +426,11 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         turn: { request: `repair-${round}`, key: `output:${fixer}:repair-${round}` },
         model: models.builder,
         branch: dev,
-        scope: [...new Set(planned.tasks.flatMap((task) => task.files))],
+        scope: merge ? [...new Set([...taskFiles, ...merge.conflicts])] : taskFiles,
         active,
         checker: deps.checker(dev),
-        base: input.base,
+        base: mergeBase,
+        ...(merge ? { baseFiles: merge.files.filter((path) => !merge.conflicts.includes(path)) } : {}),
         review: {
           '/ask.md': input.ask,
           '/plan.md': planText,
@@ -443,83 +443,204 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
       }),
     )
     state.repairs.push({ round, cause, log })
-    if (log.blocked.trim()) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
-    head = await publish()
-    repaired = true
-    ci = await waitCi(`ci.repair.${round}`, head)
+    return log
   }
 
-  // Hygiene and the criteria. When the budget is used, the run ends failed with the last cause.
-  const reviewed = state.reviews.length >= routed.passes && state.reviews.at(-1)?.pass === true && !repaired
-  const finalCi = ci.sha === head ? ci : null
-  const changed = await dev.changedFiles(input.base, head)
-  const forbidden = forbiddenPaths(changed, active)
-  const solidity = active.find((profile) => profile.id === 'solidity')
-  const audit = solidity !== undefined && changed.some((path) => solidity.files.test(path))
-  const criteria: Criterion[] = [
-    // The marks of the answers tell who confirmed the ask. A ledger from before D11 posted every question, also the route questions.
-    {
-      name: 'Ask confirmed',
-      ok: true,
-      detail: recommend
-        ? `${input.hotfix ? 'hotfix' : 'standing answers'}: the host took every recommendation`
-        : intakeAnswers.some((answer) => answer.decidedBy !== 'run')
-          ? 'you answered the intake questions'
-          : 'the run took the recommendations of the intake agent (D11)',
-    },
-    { name: 'Plan with its four parts', ok: true, detail: `${planned.tasks.length} tasks in ${scheduled.length} waves` },
-    { name: 'Every task built', ok: true, detail: state.built.map((entry) => entry.task.id).join(', ') },
-    {
-      name: `Review loop PASS on the head, at least ${routed.passes} ${routed.passes === 1 ? 'pass' : 'passes'}`,
-      ok: reviewed,
-      detail: [
-        ...state.reviews.map((review, index) => `pass ${index + 1}: ${review.pass ? 'PASS' : 'FAIL'}`),
-        ...(state.reviews.length === 0 ? ['no pass ran'] : []),
-        ...(repaired ? ['a repair after the last pass'] : []),
-      ].join(', '),
-    },
-    {
-      name: 'CI green on the head',
-      ok: finalCi?.state === 'pass',
-      detail: finalCi ? `${head.slice(0, 12)}: ${finalCi.jobs.map((job) => `${job.name}=${job.ok ? 'pass' : 'fail'}`).join(', ')}` : 'not checked: the review loop did not pass',
-    },
-    { name: 'No build output, logs or environment files', ok: forbidden.length === 0, detail: forbidden.join(', ') || 'none in the change' },
-    ...(audit ? [{ name: 'Auditor for Solidity src/', ok: false, detail: 'required, not built yet. Audit the change before you merge. The PR stays draft.' }] : []),
-  ]
-  const pass = criteria.every((criterion) => criterion.ok)
-  if (!pass) {
-    const used = unrepaired ? `The run used its ${repairRounds} repair rounds. The last cause: ${unrepaired.from}, ${unrepaired.short}. ` : ''
-    return finish('failed', criteria, `${used}The PR stays draft.`)
+  // Runs until CI and the review passes hold on the head, or the budget is used. It returns the end of a blocked run.
+  const repairLoop = async (): Promise<DevelopResult | null> => {
+    for (;;) {
+      if (ci.state === 'none') return finish('blocked', [], noCi(ci.sha), true)
+      let cause: Cause
+      if (ci.state === 'fail') cause = ciCause(ci)
+      else if (state.reviews.length < routed.passes || state.reviews.at(-1)?.pass !== true || unreviewed !== null) {
+        const pass = state.reviews.length + 1
+        const review = await reviewPass(pass, head, mergeBase)
+        unreviewed = null
+        if (review.final !== review.head) {
+          await step(ledger, `merge.review.${pass}`, async () => {
+            await dev.merge(review.final, `agent-factory: review loop fixes, pass ${pass} (${input.runId})`)
+            return dev.head()
+          })
+          head = await publish(`review.${pass}`)
+        }
+        if (review.pass) continue
+        cause = reviewCause(pass, review)
+      } else if (ci.sha !== head) {
+        // 7 and 8. CI on the head after the last PASS.
+        ci = await waitCi(`ci.final.${state.reviews.length}`, head)
+        continue
+      } else return null
+      if (state.repairs.length === repairRounds) {
+        unrepaired = cause
+        return null
+      }
+      const log = await repair(cause)
+      if (log.blocked.trim()) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
+      head = await publish(`repair.${state.repairs.length}`)
+      unreviewed = 'a repair after the last pass'
+      ci = await waitCi(`ci.repair.${state.repairs.length}`, head)
+    }
   }
+
+  // Hygiene and the criteria of the head.
+  const judge = async (): Promise<Criterion[]> => {
+    const reviewed = state.reviews.length >= routed.passes && state.reviews.at(-1)?.pass === true && unreviewed === null
+    const finalCi = ci.sha === head ? ci : null
+    const changed = await dev.changedFiles(mergeBase, head)
+    const forbidden = forbiddenPaths(changed, active)
+    const solidity = active.find((profile) => profile.id === 'solidity')
+    const audit = solidity !== undefined && changed.some((path) => solidity.files.test(path))
+    return [
+      // The marks of the answers tell who confirmed the ask. A ledger from before D11 posted every question, also the route questions.
+      {
+        name: 'Ask confirmed',
+        ok: true,
+        detail: recommend
+          ? `${input.hotfix ? 'hotfix' : 'standing answers'}: the host took every recommendation`
+          : intakeAnswers.some((answer) => answer.decidedBy !== 'run')
+            ? 'you answered the intake questions'
+            : 'the run took the recommendations of the intake agent (D11)',
+      },
+      { name: 'Plan with its four parts', ok: true, detail: `${planned.tasks.length} tasks in ${scheduled.length} waves` },
+      { name: 'Every task built', ok: true, detail: state.built.map((entry) => entry.task.id).join(', ') },
+      {
+        name: `Review loop PASS on the head, at least ${routed.passes} ${routed.passes === 1 ? 'pass' : 'passes'}`,
+        ok: reviewed,
+        detail: [
+          ...state.reviews.map((review, index) => `pass ${index + 1}: ${review.pass ? 'PASS' : 'FAIL'}`),
+          ...(state.reviews.length === 0 ? ['no pass ran'] : []),
+          ...(unreviewed === null ? [] : [unreviewed]),
+        ].join(', '),
+      },
+      {
+        name: 'CI green on the head',
+        ok: finalCi?.state === 'pass',
+        detail: finalCi ? `${head.slice(0, 12)}: ${finalCi.jobs.map((job) => `${job.name}=${job.ok ? 'pass' : 'fail'}`).join(', ')}` : 'not checked: the review loop did not pass',
+      },
+      { name: 'No build output, logs or environment files', ok: forbidden.length === 0, detail: forbidden.join(', ') || 'none in the change' },
+      ...(audit ? [{ name: 'Auditor for Solidity src/', ok: false, detail: 'required, not built yet. Audit the change before you merge. The PR stays draft.' }] : []),
+    ]
+  }
+  const passed = (list: Criterion[]) => list.every((criterion) => criterion.ok)
+  const used = (cause: Cause) => `the run used its ${repairRounds} repair rounds. The last cause: ${cause.from}, ${cause.short}`
+
+  const looped = await repairLoop()
+  if (looped) return looped
+  let criteria = await judge()
+  // When the budget is used, the run ends failed with the last cause.
+  if (!passed(criteria)) return finish('failed', criteria, `${unrepaired ? `${sentence(used(unrepaired))}. ` : ''}The PR stays draft.`)
+
+  // D16. The base checks of the run. Each one is a ledger step with its base merge, so that a resume never merges again.
+  // A ledger from before D16 marked the PR ready without a base check, so its resume does not change the reviewed PR.
+  const baseChecks = ledger.get('base-merge-workflow') === true || !ledger.get('step:ready')
+  if (baseChecks) ledger.put('base-merge-workflow', true)
+  let checks = 0
+  const checkBase = async (point: BasePoint): Promise<BaseCheck> => {
+    checks += 1
+    const check = await step(ledger, `base-check.${checks}`, async (): Promise<BaseCheck> => {
+      const base = await branches.remoteHead(input.baseRef)
+      const moved = (await dev.mergeBaseWith(base)) !== base
+      if (!moved || state.baseMerges.length >= baseMergeLimit) return { point, base, moved, merge: null }
+      const change = await dev.touchedFiles(mergeBase, await dev.head())
+      const merged = await dev.mergeCommit(base, `agent-factory: merge ${input.baseRef} (${input.runId})`)
+      return { point, base, moved, merge: { ...merged, change } }
+    })
+    if (check.merge) state.baseMerges.push(check)
+    return check
+  }
+  // The end of a run whose base merge did not finish: before ready, the run fails with the PR draft. Before the merge,
+  // the PR stays ready and the host does not merge.
+  const unmerged = (point: BasePoint, shown: Criterion[], reason: string) =>
+    point === 'ready' ? finish('failed', shown, `${sentence(reason)}. The PR stays draft.`) : finish('ready', shown, `Not merged: ${reason}. The PR stays ready for your review. You merge.`)
+  // Before the merge, an error of the base merge or of its push leaves the PR ready. A pause or a stop stays an error.
+  const thrown = (point: BasePoint, error: unknown) => point === 'ready' || error instanceof PausedError || error instanceof BudgetStop || error instanceof StopError
+
+  // Merges the base while it moves, up to the limit of the run. After each merge: a conflict round when needed, the
+  // push, CI, the repair loop and the criteria. It returns the end of the run, or null when the run goes on.
+  const settle = async (point: BasePoint): Promise<DevelopResult | null> => {
+    if (!baseChecks) return null
+    for (;;) {
+      let check: BaseCheck
+      try {
+        check = await checkBase(point)
+      } catch (error) {
+        if (thrown(point, error)) throw error
+        return unmerged(point, criteria, `the base merge failed: ${reasonOf(error)}`)
+      }
+      if (!check.moved) return null
+      const merge = check.merge
+      // At the limit, the ready step takes the PR as it is. The merge waits for the user.
+      if (!merge) return point === 'ready' ? null : unmerged(point, criteria, 'the base keeps moving')
+      const n = state.baseMerges.length
+      mergeBase = check.base
+      // The PR on GitHub is still the head of the passed criteria, so the merge point shows them.
+      const shown = point === 'ready' ? [] : criteria
+      if (merge.conflicts.length > 0) {
+        const cause = mergeCause(check.base, merge.conflicts)
+        if (state.repairs.length === repairRounds) {
+          unrepaired = cause
+          return unmerged(point, shown, used(cause))
+        }
+        const log = await repair(cause, merge)
+        if (log.blocked.trim()) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
+        const marked = await step(ledger, `finish-merge.${n}`, () => dev.finishMerge(merge.conflicts, `agent-factory: merge ${input.baseRef} (${input.runId})`))
+        if (marked.length > 0) return unmerged(point, shown, `the conflict markers remain in ${marked.join(', ')}`)
+      }
+      try {
+        head = await publish(`base.${n}`)
+      } catch (error) {
+        if (thrown(point, error)) throw error
+        return unmerged(point, criteria, `the push of the base merge failed: ${reasonOf(error)}`)
+      }
+      if (merge.conflicts.length > 0 || merge.files.some((path) => merge.change.includes(path))) unreviewed = 'a base merge after the last pass'
+      ci = await waitCi(`ci.base.${n}`, head)
+      const ended = await repairLoop()
+      if (ended) return ended
+      criteria = await judge()
+      if (!passed(criteria)) return unmerged(point, criteria, unrepaired ? used(unrepaired) : 'a criterion failed after the base merge')
+    }
+  }
+
+  const beforeReady = await settle('ready')
+  if (beforeReady) return beforeReady
   const pr = state.pr!.number
   await step(ledger, 'ready', async () => (await pulls.ready(pr), true))
   const method = input.config.merge
   if (!method) return finish('ready', criteria, 'Ready for your review. You merge.')
 
-  // 9. The merge, only with the standing permission and only at the head that the final CI checked. The step records a
-  // refusal as a result, so that a resumed run never tries the merge again.
-  const merged = await step(ledger, 'merge', async (): Promise<MergeResult> => {
-    try {
-      return await pulls.merge(pr, { method, sha: head })
-    } catch (error) {
-      return { merged: false, reason: reasonOf(error) }
+  // 9. The merge, only with the standing permission and only at the head that the final CI checked. Each try is a step
+  // that records a refusal as a result, so that a resumed run never tries it again. The first keeps the step name of
+  // older ledgers. A 'stale' refusal gets a base check and another try (D16). A recorded refusal without a kind is 'other'.
+  for (let attempt = 1; ; attempt++) {
+    const beforeMerge = await settle('merge')
+    if (beforeMerge) return beforeMerge
+    const merged = await step(ledger, attempt === 1 ? 'merge' : `merge.${attempt}`, async (): Promise<RecordedMerge> => {
+      try {
+        return await pulls.merge(pr, { method, sha: head })
+      } catch (error) {
+        return { merged: false, reason: reasonOf(error), kind: 'other' }
+      }
+    })
+    state.mergeTries.push(merged)
+    if (!merged.merged) {
+      if ((merged.kind ?? 'other') === 'stale' && attempt < mergeTryLimit) continue
+      return finish('ready', criteria, `Not merged: ${merged.reason}. The PR stays ready for your review. You merge.`)
     }
-  })
-  if (!merged.merged) return finish('ready', criteria, `Not merged: ${merged.reason}. The PR stays ready for your review. You merge.`)
-  const deleted = await step(ledger, 'delete-branch', async (): Promise<{ deleted: true } | { deleted: false; reason: string }> => {
-    try {
-      await branches.deleteRemote(branchName)
-      return { deleted: true }
-    } catch (error) {
-      return { deleted: false, reason: reasonOf(error) }
-    }
-  })
-  remoteDeleted = deleted.deleted
-  const note = [
-    `Merged by the host (${method}): ${merged.sha}.`,
-    ...(deleted.deleted ? [] : [`The host did not delete the branch ${branchName}: ${deleted.reason}.`]),
-  ].join(' ')
-  return finish('ready', criteria, note, false, { method, sha: merged.sha })
+    const deleted = await step(ledger, 'delete-branch', async (): Promise<{ deleted: true } | { deleted: false; reason: string }> => {
+      try {
+        await branches.deleteRemote(branchName)
+        return { deleted: true }
+      } catch (error) {
+        return { deleted: false, reason: reasonOf(error) }
+      }
+    })
+    remoteDeleted = deleted.deleted
+    const note = [
+      `Merged by the host (${method}): ${merged.sha}.`,
+      ...(deleted.deleted ? [] : [`The host did not delete the branch ${branchName}: ${deleted.reason}.`]),
+    ].join(' ')
+    return finish('ready', criteria, note, false, { method, sha: merged.sha })
+  }
 }
 
 /**
@@ -575,14 +696,32 @@ function repairPrompt(round: number, cause: Cause): string {
     `Repair round ${round} of ${repairRounds}. The cause: ${cause.from}, ${cause.short}.`,
     '',
     '- The causes: /review/repair.txt',
+    ...(cause.conflicts ? [`- The files that conflict: ${cause.conflicts.join(', ')}. The merge of the base is in progress in /repo.`] : []),
     ...(cause.logs === null ? [] : ['- The CI logs: /review/ci-failure.txt']),
     ...(cause.report === null ? [] : ['- The report of the review pass, with the findings that the patch agents skipped: /review/review-report.md']),
     '- The plan: /review/plan.md',
     '- The ask: /review/ask.md',
     '',
-    'Fix the cause, not the check. Checkpoint, then call submit_build_log one time.',
+    cause.conflicts
+      ? 'Keep the changes of both sides in each file that conflicts, and remove the conflict markers. Checkpoint, then call submit_build_log one time.'
+      : 'Fix the cause, not the check. Checkpoint, then call submit_build_log one time.',
   ].join('\n')
 }
+
+/** A base merge with conflicts as a repair cause (D16). The files that conflict have conflict markers in the tree. */
+function mergeCause(base: string, conflicts: string[]): Cause {
+  const at = base.slice(0, 12)
+  return {
+    from: 'base merge',
+    short: `${at} conflicts in ${conflicts.join(', ')}`,
+    text: [`# The merge of the base ${at} has conflicts`, '', ...conflicts.map((path) => `- ${path}`), '', 'The merge is in progress. Your checkpoint commits it.', ''].join('\n'),
+    logs: null,
+    report: null,
+    conflicts,
+  }
+}
+
+const sentence = (text: string) => text.charAt(0).toUpperCase() + text.slice(1)
 
 /** A red CI as a repair cause: the failed jobs, with the logs in /review/ci-failure.txt. */
 function ciCause(ci: Ci): Cause {
@@ -703,6 +842,8 @@ type ReportState = {
   reviews: Review[]
   /** The review pass that stopped at its budget. Its spend counts until the pass runs again and finishes. */
   stoppedReview: Review | null
+  baseMerges: BaseCheck[]
+  mergeTries: RecordedMerge[]
 }
 
 /** One row of the Usage section for a review pass, with the tokens and USD of all its agents. */
@@ -763,6 +904,25 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
           ...state.repairs.map(
             (repair) => `- Round ${repair.round}, ${repair.cause.from}: ${repair.cause.short}. ${repair.log.blocked.trim() ? `Blocked: ${repair.log.blocked}` : repair.log.summary}`,
           ),
+          '',
+        ]
+      : []),
+    ...(state.baseMerges.length > 0
+      ? [
+          '## Base merges',
+          '',
+          ...state.baseMerges.map(
+            ({ point, base, merge }) =>
+              `- Before ${point === 'ready' ? 'ready' : 'the merge'}: ${base.slice(0, 12)}, ${merge?.conflicts.length ? `conflict in ${merge.conflicts.join(', ')}` : 'clean'}. Files: ${merge?.files.join(', ') || 'none'}`,
+          ),
+          '',
+        ]
+      : []),
+    ...(state.mergeTries.length > 0
+      ? [
+          '## Merge tries',
+          '',
+          ...state.mergeTries.map((merge, index) => `- Try ${index + 1}: ${merge.merged ? `merged as ${merge.sha}` : `refused (${merge.kind ?? 'other'}): ${merge.reason}`}`),
           '',
         ]
       : []),
