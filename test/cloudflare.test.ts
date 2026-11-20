@@ -76,9 +76,9 @@ test('on Cloudflare, development collects a stopped review before a budget raise
     await until(async () => (await status(5)).runs[0]?.state === 'paused' ? true : undefined, 30_000, describe)
     assert.equal((await status(pull)).runs.length, 1, describe())
     await answer('/answer\nQ1: 1000')
-    const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run: READY')), 180_000, describe)
+    const done = await until(() => on(5).find((entry) => /^# Development run: READY/m.test(entry.body)), 180_000, describe)
     assert.equal((await status(pull)).runs.length, 2, describe())
-    const totals = on(pull).filter((entry) => entry.body.startsWith('### agent-factory:')).map((entry) => {
+    const totals = on(pull).filter((entry) => /^### agent-factory:/m.test(entry.body)).map((entry) => {
       const total = /^\| \*\*Total\*\* \|.*\| \$([\d.]+) \|$/m.exec(entry.body)
       assert.ok(total, entry.body)
       return Number(total[1])
@@ -112,7 +112,7 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
 
     mock.comment('maintainer', '/answer\nQ1: b')
     await sendWebhook(worker.url, secret, 'issue_comment', comment('maintainer', '/answer\nQ1: b'))
-    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
+    const done = await until(() => mock.state.comments.find((entry) => /^### agent-factory:/m.test(entry.body)), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/, done.body)
     assert.match(done.body, /CI \(push\): pass/)
     assert.match(done.body, /May sub return a negative number\? \*\*No, throw an error\*\*/)
@@ -173,7 +173,7 @@ test('on Cloudflare, a /review patch agent that breaks a test gets the failing o
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
   try {
     const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })).json()) as { run: string }
-    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 150_000, describe)
+    const done = await until(() => mock.state.comments.find((entry) => /^### agent-factory:/m.test(entry.body)), 150_000, describe)
     assert.match(done.body, /agent-factory: PASS/, done.body)
     assert.equal(mock.fileAt(`refs/heads/factory/${started.run}`, 'src/math.ts'), fixed)
     const output = mock.state.turns.filter((turn) => turn.role === 'patch' && turn.output).map((turn) => turn.output).join('\n')
@@ -199,7 +199,7 @@ test('on Cloudflare, a /review whose config has ci runs ci on the machine as its
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
   try {
     const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })).json()) as { run: string }
-    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 150_000, describe)
+    const done = await until(() => mock.state.comments.find((entry) => /^### agent-factory:/m.test(entry.body)), 150_000, describe)
     assert.match(done.body, /agent-factory: PASS/, done.body)
     assert.equal(mock.fileAt(`refs/heads/factory/${started.run}`, 'src/math.ts'), fixed)
     // The patch gate and the final checks ran ci on the machine, in the directory of the review run.
@@ -224,7 +224,9 @@ test('on Cloudflare, a review whose config has tests fails the preflight when th
     assert.match(stopped.body, /^agent-factory did not start run `pr-7-[^`]+`: the preflight found failed checks\./)
     assert.match(stopped.body, /- \*\*Build container\*\*: this Worker has no container for builds\. Fix: add the containers section of wrangler\.jsonc and deploy again/)
     assert.match(stopped.body, /continue the run with `npm run remote -- resume acme\/app#7`\.$/)
-    assert.equal(mock.state.comments.length, 1, describe())
+    // The status comment comes first, then the one comment with the failed checks.
+    assert.equal(mock.state.comments.length, 2, describe())
+    assert.match(mock.state.comments[0]!.body, /^<!-- agent-factory:status run=pr-7-[^ ]+ -->\n[\s\S]*\*\*State:\*\* stopped: the preflight found failed checks/)
     assert.equal(mock.state.turns.length, 0)
     const status = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin })).json()) as { runs: { state: string; note: string }[] }
     assert.equal(status.runs[0]?.state, 'error')
@@ -235,7 +237,7 @@ test('on Cloudflare, a review whose config has tests fails the preflight when th
   }
 })
 
-test('on Cloudflare, development and research runs fail the preflight with one comment each: the development run checks CI on the default branch', { timeout: 120_000 }, async () => {
+test('on Cloudflare, development and research runs fail the preflight with a status comment and one error comment each: the development run checks CI on the default branch', { timeout: 120_000 }, async () => {
   const mock = await mockServices(fixtureRepo(), { botLogin: 'factory-bot', name: 'app', owner: 'acme', script: scriptFor({ tests: false }) })
   const worker = await startFor(mock, vars(mock))
   const admin = { authorization: 'Bearer admin' }
@@ -244,7 +246,8 @@ test('on Cloudflare, development and research runs fail the preflight with one c
   const failed = async (kind: string, issue: number) => {
     await fetch(`${worker.url}/${kind}/acme/app/${issue}`, { body: '{}', headers: admin, method: 'POST' })
     const stopped = await until(() => on(issue).find((entry) => entry.body.includes('did not start run')), 60_000, describe)
-    assert.equal(on(issue).length, 1, describe())
+    assert.equal(on(issue).length, 2, describe())
+    assert.ok(on(issue)[0]!.body.startsWith('<!-- agent-factory:status run='), describe())
     assert.equal(mock.state.turns.length, 0, describe())
     const status = (await (await fetch(`${worker.url}/runs/acme/app/${issue}`, { headers: admin })).json()) as { runs: { state: string; note: string }[] }
     assert.equal(status.runs[0]?.state, 'error')
@@ -366,7 +369,7 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
     assert.match(asked.body.split('\n')[0]!, /^@maintainer$/i)
     assert.deepEqual(mock.state.labels.get(7), ['agent-review'])
     mock.comment('maintainer', '/answer recommended')
-    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
+    const done = await until(() => mock.state.comments.find((entry) => /^### agent-factory:/m.test(entry.body)), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/)
     assert.doesNotMatch(done.body, /@Maintainer/i)
     assert.match(done.body, /May sub return a negative number\? \*\*Yes, return -2\*\* \(recommended\)/)
@@ -388,13 +391,19 @@ test('on Cloudflare, /openapi.json needs no token, has the origin of the Worker,
         .filter((key) => key !== 'parameters')
         .map((method) => ({ method: method.toUpperCase(), path: path.replace('{owner}', 'acme').replace('{repo}', 'app').replace('{number}', '7') })),
     )
-    assert.equal(operations.length, 6)
+    assert.equal(operations.length, 7)
     for (const { method, path } of operations) {
       // A body that is not a JSON object stops a start route before it starts a run.
       const init = { headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, method, ...(method === 'POST' ? { body: '[]' } : {}) }
       const { status } = await fetch(`${worker.url}${path}`, init)
       assert.ok(status !== 404 && status !== 405, `${method} ${path} answered ${status}`)
     }
+    // This Worker has no App secrets, so the inbox names the GitHub App and the missing secrets.
+    const inbox = await fetch(`${worker.url}/inbox`, { headers: { authorization: 'Bearer admin' } })
+    assert.equal(inbox.status, 503)
+    assert.match(await inbox.text(), /GitHub App.*GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY/)
+    assert.equal((await fetch(`${worker.url}/inbox`, { headers: { authorization: 'Bearer admin' }, method: 'POST' })).status, 405)
+    assert.equal((await fetch(`${worker.url}/inbox`)).status, 401)
   } finally {
     await worker.stop()
   }
@@ -407,7 +416,7 @@ test('on Cloudflare, a docs and tests only change takes the light loop, with hos
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
   try {
     const started = (await (await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })).json()) as { run: string }
-    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
+    const done = await until(() => mock.state.comments.find((entry) => /^### agent-factory:/m.test(entry.body)), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/, done.body)
     assert.deepEqual([...new Set(mock.state.turns.map((turn) => turn.role))], ['light'])
     assert.equal(mock.fileAt(`refs/heads/factory/${started.run}`, 'test/Vault.t.sol'), lightFixed.test)
@@ -460,7 +469,7 @@ test('on Cloudflare, deleted source files and the old paths of renamed source fi
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 160)))}\nworker:\n${worker.output().slice(-3000)}`
   try {
     await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { authorization: 'Bearer admin' }, method: 'POST' })
-    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
+    const done = await until(() => mock.state.comments.find((entry) => /^### agent-factory:/m.test(entry.body)), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/, done.body)
     const report = await (await fetch(`${worker.url}/runs/acme/app/7/report`, { headers: { authorization: 'Bearer admin' } })).text()
     assert.match(report, /TRIAGE path=full reason=not-docs-or-tests files=[^\n`]*src\/math\.ts/)
@@ -491,16 +500,27 @@ test('on Cloudflare, a missing permission stops the run at once, and resume cont
 
     // The webhook path does not restart a stopped run. Only the admin route does.
     assert.deepEqual(await (await sendWebhook(worker.url, secret, 'issue_comment', comment('maintainer', '/answer recommended'))).json(), { resumed: false })
+    const resume = (pr: number) => fetch(`${worker.url}/runs/acme/app/${pr}/resume`, { headers: admin, method: 'POST' })
+    // A resume before the fix stops again with the same error: the run posts no new comment (D21).
+    const posted = mock.state.comments.length
+    assert.deepEqual(await (await resume(7)).json(), { reason: 'started the run again from its ledger after the error', resumed: true, state: 'error' })
+    await until(async () => {
+      const status = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: admin })).json()) as { runs: { state: string }[] }
+      return status.runs[0]?.state === 'error' && mock.state.requests.filter((route) => route.endsWith('/actions/runs')).length === 2 ? true : undefined
+    }, 120_000, describe)
+    assert.equal(mock.state.comments.length, posted, describe())
     const calls = modelCalls()
     mock.state.ciStatus = 200
-    const resume = (pr: number) => fetch(`${worker.url}/runs/acme/app/${pr}/resume`, { headers: admin, method: 'POST' })
     assert.deepEqual(await (await resume(7)).json(), { reason: 'started the run again from its ledger after the error', resumed: true, state: 'error' })
-    const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
+    const done = await until(() => mock.state.comments.find((entry) => /^### agent-factory:/m.test(entry.body)), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/)
     assert.ok(!mock.state.comments.some((entry) => entry.body.includes('agent-factory:questions')), describe())
     assert.match(done.body, /## Decisions the run made\n\n- May sub return a negative number\? \*\*Yes, return -2\*\*/)
     // Only the intent check was left: the reviewers and patch agents did not run again.
     assert.ok(modelCalls() - calls <= 2, `${modelCalls() - calls} model calls after resume`)
+    // The run has one status comment, and it shows the result.
+    const statuses = mock.state.comments.filter((entry) => entry.body.startsWith('<!-- agent-factory:status run='))
+    assert.deepEqual(statuses, [done], describe())
 
     const finished = await resume(7)
     assert.equal(finished.status, 202)
@@ -535,8 +555,8 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     const started = (await (await sendWebhook(worker.url, secret, 'issue_comment', issueComment)).json()) as { run: string; started: boolean }
     assert.equal(started.started, true)
     // The intake agent raised no user question, so the run takes its recommendations and does not ask on the issue (D11).
-    const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
-    assert.match(done.body, /^# Development run: READY/, done.body)
+    const done = await until(() => on(5).find((entry) => /^# Development run:/m.test(entry.body)), 240_000, describe)
+    assert.match(done.body, /^# Development run: READY/m, done.body)
     assert.match(done.body, /^- Alarm calls: [1-9]\d* planned stops?, \d+ crash restarts?$/m, done.body)
     assert.ok(!on(5).some((entry) => entry.body.includes('agent-factory:questions')), describe())
     assert.match(done.body, /## Decisions the run made\n\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\*/)
@@ -558,7 +578,7 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     assert.match(outputs, /checkpoint refused:.*test\/run.log/)
 
     // The review loop ran as a review run of the new PR, and the report went to the PR and the issue.
-    assert.ok(on(number).some((entry) => entry.body.startsWith('### agent-factory: PASS')), describe())
+    assert.ok(on(number).some((entry) => /^### agent-factory: PASS/m.test(entry.body)), describe())
     assert.ok(on(number).some((entry) => entry.body.startsWith('# Development run: READY')))
     // Each run added the label of its kind: the development run to the issue, and the review run of the pass to the PR.
     assert.deepEqual([mock.state.labels.get(5), mock.state.labels.get(number)], [['agent-develop'], ['agent-review']])
@@ -606,8 +626,8 @@ test('on Cloudflare, /develop asks a user question of the intake agent on the is
     mock.comment('maintainer', '/answer recommended', 5)
     await sendWebhook(worker.url, secret, 'issue_comment', { ...issueComment, comment: { body: '/answer recommended', user: { login: 'maintainer' } } })
 
-    const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
-    assert.match(done.body, /^# Development run: READY/, done.body)
+    const done = await until(() => on(5).find((entry) => /^# Development run:/m.test(entry.body)), 240_000, describe)
+    assert.match(done.body, /^# Development run: READY/m, done.body)
     assert.equal(on(5).filter((entry) => entry.body.includes('agent-factory:questions')).length, 1, describe())
     assert.match(asked.body.split('\n')[0]!, /^@maintainer$/i)
     assert.doesNotMatch(done.body, /@Maintainer/i)

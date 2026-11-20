@@ -3,11 +3,10 @@ import module from 'nanocode-ts/nanocode_wasm.wasm'
 import { commandChecker, hasCi, type RepoConfig } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Checker } from '../core/platform.ts'
-import { commentChannel, commentLimit, type Comments } from '../core/questions.ts'
+import { commentLimit, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { parsePrices, zeroTokens, type RunUsage } from '../core/usage.ts'
 import { allowedModelsFrom, codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
-import { reviewAnnouncement } from './announcements.ts'
 import { boxMachine, syncWithSetup } from './box.ts'
 import { ciChecker, reviewChecker } from './checker.ts'
 import { baseConfig } from './config.ts'
@@ -17,7 +16,7 @@ import { workLabels } from './labels.ts'
 import { loopChoices, type PreflightNeeds } from './preflight.ts'
 import { githubRepo, type GitHubRepo, type PullRequest } from './repo.ts'
 import { githubSigning } from './signing.ts'
-import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs, type Call, type RunMachine } from './runs.ts'
+import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs, type Call, type RunMachine, type RunResult } from './runs.ts'
 import { sqlFiles, sqlLedger } from './storage.ts'
 
 export { allowedUsers, type Env } from './runs.ts'
@@ -35,6 +34,7 @@ export type ReviewOutcome = { waiting: string } | (LoopResult & { waiting?: unde
 /** The review runs of one PR. */
 export class PullRequestRuns extends Runs<StartRequest> {
   protected readonly label = workLabels.review
+  protected readonly kind = 'review'
 
   protected number(request: StartRequest) {
     return request.pr
@@ -42,10 +42,6 @@ export class PullRequestRuns extends Runs<StartRequest> {
 
   protected runName(request: StartRequest, stamp: string) {
     return `pr-${request.pr}-${stamp}`
-  }
-
-  protected announcement(run: string, request: StartRequest) {
-    return reviewAnnouncement(run, request.by)
   }
 
   /** The result of a review run, with its fixes as a commit on GitHub, or what the run waits for. */
@@ -70,7 +66,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     }
   }
 
-  protected async execute(run: string, request: StartRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call) {
+  protected async execute(run: string, request: StartRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call): Promise<RunResult> {
     const recorded = ledger.get<LoopInput>('input')
     // A run that started before a model role existed has no choice for it: use the default.
     const input = recorded ? { ...recorded, models: mergeModels(recorded.models) } : await this.input(run, request, gh)
@@ -84,7 +80,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     const ci = ciChecker({ branch, gh, ledger, pull, repo, timeoutMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000 })
     const machine = input.config.tests || hasCi(input.config) ? await call.machine() : undefined
     const result = await codeReviewLoop(input, {
-      channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, pollMs: 0, waitMs: 0 }),
+      channel: this.channel(comments, answerersOf(this.env, input.config.answerers), call),
       checker: machine ? machineChecker(machine, run, repo, input.config, ci, log) : ci,
       credentials: credentialsFor(this.env, providersOf(input.models)),
       files: sqlFiles(this.ctx.storage.sql, run),
@@ -98,7 +94,12 @@ export class PullRequestRuns extends Runs<StartRequest> {
       signing: { apply: signing.apply, check: (branches) => signing.check([...branches, branch]) },
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
-    return { passed: result.pass, summary: summary(run, result) }
+    const done = { passed: result.pass, summary: summary(run, result) }
+    // The development run that started a review carries its result, so the review needs nothing from the user (D21).
+    if (request.stopAtBudget) return done
+    if (!result.pass) return { ...done, attention: { kind: 'failed', reason: 'the review failed' } }
+    if (request.ship) return { ...done, attention: { kind: 'ready', reason: 'the PR passed the review and waits for a merge', url: `https://github.com/${request.owner}/${request.repo}/pull/${request.pr}` } }
+    return done
   }
 
   /** The base config, when it is not recorded, says whether the run tests on the build container. A fork PR stops here. */

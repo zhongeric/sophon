@@ -32,8 +32,8 @@ async function startFor(mock: Mock, workerVars: Record<string, string>) {
 }
 
 /**
- * Starts a review run on the PR and waits for its preflight comment. Checks that the comment is the only comment on the
- * PR, that no agent turn ran, and that the run waits with error.
+ * Starts a review run on the PR and waits for its preflight comment. Checks that the PR has only the status comment and
+ * this comment, that no agent turn ran, and that the run waits with error.
  */
 async function failedPreflight(mock: Mock, worker: Worker, pr: number): Promise<string> {
   const on = () => mock.state.comments.filter((entry) => entry.issue === pr)
@@ -43,7 +43,8 @@ async function failedPreflight(mock: Mock, worker: Worker, pr: number): Promise<
   assert.match(failed.body, new RegExp(`^agent-factory did not start run \`pr-${pr}-[^\`]+\`: the preflight found failed checks\\.\n\n<details><summary>Failed checks</summary>\n\n- \\*\\*`))
   assert.match(failed.body, /\n\n<\/details>\n\nAfter you fix them/)
   assert.match(failed.body, new RegExp(`After you fix them, continue the run with \`npm run remote -- resume acme/app#${pr}\`\\.$`))
-  assert.equal(on().length, 1, describe())
+  assert.equal(on().length, 2, describe())
+  assert.match(on()[0]!.body, new RegExp(`^<!-- agent-factory:status run=pr-${pr}-[^ ]+ -->\n[\\s\\S]*\\*\\*State:\\*\\* stopped: the preflight found failed checks`), describe())
   assert.equal(mock.state.turns.length, 0, describe())
   const status = (await (await fetch(`${worker.url}/runs/acme/app/${pr}`, { headers: admin })).json()) as { runs: { state: string; note: string }[] }
   assert.equal(status.runs[0]?.state, 'error')
@@ -87,10 +88,10 @@ test('on Cloudflare, a review without a workflow file and a refused probe each f
     const probes = mock.state.probes.length
     const resumed = await fetch(`${worker.url}/runs/acme/app/7/resume`, { headers: admin, method: 'POST' })
     assert.deepEqual(await resumed.json(), { reason: 'started the run again from its ledger after the error', resumed: true, state: 'error' })
-    const done = await until(() => on(7).find((entry) => entry.body.startsWith('### agent-factory:')), 150_000, describe)
+    const done = await until(() => on(7).find((entry) => /^### agent-factory:/m.test(entry.body)), 150_000, describe)
     assert.match(done.body, /agent-factory: PASS/, done.body)
     assert.deepEqual(new Set(mock.state.probes.slice(probes).map((probe) => probe.provider)), new Set(['claude', 'codex']))
-    assert.equal(on(7).filter((entry) => entry.body.startsWith('agent-factory started review run')).length, 1, describe())
+    assert.equal(on(7).filter((entry) => entry.body.startsWith('<!-- agent-factory:status run=pr-7-')).length, 1, describe())
     assert.equal(on(7).filter((entry) => entry.body.includes('did not start run')).length, 1, describe())
   } finally {
     await worker.stop()

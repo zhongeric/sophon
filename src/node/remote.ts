@@ -5,7 +5,7 @@ import { parseParallel } from '../core/plan.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
 
-const usage = `Usage: npm run remote -- <command> <number or repo> [options]
+const usage = `Usage: npm run remote -- <command> [<number or repo>] [options]
 
 Drives the Cloudflare Worker without the GitHub webhook.
 
@@ -22,6 +22,8 @@ Commands:
   report <number>   Print the report of the latest run
   prune <repo>      Delete the factory/* branches that are merged, applied or stranded, and print each deleted,
                     kept and failed branch (exit 0 also with failed deletes)
+  inbox             Print what the runs of all repositories of the GitHub App need from you: open questions,
+                    failed, blocked and stopped runs, and ready PRs that the host did not merge. It takes no target
 
 <pr>, <issue> and <number> are owner/repo#123, or a GitHub PR or issue URL. <repo> is owner/repo, or its GitHub URL.
 
@@ -80,6 +82,39 @@ export function pruneOutcome({ ok, text }: { ok: boolean; text: string }): { cod
   return { code: 0, text: lines.length > 0 ? lines.join('\n') : 'no factory/* branches' }
 }
 
+type InboxItem = { kind: string; repository: string; number: number; run: string; reason: string; link: string }
+type InboxFailure = { repository: string; reason: string }
+
+const fieldsOf = (value: unknown): Record<string, unknown> | null =>
+  typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null
+const hasStrings = (value: unknown, keys: string[]) => keys.every((key) => typeof fieldsOf(value)?.[key] === 'string')
+const isInboxItem = (value: unknown): value is InboxItem =>
+  hasStrings(value, ['kind', 'repository', 'run', 'reason', 'link']) &&
+  ['question', 'failed', 'blocked', 'error', 'ready'].includes(String(fieldsOf(value)?.kind)) &&
+  Number.isInteger(fieldsOf(value)?.number)
+const isInboxFailure = (value: unknown): value is InboxFailure => hasStrings(value, ['repository', 'reason'])
+
+/**
+ * Gives the lines and the exit code for an inbox response: one line for each item and for each repository that the
+ * Worker could not read. A failed route, or a body that is not the inbox, gives the raw text and exit code 1.
+ */
+export function inboxOutcome({ ok, text }: { ok: boolean; text: string }): { code: number; text: string } {
+  if (!ok) return { code: 1, text }
+  let body: unknown
+  try {
+    body = JSON.parse(text)
+  } catch {
+    return { code: 1, text }
+  }
+  const [items, failed] = [fieldsOf(body)?.items, fieldsOf(body)?.failed]
+  if (!Array.isArray(items) || !Array.isArray(failed) || !items.every(isInboxItem) || !failed.every(isInboxFailure)) return { code: 1, text }
+  const lines = [
+    ...items.map((item) => `${item.kind} ${item.repository}#${item.number} ${item.run}: ${item.reason} ${item.link}`),
+    ...failed.map((failure) => `not read ${failure.repository}: ${failure.reason}`),
+  ]
+  return { code: 0, text: lines.length > 0 ? lines.join('\n') : 'the inbox is empty' }
+}
+
 /**
  * Gives the text and the exit code for a resume response.
  * A body without a boolean `resumed` gives the raw text and exit code 1.
@@ -130,6 +165,10 @@ export type RemoteRequest = { body?: string; method: 'GET' | 'POST'; path: strin
 export function remoteRequest(command: string, target: string, options: RemoteOptions): RemoteRequest {
   if (options.budget !== undefined && command !== 'start' && command !== 'develop' && command !== 'research')
     throw new StopError('only start, develop and research take --budget')
+  if (command === 'inbox') {
+    if (target) throw new StopError('inbox takes no target: it lists all repositories')
+    return { method: 'GET', path: '/inbox' }
+  }
   if (command === 'research')
     for (const flag of ['hotfix', 'full', 'ship'] as const) if (options[flag]) throw new StopError(`research does not take --${flag}`)
   if (command === 'prune') {
@@ -168,18 +207,19 @@ async function main(): Promise<number> {
     },
   })
   const [command, target] = positionals
-  if (values.help || !command || !target) {
+  // Only inbox takes no target.
+  if (values.help || !command || (!target && command !== 'inbox')) {
     console.log(usage)
     return values.help ? 0 : 2
   }
-  const request = remoteRequest(command, target, values)
+  const request = remoteRequest(command, target ?? '', values)
   const factory = setting('FACTORY_URL').replace(/\/$/, '')
   const headers: Record<string, string> = { authorization: `Bearer ${setting('ADMIN_TOKEN')}` }
   if (request.body !== undefined) headers['content-type'] = 'application/json'
   const response = await fetch(`${factory}${request.path}`, { body: request.body, headers, method: request.method })
   const text = await response.text()
-  if (command === 'prune') {
-    const outcome = pruneOutcome({ ok: response.ok, text })
+  if (command === 'prune' || command === 'inbox') {
+    const outcome = (command === 'prune' ? pruneOutcome : inboxOutcome)({ ok: response.ok, text })
     console.log(outcome.text)
     return outcome.code
   }

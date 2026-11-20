@@ -80,6 +80,34 @@ export function openApi(origin: string) {
           },
           required: ['resumed', 'state', 'reason'],
         },
+        InboxItem: {
+          type: 'object',
+          properties: {
+            kind: {
+              type: 'string',
+              enum: ['question', 'failed', 'blocked', 'error', 'ready'],
+              description: 'question: open questions. error: the run stopped, and resumeRun starts it again. ready: a PR that waits for a merge',
+            },
+            repository: { type: 'string', description: 'owner/repo' },
+            number: { type: 'integer', description: 'The number of the issue or the PR' },
+            run: { type: 'string', description: 'The run ID' },
+            reason: { type: 'string' },
+            link: { type: 'string', description: 'Where you act: the questions, the result or stop comment, or the PR' },
+          },
+          required: ['kind', 'repository', 'number', 'run', 'reason', 'link'],
+        },
+        Inbox: {
+          type: 'object',
+          properties: {
+            items: { type: 'array', items: ref('InboxItem') },
+            failed: {
+              type: 'array',
+              description: 'The repositories or installations that the Worker could not read',
+              items: { type: 'object', properties: { repository: { type: 'string' }, reason: { type: 'string' } }, required: ['repository', 'reason'] },
+            },
+          },
+          required: ['items', 'failed'],
+        },
         Budget: {
           type: 'number',
           exclusiveMinimum: 0,
@@ -89,6 +117,19 @@ export function openApi(origin: string) {
       },
     },
     paths: {
+      '/inbox': {
+        get: {
+          operationId: 'getInbox',
+          summary: 'List what the runs need from you',
+          description:
+            'For each open issue and PR with a work label in the repositories of the GitHub App: open questions, failed, blocked or stopped runs, and ready PRs that the host did not merge.',
+          responses: {
+            200: { description: 'The inbox', content: json(ref('Inbox')) },
+            401: unauthorized,
+            503: { description: 'The Worker has no GitHub App. The text names the missing secrets.', content: { 'text/plain': { schema: { type: 'string' } } } },
+          },
+        },
+      },
       '/runs/{owner}/{repo}/{number}': {
         parameters: target,
         get: {

@@ -21,18 +21,21 @@ export type WorkSweep = {
   log: (line: string) => void
 }
 
-type Repository = { name: string; owner: { login: string } }
-type Issue = { number: number; pull_request?: unknown }
+export type Repository = { name: string; owner: { login: string } }
+/** An issue or a PR of the issue list. The sweep reads only `number` and `pull_request`. */
+export type Issue = { number: number; pull_request?: unknown; state?: unknown; labels?: unknown }
 type IssueEvent = { event: string; label?: { name: string } | null; actor?: { login: string } | null }
 
 const pageSize = 100
-const kinds = Object.keys(workLabels) as WorkKind[]
+export const kinds = Object.keys(workLabels) as WorkKind[]
 
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
-const isInstallation = (value: unknown): value is { id: number } => isRecord(value) && Number.isInteger(value.id)
-const isRepository = (value: unknown): value is Repository =>
+export const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+export const isInstallation = (value: unknown): value is { id: number } => isRecord(value) && Number.isInteger(value.id)
+export const isRepository = (value: unknown): value is Repository =>
   isRecord(value) && typeof value.name === 'string' && isRecord(value.owner) && typeof value.owner.login === 'string'
-const isIssue = (value: unknown): value is Issue => isRecord(value) && Number.isInteger(value.number)
+export const isIssue = (value: unknown): value is Issue => isRecord(value) && Number.isInteger(value.number)
+/** The repositories of an installation are in the `repositories` field of the answer. */
+export const repositoriesOf = (answer: unknown) => (isRecord(answer) ? answer.repositories : undefined)
 const requireEvent = (value: unknown): value is IssueEvent => {
   if (
     isRecord(value) &&
@@ -46,16 +49,22 @@ const requireEvent = (value: unknown): value is IssueEvent => {
 
 /**
  * All pages of a GitHub list, with only the entries that `is` accepts. `list` takes the array from an answer that is not
- * an array. An answer without an array throws, and the sweep logs each entry that `is` refuses.
+ * an array. An answer without an array throws, and `skip` gets the path of each entry that `is` refuses.
  */
-async function pages<T>(sweep: WorkSweep, gh: GitHub, path: string, is: (value: unknown) => value is T, list = (answer: unknown) => answer): Promise<T[]> {
+export async function pages<T>(
+  skip: (path: string) => void,
+  gh: GitHub,
+  path: string,
+  is: (value: unknown) => value is T,
+  list = (answer: unknown) => answer,
+): Promise<T[]> {
   const all: T[] = []
   for (let page = 1; ; page++) {
     const batch = list(await gh.json<unknown>('GET', `${path}${path.includes('?') ? '&' : '?'}per_page=${pageSize}&page=${page}`))
     if (!Array.isArray(batch)) throw new Error(`GitHub GET ${path} gave no list`)
     for (const entry of batch) {
       if (is(entry)) all.push(entry)
-      else sweep.log(`the work sweep skips an entry of GET ${path} with an incorrect shape`)
+      else skip(path)
     }
     if (batch.length < pageSize) return all
   }
@@ -68,9 +77,10 @@ async function pages<T>(sweep: WorkSweep, gh: GitHub, path: string, is: (value: 
  */
 export async function sweepWork(sweep: WorkSweep): Promise<void> {
   const allowed = new Set(sweep.allowed.map((login) => login.toLowerCase()))
+  const skip = (path: string) => sweep.log(`the work sweep skips an entry of GET ${path} with an incorrect shape`)
   let installations: { id: number }[]
   try {
-    installations = await pages(sweep, sweep.app, '/app/installations', isInstallation)
+    installations = await pages(skip, sweep.app, '/app/installations', isInstallation)
   } catch (error) {
     sweep.log(`the work sweep cannot list the installations: ${reasonOf(error)}`)
     return
@@ -79,7 +89,7 @@ export async function sweepWork(sweep: WorkSweep): Promise<void> {
     let repositories: Repository[]
     const gh = sweep.installation(id)
     try {
-      repositories = await pages(sweep, gh, '/installation/repositories', isRepository, (answer) => (isRecord(answer) ? answer.repositories : undefined))
+      repositories = await pages(skip, gh, '/installation/repositories', isRepository, repositoriesOf)
     } catch (error) {
       sweep.log(`the work sweep cannot list the repositories of installation ${id}: ${reasonOf(error)}`)
       continue
@@ -91,7 +101,7 @@ export async function sweepWork(sweep: WorkSweep): Promise<void> {
         const label = workLabels[kind]
         let issues: Issue[]
         try {
-          issues = await pages(sweep, gh, `/repos/${owner}/${repo}/issues?state=open&labels=${encodeURIComponent(label)}`, isIssue)
+          issues = await pages(skip, gh, `/repos/${owner}/${repo}/issues?state=open&labels=${encodeURIComponent(label)}`, isIssue)
         } catch (error) {
           sweep.log(`the work sweep cannot list the ${label} items of ${owner}/${repo}: ${reasonOf(error)}`)
           continue
@@ -100,7 +110,7 @@ export async function sweepWork(sweep: WorkSweep): Promise<void> {
         for (const { number } of issues.filter((found) => (kind === 'review') === Boolean(found.pull_request))) {
           try {
             if (await sweep.hasRun(kind, owner, repo, number)) continue
-            const events = await pages(sweep, gh, `/repos/${owner}/${repo}/issues/${number}/events`, requireEvent)
+            const events = await pages(skip, gh, `/repos/${owner}/${repo}/issues/${number}/events`, requireEvent)
             // GitHub lists the events from the oldest, so the last match is the latest.
             const by = events.filter((event) => event.event === 'labeled' && event.label?.name === label).at(-1)?.actor?.login
             if (!by || !allowed.has(by.toLowerCase())) continue

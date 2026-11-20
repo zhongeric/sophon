@@ -92,13 +92,14 @@ test('on Cloudflare, /research runs the research workflow on an issue and opens 
         }
         await say(asked.issue, /batch=pick /.test(asked.body) ? '/answer\nQ1: a' : '/answer recommended')
       }
-      return on(5).find((entry) => entry.body.startsWith('# Research run:'))
+      return on(5).find((entry) => /^# Research run:/m.test(entry.body))
     },
     540_000,
     describe,
   )
-  assert.match(result.body, /^# Research run: READY/, describe())
-  assert.ok(on(5).some((entry) => entry.body.startsWith(`agent-factory started research run \`${started.run}\``)))
+  assert.match(result.body, /^# Research run: READY/m, describe())
+  // The result needs nothing from the user, so it is in the status comment of the run.
+  assert.ok(result.body.startsWith(`<!-- agent-factory:status run=${started.run} -->`), describe())
   assert.deepEqual(mock.state.labels.get(5), ['agent-research'])
   const dossier = [...mock.state.pulls.values()].find((pull) => pull.head.startsWith(`factory/research-${started.run}`))
   assert.ok(dossier, describe())

@@ -113,8 +113,8 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 - **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
   fixes stay on `factory/<run>`. The run deletes it at its end after `--ship` or a closed PR.
 - **Models:** `--models file.json` sets the model of each role.
-- **Budget:** `--budget <usd>` sets a soft limit on the spend of a run. At the budget, the run posts a notice and
-  continues. At two times the budget, it asks you to raise the budget or stop, and `/answer recommended` raises it to
+- **Budget:** `--budget <usd>` sets a soft limit on the spend of a run. At the budget, the run shows a notice and
+  continues. On Cloudflare, the notice is in the status comment. At two times the budget, it asks you to raise the budget or stop, and `/answer recommended` raises it to
   two times the spend. Prices come from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`,
   `cached_input`, `cache_write`, `output`). Each report shows the usage of each step.
 - **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
@@ -143,7 +143,9 @@ as a secret to use budgets. The `secret` of a research credential is the name of
 
 `npm run remote` starts and follows runs. It reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from
 `.secrets/cloudflare.env`. For other tools, `https://<worker>/openapi.json` describes the same routes. A run that stops on
-an error that can pass starts again by itself after 30 minutes, at most three times.
+an error that can pass starts again by itself after 30 minutes, at most three times. Each run keeps one status comment
+on its issue or PR, and posts a new comment only when you must act: questions, a failed, blocked or stopped run, or a
+ready PR that the host did not merge. The inbox lists these for all repositories of the App.
 
 ```bash
 npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full, --budget)
@@ -152,6 +154,7 @@ npm run remote -- research acme/app#45   # a research run on a program issue (--
 npm run remote -- resume acme/app#45     # wake a paused run, or start a run that stopped on an error
 npm run remote -- status acme/app#45     # or report
 npm run remote -- prune acme/app         # delete the merged, applied and stranded factory/* branches
+npm run remote -- inbox                  # what the runs need from you, with links (needs the App)
 npm run metrics                          # CPU, memory and network of each build container
 ```
 
