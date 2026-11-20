@@ -116,6 +116,19 @@ test('research: after an analyst change, only the analysis runs again when the r
   assert.match(result.report, /Reproduction at [0-9a-f]{12} \(output artifact [0-9a-f]{64}\): PASS/)
 })
 
+test('research: the analysis build runs no ci commands of the notebook', { timeout: 300_000 }, async () => {
+  const { repo, base } = notebook({ config: { checks: { smoke: 'true' }, ci: { broken: 'false' }, research: researchConfig } })
+  const turns: Turn[] = []
+  const { channel } = memoryChannel({ pick: '/answer\nQ1: a' })
+  const { result } = await runResearch(repo, mkdtempSync(join(tmpdir(), 'factory-research-runs-')), researchInput(base, 'a5'), {
+    channel,
+    dispatch: scriptedDispatch(researchScript(), turns),
+  })
+  // The builder got no ci refusal, and the analysis passed. The review loop of the dossier PR keeps its ci gate.
+  assert.ok(!turns.some((turn) => turn.role === 'builder' && turn.request.includes('the ci commands failed')))
+  assert.match(result.report, /Analysis round \d at [0-9a-f]{12}: PASS/)
+})
+
 test('research: a reproduction without the analysis hash blocks the run before the push', { timeout: 300_000 }, async () => {
   const { result, origin, pulls } = await analysisRun('a4', {}, { reproduce: `OMIT_ANALYSIS=1 ${researchConfig.commands.reproduce}` })
   assert.equal(result.status, 'blocked', result.report)

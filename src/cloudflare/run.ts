@@ -1,6 +1,6 @@
 import { Sql } from 'nanocode-ts/cloudflare'
 import module from 'nanocode-ts/nanocode_wasm.wasm'
-import { commandChecker, type RepoConfig } from '../core/checks.ts'
+import { commandChecker, hasCi, type RepoConfig } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Checker } from '../core/platform.ts'
 import { commentChannel, commentLimit, type Comments } from '../core/questions.ts'
@@ -78,7 +78,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     const repo = githubRepo({ branch, gh, ledger, log, pull, runId: run, sql })
     const signing = githubSigning(gh, request.owner, request.repo)
     const ci = ciChecker({ branch, gh, ledger, pull, repo, timeoutMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000 })
-    const machine = input.config.tests ? await call.machine() : undefined
+    const machine = input.config.tests || hasCi(input.config) ? await call.machine() : undefined
     const result = await codeReviewLoop(input, {
       channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, pollMs: 0, waitMs: 0 }),
       checker: machine ? machineChecker(machine, run, repo, input.config, ci, log) : ci,
@@ -131,7 +131,7 @@ function machineChecker({ box, syncs, jobs }: RunMachine, run: string, repo: Git
   const pending = new Map<string, Promise<void>>()
   // The setup runs after each full copy, so a container that came back empty installs its dependencies again.
   const sync = () => syncWithSetup(box, syncs, pending, repo.tree, dir, { command: config.setup, timeoutMs: setupTimeoutMs }, log, jobs)
-  return reviewChecker(ci, commandChecker(repo, { ...config, setup: undefined }, boxMachine(box, dir, sync, jobs)))
+  return reviewChecker(ci, commandChecker(repo, { ...config, setup: undefined }, boxMachine(box, dir, sync, jobs)), repo.publish)
 }
 
 function summary(run: string, result: LoopResult): string {
