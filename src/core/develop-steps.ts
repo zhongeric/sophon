@@ -142,6 +142,11 @@ export type BuildTask = {
   checker: Checker
   /** The commit that the work started from, for the files that run_checks checks and the targeted tests at submit. */
   base: string
+  /**
+   * In a repair round of a base merge with a conflict: the files that the merge brings, without the files that conflict.
+   * They are not the work of the builder, so the scope check of checkpoint and the list of changes at submit skip them (D16).
+   */
+  baseFiles?: string[]
   review: Record<string, string>
   prompt: string
   /** The start of each checkpoint's commit message. */
@@ -176,6 +181,7 @@ const continuePrompt = (remaining: string) =>
  */
 export async function build(context: DevelopContext, task: BuildTask): Promise<BuildLog> {
   const { branch, checker } = task
+  const baseFiles = new Set(task.baseFiles)
   const ledger = context.host.ledger
   const startKey = `start:${task.turn.key}`
   const start = ledger.get<string>(startKey) ?? (await branch.head())
@@ -198,7 +204,7 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
         const pending = await branch.pending()
         if (pending.changed.length === 0 && pending.diff.trim() === '') throw new Error('nothing to commit')
         // A command, for example a test run or the setup, can change files outside the scope of the builder.
-        const outside = [...pending.changed, ...pending.removed].filter((path) => !inScope(path, task.scope))
+        const outside = [...pending.changed, ...pending.removed].filter((path) => !inScope(path, task.scope) && !baseFiles.has(path))
         if (outside.length > 0)
           throw new Error(`checkpoint refused: these changes are outside the files of the task, and only the user can commit them: ${outside.join(', ')}. If the task needs them, say so in blocked.`)
         const problems = staticFindings(pending.diff, pending.changed, task.active).map(
@@ -234,8 +240,10 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       if (pending.changed.length > 0 || pending.diff.trim() !== '') throw new Error(`checkpoint first: uncommitted changes in ${pending.changed.join(', ') || 'deleted files'}`)
       const head = await branch.head()
       const changed = head === start ? [] : await branch.changedFiles(start, head)
-      if (changed.length === 0) throw new Error('no commits since the task started: checkpoint your work, or say in blocked why you cannot finish')
-      const missing = changed.filter((path) => !log.changes.some((change) => change.path.replace(/^\/repo\//, '') === path))
+      // A merge commit of the base can keep the tree of the start, for example when the fixer keeps its side of each conflict.
+      if (head === start || (changed.length === 0 && !task.baseFiles))
+        throw new Error('no commits since the task started: checkpoint your work, or say in blocked why you cannot finish')
+      const missing = changed.filter((path) => !baseFiles.has(path) && !log.changes.some((change) => change.path.replace(/^\/repo\//, '') === path))
       if (missing.length > 0) throw new Error(`list every changed file in changes: missing ${missing.join(', ')}`)
       const refuse = (cause: string, failed: CheckResult[]) =>
         new Error([`${cause}. Fix the cause, checkpoint and submit again. When you cannot fix it, submit with the reason in blocked.`, ...failureText(failed)].join('\n'))

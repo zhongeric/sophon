@@ -239,12 +239,15 @@ function stubbed(...answers: (unknown | Error)[]) {
   return { calls, stub }
 }
 
-test('a PR merge sends the method and the head, and a refusal of GitHub throws', async () => {
-  const refusal = new GitHubError(409, 'GitHub PUT /repos/acme/app/pulls/7/merge answered HTTP 409: Head branch was modified')
-  const { calls, stub } = stubbed({ merged: true, sha: 'abc123', message: 'Pull Request successfully merged' }, refusal)
+test('a PR merge sends the method and the head, a stale refusal is a result, and other refusals of GitHub throw', async () => {
+  const stale = new GitHubError(409, 'GitHub PUT /repos/acme/app/pulls/7/merge answered HTTP 409: Head branch was modified')
+  const refusal = new GitHubError(405, 'GitHub PUT /repos/acme/app/pulls/7/merge answered HTTP 405: Pull Request is not mergeable')
+  const unread = new GitHubError(404, 'Not Found')
+  const { calls, stub } = stubbed({ merged: true, sha: 'abc123', message: 'Pull Request successfully merged' }, stale, unread, refusal, unread)
   const pulls = githubPulls(stub, 'acme', 'app', 'main')
   assert.deepEqual(await pulls.merge(7, { method: 'squash', sha: 'f00d' }), { merged: true, sha: 'abc123' })
   assert.deepEqual(calls, [{ method: 'PUT', path: '/repos/acme/app/pulls/7/merge', body: { merge_method: 'squash', sha: 'f00d' } }])
+  assert.deepEqual(await pulls.merge(7, { method: 'rebase', sha: 'f00d' }), { merged: false, reason: stale.message, kind: 'stale' })
   await assert.rejects(pulls.merge(7, { method: 'rebase', sha: 'f00d' }), refusal)
 })
 

@@ -5,6 +5,12 @@ import { gh } from './channels.ts'
 
 const logTailChars = 6_000
 
+/** gh api gives the HTTP status of a failed call only in its error text, for example "... (HTTP 409)". */
+const httpStatus = (error: unknown): number | undefined => {
+  const status = /\(HTTP (\d{3})\)/.exec(error instanceof Error ? error.message : String(error))?.[1]
+  return status === undefined ? undefined : Number(status)
+}
+
 /** The PRs and CI of the repository at `repo`, through the gh CLI and its login. */
 export function ghPullRequests(repo: string, baseRef: string): PullRequests {
   const run = gh(repo)
@@ -23,7 +29,7 @@ export function ghPullRequests(repo: string, baseRef: string): PullRequests {
     },
     // The merge API merges immediately or refuses. gh pr merge can add the PR to a merge queue.
     // The answer gives the merge commit, so the host does not make a second call after the merge.
-    merge: (pr, { method, sha }) => mergePull(put, get, `repos/{owner}/{repo}/pulls/${pr}`, method, sha),
+    merge: (pr, { method, sha }) => mergePull(put, get, `repos/{owner}/{repo}/pulls/${pr}`, method, sha, httpStatus),
     async comment(pr, body) {
       await run(['pr', 'comment', String(pr), '--body-file', '-'], body)
     },
