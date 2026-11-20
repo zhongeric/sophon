@@ -28,6 +28,8 @@ export type RepoConfig = {
   timeout_ms?: number
   /** The standing permission for the host to merge a ready development PR, with this method. Without it, the host does not merge. */
   merge?: MergeMethod
+  /** The standing answer to every question of a run: the host takes the recommendation and asks nobody (D11). */
+  questions?: 'recommended'
   /** The domain of a research notebook: section 6.3 of docs/specs/research-workflow.md. */
   research?: ResearchConfig
 }
@@ -41,6 +43,7 @@ export function parseRepoConfig(text: string, source: string): Partial<RepoConfi
     throw new StopError(`${source}: checks must be an object of named commands`)
   if (config.tests && !/\{tests?\}/.test(config.tests.command)) throw new StopError(`${source}: tests.command needs {test} or {tests}`)
   if ('merge' in config && !mergeMethods.includes(config.merge)) throw new StopError(`${source}: merge must be "squash", "merge" or "rebase"`)
+  if ('questions' in config && config.questions !== 'recommended') throw new StopError(`${source}: questions must be "recommended"`)
   if (config.research !== undefined) config.research = parseResearchConfig(config.research, source)
   return config
 }

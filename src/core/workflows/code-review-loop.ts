@@ -168,7 +168,9 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   if (resolveBudget(deps.ledger, input.budget, input.budgetOverride) !== undefined) checkPriced(loopModelIds(input.models), prices)
 
   const { ledger, repo } = deps
-  const budget = budgetGate({ channel: deps.channel, ledger, log: deps.log, prices, runId: input.runId, stopAtBudget: input.stopAtBudget === true })
+  // The standing answers of the repository take every recommendation (D11).
+  const recommend = input.config.questions === 'recommended'
+  const budget = budgetGate({ channel: deps.channel, ledger, log: deps.log, prices, recommend, runId: input.runId, stopAtBudget: input.stopAtBudget === true })
   // A resume without --budget must not apply the override again, so the recorded input does not keep it.
   const { budgetOverride, ...recorded } = input
   ledger.put('input', recorded)
@@ -200,7 +202,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   deps.log(`froze ${frozen.head.slice(0, 12)} over base ${frozen.base.slice(0, 12)}: ${touched.length} files, ${frozen.location}`)
   deps.log(triageLine(triaged))
 
-  const questions = asker(ledger, deps.channel, input.runId, deps.log)
+  const questions = asker(ledger, deps.channel, input.runId, deps.log, { recommend })
   const gateLog = 'gate-log.txt'
   if (!ledger.get('logged:triage')) {
     deps.files.append(gateLog, `${triageLine(triaged)}\n\n`)

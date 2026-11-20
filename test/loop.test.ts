@@ -499,6 +499,20 @@ test('the user answers the open questions before the gate, and decides the findi
   assert.match(result.report, /## Your decisions\n\n- May sub return a negative number\? \*\*No, throw an error\*\*/)
 })
 
+test('with the standing answers of the repository, the open questions and the held findings take the recommendation, and nothing is posted', async () => {
+  const repo = fixtureRepo()
+  const turns: Turn[] = []
+  const { channel, posted } = memoryChannel({ ask: null, 'step1.gate': null })
+  const base = await loopInput(repo, 'standing')
+  const input = { ...base, config: { ...base.config, questions: 'recommended' as const } }
+  const result = await runLoop(repo, 'standing', runsDir(), { channel, input, dispatch: scriptedDispatch(scriptFor({ holdBug: true, tests: true }), turns) })
+
+  assert.equal(result.pass, true, result.report)
+  assert.deepEqual(posted, [])
+  assert.match(result.report, /## Your decisions\n\n- May sub return a negative number\? \*\*.+\*\* \(recommended\)/)
+  assert.match(result.report, /bugs-001 at src\/math\.ts:6: Subtract b in sub\. Fix it\? \*\*.+\*\* \(recommended\)/)
+})
+
 test('a run without answers pauses, and resumes without asking again or repeating the reviewers', async () => {
   const repo = fixtureRepo()
   const dir = runsDir()

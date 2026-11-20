@@ -168,6 +168,13 @@ test('the merge field is the standing merge permission: squash, merge or rebase,
     assert.throws(() => parseRepoConfig(manifest({ merge }), '.agent-factory.json'), { message: '.agent-factory.json: merge must be "squash", "merge" or "rebase"' }, String(merge))
 })
 
+test('the questions field is the standing answer of the runs: only "recommended"', () => {
+  assert.equal(parseRepoConfig(manifest({ questions: 'recommended' }), 'test').questions, 'recommended')
+  assert.equal('questions' in parseRepoConfig(manifest({}), 'test'), false)
+  for (const questions of [null, true, 'ask', 'Recommended'])
+    assert.throws(() => parseRepoConfig(manifest({ questions }), '.agent-factory.json'), { message: '.agent-factory.json: questions must be "recommended"' }, String(questions))
+})
+
 test('locally, a repository without .agent-factory.json gets the defaults of its working copy, and needs at least one check', async () => {
   const repo = mkdtempSync(join(tmpdir(), 'factory-config-'))
   await assert.rejects(loadRepoConfig(repo), /has no checks/)

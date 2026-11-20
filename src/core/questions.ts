@@ -166,10 +166,15 @@ export function checkQuestions(input: unknown): Question[] {
  * Posts the user questions of each batch one time, and records the answers of all its questions in the ledger.
  * A batch with only run questions takes its recommendations at once, with no post (D11). A posted batch without answers pauses the run. The resumed run reads the answers from where the batch went.
  * With `decisions` false, the answers do not go into the decisions of the run, which the agents read, for example the answers about the cost budget.
+ * With `recommend`, each batch takes its recommendations at once, also for user questions, and posts nothing (a hotfix, or standing answers).
  */
-export function asker(ledger: Ledger, channel: Channel, runId: string, log: (line: string) => void, options: { decisions?: boolean } = {}) {
+export function asker(ledger: Ledger, channel: Channel, runId: string, log: (line: string) => void, options: { decisions?: boolean; recommend?: boolean } = {}) {
   const post = async (batch: string, questions: Question[]) => {
     if (ledger.get(`answers:${batch}`)) return
+    if (options.recommend) {
+      recommend(batch, questions)
+      return
+    }
     // A batch keeps its questions, also when it is from before D11.
     questions = ledger.get<Question[]>(`questions:${batch}`) ?? questions
     ledger.put(`questions:${batch}`, questions)

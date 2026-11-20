@@ -70,6 +70,10 @@ The principles of the development workflow hold. These follow from them.
 | 10 Holdout | none | host | The egress refuses the holdout to agents from the start of the run. It refuses the holdout to box commands only after RG1. The host permits only `evaluate` in stage 10 and `reproduce` in stage 11 to read the holdout. In this stage, the host runs the domain's `evaluate` command on the holdout, with the frozen prereg. Its output is the outcome: recovered, inconsistent, excluded or insufficient. |
 | 11 Dossier | ready PR | writer, then the code review loop on the analysis code | Each number cites an artifact. Each item of the domain's checklist has a status: ruled out, open or not tested. Coverage and completeness. After review fixes, the analysis runs again. A failed analysis or a changed analysis hash fails the run, and the PR stays a draft. The host runs the domain's `reproduce` command on a clean box and compares the hashes of the calibration and of the analysis. |
 
+With the standing answers of D11 (`questions: "recommended"` in the notebook config), no stage asks the user. The host
+confirms the program, takes the recommended cap, picks the first hypothesis, approves each prereg and accepts each
+conceded objection. A blocker still stops the run.
+
 ### Scout
 
 A second, smaller workflow watches for new developments. A cron reads the domain's `feeds`, for example new papers,

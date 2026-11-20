@@ -91,6 +91,8 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
   patch agents and light agents runs only the checks. Their targeted tests run one time, when they submit their log.
 - `merge` (`"squash"`, `"merge"` or `"rebase"`) is the standing permission for the host to merge a ready development
   PR with that method. Without it, the host does not merge.
+- `questions: "recommended"` is the standing answer to every question of a run: the host takes the recommendation, also
+  to raise the budget, and asks nobody. The report lists the answers. `--hotfix` does the same for one run.
 
 The STE dictionary is optional: see [agents/guides/ste/README.md](agents/guides/ste/README.md).
 
