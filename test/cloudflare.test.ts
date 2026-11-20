@@ -241,6 +241,10 @@ test('on Cloudflare, the App webhook secret replaces the webhook secret, and com
   try {
     assert.equal((await sendWebhook(worker.url, secret, 'issue_comment', comment('mallory', '/review'))).status, 401)
     assert.deepEqual(await (await sendWebhook(worker.url, appSecret, 'issue_comment', { ...comment('mallory', '/review'), sender: { login: 'mallory' } })).json(), { ignored: 'not an allowed user' })
+    // The ping of the App has no repository.
+    const ping = await sendWebhook(worker.url, appSecret, 'ping', { hook_id: 1, zen: 'Keep it logically awesome.' })
+    assert.equal(ping.status, 202)
+    assert.deepEqual(await ping.json(), { ignored: 'ping' })
     assert.equal(appLookups(), 0, describe())
 
     const ignored = { ignored: 'the App bot' }
