@@ -4,10 +4,12 @@ import { ScanBoxes } from './scan.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
 import { sameSecret, verifySignature } from './github.ts'
-import { appBotLogin, githubAccess, type BotLogins, type InstallationTokens } from './github-app.ts'
+import { appBotLogin, githubAccess, githubApp, type BotLogins, type InstallationTokens } from './github-app.ts'
+import { workLabels, type WorkKind } from './labels.ts'
 import { openApi } from './openapi.ts'
 import { sweepBranches } from './prune.ts'
 import { allowedUsers, PullRequestRuns, type Env } from './run.ts'
+import { missingAppSecrets, sweepWork, type WorkItem } from './work-sweep.ts'
 
 export { DevelopmentRuns, PullRequestRuns, ResearchRuns, ScanBoxes }
 
@@ -32,6 +34,15 @@ async function prune(env: Env, owner: string, repo: string, only?: (name: string
 }
 
 const botLogins: BotLogins = new Map()
+/** True after the cron logged the missing App secrets in this isolate. */
+let missingLogged = false
+
+/** Starts the run of a work label, from the webhook or the work sweep. A label gives no options, and its review does not ship. */
+function startLabeled(env: Env, kind: WorkKind, { by, number, owner, repo }: WorkItem) {
+  if (kind === 'review') return pullRequest(env, owner, repo, number).start({ by, owner, pr: number, repo, ship: false })
+  if (kind === 'develop') return issue(env, owner, repo, number).start({ by, issue: number, owner, repo })
+  return research(env, owner, repo, number).start({ by, issue: number, owner, repo })
+}
 
 /**
  * The review runs of a PR, else the development or the research runs of an issue: the object whose latest run started
@@ -85,8 +96,27 @@ function budgetOf(body: Record<string, unknown>): { budget?: number } | Response
 }
 
 export default {
-  // The cron trigger of wrangler.jsonc calls this. The sweep of D18 is not built yet.
-  async scheduled(): Promise<void> {},
+  // The cron trigger of wrangler.jsonc calls this every 5 minutes for the work sweep of D18.
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    const missing = missingAppSecrets(env)
+    if (missing) {
+      if (!missingLogged) console.error(missing)
+      missingLogged = true
+      return
+    }
+    const { app, installation } = githubApp(env, tokens)
+    const objectOf = (kind: WorkKind, owner: string, repo: string, number: number) =>
+      kind === 'review' ? pullRequest(env, owner, repo, number) : kind === 'develop' ? issue(env, owner, repo, number) : research(env, owner, repo, number)
+    await sweepWork({
+      allowed: allowedUsers(env),
+      app,
+      hasRun: async (kind, owner, repo, number) => (await objectOf(kind, owner, repo, number).status()).runs.length > 0,
+      installation,
+      log: (line) => console.log(line),
+      prune: (owner, repo) => prune(env, owner, repo),
+      start: (kind, item) => startLabeled(env, kind, item),
+    })
+  },
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
     if (request.method === 'POST' && url.pathname === '/github/webhook') return webhook(request, env)
@@ -200,17 +230,16 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       }
     }
   }
-  if (event === 'pull_request' && payload.action === 'labeled' && payload.label?.name === 'agent-review' && payload.pull_request && allowed(payload.sender?.login))
-    return accepted(await pullRequest(env, owner, repo, payload.pull_request.number).start({ by: payload.sender!.login, owner, pr: payload.pull_request.number, repo, ship: false }))
+  if (event === 'pull_request' && payload.action === 'labeled' && payload.label?.name === workLabels.review && payload.pull_request && allowed(payload.sender?.login))
+    return accepted(await startLabeled(env, 'review', { by: payload.sender!.login, number: payload.pull_request.number, owner, repo }))
   if (event === 'pull_request' && payload.action === 'closed' && payload.pull_request) {
     const { number, head } = payload.pull_request
     const own = head?.ref.startsWith('factory/') ? head.ref : null
     return accepted(await prune(env, owner, repo, (name) => name === own || name.startsWith(`factory/pr-${number}-`)))
   }
-  if (event === 'issues' && payload.action === 'labeled' && payload.label?.name === 'agent-develop' && payload.issue && !payload.issue.pull_request && allowed(payload.sender?.login))
-    return accepted(await issue(env, owner, repo, payload.issue.number).start({ by: payload.sender!.login, issue: payload.issue.number, owner, repo }))
-  if (event === 'issues' && payload.action === 'labeled' && payload.label?.name === 'agent-research' && payload.issue && !payload.issue.pull_request && allowed(payload.sender?.login))
-    return accepted(await research(env, owner, repo, payload.issue.number).start({ by: payload.sender!.login, issue: payload.issue.number, owner, repo }))
+  const issueKind = payload.label?.name === workLabels.develop ? 'develop' : payload.label?.name === workLabels.research ? 'research' : null
+  if (event === 'issues' && payload.action === 'labeled' && issueKind && payload.issue && !payload.issue.pull_request && allowed(payload.sender?.login))
+    return accepted(await startLabeled(env, issueKind, { by: payload.sender!.login, number: payload.issue.number, owner, repo }))
   if (event === 'workflow_run' || event === 'check_suite' || event === 'check_run' || event === 'status') {
     const suite = payload.workflow_run ?? payload.check_suite ?? payload.check_run?.check_suite
     const branches = suite ? [suite.head_branch ?? ''] : (payload.branches ?? []).map((branch) => branch.name)

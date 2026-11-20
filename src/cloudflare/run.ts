@@ -13,6 +13,7 @@ import { ciChecker, reviewChecker } from './checker.ts'
 import { baseConfig } from './config.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
+import { workLabels } from './labels.ts'
 import { githubRepo, type GitHubRepo, type PullRequest } from './repo.ts'
 import { githubSigning } from './signing.ts'
 import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs, type Call, type RunMachine } from './runs.ts'
@@ -32,6 +33,8 @@ export type ReviewOutcome = { waiting: string } | (LoopResult & { waiting?: unde
 
 /** The review runs of one PR. */
 export class PullRequestRuns extends Runs<StartRequest> {
+  protected readonly label = workLabels.review
+
   protected number(request: StartRequest) {
     return request.pr
   }

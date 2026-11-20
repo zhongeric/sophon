@@ -19,6 +19,7 @@ import { baseConfig, baseResearch } from './config.ts'
 import { checkWorkerCredentials, egressUrlFetch, workerSecret } from './egress.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
+import { workLabels } from './labels.ts'
 import { githubPulls } from './pulls.ts'
 import { reviewPass } from './review.ts'
 import { answerersOf, credentialsFor, Runs, setupTimeoutMs, type Call } from './runs.ts'
@@ -40,6 +41,8 @@ type Notebook = { input: ResearchInput; config: RepoConfig; domain: ResearchDoma
  * commands of the notebook, on copies of the branches and on clean checkouts of commits.
  */
 export class ResearchRuns extends Runs<ResearchRequest> {
+  protected readonly label = workLabels.research
+
   protected number(request: ResearchRequest) {
     return request.issue
   }

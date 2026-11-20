@@ -153,12 +153,14 @@ npm run remote -- prune acme/app         # delete the merged, applied and strand
 npm run metrics                          # CPU, memory and network of each build container
 ```
 
-The webhook is optional. With it, a `/review`, `/develop` or `/research` comment, or the `agent-review`,
-`agent-develop` or `agent-research` label, starts a run, and answers take effect at once. Without it, runs poll for
-answers and CI. One App webhook replaces the webhook of each repository: point it at
-`https://<worker>/github/webhook` and set its secret as `GITHUB_APP_WEBHOOK_SECRET`. Without that secret, the Worker
-checks the webhook of each repository with `GITHUB_WEBHOOK_SECRET`. Use the events Issue comments, Issues, Pull
-requests, Workflow runs and Statuses. The Worker ignores the comment, issue and PR events of its own bot.
+Every 5 minutes, a sweep finds the open issues with the `agent-develop` or `agent-research` label and the open PRs with
+the `agent-review` label. It starts a run for each one that has no run, when a login in `ALLOWED_USERS` added the
+label. The sweep also prunes the factory/* branches of each repository, and it needs the App. The webhook is optional:
+it makes labels, comments and answers take effect at once. Without it, runs poll for answers and CI. One App webhook
+replaces the webhook of each repository: point it at `https://<worker>/github/webhook` and set its secret as
+`GITHUB_APP_WEBHOOK_SECRET`. Without that secret, the Worker checks the webhook of each repository with
+`GITHUB_WEBHOOK_SECRET`. Use the events Issue comments, Issues, Pull requests, Workflow runs and Statuses. The Worker
+ignores the comment, issue and PR events of its own bot.
 
 A Durable Object holds the ledger, the repository tree and the agent sessions of each run. Alarms drive the run and
 resume it after a crash. Development and research runs run their commands, and review runs with tests run their

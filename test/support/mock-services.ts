@@ -73,6 +73,10 @@ export async function mockServices(
     deleted: [] as string[],
     /** The requests that reached the egress route: the URL that the run fetched, and its x-api-key header. */
     egress: [] as { url: string; key: string | null }[],
+    /** The labels of the repository. It has none at the start, so a run makes the label of its kind. */
+    repoLabels: new Set<string>(),
+    /** The labels of each issue or PR, by number. */
+    labels: new Map<number, string[]>(),
   }
   let next = Math.max(100, ...pulls.keys(), ...issues.keys())
   let ids = 0
@@ -355,6 +359,26 @@ export async function mockServices(
           return
         }
         return json(response, 200, listing.startsWith('120000') ? { target: content.toString(), type: 'symlink' } : { type: 'file' })
+      }
+      if (route.startsWith(`GET ${api}/labels/`)) {
+        const name = decodeURIComponent(url.pathname.slice(`${api}/labels/`.length))
+        return state.repoLabels.has(name) ? json(response, 200, { name }) : json(response, 404, { message: 'Not Found' })
+      }
+      if (route === `POST ${api}/labels`) {
+        const fields = input()
+        const name = string(fields.name, 'name')
+        string(fields.color, 'color')
+        if (state.repoLabels.has(name)) return json(response, 422, { errors: [{ code: 'already_exists', field: 'name', resource: 'Label' }], message: 'Validation Failed' })
+        state.repoLabels.add(name)
+        return json(response, 201, { name })
+      }
+      const issueLabels = new RegExp(`^POST ${api}/issues/(\\d+)/labels$`).exec(route)
+      if (issueLabels) {
+        const number = Number(issueLabels[1])
+        const added = strings(input().labels, 'labels')
+        const labels = [...new Set([...(state.labels.get(number) ?? []), ...added])]
+        state.labels.set(number, labels)
+        return json(response, 200, labels.map((name) => ({ name })))
       }
       const comments = new RegExp(`^(GET|POST) ${api}/issues/(\\d+)/comments$`).exec(route)
       if (comments?.[1] === 'GET') return json(response, 200, page(url, state.comments.filter((entry) => entry.issue === Number(comments[2]))))

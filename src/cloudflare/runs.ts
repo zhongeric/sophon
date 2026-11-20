@@ -12,6 +12,7 @@ import type { DevelopmentRuns } from './develop.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { githubAccess, type InstallationTokens } from './github-app.ts'
 import { hasOpenJobs, jobRunner, resetJobStarts, type JobRunner } from './jobs.ts'
+import { addLabel } from './labels.ts'
 import type { State } from './prune.ts'
 import type { ResearchRuns } from './research.ts'
 import type { PullRequestRuns } from './run.ts'
@@ -141,6 +142,8 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
 
   /** The number of the PR or issue whose comments carry the run's questions and results. */
   protected abstract number(request: Request): number
+  /** The work label of this kind of run. The run adds it to its issue or PR at its start. */
+  protected abstract readonly label: string
   protected abstract runName(request: Request, stamp: string): string
   protected abstract announcement(run: string, request: Request): string
   /** Runs the work, or resumes it from the ledger. Returns whether it passed, and the comment for the end of the run. */
@@ -230,6 +233,9 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       initCounters(ledger)
       if (row.state === 'running') countRestart(ledger)
       this.setState(row.run, 'running', '')
+      // The ledger records the attempt also when it failed, so that a failed add does not repeat at each alarm.
+      const log = (error: unknown) => console.error(`[${row.run}] the add of the label ${this.label} failed`, error)
+      await once(ledger, 'label', () => addLabel({ gh: access.gh, log, name: this.label, number: this.number(request), owner: request.owner, repo: request.repo }))
       await once(ledger, 'announced', () => posts.post(this.announcement(row.run, request)))
       const result = await this.execute(row.run, request, ledger, access.gh, posts, call)
       this.setState(row.run, result.passed ? 'passed' : 'failed', '')
