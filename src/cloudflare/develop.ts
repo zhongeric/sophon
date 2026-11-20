@@ -13,6 +13,7 @@ import { boxMachine, syncWithSetup } from './box.ts'
 import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
+import { workLabels } from './labels.ts'
 import { loopChoices, type PreflightNeeds } from './preflight.ts'
 import { githubPulls } from './pulls.ts'
 import { githubSigning } from './signing.ts'
@@ -35,6 +36,8 @@ export type DevelopRequest = { owner: string; repo: string; issue: number; by: s
  * container directory got from its last sync, for each run. Thus a restart of this object does not cause a full copy.
  */
 export class DevelopmentRuns extends Runs<DevelopRequest> {
+  protected readonly label = workLabels.develop
+
   protected number(request: DevelopRequest) {
     return request.issue
   }

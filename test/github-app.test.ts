@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { appBotLogin, appJwt, githubAccess, type BotLogins, type GitHubSecrets, type InstallationTokens } from '../src/cloudflare/github-app.ts'
+import { appBotLogin, appJwt, githubAccess, githubApp, type BotLogins, type GitHubSecrets, type InstallationTokens } from '../src/cloudflare/github-app.ts'
 import { StopError } from '../src/core/stop.ts'
 import { mockServices } from './support/mock-services.ts'
 
@@ -115,6 +115,22 @@ test('with the App secrets and GITHUB_TOKEN, requests carry the installation tok
     await gh.json('GET', '/repos/acme/app')
     assert.ok(mock.state.authorizations.every((entry) => entry.authorization !== 'Bearer personal'))
     assert.deepEqual(mock.state.authorizations.at(-1), { authorization: 'Bearer ghs_installation1', route: 'GET /repos/acme/app' })
+  })
+})
+
+test('the App helper gives the App JWT client and an installation client that shares the token cache with githubAccess', async () => {
+  await withMock({ installed: true, slug: 'factory' }, async (mock) => {
+    const cache: InstallationTokens = new Map()
+    const { app, installation } = githubApp(appSecrets(mock.url), cache)
+    assert.deepEqual(await app.json('GET', '/app'), { slug: 'factory' })
+    assert.ok(signed(mock.state.authorizations[0]?.authorization.replace(/^Bearer /, '') ?? ''))
+    const gh = installation(42)
+    await Promise.all([1, 2].map(() => gh.json('GET', '/repos/acme/app')))
+    await (await githubAccess(appSecrets(mock.url), 'acme', 'app', cache)).gh.json('GET', '/repos/acme/app')
+    const used = mock.state.authorizations.filter((entry) => entry.route === 'GET /repos/acme/app').map((entry) => entry.authorization)
+    assert.deepEqual(used, Array(3).fill('Bearer ghs_installation1'))
+    assert.equal(mock.state.requests.filter((route) => route === 'POST /app/installations/42/access_tokens').length, 1)
+    assert.throws(() => githubApp({ GITHUB_API_URL: mock.url, GITHUB_APP_ID: '123' }, cache), (error: unknown) => error instanceof StopError && /^GITHUB_APP_PRIVATE_KEY is not set/.test(error.message))
   })
 })
 

@@ -99,6 +99,7 @@ test('on Cloudflare, /research runs the research workflow on an issue and opens 
   )
   assert.match(result.body, /^# Research run: READY/, describe())
   assert.ok(on(5).some((entry) => entry.body.startsWith(`agent-factory started research run \`${started.run}\``)))
+  assert.deepEqual(mock.state.labels.get(5), ['agent-research'])
   const dossier = [...mock.state.pulls.values()].find((pull) => pull.head.startsWith(`factory/research-${started.run}`))
   assert.ok(dossier, describe())
   assert.equal((await status(5)).runs[0]?.state, 'passed')

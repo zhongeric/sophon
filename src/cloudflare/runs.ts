@@ -13,6 +13,7 @@ import type { DevelopmentRuns } from './develop.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { githubAccess, type InstallationTokens } from './github-app.ts'
 import { hasOpenJobs, jobRunner, resetJobStarts, type JobRunner } from './jobs.ts'
+import { addLabel } from './labels.ts'
 import { preflight, PreflightFailed, type PreflightNeeds } from './preflight.ts'
 import type { State } from './prune.ts'
 import type { ResearchRuns } from './research.ts'
@@ -146,6 +147,8 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
 
   /** The number of the PR or issue whose comments carry the run's questions and results. */
   protected abstract number(request: Request): number
+  /** The work label of this kind of run. The run adds it to its issue or PR at its start. */
+  protected abstract readonly label: string
   protected abstract runName(request: Request, stamp: string): string
   protected abstract announcement(run: string, request: Request): string
   /** Runs the work, or resumes it from the ledger. Returns whether it passed, and the comment for the end of the run. */
@@ -160,8 +163,12 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => syncs.clear() })
   }
 
-  async start(request: Request): Promise<{ run: string; started: boolean }> {
-    const active = this.active()
+  /**
+   * Starts a run unless one is active. With `once`, also refuses when this object has a run in any state: the work
+   * sweep never starts a run again (D13 restarts runs). The check and the insert are in one call, so no start comes between.
+   */
+  async start(request: Request, options: { once?: boolean } = {}): Promise<{ run: string; started: boolean }> {
+    const active = options.once ? this.ctx.storage.sql.exec<RunRow>('select * from factory_runs order by created desc limit 1').toArray()[0] : this.active()
     if (active) return { run: active.run, started: false }
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
     const run = this.runName(request, stamp)
@@ -255,6 +262,9 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       initCounters(ledger)
       if (row.state === 'running') countRestart(ledger)
       this.setState(row.run, 'running', '')
+      // The ledger records the attempt also when it failed, so that a failed add does not repeat at each alarm.
+      const log = (error: unknown) => console.error(`[${row.run}] the add of the label ${this.label} failed`, error)
+      await once(ledger, 'label', () => addLabel({ gh: access.gh, log, name: this.label, number: this.number(request), owner: request.owner, repo: request.repo }))
       await once(ledger, 'announced', () => posts.post(this.announcement(row.run, request)))
       const result = await this.execute(row.run, request, ledger, access.gh, posts, call)
       this.setState(row.run, result.passed ? 'passed' : 'failed', '')

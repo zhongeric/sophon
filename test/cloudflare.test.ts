@@ -106,6 +106,9 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
     assert.equal(started.started, true)
     const asked = await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
     assert.match(asked.body, /May sub return a negative number\?/)
+    // The run adds the label of its kind at its start. The repository had no such label, so the run made it first.
+    assert.deepEqual(mock.state.labels.get(7), ['agent-review'])
+    assert.deepEqual([...mock.state.repoLabels], ['agent-review'])
 
     mock.comment('maintainer', '/answer\nQ1: b')
     await sendWebhook(worker.url, secret, 'issue_comment', comment('maintainer', '/answer\nQ1: b'))
@@ -361,6 +364,7 @@ test('on Cloudflare, the admin route starts a run, and the run picks up the answ
     assert.doesNotMatch(mock.state.comments[0]!.body, /@/)
     // answerersOf gives the ALLOWED_USERS fallback in lower case, and GitHub mentions ignore case.
     assert.match(asked.body.split('\n')[0]!, /^@maintainer$/i)
+    assert.deepEqual(mock.state.labels.get(7), ['agent-review'])
     mock.comment('maintainer', '/answer recommended')
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/)
@@ -556,6 +560,8 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     // The review loop ran as a review run of the new PR, and the report went to the PR and the issue.
     assert.ok(on(number).some((entry) => entry.body.startsWith('### agent-factory: PASS')), describe())
     assert.ok(on(number).some((entry) => entry.body.startsWith('# Development run: READY')))
+    // Each run added the label of its kind: the development run to the issue, and the review run of the pass to the PR.
+    assert.deepEqual([mock.state.labels.get(5), mock.state.labels.get(number)], [['agent-develop'], ['agent-review']])
 
     // With the standing permission, the host merged the PR at the head that the final CI checked. Then it deleted the run's branch, and the
     // prune deleted the review fix branch, whose fixes the run merged.
