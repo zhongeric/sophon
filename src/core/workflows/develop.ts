@@ -100,7 +100,7 @@ const repairRounds = 5
 /** Base merges of a run: the checks before ready and before the merge, and the retries after a 'stale' refusal, share them (D16). */
 const baseMergeLimit = 3
 /** Merge tries of a run. Each try after a 'stale' refusal comes after a base check (D16). */
-const mergeTries = 3
+const mergeTryLimit = 3
 /** How long CI can take to start for a push of a commit that already has finished CI. */
 const ciGraceMs = 3 * 60_000
 /** The most that GitHub's clock and the host's clock can differ. */
@@ -341,13 +341,17 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   }
 
   // Draft PR and CI. CI and the review loop see the pushed commit.
-  const publish = async () => {
-    const local = await dev.head()
-    const sha = await step(ledger, `push.${local}`, async () => {
-      const at = Date.now()
-      const pushed = await branches.push(dev)
-      ledger.put(`pushed-at:${pushed}`, at)
-      return pushed
+  // `point` names the push in the run. A resume gets the head of each push from the ledger, not the local head, which a
+  // later base merge moved.
+  // A resolved base merge can keep the local head but still need a push to create its merge commit.
+  const publish = async (point: string) => {
+    const sha = await step(ledger, `head.${point}`, async () => {
+      return step(ledger, `push.${point}`, async () => {
+        const at = Date.now()
+        const pushed = await branches.push(dev)
+        ledger.put(`pushed-at:${pushed}`, at)
+        return pushed
+      })
     })
     state.head = sha
     return sha
@@ -357,7 +361,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     state.cis.push(result)
     return result
   }
-  const pushed = await publish()
+  const pushed = await publish('build')
   state.pr = await step(ledger, 'pr', () => pulls.open({ head: branchName, title: intook.title, body: prBody(input, decisions(ledger), planText, planned.smallest_change) }))
   const fixer = planned.tasks.length === 1 ? `build.${planned.tasks[0]!.id}` : 'ci-fix'
 
@@ -457,7 +461,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
             await dev.merge(review.final, `agent-factory: review loop fixes, pass ${pass} (${input.runId})`)
             return dev.head()
           })
-          head = await publish()
+          head = await publish(`review.${pass}`)
         }
         if (review.pass) continue
         cause = reviewCause(pass, review)
@@ -472,7 +476,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
       }
       const log = await repair(cause)
       if (log.blocked.trim()) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
-      head = await publish()
+      head = await publish(`repair.${state.repairs.length}`)
       unreviewed = 'a repair after the last pass'
       ci = await waitCi(`ci.repair.${state.repairs.length}`, head)
     }
@@ -549,24 +553,20 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const unmerged = (point: BasePoint, shown: Criterion[], reason: string) =>
     point === 'ready' ? finish('failed', shown, `${sentence(reason)}. The PR stays draft.`) : finish('ready', shown, `Not merged: ${reason}. The PR stays ready for your review. You merge.`)
   // Before the merge, an error of the base merge or of its push leaves the PR ready. A pause or a stop stays an error.
-  const atMerge = async <T>(point: BasePoint, run: () => Promise<T>): Promise<T | { error: string }> => {
-    if (point === 'ready') return run()
-    try {
-      return await run()
-    } catch (error) {
-      if (error instanceof PausedError || error instanceof BudgetStop || error instanceof StopError) throw error
-      return { error: reasonOf(error) }
-    }
-  }
-  const failedOf = (value: unknown): value is { error: string } => typeof value === 'object' && value !== null && 'error' in value
+  const thrown = (point: BasePoint, error: unknown) => point === 'ready' || error instanceof PausedError || error instanceof BudgetStop || error instanceof StopError
 
   // Merges the base while it moves, up to the limit of the run. After each merge: a conflict round when needed, the
   // push, CI, the repair loop and the criteria. It returns the end of the run, or null when the run goes on.
   const settle = async (point: BasePoint): Promise<DevelopResult | null> => {
     if (!baseChecks) return null
     for (;;) {
-      const check = await atMerge(point, () => checkBase(point))
-      if (failedOf(check)) return unmerged(point, criteria, `the base merge failed: ${check.error}`)
+      let check: BaseCheck
+      try {
+        check = await checkBase(point)
+      } catch (error) {
+        if (thrown(point, error)) throw error
+        return unmerged(point, criteria, `the base merge failed: ${reasonOf(error)}`)
+      }
       if (!check.moved) return null
       const merge = check.merge
       // At the limit, the ready step takes the PR as it is. The merge waits for the user.
@@ -586,9 +586,12 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         const marked = await step(ledger, `finish-merge.${n}`, () => dev.finishMerge(merge.conflicts, `agent-factory: merge ${input.baseRef} (${input.runId})`))
         if (marked.length > 0) return unmerged(point, shown, `the conflict markers remain in ${marked.join(', ')}`)
       }
-      const published = await atMerge(point, publish)
-      if (failedOf(published)) return unmerged(point, criteria, `the push of the base merge failed: ${published.error}`)
-      head = published
+      try {
+        head = await publish(`base.${n}`)
+      } catch (error) {
+        if (thrown(point, error)) throw error
+        return unmerged(point, criteria, `the push of the base merge failed: ${reasonOf(error)}`)
+      }
       if (merge.conflicts.length > 0 || merge.files.some((path) => merge.change.includes(path))) unreviewed = 'a base merge after the last pass'
       ci = await waitCi(`ci.base.${n}`, head)
       const ended = await repairLoop()
@@ -620,7 +623,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     })
     state.mergeTries.push(merged)
     if (!merged.merged) {
-      if ((merged.kind ?? 'other') === 'stale' && attempt < mergeTries) continue
+      if ((merged.kind ?? 'other') === 'stale' && attempt < mergeTryLimit) continue
       return finish('ready', criteria, `Not merged: ${merged.reason}. The PR stays ready for your review. You merge.`)
     }
     const deleted = await step(ledger, 'delete-branch', async (): Promise<{ deleted: true } | { deleted: false; reason: string }> => {

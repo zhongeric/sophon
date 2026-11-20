@@ -7,7 +7,8 @@ import type { Branch, Checker, Guides } from './platform.ts'
 import { staticFindings, type Profile } from './profiles.ts'
 import { decisionsFile, decisionsLine } from './questions.ts'
 import { developRoles, instructions, type ModelChoice, type Role } from './roles.ts'
-import { allowFiles, createWorkspace, guard, readOnly } from './workspace.ts'
+import { diffFiles } from './split.ts'
+import { allowFiles, createWorkspace, fileHash, guard, readOnly } from './workspace.ts'
 
 /** What every agent of one development run shares. */
 export type DevelopContext = {
@@ -144,7 +145,7 @@ export type BuildTask = {
   base: string
   /**
    * In a repair round of a base merge with a conflict: the files that the merge brings, without the files that conflict.
-   * They are not the work of the builder, so the scope check of checkpoint and the list of changes at submit skip them (D16).
+   * Checkpoint and submit skip these files. The builder cannot change them (D16).
    */
   baseFiles?: string[]
   review: Record<string, string>
@@ -186,6 +187,19 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
   const startKey = `start:${task.turn.key}`
   const start = ledger.get<string>(startKey) ?? (await branch.head())
   ledger.put(startKey, start)
+  const baseHashesKey = `base-files:${task.turn.key}`
+  const baseHashes = ledger.get<Record<string, string | null>>(baseHashesKey) ?? Object.fromEntries(
+    await Promise.all([...baseFiles].map(async (path) => [path, await fileHash(branch.tree, path)] as const)),
+  )
+  if (baseFiles.size > 0) ledger.put(baseHashesKey, baseHashes)
+  const checkBaseFiles = async (gate: 'checkpoint' | 'submit') => {
+    const changed: string[] = []
+    for (const path of baseFiles) {
+      if (await fileHash(branch.tree, path) !== baseHashes[path]) changed.push(path)
+    }
+    if (changed.length > 0)
+      throw new Error(`${gate} refused: restore the unchanged files from the base merge: ${changed.join(', ')}`)
+  }
   // The time that the call has left when it is too short for a command, else null. A platform without call limits gives null.
   const shortTime = () => {
     const left = ledger.timeLeft?.()
@@ -201,13 +215,20 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
     checkpoint: {
       definition: checkpointTool,
       async call(input) {
+        await checkBaseFiles('checkpoint')
         const pending = await branch.pending()
-        if (pending.changed.length === 0 && pending.diff.trim() === '') throw new Error('nothing to commit')
+        if (pending.changed.length === 0 && pending.diff.trim() === '') {
+          // A resolved base merge can keep the tree of the head. The host commits the merge after the submit (D16).
+          if (task.baseFiles && (await branch.head()) === start) return { commit: null, note: 'the tree is the same as the head, so nothing is committed. Submit, and the host commits the merge.' }
+          throw new Error('nothing to commit')
+        }
         // A command, for example a test run or the setup, can change files outside the scope of the builder.
         const outside = [...pending.changed, ...pending.removed].filter((path) => !inScope(path, task.scope) && !baseFiles.has(path))
         if (outside.length > 0)
           throw new Error(`checkpoint refused: these changes are outside the files of the task, and only the user can commit them: ${outside.join(', ')}. If the task needs them, say so in blocked.`)
-        const problems = staticFindings(pending.diff, pending.changed, task.active).map(
+        const own = (path: string) => !baseFiles.has(path)
+        const diff = baseFiles.size === 0 ? pending.diff : diffFiles(pending.diff).filter((file) => own(file.path)).map((file) => file.section).join('')
+        const problems = staticFindings(diff, pending.changed.filter(own), task.active).map(
           (finding) => `${finding.location}: ${finding.title}. ${finding.recommendation}. Line: ${finding.evidence}`,
         )
         if (problems.length > 0) throw new Error(`checkpoint refused:\n${problems.join('\n')}`)
@@ -236,12 +257,13 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
         if (shortTime() === null) throw new Error('remaining is only for a turn whose alarm call has no time left. Finish the task, or say in blocked why you cannot.')
         return log
       }
+      await checkBaseFiles('submit')
       const pending = await branch.pending()
       if (pending.changed.length > 0 || pending.diff.trim() !== '') throw new Error(`checkpoint first: uncommitted changes in ${pending.changed.join(', ') || 'deleted files'}`)
       const head = await branch.head()
       const changed = head === start ? [] : await branch.changedFiles(start, head)
-      // A merge commit of the base can keep the tree of the start, for example when the fixer keeps its side of each conflict.
-      if (head === start || (changed.length === 0 && !task.baseFiles))
+      // In a base merge, the fixer can keep its side of each conflict. finishMerge then commits the merge with the tree of the start.
+      if (!task.baseFiles && (head === start || changed.length === 0))
         throw new Error('no commits since the task started: checkpoint your work, or say in blocked why you cannot finish')
       const missing = changed.filter((path) => !baseFiles.has(path) && !log.changes.some((change) => change.path.replace(/^\/repo\//, '') === path))
       if (missing.length > 0) throw new Error(`list every changed file in changes: missing ${missing.join(', ')}`)

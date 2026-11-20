@@ -15,6 +15,7 @@ import { ghPullRequests } from '../src/node/github.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { nodeDevelop } from '../src/node/platform.ts'
 import { developInput, developScript, developRepo, fakePulls, mergeCommit, pauseAtCi, plan, pushBase, runDevelop, scopeQuestion, scriptedReview, sources } from './support/develop.ts'
+import { parents } from './support/base-merge.ts'
 import { credentials, memoryChannel, module, withoutKey } from './support/fixture.ts'
 import { probeNetwork, scriptedDispatch, webSearch, type Turn } from './support/scripted-model.ts'
 import { visible, visibleLines, visibleWords } from './support/visible.ts'
@@ -339,9 +340,6 @@ test('develop: a refused rejection of a high finding goes to the fixer with the 
   assert.equal(requests.length, 2)
 })
 
-/** The parents of a commit on origin. */
-const parents = (origin: string, sha: string) => execFileSync('git', ['--git-dir', origin, 'rev-list', '--parents', '-n', '1', sha]).toString().trim().split(' ').slice(1)
-
 test('develop: a base that moves without a conflict gets a merge commit and CI again, no new review pass, and the run merges the new head', { timeout: 240_000 }, async () => {
   const { repo, origin } = developRepo(undefined, { merge: 'squash' })
   const dir = runsDir()
@@ -415,6 +413,37 @@ test('develop: a base merge with a conflict on a file of the change gets a repai
   assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
 })
 
+test('develop: a base merge whose fixer keeps its side of the conflict gets the merge commit with the tree of the head, and the run merges', { timeout: 240_000 }, async () => {
+  const { repo, origin } = developRepo(undefined, { merge: 'squash' })
+  const github = fakePulls([true])
+  const review = scriptedReview([[], []], [])
+  const base = pushBase(origin, { 'src/sub.ts': 'export function sub(a: number, b: number): number {\n  return -(b - a)\n}\n' })
+  const script = developScript({ resolved: { 'src/sub.ts': sources.sub } })
+  const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(script, []), pulls: github.pulls, review, runId: 'base-keep' })
+  assert.equal(result.status, 'ready', result.report)
+
+  const [built, head] = github.state.shas as [string, string]
+  assert.deepEqual(parents(origin, head), [built, base])
+  const tree = (sha: string) => execFileSync('git', ['--git-dir', origin, 'rev-parse', `${sha}^{tree}`]).toString().trim()
+  assert.equal(tree(head), tree(built))
+  assert.deepEqual(github.state.merges, [{ pr: 9, method: 'squash', sha: head }])
+})
+
+test('develop: in a base merge with a conflict, the static rules skip the files that the base brings', { timeout: 240_000 }, async () => {
+  const { repo, origin } = developRepo(undefined, { merge: 'squash' })
+  const github = fakePulls([true])
+  const review = scriptedReview([[], []], [])
+  // A .log file breaks a static rule. The base brings it, so the checkpoint of the fixer does not refuse it.
+  const base = pushBase(origin, { 'src/sub.ts': 'export function sub(a: number, b: number): number {\n  return -(b - a)\n}\n', 'notes/base.log': 'base\n' })
+  const script = developScript({ resolved: { 'src/sub.ts': 'export const sub = (a: number, b: number) => a - b\n' } })
+  const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(script, []), pulls: github.pulls, review, runId: 'base-rules' })
+  assert.equal(result.status, 'ready', result.report)
+
+  const [built, head] = github.state.shas as [string, string]
+  assert.deepEqual(parents(origin, head), [built, base])
+  assert.equal(execFileSync('git', ['--git-dir', origin, 'show', `${head}:notes/base.log`]).toString(), 'base\n')
+})
+
 test('develop: a merge that GitHub refuses as stale gets a base check, CI again and a second try, and the report lists both tries', { timeout: 240_000 }, async () => {
   const { repo, origin } = developRepo(undefined, { merge: 'squash' })
   const dir = runsDir()
@@ -448,6 +477,42 @@ test('develop: a merge that GitHub refuses as stale gets a base check, CI again 
   const again = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls: github.pulls, review, runId: 'stale' })
   assert.equal(again.report, result.report)
   assert.equal(github.state.merges.length, 2)
+})
+
+test('develop: a resume after a review pass with fixes and a base merge replays the head of each push and ends ready', { timeout: 240_000 }, async () => {
+  const { repo, origin } = developRepo()
+  const dir = runsDir()
+  const github = fakePulls([true])
+  const requests: ReviewRequest[] = []
+  const scripted = scriptedReview([[]], requests)
+  // The review pass makes a fix commit on the head, so that ci.final.1 records the head before the base merge.
+  const review: typeof scripted = async (request) => {
+    const result = await scripted(request)
+    const fixed = execFileSync('git', ['commit-tree', '--no-gpg-sign', '-m', 'review fix', '-p', request.head, `${request.head}^{tree}`], {
+      cwd: repo,
+      env: { ...process.env, GIT_AUTHOR_NAME: 'Review', GIT_AUTHOR_EMAIL: 'review@example.com', GIT_COMMITTER_NAME: 'Review', GIT_COMMITTER_EMAIL: 'review@example.com' },
+    }).toString().trim()
+    return { ...result, final: fixed }
+  }
+  const input = await developInput(repo, 'base-resume')
+  const base = pushBase(origin, { 'docs/base.md': '# Base\n' })
+  // The run pauses at the CI of the base merge, the third commit with CI.
+  await assert.rejects(runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), input, pulls: pauseAtCi(github.pulls, 3), review, runId: 'base-resume' }), PausedError)
+  const turns: Turn[] = []
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), turns), input, pulls: github.pulls, review, runId: 'base-resume' })
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(turns, [])
+
+  // The resume ran no second review pass and no second base merge. The head is the merge of the fixed head and the base.
+  assert.equal(requests.length, 1)
+  assert.equal(github.state.shas.length, 3)
+  const [built, fixed, head] = github.state.shas as [string, string, string]
+  assert.deepEqual(parents(origin, fixed), [built])
+  assert.deepEqual(parents(origin, head), [fixed, base])
+  const ledger = fileLedger(join(dir, 'base-resume', 'state.json'))
+  assert.deepEqual(ledger.get('step:head.review.1'), { result: fixed })
+  assert.deepEqual(ledger.get('step:head.base.1'), { result: head })
+  assert.deepEqual(github.state.ready, [9])
 })
 
 test('develop: a resumed run with review passes from before D14 ends failed, does not repair, and does not mark the PR ready or merge', { timeout: 240_000 }, async () => {

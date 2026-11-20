@@ -22,7 +22,8 @@ test('mergeRefusal is stale for a 409 or a base that moved, else other', () => {
 test('hasConflictMarkers finds each marker line, and not a similar line', () => {
   assert.equal(hasConflictMarkers('a\n<<<<<<< HEAD\nb\n=======\nc\n>>>>>>> main\n'), true)
   assert.equal(hasConflictMarkers('<<<<<<< HEAD'), true)
-  assert.equal(hasConflictMarkers('a\r\n=======\r\nb'), true)
+  // A heading underline of seven = characters, with no opening or closing marker.
+  assert.equal(hasConflictMarkers('Title\r\n=======\r\nb'), false)
   assert.equal(hasConflictMarkers('x\n>>>>>>> 1a2b3c'), true)
   assert.equal(hasConflictMarkers('const a = 1\n'), false)
   assert.equal(hasConflictMarkers('<<<<<<<HEAD\n======== \n ======= \n>>>>>>>\n'), false)

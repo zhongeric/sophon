@@ -14,9 +14,12 @@ export function mergeRefusal(status: number | undefined, message: string): Merge
   return status === 409 || staleMessage.test(message) ? 'stale' : 'other'
 }
 
-/** True when the text has a line of a git conflict marker. */
+/**
+ * True when the text has an opening or a closing git conflict marker. A line of only ======= is not one: it can be a
+ * heading underline, and it is in a conflict only between the two markers.
+ */
 export function hasConflictMarkers(text: string): boolean {
-  return text.split(/\r?\n/).some((line) => line.startsWith('<<<<<<< ') || line === '=======' || line.startsWith('>>>>>>> '))
+  return text.split(/\r?\n/).some((line) => line.startsWith('<<<<<<< ') || line.startsWith('>>>>>>> '))
 }
 
 /** The files of `files` that have conflict markers in `tree`. A file that is not in the tree has none: a delete resolves a conflict. */

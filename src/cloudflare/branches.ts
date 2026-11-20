@@ -105,6 +105,12 @@ const compareStatus = (file: ChangedFile): [string, string][] =>
 type Merging = { parent: string; message: string; finished?: boolean; created?: string }
 
 /**
+ * A clean base merge that GitHub made, until the local commit records it. A retry after a failure finishes it and does
+ * not merge again. `local` and `from` are the local head and the pushed head before the merge, `sha` is the merge commit.
+ */
+type BaseMerged = { local: string; from: string; sha: string; files: string[] }
+
+/**
  * The branches of a development run in Durable Object SQL: one tree for each branch, with in-process git. A new
  * branch copies the tree of its start commit, .git included, so that commit IDs agree across branches. Pushes go
  * to GitHub through the Git Data API, so no token ever reaches the build machine. The ledger maps local commits to
@@ -131,6 +137,7 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
   }
   const headOf = async (scope: string) => (await open(scope).git('rev-parse', 'HEAD')).trim()
   const mergings = () => ledger.get<Record<string, Merging>>('merging') ?? {}
+  const baseMerges = () => ledger.get<Record<string, BaseMerged>>('base-merged') ?? {}
   const remoteHead = async (ref: string) => (await gh.json<{ object: { sha: string } }>('GET', `${api}/git/ref/heads/${encodePath(ref)}`)).object.sha
 
   /** The compare of GitHub from `from` to `to`. A list of 300 files or more can be incomplete, so it stops the run. */
@@ -220,6 +227,18 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
         else await restoreFromGitHub(gh, api, tree, file.filename, ref)
       }
     }
+    /** Writes the GitHub merge commit of a clean base merge to the tree, and records that the local commit stands for it. */
+    const finishBaseMerge = async (done: BaseMerged, message: string) => {
+      // A failure after the local commit leaves only the records to write.
+      if ((await head()) === done.local) {
+        await restore((await compare(name, done.from, done.sha)).files ?? [], done.sha)
+        await commit(message)
+      }
+      remember(await head(), done.sha)
+      ledger.put('pushed', { ...(ledger.get<Record<string, string>>('pushed') ?? {}), [name]: done.sha })
+      ledger.put('base-merged', Object.fromEntries(Object.entries(baseMerges()).filter(([key]) => key !== name)))
+      return { files: done.files, conflicts: [] }
+    }
     /**
      * Without a 3-way merge in process: each file that both sides changed since the merge base gets whole-file conflict
      * markers, and the files of only the base come from `target`. The ledger keeps `target` for the push.
@@ -295,7 +314,11 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
         return (await compare(name, pushed, target)).merge_base_commit.sha
       },
       async mergeCommit(target, message) {
-        const pushed = remotes()[await head()]
+        const local = await head()
+        const pushed = remotes()[local]
+        const done = baseMerges()[name]
+        // GitHub made this merge before a failure: finish it, and do not merge again.
+        if (done && (local === done.local || !pushed) && (await remoteHead(name)) === done.sha) return finishBaseMerge(done, message)
         if (!pushed) throw new Error(`${name}: push the branch before you merge ${target}`)
         // GitHub merges into its branch head. A commit there that the run did not push stops the merge: no force.
         const current = await remoteHead(name)
@@ -312,11 +335,9 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
         }
         // HTTP 204: the branch has the commit already.
         if (!merged) return { files, conflicts: [] }
-        await restore((await compare(name, pushed, merged.sha)).files ?? [], merged.sha)
-        await commit(message)
-        remember(await head(), merged.sha)
-        ledger.put('pushed', { ...(ledger.get<Record<string, string>>('pushed') ?? {}), [name]: merged.sha })
-        return { files, conflicts: [] }
+        const record = { local, from: pushed, sha: merged.sha, files }
+        ledger.put('base-merged', { ...baseMerges(), [name]: record })
+        return finishBaseMerge(record, message)
       },
       async finishMerge(files, message) {
         const marked = await markedFiles(tree, files)

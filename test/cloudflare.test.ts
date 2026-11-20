@@ -4,6 +4,7 @@ import { generateKeyPairSync } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { moveBase, parents } from './support/base-merge.ts'
 import { developRepo, developScript, sources } from './support/develop.ts'
 import { fixed, fixtureRepo, lightFixed, scriptFor } from './support/fixture.ts'
 import { mockServices } from './support/mock-services.ts'
@@ -35,6 +36,41 @@ async function startFor(mock: { close: () => Promise<void> }, ...args: Parameter
   }
 }
 const comment = (login: string, body: string) => ({ action: 'created', comment: { body, user: { login } }, issue: { number: 7, pull_request: {} }, repository })
+
+test('on Cloudflare, a base-merge fixer that keeps the original tree still pushes a two-parent merge commit', { timeout: 300_000 }, async () => {
+  const { repo } = developRepo(undefined, { merge: 'squash' })
+  const issues = { 5: { body: 'Add sub and mul next to add, with tests.', title: 'Add sub and mul' } }
+  const script = developScript({ resolved: { 'src/sub.ts': sources.sub } })
+  let base = ''
+  const mock = await mockServices(repo, {
+    botLogin: 'factory-bot', issues, name: 'app', owner: 'acme',
+    script: (turn) => {
+      if (turn.role === 'planner' && !base) base = moveBase(repo, { 'src/sub.ts': 'export const sub = (a: number, b: number) => -(b - a)\n' })
+      return script(turn)
+    },
+  })
+  const worker = await startFor(mock, withMachine(mock))
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments)}\nworker:\n${worker.output().slice(-4000)}`
+  try {
+    const started = await fetch(`${worker.url}/develop/acme/app/5`, { body: '{}', headers: { authorization: 'Bearer admin', 'content-type': 'application/json' }, method: 'POST' })
+    assert.equal(started.status, 202)
+    const done = await until(() => mock.state.comments.find((entry) => entry.issue === 5 && entry.body.startsWith('# Development run:')), 240_000, describe)
+    assert.match(done.body, /^# Development run: READY/, done.body)
+    assert.equal(mock.state.merges.length, 1, describe())
+    const merged = mock.state.merges[0]
+    assert.ok(merged)
+    const [built, incoming] = parents(repo, merged.sha)
+    assert.ok(built)
+    assert.equal(incoming, base)
+    const tree = (sha: string) => execFileSync('git', ['rev-parse', `${sha}^{tree}`], { cwd: repo }).toString().trim()
+    assert.equal(tree(merged.sha), tree(built))
+    assert.match(done.body, /- Round 1, base merge:/)
+    assert.match(done.body, /- Pass 2: PASS/)
+  } finally {
+    await worker.stop()
+    await mock.close()
+  }
+})
 
 test('on Cloudflare, development collects a stopped review before a budget raise starts its replacement', { timeout: 360_000 }, async () => {
   const { repo } = developRepo()

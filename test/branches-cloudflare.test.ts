@@ -1,6 +1,4 @@
 import assert from 'node:assert/strict'
-import { writeFileSync } from 'node:fs'
-import { join } from 'node:path'
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { test } from 'node:test'
 import type { Contracts } from 'nanocode-ts'
@@ -10,13 +8,12 @@ import { github } from '../src/cloudflare/github.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import { hasConflictMarkers } from '../src/core/merge.ts'
 import { git } from '../src/node/git.ts'
+import { moveBase, parents } from './support/base-merge.ts'
 import { developRepo } from './support/develop.ts'
 import { mockServices } from './support/mock-services.ts'
 
 const read = async (tree: FileSystem.FileSystem, path: string) => new TextDecoder().decode(await tree.read(path))
 const write = (tree: FileSystem.FileSystem, path: string, text: string) => tree.write(path, new TextEncoder().encode(text))
-/** The parents of a commit. */
-const parents = async (repo: string, commit: string) => (await git(repo, 'rev-list', '--parents', '-n', '1', commit)).trim().split(' ').slice(1)
 
 /** Durable Object SQL over node:sqlite: blobs go in and come out as ArrayBuffer. */
 function sqlHost(): Contracts.SqlHost {
@@ -47,15 +44,6 @@ function memoryLedger(): Ledger {
   return { get: <T>(key: string) => values.get(key) as T | undefined, put: (key, value) => void values.set(key, structuredClone(value)) }
 }
 
-/** Commits files on main of the repository and pushes them to origin, so that the base moves. Returns the new base head. */
-async function moveBase(repo: string, files: Record<string, string>): Promise<string> {
-  for (const [path, text] of Object.entries(files)) writeFileSync(join(repo, path), text)
-  await git(repo, 'add', '-A')
-  await git(repo, 'commit', '-q', '-m', 'base moves')
-  await git(repo, 'push', '-q', 'origin', 'main')
-  return (await git(repo, 'rev-parse', 'HEAD')).trim()
-}
-
 /** Run branches in SQL over the mock GitHub, whose repository is the origin, and a run branch with a change to src/math.ts, pushed. */
 async function changedBranch(t: { after(fn: () => Promise<void>): void }) {
   const { repo, origin } = developRepo()
@@ -80,13 +68,13 @@ async function changedBranch(t: { after(fn: () => Promise<void>): void }) {
 
 test('Cloudflare branches: a clean base merge makes a merge commit with two parents on GitHub', async (t) => {
   const { repo, origin, branches, branch, start, before } = await changedBranch(t)
-  const baseHead = await moveBase(repo, { 'src/other.ts': 'export const other = 1\n' })
+  const baseHead = moveBase(repo, { 'src/other.ts': 'export const other = 1\n' })
   assert.equal(await branches.remoteHead('main'), baseHead)
   assert.equal(await branch.mergeBaseWith(baseHead), start)
 
   assert.deepEqual(await branch.mergeCommit(baseHead, 'merge main'), { files: ['src/other.ts'], conflicts: [] })
   const merged = (await git(origin, 'rev-parse', 'refs/heads/factory/dev-x')).trim()
-  assert.deepEqual(await parents(origin, merged), [before, baseHead])
+  assert.deepEqual(parents(origin, merged), [before, baseHead])
   assert.equal(await read(branch.tree, '/src/other.ts'), 'export const other = 1\n')
   // The local head stands for the GitHub merge commit, so the push changes nothing.
   assert.equal(await branches.push(branch), merged)
@@ -102,7 +90,7 @@ test('Cloudflare branches: a clean base merge makes a merge commit with two pare
 
 test('Cloudflare branches: a conflict writes markers, and the resolved push makes a GitHub commit with two parents', async (t) => {
   const { repo, origin, branches, branch, before } = await changedBranch(t)
-  const baseHead = await moveBase(repo, { 'src/math.ts': 'export function add(a: number, b: number): number {\n  return b + a\n}\n', 'src/other.ts': 'export const other = 1\n' })
+  const baseHead = moveBase(repo, { 'src/math.ts': 'export function add(a: number, b: number): number {\n  return b + a\n}\n', 'src/other.ts': 'export const other = 1\n' })
 
   assert.deepEqual(await branch.mergeCommit(baseHead, 'merge main'), { files: ['src/math.ts', 'src/other.ts'], conflicts: ['src/math.ts'] })
   const marked = await read(branch.tree, '/src/math.ts')
@@ -119,7 +107,7 @@ test('Cloudflare branches: a conflict writes markers, and the resolved push make
   await branch.commit('agent-factory: checkpoint')
   assert.deepEqual(await branch.finishMerge(['src/math.ts'], 'merge main'), [])
   const merged = await branches.push(branch)
-  assert.deepEqual(await parents(origin, merged), [before, baseHead])
+  assert.deepEqual(parents(origin, merged), [before, baseHead])
   assert.equal((await git(origin, 'show', `${merged}:src/math.ts`)), 'export const add = (a: number, b: number) => b + a\n')
   assert.equal((await git(origin, 'show', `${merged}:src/other.ts`)), 'export const other = 1\n')
   assert.equal(await branch.mergeBaseWith(baseHead), baseHead)
@@ -128,12 +116,27 @@ test('Cloudflare branches: a conflict writes markers, and the resolved push make
   // The push ended the merge: the next commit has one parent.
   await write(branch.tree, '/src/mul.ts', 'export const mul = (a: number, b: number) => a * b\n')
   await branch.commit('add mul')
-  assert.deepEqual(await parents(origin, await branches.push(branch)), [merged])
+  assert.deepEqual(parents(origin, await branches.push(branch)), [merged])
+})
+
+test('Cloudflare branches: a resolved merge with the tree of the head makes a GitHub commit with two parents', async (t) => {
+  const { repo, origin, branches, branch, before } = await changedBranch(t)
+  const mine = await read(branch.tree, '/src/math.ts')
+  const baseHead = moveBase(repo, { 'src/math.ts': 'export function add(a: number, b: number): number {\n  return b + a\n}\n' })
+
+  assert.deepEqual(await branch.mergeCommit(baseHead, 'merge main'), { files: ['src/math.ts'], conflicts: ['src/math.ts'] })
+  await write(branch.tree, '/src/math.ts', mine)
+  assert.deepEqual((await branch.pending()).changed, [])
+  assert.deepEqual(await branch.finishMerge(['src/math.ts'], 'merge main'), [])
+  const merged = await branches.push(branch)
+  assert.deepEqual(parents(origin, merged), [before, baseHead])
+  assert.equal(await git(origin, 'show', `${merged}:src/math.ts`), mine)
+  assert.equal(await branch.mergeBaseWith(baseHead), baseHead)
 })
 
 test('Cloudflare branches: a base merge stops when GitHub has a commit that the run did not push', async (t) => {
   const { repo, origin, branches, branch, before } = await changedBranch(t)
-  const baseHead = await moveBase(repo, { 'src/other.ts': 'export const other = 1\n' })
+  const baseHead = moveBase(repo, { 'src/other.ts': 'export const other = 1\n' })
   const tree = (await git(origin, 'rev-parse', `${before}^{tree}`)).trim()
   const foreign = (await git(origin, '-c', 'user.name=Other', '-c', 'user.email=other@example.com', 'commit-tree', tree, '-p', before, '-m', 'foreign')).trim()
   await git(origin, 'update-ref', 'refs/heads/factory/dev-x', foreign)
