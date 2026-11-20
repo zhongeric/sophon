@@ -107,6 +107,8 @@ export type Checker = {
    * platform has no machine for agents. An agent tool never calls `checks`, because on Cloudflare it is the CI.
    */
   agentChecks?: (changed: string[]) => Promise<CheckResult[]>
+  /** The `ci` commands of the config on a real machine, for the submit gates (D15). Absent without `ci` entries or without a machine. */
+  ci?: (changed: string[]) => Promise<CheckResult[]>
 }
 
 /** The output files of the run, such as report.md and gate-log.txt. */

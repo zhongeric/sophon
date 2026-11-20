@@ -253,8 +253,13 @@ test('the checker of a review run keeps CI as its checks, and gives a failed set
   writeFileSync(join(fixture.root, 'fail'), '')
   const config = { stack: 'TypeScript', checks: { smoke: 'true' }, tests: { pattern: '\\.test\\.ts$', command: 'node --test {tests}' } }
   const ci: Checker = { checks: async () => [], tests: null }
-  const checker = reviewChecker(ci, commandChecker({ committedFiles: async () => [], tree: fixture.tree }, config, boxMachine(fixture.box, 'work/x', fixture.sync)))
+  const checker = reviewChecker(
+    ci,
+    commandChecker({ committedFiles: async () => [], tree: fixture.tree }, config, boxMachine(fixture.box, 'work/x', fixture.sync)),
+    async () => assert.fail('a review run without ci publishes in its CI checks'),
+  )
   assert.equal(checker.checks, ci.checks)
+  assert.equal(checker.ci, undefined)
   const failed = { command: 'test ! -f ../../fail && echo run >> setup.log', exit_code: 1, name: 'setup', output: '', status: 'fail' }
   assert.deepEqual(await checker.tests!(['test/a.test.ts']), [failed])
   assert.deepEqual(await checker.agentChecks!([]), [failed])
@@ -263,6 +268,36 @@ test('the checker of a review run keeps CI as its checks, and gives a failed set
   rmSync(join(fixture.root, 'fail'))
   fixture.failTar = true
   await assert.rejects(checker.tests!(['test/a.test.ts']), /syncing work\/x failed/)
+})
+
+test('the checker of a review run with ci publishes the fixes, then runs ci on the machine as its final checks, not GitHub CI (D15)', async () => {
+  const fixture = syncFixture()
+  const config = { stack: 'TypeScript', checks: { smoke: 'true' }, ci: { build: 'cat a.txt' } }
+  const ci: Checker = { checks: async () => assert.fail('a review run with ci reads no GitHub CI'), tests: null }
+  const published: number[] = []
+  const machine = commandChecker({ committedFiles: async () => [], tree: fixture.tree }, config, boxMachine(fixture.box, 'work/x', fixture.sync))
+  const checker = reviewChecker(ci, machine, async () => {
+    // The count of commands on the machine at the publish shows that the publish comes before ci.
+    published.push(fixture.commands.filter((command) => command.includes('cat a.txt')).length)
+    return 'sha'
+  })
+  assert.equal(checker.tests, null)
+  const passed = { command: 'cat a.txt', exit_code: 0, name: 'ci build', output: 'a', status: 'pass' }
+  assert.deepEqual(await checker.checks(['a.txt']), [passed])
+  assert.deepEqual(published, [0])
+  // The submit gates run the same ci on the machine, with no publish.
+  assert.deepEqual(await checker.ci!(['a.txt']), [passed])
+  assert.deepEqual(published, [0])
+
+
+  // A failed setup on the machine gives a failed result named setup.
+  const broken = syncFixture()
+  writeFileSync(join(broken.root, 'fail'), '')
+  const brokenMachine = commandChecker({ committedFiles: async () => [], tree: broken.tree }, config, boxMachine(broken.box, 'work/x', broken.sync))
+  const brokenChecker = reviewChecker(ci, brokenMachine, async () => 'sha')
+  const failed = { command: 'test ! -f ../../fail && echo run >> setup.log', exit_code: 1, name: 'setup', output: '', status: 'fail' }
+  assert.deepEqual(await brokenChecker.checks(['a.txt']), [failed])
+  assert.deepEqual(await brokenChecker.ci!(['a.txt']), [failed])
 })
 
 test('a sync with changes removes the marker before its first write, so a failed copy leaves no valid state', async () => {

@@ -124,6 +124,71 @@ test('a patch agent that changed no files submits without a gate run', async () 
   assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(callers depend on the sum\); min-001 \(inlining adds nothing\)$/m)
 })
 
+/** The loop input of the fixture with tests off and with the ci commands of `ci`. */
+async function ciInput(repo: string, runId: string, ci: Record<string, string>): Promise<LoopInput> {
+  const input = await loopInput(repo, runId)
+  return { ...input, config: { ...input.config, tests: null, ci } }
+}
+
+const subCi = { sub: 'env -u NODE_TEST_CONTEXT node --test test/sub.test.ts' }
+
+/** Records the files of each ci call of the checker. With `setupFails`, each call gives a failed setup and runs nothing. */
+function ciCalls(options: { setupFails?: boolean } = {}) {
+  const calls: string[][] = []
+  const checker = (real: Checker): Checker => ({
+    ...real,
+    ci: async (changed) => {
+      calls.push(changed)
+      if (options.setupFails) return [{ name: 'setup', command: 'npm ci', status: 'fail', exit_code: 1, output: 'npm ERR! setup failed' }]
+      return real.ci ? real.ci(changed) : []
+    },
+  })
+  return { calls, checker }
+}
+
+test('with ci and no tests, the host refuses a patch log while a ci command fails, and accepts it after the fix', async () => {
+  const repo = fixtureRepo()
+  const turns: Turn[] = []
+  const { calls, checker } = ciCalls()
+  const input = await ciInput(repo, 'ci-break-first', subCi)
+  const result = await runLoop(repo, 'ci-break-first', runsDir(), { input, checker, dispatch: scriptedDispatch(scriptFor({ tests: false, breakFirst: true }), turns) })
+
+  assert.equal(result.pass, true, result.report)
+  assert.equal(execFileSync('git', ['show', `${result.branch}:src/math.ts`], { cwd: repo }).toString(), fixed)
+  const output = patchOutput(turns)
+  assert.match(output, /refused: .*the ci commands failed \(ci sub\)\. Fix the cause and submit again\./)
+  assert.match(output, /--- ci sub \(exit code 1\) ---/)
+  assert.match(output, /3 !== 2/)
+  assert.doesNotMatch(output, /FAILING PATCH ACCEPTED/)
+  assert.deepEqual(calls, [['src/math.ts'], ['src/math.ts']])
+  assert.ok(turns.some((turn) => turn.role === 'patch' && turn.request.includes('When you submit, the host runs the ci commands of the repository, and refuses the log while one fails.')))
+  assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 \(sub returns a - b\); skipped: min-001 \(inlining adds nothing\)$/m)
+  // On Node, the final checks also run ci.
+  assert.match(result.report, /ci sub/)
+})
+
+test('a patch agent that changed no files runs no ci', async () => {
+  const repo = fixtureRepo()
+  const { calls, checker } = ciCalls()
+  const input = await ciInput(repo, 'ci-no-edits', subCi)
+  const result = await runLoop(repo, 'ci-no-edits', runsDir(), { input, checker, dispatch: scriptedDispatch(scriptFor({ rejectBug: true, tests: false }), []) })
+
+  assert.deepEqual(calls, [])
+  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(callers depend on the sum\); min-001 \(inlining adds nothing\)$/m)
+})
+
+test('a failed setup at the ci gate accepts the log, and the report says that the tests did not run', async () => {
+  const repo = fixtureRepo()
+  const { calls, checker } = ciCalls({ setupFails: true })
+  const input = await ciInput(repo, 'ci-setup', subCi)
+  const result = await runLoop(repo, 'ci-setup', runsDir(), { input, checker, dispatch: scriptedDispatch(scriptFor({ tests: false }), []) })
+
+  assert.equal(result.pass, true, result.report)
+  assert.equal(execFileSync('git', ['show', `${result.branch}:src/math.ts`], { cwd: repo }).toString(), fixed)
+  assert.deepEqual(calls, [['src/math.ts']])
+  assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 .*; targeted tests did not run: the setup failed$/m)
+})
+
 test('a patch agent that reverts its edit after a refusal, because the targeted test fails at the base, can skip the finding', async () => {
   const { calls, checker } = testCalls()
   const base = fixed.replace('a - b', 'a + b')

@@ -16,6 +16,8 @@ export type RepoConfig = {
   checks: Record<string, Check>
   /** Null in .agent-factory.json turns off the tests that a profile gives. */
   tests?: { pattern: string; command: string } | null
+  /** The commands of the repository CI, in the form of `checks`. Each submit gate and the final checks run them (D15). No profile gives them. */
+  ci?: Record<string, Check> | null
   /** A command that the host runs in each new worktree before its first check, for example npm ci. */
   setup?: string
   /** Reference material mounted read-only at /guides/<name>: name to file or directory path, on hosts with a disk. */
@@ -41,6 +43,8 @@ export function parseRepoConfig(text: string, source: string): Partial<RepoConfi
   const config = JSON.parse(text) as Partial<RepoConfig>
   if (config.checks !== undefined && (typeof config.checks !== 'object' || config.checks === null))
     throw new StopError(`${source}: checks must be an object of named commands`)
+  if (config.ci !== undefined && config.ci !== null && (typeof config.ci !== 'object' || Array.isArray(config.ci)))
+    throw new StopError(`${source}: ci must be an object of named commands`)
   if (config.tests && !/\{tests?\}/.test(config.tests.command)) throw new StopError(`${source}: tests.command needs {test} or {tests}`)
   if ('merge' in config && !mergeMethods.includes(config.merge)) throw new StopError(`${source}: merge must be "squash", "merge" or "rebase"`)
   if ('questions' in config && config.questions !== 'recommended') throw new StopError(`${source}: questions must be "recommended"`)
@@ -62,6 +66,9 @@ export async function readRepoConfig(root: RootFiles, source: string): Promise<R
   const text = await root.read(repoConfigFile)
   return resolveRepoConfig(await profileDefaults(root), text === null ? null : parseRepoConfig(text, `${repoConfigFile} ${source}`))
 }
+
+/** True when the config has at least one `ci` command. */
+export const hasCi = (config: RepoConfig): boolean => Object.keys(config.ci ?? {}).length > 0
 
 /** A host that runs the checks on a machine needs at least one check. */
 export function requireChecks(config: RepoConfig, repository: string): RepoConfig {
@@ -218,11 +225,11 @@ export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine)
     for (const test of tests) results.push(await run(`test ${test}`, command.replace('{test}', quote(test))))
     return results
   }
-  const checks: Checker['checks'] = async (changed, options = {}) => {
-    const failed = await setup()
-    if (failed) return [failed]
+  // The named commands of `checks` or of `ci`, after the setup passed. `prefix` tells a ci result from a check of the same name.
+  const runNamed = async (entries: Record<string, Check>, changed: string[], prefix: string): Promise<CheckResult[]> => {
     const results: CheckResult[] = []
-    for (const [name, check] of Object.entries(config.checks)) {
+    for (const [key, check] of Object.entries(entries)) {
+      const name = `${prefix}${key}`
       const { command, files } = typeof check === 'string' ? { command: check, files: undefined } : check
       if (!command.includes('{files}')) {
         results.push(await run(name, command))
@@ -233,13 +240,31 @@ export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine)
       if (matching.length === 0) results.push({ name, command, status: 'skipped', exit_code: null, output: 'no changed files match' })
       else results.push(await run(name, command.replace('{files}', matching.map(quote).join(' '))))
     }
+    return results
+  }
+  const ci = async (changed: string[]): Promise<CheckResult[]> => {
+    const failed = await setup()
+    if (failed) return [failed]
+    return runNamed(config.ci ?? {}, changed, 'ci ')
+  }
+  const checks: Checker['checks'] = async (changed, options = {}) => {
+    const failed = await setup()
+    if (failed) return [failed]
+    const results = await runNamed(config.checks, changed, '')
     if (options.tests === false) return results
     const tests = await targetedTests(repo, config, changed)
     if (tests.length === 0) results.push({ name: 'tests', command: config.tests?.command ?? '', status: 'skipped', exit_code: null, output: 'no targeted tests' })
     else results.push(...(await runTests(tests)))
+    // On Node, the final checks also run the ci commands, after the tests (D15).
+    if (hasCi(config)) results.push(...(await ci(changed)))
     return results
   }
-  return { checks, tests: config.tests ? runTests : null, agentChecks: (changed) => checks(changed, { tests: false }) }
+  return {
+    checks,
+    tests: config.tests ? runTests : null,
+    agentChecks: (changed) => checks(changed, { tests: false }),
+    ...(hasCi(config) ? { ci } : {}),
+  }
 }
 
 export const runTestsTool: Contracts.HostTool = {

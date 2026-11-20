@@ -42,10 +42,12 @@ export function ciChecker(options: { gh: GitHub; pull: PullRequest; repo: GitHub
 }
 
 /**
- * The checker of a review run whose config has tests. The final checks use CI. The tests and the agent checks use the
- * build machine. A failed setup there gives a failed result named setup, so the gate accepts the log with a report note.
+ * The checker of a review run whose config has tests or ci. The tests, the agent checks and ci use the build machine.
+ * A failed setup there gives a failed result named setup, so the gate accepts the log with a report note. With ci, the
+ * final checks publish the fixes and then run ci on the machine, not GitHub CI (D15). Without ci, the final checks
+ * use GitHub CI.
  */
-export function reviewChecker(ci: Checker, machine: Checker): Checker {
+export function reviewChecker(ci: Checker, machine: Checker, publish: () => Promise<string>): Checker {
   const settle = async (run: () => Promise<CheckResult[]>): Promise<CheckResult[]> => {
     try {
       return await run()
@@ -54,11 +56,22 @@ export function reviewChecker(ci: Checker, machine: Checker): Checker {
       return [{ name: 'setup', command: error.command, status: 'fail', ...error.result }]
     }
   }
-  const { tests, agentChecks } = machine
-  if (!tests || !agentChecks) throw new Error('the machine checker of a review run needs tests and agent checks')
-  return {
+  const { tests, agentChecks, ci: boxCi } = machine
+  if (!agentChecks) throw new Error('the machine checker of a review run needs agent checks')
+  const settled: Checker = {
     checks: ci.checks,
-    tests: (paths) => settle(() => tests(paths)),
+    tests: tests ? (paths) => settle(() => tests(paths)) : null,
     agentChecks: (changed) => settle(() => agentChecks(changed)),
+  }
+  if (!boxCi) return settled
+  const runCi = (changed: string[]) => settle(() => boxCi(changed))
+  return {
+    ...settled,
+    // The publish comes first, so that outcome() and the development run read the fixes as final.
+    async checks(changed) {
+      await publish()
+      return runCi(changed)
+    },
+    ci: runCi,
   }
 }

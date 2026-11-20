@@ -1,7 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { runTurn, submitOnce, type AgentHost, type AgentSpec, type HostTools } from './agent.ts'
-import { callRunTests, checkTails, failureText, isProtected, protectedEntries, runChecksTool, runTestsTool, targetedTests, type RepoConfig } from './checks.ts'
+import { callRunTests, checkTails, failureText, isProtected, protectedEntries, runChecksTool, runTestsTool, targetedTests, type CheckResult, type RepoConfig } from './checks.ts'
 import { checkIntake, checkPlan, checkSpec, inScope, submitIntake, submitPlan, submitSpec, type Intake, type Plan, type Spec } from './plan.ts'
 import type { Branch, Checker, Guides } from './platform.ts'
 import { staticFindings, type Profile } from './profiles.ts'
@@ -109,7 +109,7 @@ const submitBuildLog: Contracts.HostTool = {
   description:
     'Submit what you built, one time, after your last checkpoint. List every file that your commits changed, with the reason. ' +
     'When you cannot finish, say why in blocked, and the host reports it to the user. Else blocked is an empty string. ' +
-    'When you submit, the host runs the targeted tests of the changes of the task, and refuses the log when one fails. A blocked log runs no tests. ' +
+    'When you submit, the host runs the targeted tests of the changes of the task, then the ci commands of the repository, and refuses the log when one fails. A blocked log runs no tests. ' +
     'When the host says that the alarm call has no time left, submit with what is left to do in remaining. The host then runs no tests, and continues the task in a new turn of this session.',
   parameters: {
     type: 'object',
@@ -169,7 +169,7 @@ const continuePrompt = (remaining: string) =>
  * One builder task, in one or more turns of one session. The agent can write only the files in its scope of the branch.
  * The agent commits through checkpoint, runs the checks and its tests, and submits a build log.
  * The host refuses a checkpoint that breaks a static rule or adds a forbidden path.
- * The host refuses a completed log with uncommitted work, or when a targeted test of the changes since `base` fails.
+ * The host refuses a completed log with uncommitted work, or when a targeted test or a ci command (D15) on the changes since `base` fails.
  * A blocked log can report uncommitted work, and runs no tests. When the alarm call has less than `minCommandMs` left, the
  * agent submits what is left in `remaining`, and the next turn continues the task (D12).
  */
@@ -236,22 +236,23 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       if (changed.length === 0) throw new Error('no commits since the task started: checkpoint your work, or say in blocked why you cannot finish')
       const missing = changed.filter((path) => !log.changes.some((change) => change.path.replace(/^\/repo\//, '') === path))
       if (missing.length > 0) throw new Error(`list every changed file in changes: missing ${missing.join(', ')}`)
+      const refuse = (cause: string, failed: CheckResult[]) =>
+        new Error([`${cause}. Fix the cause, checkpoint and submit again. When you cannot fix it, submit with the reason in blocked.`, ...failureText(failed)].join('\n'))
+      const setupFailed = (failed: CheckResult[]) => failed.some(({ name }) => name === 'setup')
+      const taskChanges = await branch.changedFiles(task.base, head)
       const runTests = checker.tests
-      const tests = runTests ? await targetedTests(branch, context.config, await branch.changedFiles(task.base, head)) : []
-      if (!runTests || tests.length === 0) return log
-      const left = shortTime()
-      if (left !== null) throw new Error(outOfTime(left))
-      const failed = (await runTests(tests)).filter((result) => result.status !== 'pass')
+      const tests = runTests ? await targetedTests(branch, context.config, taskChanges) : []
+      if (runTests && tests.length > 0) {
+        const failed = (await command(() => runTests(tests))).filter((result) => result.status !== 'pass')
+        if (failed.length > 0)
+          throw refuse(setupFailed(failed) ? `the setup failed, so the targeted tests (${tests.join(', ')}) did not run` : `the targeted tests failed (${tests.join(', ')})`, failed)
+      }
+      const ci = checker.ci
+      if (!ci) return log
+      // A skipped {files} command is not a failure (D15).
+      const failed = (await command(() => ci(taskChanges))).filter((result) => result.status === 'fail')
       if (failed.length === 0) return log
-      const cause = failed.some(({ name }) => name === 'setup')
-        ? `the setup failed, so the targeted tests (${tests.join(', ')}) did not run`
-        : `the targeted tests failed (${tests.join(', ')})`
-      throw new Error(
-        [
-          `${cause}. Fix the cause, checkpoint and submit again. When you cannot fix it, submit with the reason in blocked.`,
-          ...failureText(failed),
-        ].join('\n'),
-      )
+      throw refuse(setupFailed(failed) ? 'the setup failed, so the ci commands did not run' : `the ci commands failed (${failed.map(({ name }) => name).join(', ')})`, failed)
     }),
   })
   const repo = allowFiles(guard(branch.tree, (path) => isProtected(context.config, path)), (path) => inScope(path, task.scope))
