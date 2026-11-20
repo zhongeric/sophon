@@ -5,6 +5,7 @@ import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
 import { sameSecret, verifySignature, type GitHub } from './github.ts'
 import { appBotLogin, githubAccess, githubApp, type BotLogins, type InstallationTokens } from './github-app.ts'
+import { listInbox } from './inbox.ts'
 import { workLabels, type WorkKind } from './labels.ts'
 import { openApi } from './openapi.ts'
 import { sweepBranches } from './prune.ts'
@@ -60,6 +61,22 @@ async function runsOf(env: Env, owner: string, repo: string, number: number) {
   const researches = research(env, owner, repo, number)
   const [developed, researched] = await Promise.all([develops.status(), researches.status()])
   return (researched.runs[0]?.created ?? -1) > (developed.runs[0]?.created ?? -1) ? researches : develops
+}
+
+/** GET /inbox: what the runs of all installations of the GitHub App need from the user (D21). */
+async function inbox(env: Env): Promise<Response> {
+  const missing = (['GITHUB_APP_ID', 'GITHUB_APP_PRIVATE_KEY'] as const).filter((name) => !env[name])
+  if (missing.length > 0)
+    return new Response(`the inbox lists the repositories of the GitHub App, and this Worker has no App: set ${missing.join(' and ')}`, { status: 503 })
+  const { app, installation } = githubApp(env, tokens)
+  return Response.json(
+    await listInbox({
+      app,
+      entries: (kind, owner, repo, number) => objectOf[kind](env, owner, repo, number).inbox(),
+      installation,
+      log: (line) => console.log(line),
+    }),
+  )
 }
 
 type DevelopOptions = Pick<DevelopRequest, 'base' | 'hotfix' | 'full' | 'parallel'>
@@ -130,8 +147,10 @@ export default {
     if (request.method === 'GET' && url.pathname === '/openapi.json') return Response.json(openApi(url.origin))
     const route = /^\/(runs|develop|research)\/([^/]+)\/([^/]+)\/(\d+)(?:\/(report|resume))?$/.exec(url.pathname)
     const pruneRoute = /^\/prune\/([^/]+)\/([^/]+)$/.exec(url.pathname)
-    if (!route && !pruneRoute) return new Response('agent-factory', { status: url.pathname === '/' ? 200 : 404 })
+    const inboxRoute = url.pathname === '/inbox'
+    if (!route && !pruneRoute && !inboxRoute) return new Response('agent-factory', { status: url.pathname === '/' ? 200 : 404 })
     if (!env.ADMIN_TOKEN || !sameSecret(request.headers.get('authorization') ?? '', `Bearer ${env.ADMIN_TOKEN}`)) return new Response('unauthorized', { status: 401 })
+    if (inboxRoute) return request.method === 'GET' ? inbox(env) : new Response('method not allowed', { status: 405 })
     if (pruneRoute) {
       if (request.method !== 'POST') return new Response('method not allowed', { status: 405 })
       return Response.json(await prune(env, pruneRoute[1]!, pruneRoute[2]!))

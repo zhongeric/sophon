@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { developAnnouncement, reviewAnnouncement } from '../src/cloudflare/announcements.ts'
+import { renderStatus, type StatusView } from '../src/cloudflare/status.ts'
 import { renderPlan } from '../src/core/plan.ts'
 import { commentLimit, render, type Answer, type Question } from '../src/core/questions.ts'
 import { defaultModels } from '../src/core/workflows/code-review-loop.ts'
@@ -102,10 +102,22 @@ test('the question comment has the marker, one line about how to answer, then ev
   assert.ok(lines.includes('- a) up (recommended)') && lines.includes('- b) no'))
 })
 
-test('each start comment is one line', () => {
-  for (const text of [developAnnouncement('dev-5-1', 'maintainer'), reviewAnnouncement('pr-7-1', 'maintainer')]) {
-    assert.doesNotMatch(text, /\n/)
+test('the status comment has the marker, the run, its state and one line about how to answer', () => {
+  const view = (kind: StatusView['kind'], run: string): StatusView => ({ by: 'maintainer', kind, notice: null, run, shown: { state: 'running' }, step: null, target: 'acme/app#5' })
+  for (const [kind, run] of [['development', 'dev-5-1'], ['review', 'pr-7-1'], ['research', 'research-9-1']] as const) {
+    const text = renderStatus(view(kind, run))
+    assert.equal(text.split('\n')[0], `<!-- agent-factory:status run=${run} -->`)
     assert.doesNotMatch(text, /@/)
-    assert.match(text, /^agent-factory started (development|review) run `(dev-5-1|pr-7-1)` for `maintainer`\. .*`\/answer`/)
+    assert.deepEqual(visibleLines(text), [`**agent-factory** ${kind} run \`${run}\` for \`maintainer\``, '**State:** running.', 'Questions come as new comments. Answer them with a `/answer` comment.'])
   }
+})
+
+test('the status comment collapses a result without a result comment, and links to a result comment', () => {
+  const base: StatusView = { by: 'maintainer', kind: 'development', notice: null, run: 'dev-5-1', shown: { state: 'running' }, step: null, target: 'acme/app#5' }
+  const inline = renderStatus({ ...base, shown: { comment: null, passed: true, state: 'ended', summary: '# Development run: READY' } })
+  assert.ok(visibleLines(inline).includes('**Result:** passed.'))
+  assert.match(inline, /<details><summary>Result<\/summary>\n\n# Development run: READY\n\n<\/details>/)
+  const linked = renderStatus({ ...base, shown: { comment: 'https://github.com/acme/app/issues/5#issuecomment-9', passed: false, state: 'ended', summary: '' } })
+  assert.ok(visibleLines(linked).includes('**Result:** failed. See the [result comment](https://github.com/acme/app/issues/5#issuecomment-9).'))
+  assert.doesNotMatch(linked, /<details>/)
 })

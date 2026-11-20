@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { parseRepo, parseTarget, pruneOutcome, remoteRequest, resumeOutcome } from '../src/node/remote.ts'
+import { inboxOutcome, parseRepo, parseTarget, pruneOutcome, remoteRequest, resumeOutcome } from '../src/node/remote.ts'
 
 test('a PR or an issue is owner/repo#number or its GitHub URL', () => {
   assert.deepEqual(parseTarget('acme/app#7'), { owner: 'acme', pr: 7, repo: 'app' })
@@ -103,4 +103,46 @@ test('the other commands keep their requests', () => {
   assert.deepEqual(remoteRequest('resume', 'acme/app#7', {}), { method: 'POST', path: '/runs/acme/app/7/resume' })
   assert.deepEqual(remoteRequest('prune', 'acme/app', {}), { method: 'POST', path: '/prune/acme/app' })
   assert.throws(() => remoteRequest('toString', 'acme/app#7', {}), /unknown command toString/)
+})
+
+test('inbox takes no target and requests GET /inbox', () => {
+  assert.deepEqual(remoteRequest('inbox', '', {}), { method: 'GET', path: '/inbox' })
+  assert.throws(() => remoteRequest('inbox', 'acme/app#7', {}), /inbox takes no target/)
+  assert.throws(() => remoteRequest('inbox', '', { budget: '5' }), /only start, develop and research take --budget/)
+})
+
+test('inbox prints one line for each item and for each repository that the Worker could not read', () => {
+  const body = JSON.stringify({
+    failed: [{ reason: 'cannot list the agent-develop items: HTTP 500', repository: 'acme/broken' }],
+    items: [
+      { kind: 'question', link: 'https://github.com/acme/app/issues/5#issuecomment-1', number: 5, reason: 'the questions intake wait for your /answer comment', repository: 'acme/app', run: 'dev-5' },
+      { kind: 'ready', link: 'https://github.com/acme/app/pull/6', number: 6, reason: 'the host did not merge the PR', repository: 'acme/app', run: 'dev-6' },
+    ],
+  })
+  assert.deepEqual(inboxOutcome({ ok: true, text: body }), {
+    code: 0,
+    text: [
+      'question acme/app#5 dev-5: the questions intake wait for your /answer comment https://github.com/acme/app/issues/5#issuecomment-1',
+      'ready acme/app#6 dev-6: the host did not merge the PR https://github.com/acme/app/pull/6',
+      'not read acme/broken: cannot list the agent-develop items: HTTP 500',
+    ].join('\n'),
+  })
+  assert.deepEqual(inboxOutcome({ ok: true, text: '{"items":[],"failed":[]}' }), { code: 0, text: 'the inbox is empty' })
+})
+
+test('inbox exits 1 and prints the raw text when the route fails or the body is not the inbox', () => {
+  const unavailable = 'the inbox lists the repositories of the GitHub App, and this Worker has no App: set GITHUB_APP_ID'
+  assert.deepEqual(inboxOutcome({ ok: false, text: unavailable }), { code: 1, text: unavailable })
+  const item = { kind: 'error', link: 'https://github.com/acme/app/issues/5', number: 5, reason: 'stopped', repository: 'acme/app', run: 'dev-5' }
+  for (const text of [
+    'not json',
+    'null',
+    '[]',
+    '{"items":[]}',
+    JSON.stringify({ failed: [], items: [{ ...item, kind: 'done' }] }),
+    JSON.stringify({ failed: [], items: [{ ...item, number: '5' }] }),
+    JSON.stringify({ failed: [], items: [{ ...item, link: null }] }),
+    JSON.stringify({ failed: [{ repository: 'acme/app' }], items: [] }),
+  ])
+    assert.deepEqual(inboxOutcome({ ok: true, text }), { code: 1, text })
 })

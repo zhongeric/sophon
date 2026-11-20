@@ -4,14 +4,13 @@ import { commandChecker, repoConfigFile, type RepoConfig } from '../core/checks.
 import { runLock } from '../core/egress.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Branch } from '../core/platform.ts'
-import { commentChannel, type Comments } from '../core/questions.ts'
+import type { Comments } from '../core/questions.ts'
 import type { ResearchDomain } from '../core/research.ts'
 import { StopError } from '../core/stop.ts'
 import { parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
 import { cutReport } from '../core/workflows/develop.ts'
 import { defaultResearchModels, research, researchProviders, type ResearchInput, type ResearchModels } from '../core/workflows/research.ts'
-import { researchAnnouncement } from './announcements.ts'
 import { sqlArtifacts } from './artifacts.ts'
 import { boxEnv, boxMachine, cleanBox, syncWithSetup } from './box.ts'
 import { commitTree, sqlBranches } from './branches.ts'
@@ -23,7 +22,7 @@ import { workLabels } from './labels.ts'
 import { loopChoices, type PreflightNeeds } from './preflight.ts'
 import { githubPulls } from './pulls.ts'
 import { reviewPass } from './review.ts'
-import { answerersOf, credentialsFor, Runs, setupTimeoutMs, type Call } from './runs.ts'
+import { answerersOf, credentialsFor, Runs, setupTimeoutMs, type Call, type RunResult } from './runs.ts'
 import { sqlFiles } from './storage.ts'
 import { encodePath } from './trees.ts'
 
@@ -43,6 +42,7 @@ type Notebook = { input: ResearchInput; config: RepoConfig; domain: ResearchDoma
  */
 export class ResearchRuns extends Runs<ResearchRequest> {
   protected readonly label = workLabels.research
+  protected readonly kind = 'research'
 
   protected number(request: ResearchRequest) {
     return request.issue
@@ -52,11 +52,7 @@ export class ResearchRuns extends Runs<ResearchRequest> {
     return `research-${request.issue}-${stamp}`
   }
 
-  protected announcement(run: string, request: ResearchRequest) {
-    return researchAnnouncement(run, request.by)
-  }
-
-  protected async execute(run: string, request: ResearchRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call) {
+  protected async execute(run: string, request: ResearchRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call): Promise<RunResult> {
     const { input, config, domain } = ledger.get<Notebook>('notebook') ?? (await this.notebook(run, request, gh, ledger))
     // A credential that names a Worker setting stops the run before any fetch.
     checkWorkerCredentials(domain.config.credentials)
@@ -72,7 +68,7 @@ export class ResearchRuns extends Runs<ResearchRequest> {
     }
     const result = await research(input, {
       branches: sqlBranches({ gh, ledger, log, owner, repo, run, sql }),
-      channel: commentChannel({ answerers: answerersOf(this.env, config.answerers), comments, pollMs: 0, waitMs: 0 }),
+      channel: this.channel(comments, answerersOf(this.env, config.answerers), call),
       checker,
       // A new directory for each step key, so that no file of an earlier command is in it. Only the last one stays. A replay
       // of the step, for example after a pause on its job, keeps the directory of the key.
@@ -111,7 +107,11 @@ export class ResearchRuns extends Runs<ResearchRequest> {
       review: (review) => reviewPass(this.env, request, ledger, review),
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
-    return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
+    const summary = cutReport(result.report, `(cut: see the report of run \`${run}\`)`)
+    // A ready result needs nothing from the user (D21).
+    if (result.status === 'ready') return { passed: true, summary }
+    const attention = result.status === 'blocked' ? { kind: 'blocked' as const, reason: 'the run is blocked' } : { kind: 'failed' as const, reason: result.status === 'stopped' ? 'the run stopped' : 'the run failed' }
+    return { attention, passed: false, summary }
   }
 
   protected async preflightNeeds(_request: ResearchRequest, ledger: Ledger): Promise<PreflightNeeds> {

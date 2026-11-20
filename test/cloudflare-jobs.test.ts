@@ -102,12 +102,12 @@ test('on Cloudflare, a domain command that runs longer than an alarm call pauses
   const result = await until(
     async () => {
       await answer()
-      return mock.state.comments.find((entry) => entry.issue === 5 && entry.body.startsWith('# Research run:'))
+      return mock.state.comments.find((entry) => entry.issue === 5 && /^# Research run:/m.test(entry.body))
     },
     240_000,
     describe,
   )
-  assert.match(result.body, /^# Research run: READY/, describe())
+  assert.match(result.body, /^# Research run: READY/m, describe())
   assert.equal((await status(5)).runs[0]?.state, 'passed')
   // Each calibration round has a clean directory of its own, and known started one time in each.
   const dirs = knownStarts().map((entry) => entry.cwd)
@@ -119,8 +119,9 @@ test('on Cloudflare, automatic retries keep the lost-job limit, the run waits 30
   const before = knownStarts().length
   mock.state.loseJob = (argv) => argv.join(' ').includes('research/run.mjs known')
   try {
-    const started = await (await fetch(`${worker.url}/research/acme/app/5`, { body: '{}', headers, method: 'POST' })).json() as { started: boolean }
+    const started = await (await fetch(`${worker.url}/research/acme/app/5`, { body: '{}', headers, method: 'POST' })).json() as { run: string; started: boolean }
     assert.equal(started.started, true)
+    const statusComments = () => mock.state.comments.filter((entry) => entry.issue === 5 && entry.body.startsWith(`<!-- agent-factory:status run=${started.run} -->`))
     const stopped = await until(async () => {
       await answer()
       const latest = (await status(5)).runs[0]
@@ -129,8 +130,8 @@ test('on Cloudflare, automatic retries keep the lost-job limit, the run waits 30
     assert.match(stopped.note, /the machine lost the job .*research\/run\.mjs known.* 3 times.*\. The host starts the run again from its ledger at \S+ \(restart 1 of 3\)$/)
     assert.equal(knownStarts().length - before, 3, describe())
     await until(() => /attempt 3 failed/.test(worker.output()) ? true : undefined, 30_000, describe)
-    // The run needs nothing from the user, so the comment does not ask for a resume (D13).
-    const notice = await until(() => mock.state.comments.find((entry) => entry.issue === 5 && entry.body.includes('(restart 1 of 3)')), 30_000, describe)
+    // The run needs nothing from the user, so the status comment shows the restart and does not ask for a resume (D13).
+    const notice = await until(() => statusComments().find((entry) => entry.body.includes('(restart 1 of 3)')), 30_000, describe)
     assert.doesNotMatch(notice.body, /npm run remote -- resume/)
 
     const body = '/answer recommended'
@@ -140,14 +141,17 @@ test('on Cloudflare, automatic retries keep the lost-job limit, the run waits 30
     assert.equal(knownStarts().length - before, 3)
 
     mock.state.loseJob = () => false
-    const mark = mock.state.comments.length
     const resumed = await fetch(`${worker.url}/runs/acme/app/5/resume`, { headers, method: 'POST' })
     assert.deepEqual(await resumed.json(), { reason: 'started the run again from its ledger after the error', resumed: true, state: 'queued' })
     const result = await until(async () => {
       await answer()
-      return mock.state.comments.slice(mark).find((entry) => entry.issue === 5 && entry.body.startsWith('# Research run:'))
+      return statusComments().find((entry) => /^# Research run:/m.test(entry.body))
     }, 240_000, describe)
-    assert.match(result.body, /^# Research run: READY/, describe())
+    assert.match(result.body, /^# Research run: READY/m, describe())
+    // One status comment carried the run from its start to its result, and no comment of its own told about the restart.
+    assert.deepEqual(statusComments(), [result], describe())
+    assert.ok((mock.state.edits.get(result.id) ?? 0) >= 4, describe())
+    assert.ok(!mock.state.comments.some((entry) => entry.issue === 5 && entry !== result && entry.body.includes('The host starts the run again')), describe())
     assert.equal((await status(5)).runs[0]?.state, 'passed')
     assert.ok(knownStarts().length - before > 3)
   } finally {

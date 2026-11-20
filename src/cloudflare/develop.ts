@@ -3,12 +3,11 @@ import module from 'nanocode-ts/nanocode_wasm.wasm'
 import { commandChecker, requireChecks } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Branch } from '../core/platform.ts'
-import { commentChannel, type Comments } from '../core/questions.ts'
+import type { Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
-import { cutReport, defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
-import { developAnnouncement } from './announcements.ts'
+import { cutReport, defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels, type DevelopResult } from '../core/workflows/develop.ts'
 import { boxMachine, syncWithSetup } from './box.ts'
 import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
@@ -19,7 +18,8 @@ import { githubPulls } from './pulls.ts'
 import { githubSigning } from './signing.ts'
 import { baseConfig } from './config.ts'
 import { reviewPass } from './review.ts'
-import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs, type Call } from './runs.ts'
+import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs, type Call, type RunResult } from './runs.ts'
+import type { ResultAttention } from './status.ts'
 import { sqlFiles } from './storage.ts'
 import { encodePath } from './trees.ts'
 
@@ -37,6 +37,7 @@ export type DevelopRequest = { owner: string; repo: string; issue: number; by: s
  */
 export class DevelopmentRuns extends Runs<DevelopRequest> {
   protected readonly label = workLabels.develop
+  protected readonly kind = 'development'
 
   protected number(request: DevelopRequest) {
     return request.issue
@@ -46,11 +47,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     return `dev-${request.issue}-${stamp}`
   }
 
-  protected announcement(run: string, request: DevelopRequest) {
-    return developAnnouncement(run, request.by)
-  }
-
-  protected async execute(run: string, request: DevelopRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call) {
+  protected async execute(run: string, request: DevelopRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call): Promise<RunResult> {
     const input = ledger.get<DevelopInput>('input') ?? (await this.input(run, request, gh))
     const prices = parsePrices(this.env.MODEL_PRICES)
     const { owner, repo } = request
@@ -67,7 +64,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     }
     const result = await develop(input, {
       branches: sqlBranches({ gh, ledger, log, owner, repo, run, sql }),
-      channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, pollMs: 0, waitMs: 0 }),
+      channel: this.channel(comments, answerersOf(this.env, input.config.answerers), call),
       checker,
       ci: { pollMs: 0, startMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000, waitMs: 0 },
       credentials: credentialsFor(this.env, developProviders(input.models)),
@@ -84,7 +81,8 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     })
     // A run that waits for the user, for example for CI, stops on an error, so that a restart starts it again from its ledger (D13).
     if (result.resume) throw new StopError(result.resume, { transient: true })
-    return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
+    const attention = developAttention(result, owner, repo)
+    return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`), ...(attention ? { attention } : {}) }
   }
 
   protected async preflightNeeds(request: DevelopRequest, ledger: Ledger, gh: GitHub | undefined): Promise<PreflightNeeds> {
@@ -125,4 +123,12 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       ...(request.budget !== undefined ? { budget: request.budget } : {}),
     }
   }
+}
+
+/** What a development result needs from the user (D21). A ready PR that the host did not merge waits for a merge. */
+function developAttention(result: DevelopResult, owner: string, repo: string): ResultAttention | null {
+  if (result.status === 'blocked') return { kind: 'blocked', reason: 'the run is blocked' }
+  if (result.status !== 'ready') return { kind: 'failed', reason: result.status === 'stopped' ? 'the run stopped' : 'the run failed' }
+  if (result.merge === null && result.pr) return { kind: 'ready', reason: 'the PR is ready and the host did not merge it', url: `https://github.com/${owner}/${repo}/pull/${result.pr.number}` }
+  return null
 }
