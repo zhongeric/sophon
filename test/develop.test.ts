@@ -311,6 +311,96 @@ test('develop: a review that fails 6 times ends failed after 5 repair rounds, do
   assert.deepEqual(github.state.merges, [])
 })
 
+test('develop: a refused rejection of a high finding goes to the fixer with the report of the review pass', { timeout: 240_000 }, async () => {
+  const { repo } = developRepo()
+  const github = fakePulls([true])
+  const requests: ReviewRequest[] = []
+  const refused = { name: 'No critical or high finding left unapplied without your OK', ok: false, detail: 'the rejection of bugs-001 is not accepted' }
+  const skipped = '- bugs-001 (high): mul(2, 3) is not tested, test/ops.test.ts:1. Expect 6 from mul(2, 3). Skipped: out of scope.'
+  const scripted = scriptedReview([[refused], []], requests)
+  const review: typeof scripted = async (request) => ({ ...(await scripted(request)), report: `- Triage: \`TRIAGE path=full\`\n\n## Skipped\n\n${skipped}\n` })
+  // The fixer also reads /review/review-report.md before its repair.
+  const script = developScript()
+  const turns: Turn[] = []
+  const dispatch = scriptedDispatch((turn) => {
+    const reply = script(turn)
+    if (turn.role !== 'builder' || turn.output !== null || !/Repair round/.test(turn.request) || !('cell' in reply)) return reply
+    return { cell: `text('review-report.md: ' + await tools.Read({ file_path: '/review/review-report.md' }))\n${reply.cell}` }
+  }, turns)
+  const result = await runDevelop(repo, runsDir(), { dispatch, pulls: github.pulls, review, runId: 'refused-rejection' })
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(repairRounds(turns), ['1'])
+  const read = repairTexts(turns)[0] ?? ''
+  assert.match(read, /- No critical or high finding left unapplied without your OK: the rejection of bugs-001 is not accepted/)
+  assert.doesNotMatch(read, /The report of the pass: \/review\/review-report\.md/)
+  assert.match(read, /review-report\.md: .*bugs-001 \(high\): mul\(2, 3\) is not tested, test\/ops\.test\.ts:1\. Expect 6 from mul\(2, 3\)\. Skipped: out of scope\./s)
+  assert.ok(turns.some((turn) => turn.role === 'builder' && /The report of the review pass, with the findings that the patch agents skipped: \/review\/review-report\.md/.test(turn.request)))
+  assert.equal(requests.length, 2)
+})
+
+test('develop: a resumed run with review passes from before D14 ends failed, does not repair, and does not mark the PR ready or merge', { timeout: 240_000 }, async () => {
+  const { repo } = developRepo(undefined, { merge: 'squash' })
+  const dir = runsDir()
+  const github = fakePulls([false, true])
+  const requests: ReviewRequest[] = []
+  const review = scriptedReview([[]], requests)
+  // The run pauses before the repair loop. The ledger then gets a pre-D14 red CI, a CI-fix round and a PASS.
+  const pulls = { ...github.pulls, open: async () => { throw new PausedError('before the repair loop') } }
+  await assert.rejects(runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls, review, runId: 'old-ledger' }), PausedError)
+  const ledger = fileLedger(join(dir, 'old-ledger', 'state.json'))
+  const old = 'a'.repeat(40)
+  const job = { name: 'CI (pull_request)', run: 1, url: 'https://ci.example/old', created: new Date().toISOString(), done: true, ok: false }
+  ledger.put('ci:ci.build.0', { sha: old, state: 'fail', jobs: [job], failures: 'no test of mul(2, 3)' })
+  ledger.put('step:ci-fix.1', { result: { summary: 'mul(2, 3) is 6', changes: [], tests: [], blocked: '' } })
+  ledger.put('step:review.1', { result: { pass: true, head: old, final: old, branch: 'factory/review', report: '- Triage: `TRIAGE path=full`', failed: [] } })
+
+  const turns: Turn[] = []
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), turns), pulls: github.pulls, review, runId: 'old-ledger' })
+  assert.equal(result.status, 'failed', result.report)
+  assert.match(result.report, /The review passes of this run are from before D14 and did not review the repair commits\. Start a new run\. The PR stays draft\./)
+  assert.deepEqual(repairRounds(turns), [])
+  assert.equal(requests.length, 0)
+  assert.equal(fileLedger(join(dir, 'old-ledger', 'state.json')).get('step:repair.1'), undefined)
+  assert.deepEqual(github.state.ready, [])
+  assert.deepEqual(github.state.merges, [])
+  assert.equal(result.merge, null)
+})
+
+test('develop: a pre-D14 CI-fix without a review enters the repair loop and resumes after a new review', { timeout: 240_000 }, async () => {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  const github = fakePulls([false, true])
+  const requests: ReviewRequest[] = []
+  const review = scriptedReview([[{ name: 'Checks green', ok: false, detail: 'no test checks mul(2, 3)' }], []], requests)
+  const pulls = { ...github.pulls, open: async () => { throw new PausedError('before the repair loop') } }
+  await assert.rejects(runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls, review, runId: 'old-ci-fix' }), PausedError)
+  const path = join(dir, 'old-ci-fix', 'state.json')
+  const ledger = fileLedger(path)
+  ledger.put('step:ci-fix.1', { result: { summary: 'mul(2, 3) is 6', changes: [], tests: [], blocked: '' } })
+  assert.equal(ledger.get('repair-workflow'), undefined)
+  assert.equal(ledger.get('step:review.1'), undefined)
+
+  // The new loop repairs CI, records review pass 1, and pauses at the CI of repair round 2.
+  const first: Turn[] = []
+  await assert.rejects(runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), first), pulls: pauseAtCi(github.pulls, 3), review, runId: 'old-ci-fix' }), PausedError)
+  assert.deepEqual(repairRounds(first), ['1', '2'])
+  const paused = fileLedger(path)
+  assert.equal(paused.get('repair-workflow'), true)
+  for (const key of ['step:ci-fix.1', 'step:repair.1', 'step:review.1', 'step:repair.2']) assert.ok(paused.get(key), key)
+  assert.deepEqual(requests.map((request) => request.runId), ['old-ci-fix-review-1'])
+
+  const second: Turn[] = []
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), second), pulls: github.pulls, review, runId: 'old-ci-fix' })
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(repairRounds(second), [])
+  assert.ok(!second.some((turn) => /Build task/.test(turn.request)))
+  assert.deepEqual(requests.map((request) => request.runId), ['old-ci-fix-review-1', 'old-ci-fix-review-2'])
+  assert.notEqual(requests[1]!.head, requests[0]!.head)
+  assert.equal(requests[1]!.head, github.state.shas.at(-1))
+  assert.equal(fileLedger(path).get('step:repair.3'), undefined)
+  assert.deepEqual(github.state.ready, [9])
+})
+
 test('develop: a user question of the intake agent pauses the run, and the run resumes without asking again or repeating the intake', { timeout: 120_000 }, async () => {
   const { repo } = developRepo()
   const dir = runsDir()

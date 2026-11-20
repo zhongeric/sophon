@@ -93,7 +93,7 @@ export type DevelopResult = {
 }
 
 /** Repair rounds of a run: one budget for all causes, CI failures and failed review passes. Then the run fails (D14, G6). */
-export const repairRounds = 5
+const repairRounds = 5
 /** How long CI can take to start for a push of a commit that already has finished CI. */
 const ciGraceMs = 3 * 60_000
 /** The most that GitHub's clock and the host's clock can differ. */
@@ -105,9 +105,10 @@ type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failure
 type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage; failed?: Criterion[] }
 /**
  * The cause of a repair round. `from` is 'CI' or 'review pass N', `short` is one line for the prompt and the report,
- * `text` is /review/repair.txt, and `logs` is /review/ci-failure.txt when CI failed.
+ * `text` is /review/repair.txt, `logs` is /review/ci-failure.txt when CI failed, and `report` is
+ * /review/review-report.md when a review pass failed.
  */
-type Cause = { from: string; short: string; text: string; logs: string | null }
+type Cause = { from: string; short: string; text: string; logs: string | null; report: string | null }
 type Repair = { round: number; cause: Cause; log: BuildLog }
 
 /** The providers of every model that a development run uses: the development roles and the review loop. */
@@ -123,9 +124,9 @@ export function checkDevelopModels(models: DevelopModels, allowed = defaultAllow
 /**
  * The development workflow, steps 0 to 9, with its order and hard rules in code:
  * intake and the confirmation of the ask, a spec for a larger change, one plan, builders for the plan's tasks (in
- * parallel when their files do not overlap, each on its own branch), a draft PR, CI, the code review loop once or
- * twice, CI again, and a ready PR only when every criterion holds. A red CI or a failed review pass gets a repair round
- * inside one budget, and a new review pass reviews the fixes (D14). Every step is in the ledger, so the same run ID
+ * parallel when their files do not overlap, each on its own branch), a draft PR, CI, the code review loop, CI again,
+ * and a ready PR only when every criterion holds. A red CI or a failed review pass gets a repair round inside one
+ * budget, and a new review pass reviews the fixes (D14). Every step is in the ledger, so the same run ID
  * resumes after a pause or a crash without repeating finished steps. When the user stops the run at the cost budget, the
  * run ends as stopped with its report.
  */
@@ -344,22 +345,6 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const pushed = await publish()
   state.pr = await step(ledger, 'pr', () => pulls.open({ head: branchName, title: intook.title, body: prBody(input, decisions(ledger), planText, planned.smallest_change) }))
   const fixer = planned.tasks.length === 1 ? `build.${planned.tasks[0]!.id}` : 'ci-fix'
-  const repair = (round: number, cause: Cause) =>
-    step(ledger, `repair.${round}`, () =>
-      build(context, {
-        id: fixer,
-        turn: { request: `repair-${round}`, key: `output:${fixer}:repair-${round}` },
-        model: models.builder,
-        branch: dev,
-        scope: [...new Set(planned.tasks.flatMap((task) => task.files))],
-        active,
-        checker: deps.checker(dev),
-        base: input.base,
-        review: { '/ask.md': input.ask, '/plan.md': planText, '/repair.txt': cause.text, ...(cause.logs === null ? {} : { '/ci-failure.txt': cause.logs }) },
-        prompt: repairPrompt(round, cause),
-        label: `agent-factory: repair ${round}`,
-      }),
-    )
 
   // 4 and 5. Freeze and the review loop. The frozen package is the ask, the decisions and the plan.
   // A pass gets the budget up to twice the run budget and stops there without a question. That stop is not a finished
@@ -390,10 +375,18 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     return review
   }
 
-  // The repair loop (D14, G6). A red CI, a failed review pass and a red CI after the last PASS each give a cause to the
-  // fixer session, inside one budget of repairRounds. CI runs after each round, and no review pass runs while CI is red.
+  // The repair loop (D14, G6). CI failures and failed review passes share one repair budget. CI runs after each round,
+  // and no review pass runs while CI is red.
   // The fixes of a repair always go through a new review pass. All control comes from ledger steps, so a resumed run
   // replays the loop and repeats no round.
+  // A ledger from before D14 has review passes after its CI-fix rounds. The repair rounds make new commits that those
+  // passes did not review.
+  if (!ledger.get('repair-workflow')) {
+    if (ledger.get('step:ci-fix.1') && ledger.get('step:review.1'))
+      return finish('failed', [], 'The review passes of this run are from before D14 and did not review the repair commits. Start a new run. The PR stays draft.')
+    // On a resume, this record identifies new review passes as D14 passes.
+    ledger.put('repair-workflow', true)
+  }
   let head = pushed
   // The CI of the last checked commit. It checks the head only when its sha is the head.
   let ci = await waitCi('ci.build.0', head)
@@ -428,7 +421,27 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
       break
     }
     const round = state.repairs.length + 1
-    const log = await repair(round, cause)
+    const log = await step(ledger, `repair.${round}`, () =>
+      build(context, {
+        id: fixer,
+        turn: { request: `repair-${round}`, key: `output:${fixer}:repair-${round}` },
+        model: models.builder,
+        branch: dev,
+        scope: [...new Set(planned.tasks.flatMap((task) => task.files))],
+        active,
+        checker: deps.checker(dev),
+        base: input.base,
+        review: {
+          '/ask.md': input.ask,
+          '/plan.md': planText,
+          '/repair.txt': cause.text,
+          ...(cause.logs === null ? {} : { '/ci-failure.txt': cause.logs }),
+          ...(cause.report === null ? {} : { '/review-report.md': cause.report }),
+        },
+        prompt: repairPrompt(round, cause),
+        label: `agent-factory: repair ${round}`,
+      }),
+    )
     state.repairs.push({ round, cause, log })
     if (log.blocked.trim()) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
     head = await publish()
@@ -438,9 +451,8 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
 
   // Hygiene and the criteria. When the budget is used, the run ends failed with the last cause.
   const reviewed = state.reviews.length >= routed.passes && state.reviews.at(-1)?.pass === true && !repaired
-  const final = head
-  const finalCi = ci.sha === final ? ci : null
-  const changed = await dev.changedFiles(input.base, final)
+  const finalCi = ci.sha === head ? ci : null
+  const changed = await dev.changedFiles(input.base, head)
   const forbidden = forbiddenPaths(changed, active)
   const solidity = active.find((profile) => profile.id === 'solidity')
   const audit = solidity !== undefined && changed.some((path) => solidity.files.test(path))
@@ -469,7 +481,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     {
       name: 'CI green on the head',
       ok: finalCi?.state === 'pass',
-      detail: finalCi ? `${final.slice(0, 12)}: ${finalCi.jobs.map((job) => `${job.name}=${job.ok ? 'pass' : 'fail'}`).join(', ')}` : 'not checked: the review loop did not pass',
+      detail: finalCi ? `${head.slice(0, 12)}: ${finalCi.jobs.map((job) => `${job.name}=${job.ok ? 'pass' : 'fail'}`).join(', ')}` : 'not checked: the review loop did not pass',
     },
     { name: 'No build output, logs or environment files', ok: forbidden.length === 0, detail: forbidden.join(', ') || 'none in the change' },
     ...(audit ? [{ name: 'Auditor for Solidity src/', ok: false, detail: 'required, not built yet. Audit the change before you merge. The PR stays draft.' }] : []),
@@ -488,7 +500,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   // refusal as a result, so that a resumed run never tries the merge again.
   const merged = await step(ledger, 'merge', async (): Promise<MergeResult> => {
     try {
-      return await pulls.merge(pr, { method, sha: final })
+      return await pulls.merge(pr, { method, sha: head })
     } catch (error) {
       return { merged: false, reason: reasonOf(error) }
     }
@@ -564,6 +576,7 @@ function repairPrompt(round: number, cause: Cause): string {
     '',
     '- The causes: /review/repair.txt',
     ...(cause.logs === null ? [] : ['- The CI logs: /review/ci-failure.txt']),
+    ...(cause.report === null ? [] : ['- The report of the review pass, with the findings that the patch agents skipped: /review/review-report.md']),
     '- The plan: /review/plan.md',
     '- The ask: /review/ask.md',
     '',
@@ -580,10 +593,14 @@ function ciCause(ci: Ci): Cause {
     short: `${failed.map((job) => job.name).join(', ')} failed on ${at}`,
     text: [`# CI failed on ${at}`, '', ...failed.map((job) => `- ${job.name}: ${job.url}`), '', 'The logs: /review/ci-failure.txt', ''].join('\n'),
     logs: ci.failures,
+    report: null,
   }
 }
 
-/** A failed review pass as a repair cause: its failed criteria, with the intent gaps and the refused rejections in their details. */
+/**
+ * A failed review pass as a repair cause: its failed criteria, with the intent gaps and the refused rejections in their
+ * details. The report of the pass gives the skipped findings with their reasons and the checks.
+ */
 function reviewCause(pass: number, review: Review): Cause {
   const failed = review.failed ?? []
   return {
@@ -596,6 +613,7 @@ function reviewCause(pass: number, review: Review): Cause {
       '',
     ].join('\n'),
     logs: null,
+    report: review.report,
   }
 }
 
