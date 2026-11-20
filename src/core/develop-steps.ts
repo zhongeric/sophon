@@ -104,12 +104,13 @@ const checkpointTool: Contracts.HostTool = {
   parameters: { type: 'object', properties: { message: { type: 'string', description: 'What this commit does, in a few words' } }, required: ['message'], additionalProperties: false },
 }
 
-const submitBuildLog: Contracts.HostTool = {
+/** The submit tool of a builder. `ci` tells whether the submit gate runs the ci commands. */
+const submitBuildLog = (ci: boolean): Contracts.HostTool => ({
   name: 'submit_build_log',
   description:
     'Submit what you built, one time, after your last checkpoint. List every file that your commits changed, with the reason. ' +
     'When you cannot finish, say why in blocked, and the host reports it to the user. Else blocked is an empty string. ' +
-    'When you submit, the host runs the targeted tests of the changes of the task, then the ci commands of the repository, and refuses the log when one fails. A blocked log runs no tests. ' +
+    `When you submit, the host runs the targeted tests of the changes of the task${ci ? ', then the ci commands of the repository' : ''}, and refuses the log when one fails. A blocked log runs no tests. ` +
     'When the host says that the alarm call has no time left, submit with what is left to do in remaining. The host then runs no tests, and continues the task in a new turn of this session.',
   parameters: {
     type: 'object',
@@ -126,7 +127,7 @@ const submitBuildLog: Contracts.HostTool = {
     required: ['summary', 'changes', 'tests', 'blocked'],
     additionalProperties: false,
   },
-}
+})
 
 export type BuildTask = {
   /** The agent ID. A follow-up turn of the same agent uses the same ID and another `turn`. */
@@ -220,7 +221,7 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
     ...(context.config.tests && checker.tests
       ? { run_tests: { definition: runTestsTool, call: (input: unknown) => command(() => callRunTests(branch, context.config, checker.tests!, input)) } }
       : {}),
-    ...submitOnce(context.host, key, submitBuildLog, async (input) => {
+    ...submitOnce(context.host, key, submitBuildLog(Boolean(checker.ci)), async (input) => {
       const log = input as BuildLog
       if (!log?.summary?.trim() || !Array.isArray(log.changes) || !Array.isArray(log.tests) || typeof log.blocked !== 'string' || typeof (log.remaining ?? '') !== 'string')
         throw new Error('summary, changes, tests and blocked are required')
@@ -249,7 +250,7 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       }
       const ci = checker.ci
       if (!ci) return log
-      // A skipped {files} command is not a failure (D15).
+      // A skipped {files} command is not a failure.
       const failed = (await command(() => ci(taskChanges))).filter((result) => result.status === 'fail')
       if (failed.length === 0) return log
       throw refuse(setupFailed(failed) ? 'the setup failed, so the ci commands did not run' : `the ci commands failed (${failed.map(({ name }) => name).join(', ')})`, failed)

@@ -140,7 +140,8 @@ function ciCalls(options: { setupFails?: boolean } = {}) {
     ci: async (changed) => {
       calls.push(changed)
       if (options.setupFails) return [{ name: 'setup', command: 'npm ci', status: 'fail', exit_code: 1, output: 'npm ERR! setup failed' }]
-      return real.ci ? real.ci(changed) : []
+      if (!real.ci) throw new Error('the checker of the ci input has no ci')
+      return real.ci(changed)
     },
   })
   return { calls, checker }

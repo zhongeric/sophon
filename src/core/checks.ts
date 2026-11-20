@@ -38,6 +38,11 @@ export type RepoConfig = {
 
 export const repoConfigFile = '.agent-factory.json'
 
+const isCheck = (value: unknown): value is Check =>
+  typeof value === 'string' ||
+  (typeof value === 'object' && value !== null && !Array.isArray(value) && 'command' in value && typeof value.command === 'string' &&
+    (!('files' in value) || value.files === undefined || typeof value.files === 'string'))
+
 /** Parses .agent-factory.json. Each field that it sets replaces the profile default of that field. */
 export function parseRepoConfig(text: string, source: string): Partial<RepoConfig> {
   const config = JSON.parse(text) as Partial<RepoConfig>
@@ -45,6 +50,7 @@ export function parseRepoConfig(text: string, source: string): Partial<RepoConfi
     throw new StopError(`${source}: checks must be an object of named commands`)
   if (config.ci !== undefined && config.ci !== null && (typeof config.ci !== 'object' || Array.isArray(config.ci)))
     throw new StopError(`${source}: ci must be an object of named commands`)
+  for (const [name, check] of Object.entries(config.ci ?? {})) if (!isCheck(check)) throw new StopError(`${source}: ci.${name} must be a command string or { command, files? } with strings`)
   if (config.tests && !/\{tests?\}/.test(config.tests.command)) throw new StopError(`${source}: tests.command needs {test} or {tests}`)
   if ('merge' in config && !mergeMethods.includes(config.merge)) throw new StopError(`${source}: merge must be "squash", "merge" or "rebase"`)
   if ('questions' in config && config.questions !== 'recommended') throw new StopError(`${source}: questions must be "recommended"`)
@@ -67,7 +73,6 @@ export async function readRepoConfig(root: RootFiles, source: string): Promise<R
   return resolveRepoConfig(await profileDefaults(root), text === null ? null : parseRepoConfig(text, `${repoConfigFile} ${source}`))
 }
 
-/** True when the config has at least one `ci` command. */
 export const hasCi = (config: RepoConfig): boolean => Object.keys(config.ci ?? {}).length > 0
 
 /** A host that runs the checks on a machine needs at least one check. */

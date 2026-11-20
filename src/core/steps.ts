@@ -215,8 +215,7 @@ async function testGate(context: RunContext, id: string): Promise<void> {
   if (edits.length === 0) return
   const existing: string[] = []
   for (const path of edits) if ((await context.repo.tree.stat(`/${path}`)) !== null) existing.push(path)
-  // True when the setup failed, so that the gate accepts the log with the note.
-  const setupFailed = (failed: CheckResult[]) => {
+  const recordUntested = (failed: CheckResult[]) => {
     if (!failed.some((result) => result.name === 'setup')) return false
     context.host.ledger.put(untestedKey(id), true)
     return true
@@ -226,13 +225,13 @@ async function testGate(context: RunContext, id: string): Promise<void> {
     const added = existing.filter((path) => pattern.test(path))
     const targeted = [...new Set([...(await targetedTests(context.repo, config, edits)), ...added])]
     const failed = targeted.length === 0 ? [] : (await tests(targeted)).filter((result) => result.status !== 'pass')
-    if (setupFailed(failed)) return
+    if (recordUntested(failed)) return
     if (failed.length > 0) throw new Error([`the targeted tests of your edits failed (${targeted.join(', ')}). ${gateFix}`, ...failureText(failed)].join('\n'))
   }
   if (!ci) return
   // A skipped {files} command is not a failure.
   const failed = (await ci(existing)).filter((result) => result.status === 'fail')
-  if (failed.length === 0 || setupFailed(failed)) return
+  if (failed.length === 0 || recordUntested(failed)) return
   throw new Error([`the ci commands failed (${failed.map((result) => result.name).join(', ')}). ${gateFix}`, ...failureText(failed)].join('\n'))
 }
 

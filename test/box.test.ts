@@ -289,7 +289,6 @@ test('the checker of a review run with ci publishes the fixes, then runs ci on t
   assert.deepEqual(await checker.ci!(['a.txt']), [passed])
   assert.deepEqual(published, [0])
 
-
   // A failed setup on the machine gives a failed result named setup.
   const broken = syncFixture()
   writeFileSync(join(broken.root, 'fail'), '')
