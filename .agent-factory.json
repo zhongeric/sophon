@@ -3,6 +3,10 @@
   "checks": {
     "typecheck": "npm run check"
   },
+  "ci": {
+    "check": "npm run check",
+    "test": "npm test"
+  },
   "setup": "npm ci --prefer-offline --no-audit --no-fund",
   "questions": "recommended",
   "merge": "squash",
