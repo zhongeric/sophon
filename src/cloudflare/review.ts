@@ -61,8 +61,9 @@ export async function reviewPass<Id>(
       throw new StopError(`review run ${run} stopped: ${outcome.error}`, { transient: true })
     }
     const resume = await runs.resumeAfterError(run)
-    // A refused resume keeps the record, so that the next poll tries the resume again without a D13 count.
-    if (resume.resumed) ledger.put(errorKey, false)
+    // A refused resume keeps the record and counts as a D13 restart, so that the next restart tries the resume again.
+    if (!resume.resumed) throw new StopError(`review run ${run} stopped: ${outcome.error}. Its resume was refused: ${resume.reason}`, { transient: true })
+    ledger.put(errorKey, false)
     throw new PausedError(resume.reason)
   }
   // A record of an earlier error must not resume a later error without a D13 count.

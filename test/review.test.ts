@@ -99,21 +99,23 @@ test('a review run that is queued, running or paused pauses its parent without a
   }
 })
 
-test('a refused resume of a review run in error keeps the error record, so that the next poll tries the resume again', async () => {
+test('a refused resume of a review run in error counts as a D13 restart, keeps the error record, and the parent waits with error after the third restart', async () => {
   const { call, fake } = parent()
   fake.state = 'error'
-  assert.ok((await call()).error instanceof StopError)
+  assert.equal((await call()).outcome?.restart, 1)
   fake.refuse = true
-  for (let poll = 1; poll <= 2; poll++) {
+  for (let poll = 1; poll <= maxErrorRestarts; poll++) {
     const refused = await call()
-    assert.ok(refused.error instanceof PausedError)
-    assert.equal(refused.error.message, 'review run pr-9-2 of this PR is running')
-    assert.equal(refused.outcome?.state, 'paused')
+    assert.ok(refused.error instanceof StopError && refused.error.transient)
+    assert.match(refused.error.message, /review run pr-9-2 of this PR is running/)
     assert.equal(fake.resumes, poll)
+    if (poll < maxErrorRestarts) assert.equal(refused.outcome?.restart, poll + 1)
+    else assert.deepEqual([refused.outcome?.state, refused.outcome?.restart], ['error', null])
   }
+  // As after the admin resume of the parent.
   fake.refuse = false
   const resumed = await call()
   assert.ok(resumed.error instanceof PausedError)
   assert.equal(fake.state, 'queued')
-  assert.equal(fake.resumes, 3)
+  assert.equal(fake.resumes, maxErrorRestarts + 1)
 })
