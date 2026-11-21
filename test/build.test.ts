@@ -8,6 +8,7 @@ import type { AgentHost } from '../src/core/agent.ts'
 import { commandChecker, type Machine } from '../src/core/checks.ts'
 import { build, type DevelopContext } from '../src/core/develop-steps.ts'
 import type { Checker } from '../src/core/platform.ts'
+import { profilesById, type Profile } from '../src/core/profiles.ts'
 import { gitBranches } from '../src/node/git.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { loadRepoConfig, sqliteStore } from '../src/node/platform.ts'
@@ -66,12 +67,13 @@ function recorded(inner: Checker) {
  * One build() on a new git branch of developRepo, with a scripted model and the checks on `machine`. Without `script`,
  * the model runs `cell` at the start of each turn. `timeLeft` is the time that the alarm call has left.
  */
-async function buildWith(options: { cell: string; machine: Machine; config?: Record<string, unknown>; script?: Script; timeLeft?: () => number }) {
+async function buildWith(options: { cell: string; machine: Machine; config?: Record<string, unknown>; script?: Script; timeLeft?: () => number; baseFiles?: Record<string, string>; active?: Profile[] }) {
   const { repo } = developRepo(options.config)
   const dir = mkdtempSync(join(tmpdir(), 'factory-build-'))
   const config = await loadRepoConfig(repo)
   const base = execFileSync('git', ['rev-parse', 'main'], { cwd: repo }).toString().trim()
   const branch = await gitBranches(repo, join(dir, 'branches')).branch('factory/task-build-add', base)
+  for (const [path, content] of Object.entries(options.baseFiles ?? {})) await branch.tree.write(path, new TextEncoder().encode(content))
   const { calls, checker } = recorded(commandChecker(branch, config, options.machine))
   const turns: Turn[] = []
   const host: AgentHost = {
@@ -89,9 +91,10 @@ async function buildWith(options: { cell: string; machine: Machine; config?: Rec
     model: { provider: 'claude', model: 'claude-opus-5-5' },
     branch,
     scope: ['src/'],
-    active: [],
+    active: options.active ?? [],
     checker,
     base,
+    ...(options.baseFiles ? { baseFiles: Object.keys(options.baseFiles) } : {}),
     review: {},
     prompt: 'Build task add.',
     label: 'agent-factory: add',
@@ -101,6 +104,41 @@ async function buildWith(options: { cell: string; machine: Machine; config?: Rec
 }
 
 const pass = { exit_code: 0, output: 'ok' }
+
+test('build: checkpoint refuses edits to inherited base files before and after a commit', { timeout: 60_000 }, async () => {
+  const { machine } = fakeMachine(() => pass)
+  const inherited = 'pragma solidity ^0.8.28;\ncontract Base {\n  function caller() external view returns (address) { return msg.sender; }\n}\n'
+  const replace = (content: string) => `await tools.Write({ file_path: '/repo/src/Base.sol', content: ${JSON.stringify(content)} })`
+  const unsafe = replace(inherited.replace('msg.sender', 'tx.origin'))
+  const tryCheckpoint = `try { ${checkpoint}; text('UNSAFE CHECKPOINT ACCEPTED') } catch (error) { text('edit refused: ' + error) }`
+  const cell = [
+    write, unsafe, tryCheckpoint,
+    replace(inherited), checkpoint,
+    unsafe, tryCheckpoint,
+    `await tools.Bash({ command: 'rm /repo/src/Base.sol' })`, tryCheckpoint,
+    replace(inherited), trySubmit,
+  ].join('\n')
+  const { output, result } = await buildWith({ cell, machine, baseFiles: { 'src/Base.sol': inherited }, active: profilesById(['solidity']) })
+
+  assert.equal(output.match(/edit refused: Error: checkpoint refused: restore the unchanged files from the base merge: src\/Base\.sol/g)?.length, 3)
+  assert.doesNotMatch(output, /UNSAFE CHECKPOINT ACCEPTED/)
+  assert.match(output, /LOG ACCEPTED/)
+  assert.equal(result.blocked, '')
+})
+
+test('build: submit refuses a reverted base file even when the tree matches HEAD', { timeout: 60_000 }, async () => {
+  const { machine } = fakeMachine(() => pass)
+  const original = changedMath.replace('b + a', 'a + b')
+  const cell = [
+    `await tools.Write({ file_path: '/repo/src/math.ts', content: ${JSON.stringify(original)} })`, trySubmit,
+    write, checkpoint, trySubmit,
+  ].join('\n')
+  const { output, result } = await buildWith({ cell, machine, baseFiles: { 'src/math.ts': changedMath } })
+
+  assert.match(output, /submit refused: Error: submit refused: restore the unchanged files from the base merge: src\/math\.ts/)
+  assert.equal(output.match(/LOG ACCEPTED/g)?.length, 1)
+  assert.equal(result.blocked, '')
+})
 
 test('build: run_checks runs only the configured checks, and submit runs the targeted tests and accepts the log when they pass', { timeout: 60_000 }, async () => {
   const { commands, machine } = fakeMachine(() => pass)

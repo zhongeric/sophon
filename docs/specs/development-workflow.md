@@ -416,7 +416,7 @@ No rule covers these yet. Each default applies until the user replaces it.
 | Phase | Scope | Exit |
 | --- | --- | --- |
 | 0 | Review loop matches D1 and D3. The light loop, first profiles and static rules. Built. | A real run on a real PR. |
-| 1 | Profiles in code. Intake, plan, build, freeze, review loop, hygiene, CI, ready PR, on the local platform. Profiles `solidity`, `solidity-support`, `typescript`, `docs`. Built: `npm run develop`, with parallel builders for the plan's tasks, and repo overrides in `.agent-factory.json`: each field that it sets replaces its profile default. Not yet: review thread checks in hygiene. | A small real feature from ask to ready PR. |
+| 1 | Profiles in code. Intake, plan, build, freeze, review loop, hygiene, CI, ready PR, on the local platform. Profiles `solidity`, `solidity-support`, `typescript`, `docs`. Built: `npm run develop`, with parallel builders for the plan's tasks, a merge of the base when it moves (D16), and repo overrides in `.agent-factory.json`: each field that it sets replaces its profile default. Not yet: review thread checks in hygiene. | A small real feature from ask to ready PR. |
 | 2 | The Auditor as a sub-workflow, PR-delta mode first. | A Solidity change with the review loop and the Auditor. |
 | 3 | The builder on Cloudflare, through a Container per run. Built: `DevelopmentRuns`, the build container, `/develop` on issues. | The phase 1 feature, run from `npm run remote`. |
 | 4 | The deploy workflow: dry run, the user's `/go` for an exact scope, broadcast in chunks with a progress file, live verify, record. | A testnet deploy. |

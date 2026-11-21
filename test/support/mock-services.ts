@@ -459,6 +459,29 @@ export async function mockServices(
         const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
         return json(response, 201, { sha: text(['commit-tree', tree, ...parents.flatMap((parent) => ['-p', parent]), '-m', message], undefined, identity) })
       }
+      if (route === `POST ${api}/merges`) {
+        // A merge commit of head into the branch base, from a real 3-way merge: 204 when the branch has head, 409 for a conflict.
+        const fields = input()
+        const [base, head, message] = [string(fields.base, 'base'), string(fields.head, 'head'), string(fields.commit_message, 'commit_message')]
+        const [into, from] = [shaOf(`refs/heads/${base}`), shaOf(head)]
+        if (!into || !from) return json(response, 404, { message: 'Not Found' })
+        if (text(['merge-base', into, from]) === from) {
+          response.writeHead(204)
+          response.end()
+          return
+        }
+        let tree: string
+        try {
+          tree = text(['merge-tree', '--write-tree', into, from]).split('\n')[0]!
+        } catch {
+          return json(response, 409, { message: 'Merge conflict' })
+        }
+        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
+        const commit = text(['commit-tree', tree, '-p', into, '-p', from, '-m', message], undefined, identity)
+        git(['update-ref', `refs/heads/${base}`, commit])
+        state.refs.set(`refs/heads/${base}`, commit)
+        return json(response, 201, { parents: [{ sha: into }, { sha: from }], sha: commit })
+      }
       if (route === `POST ${api}/git/refs`) {
         const fields = input()
         const [ref, sha] = [string(fields.ref, 'ref'), string(fields.sha, 'sha')]

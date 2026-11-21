@@ -5,8 +5,10 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { MemoryFileSystem, type FileSystem } from 'nanocode-ts/bash'
 import { checkoutCommit } from '../src/cloudflare/branches.ts'
+import { hasConflictMarkers } from '../src/core/merge.ts'
 import { treeGit } from '../src/cloudflare/trees.ts'
 import { git, gitBranches, gitRepo, worktreePath } from '../src/node/git.ts'
+import { moveBase, parents } from './support/base-merge.ts'
 import { developRepo } from './support/develop.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
@@ -17,6 +19,79 @@ const hasBranch = async (repo: string, name: string) =>
   )
 const read = async (tree: FileSystem.FileSystem, path: string) => new TextDecoder().decode(await tree.read(path))
 const exists = async (tree: FileSystem.FileSystem, path: string) => Boolean(await tree.stat(path).catch(() => null))
+const write = (tree: FileSystem.FileSystem, path: string, text: string) => tree.write(path, new TextEncoder().encode(text))
+const mergeHead = (tree: string) => git(tree, 'rev-parse', '-q', '--verify', 'MERGE_HEAD').then((sha) => sha.trim(), () => null)
+
+/** A run branch with a change to src/math.ts, pushed to origin. */
+async function changedBranch() {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  const branches = gitBranches(repo, dir)
+  const start = (await git(repo, 'rev-parse', 'main')).trim()
+  const branch = await branches.branch('factory/dev-x', 'main')
+  await write(branch.tree, '/src/math.ts', 'export const add = (a: number, b: number) => a + b\n')
+  await branch.commit('change add')
+  await branches.push(branch)
+  return { repo, branches, branch, start, tree: worktreePath(dir, branch.name), before: await branch.head() }
+}
+
+test('Node branches: a clean base merge makes a merge commit with two parents and lists the files of the base', async () => {
+  const { repo, branches, branch, start, before } = await changedBranch()
+  const moved = moveBase(repo, { 'src/other.ts': 'export const other = 1\n' })
+  const baseHead = await branches.remoteHead('main')
+  assert.equal(baseHead, moved)
+  assert.equal(await branch.mergeBaseWith(baseHead), start)
+
+  assert.deepEqual(await branch.mergeCommit(baseHead, 'merge main'), { files: ['src/other.ts'], conflicts: [] })
+  assert.deepEqual(parents(repo, await branch.head()), [before, baseHead])
+  assert.equal(await read(branch.tree, '/src/other.ts'), 'export const other = 1\n')
+  assert.equal(await branch.mergeBaseWith(baseHead), baseHead)
+  assert.deepEqual(await branch.changedFiles(baseHead, await branch.head()), ['src/math.ts'])
+})
+
+test('Node branches: a conflict keeps the merge in progress through pending, and a checkpoint commit makes the merge commit', async () => {
+  const { repo, branches, branch, before, tree } = await changedBranch()
+  const baseHead = moveBase(repo, { 'src/math.ts': 'export function add(a: number, b: number): number {\n  return b + a\n}\n', 'src/other.ts': 'export const other = 1\n' })
+  await branches.remoteHead('main')
+
+  assert.deepEqual(await branch.mergeCommit(baseHead, 'merge main'), { files: ['src/math.ts', 'src/other.ts'], conflicts: ['src/math.ts'] })
+  assert.equal(await branch.head(), before)
+  assert.equal(await mergeHead(tree), baseHead)
+  assert.ok(hasConflictMarkers(await read(branch.tree, '/src/math.ts')))
+
+  // The fixer: each checkpoint and submit reads the pending changes.
+  assert.ok((await branch.pending()).changed.includes('src/math.ts'))
+  assert.equal(await mergeHead(tree), baseHead)
+  assert.deepEqual(await branch.finishMerge(['src/math.ts'], 'merge main'), ['src/math.ts'])
+  assert.equal(await branch.head(), before)
+  assert.equal(await mergeHead(tree), baseHead)
+
+  await write(branch.tree, '/src/math.ts', 'export const add = (a: number, b: number) => b + a\n')
+  await branch.commit('agent-factory: checkpoint')
+  const merged = await branch.head()
+  assert.deepEqual(parents(repo, merged), [before, baseHead])
+  assert.equal(await mergeHead(tree), null)
+  // The checkpoint committed the merge, so finishMerge only checks.
+  assert.deepEqual(await branch.finishMerge(['src/math.ts'], 'merge main'), [])
+  assert.equal(await branch.head(), merged)
+  assert.equal(await read(branch.tree, '/src/other.ts'), 'export const other = 1\n')
+  assert.equal(await branch.mergeBaseWith(baseHead), baseHead)
+})
+
+test('Node branches: finishMerge commits a resolved merge, also when the tree is the same as the head', async () => {
+  const { repo, branches, branch, before, tree } = await changedBranch()
+  const baseHead = moveBase(repo, { 'src/math.ts': 'export const add = (a: number, b: number) => b + a\n' })
+  await branches.remoteHead('main')
+  assert.deepEqual(await branch.mergeCommit(baseHead, 'merge main'), { files: ['src/math.ts'], conflicts: ['src/math.ts'] })
+  // The fixer keeps the version of the branch.
+  await write(branch.tree, '/src/math.ts', 'export const add = (a: number, b: number) => a + b\n')
+  await branch.pending()
+  assert.deepEqual(await branch.finishMerge(['src/math.ts'], 'merge main'), [])
+  const merged = await branch.head()
+  assert.deepEqual(parents(repo, merged), [before, baseHead])
+  assert.equal(await mergeHead(tree), null)
+  assert.deepEqual(await branch.changedFiles(baseHead, merged), ['src/math.ts'])
+})
 
 test('Node branches: touchedFiles includes deletions and both paths of a rename', async () => {
   const { repo } = developRepo()
