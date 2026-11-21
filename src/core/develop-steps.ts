@@ -68,11 +68,43 @@ export async function writeSpec(context: DevelopContext, id: string, model: Mode
   return runTurn(context.host, agent(context, id, developRoles.spec, model, workspace, tools), prompt, 'submit_spec')
 }
 
+/** The files of a tree without .git, relative to its root. A symlinked directory counts as one file. */
+async function treeFiles(tree: FileSystem.FileSystem, dir = ''): Promise<string[]> {
+  const files: string[] = []
+  for (const name of await tree.list(`/${dir}`)) {
+    if (name === '.git') continue
+    const path = dir ? `${dir}/${name}` : name
+    const stat = tree.lstat ? await tree.lstat(`/${path}`) : await tree.stat(`/${path}`)
+    if (stat?.kind === 'directory') files.push(...(await treeFiles(tree, path)))
+    else if (stat) files.push(path)
+  }
+  return files
+}
+
+/**
+ * The targeted tests of the files of a task on the base tree, which is a commit, so its files are the committed files.
+ * An entry gives the files inside it. An entry without files is a new file, but not when its last segment is empty,
+ * because all tests are targeted tests of an empty base name.
+ */
+function baseTargetedTests(config: RepoConfig, tree: FileSystem.FileSystem): (entries: string[]) => Promise<string[]> {
+  let listed: Promise<string[]> | null = null
+  const committedFiles = () => (listed ??= treeFiles(tree))
+  return async (entries) => {
+    const files = await committedFiles()
+    const changed = entries.flatMap((entry) => {
+      const inside = files.filter((path) => inScope(path, [entry]))
+      return inside.length > 0 ? inside : entry.split('/').at(-1) ? [entry] : []
+    })
+    return targetedTests({ tree, committedFiles }, config, changed)
+  }
+}
+
 /** The planner: one read-only agent that writes the four plan parts, the profile sections and the tasks (D7). */
 export async function plan(context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem, sections: string[], spec: string | null): Promise<Plan> {
   const review = { '/plan-sections.txt': sections.join('\n'), ...(spec ? { '/spec.md': spec } : {}) }
   const workspace = await readerWorkspace(context, tree, review)
-  const tools = submitOnce(context.host, `output:${id}`, submitPlan, async (input) => checkPlan(input, sections, (path) => isProtected(context.config, path)))
+  const targeted = baseTargetedTests(context.config, tree)
+  const tools = submitOnce(context.host, `output:${id}`, submitPlan, async (input) => checkPlan(input, sections, (path) => isProtected(context.config, path), targeted))
   const prompt = [
     'Plan this confirmed ask.',
     '',
