@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import { targetedTests, type RepoConfig } from '../src/core/checks.ts'
+import { baseTargetedTests } from '../src/core/develop-steps.ts'
 import { checkIntake, checkPlan, checkSpec, frozenAsk, parseIssue, parseParallel, route, routeQuestions, waves, type Plan, type PlanTask } from '../src/core/plan.ts'
 
 const intake = { title: 'Add sub', summary: 'Adds sub() to src/math.ts.', slug: 'add-sub', larger: false, passes: 1, reason: 'One small function.', questions: [] }
@@ -117,6 +118,48 @@ test('the host refuses a plan that puts a targeted test of a task in another tas
   assert.equal((await checkPlan({ ...plan, tasks: [task('triage', ['src/core/profiles.ts', 'test/loop.test.ts'])] }, [], unprotected, targeted)).tasks.length, 1)
   // A test in the files of both tasks is not refused.
   assert.equal((await checkPlan({ ...plan, tasks: [task('triage', ['src/core/profiles.ts', 'test/loop.test.ts']), task('loop', ['test/loop.test.ts'])] }, [], unprotected, targeted)).tasks.length, 2)
+})
+
+test('the targeted tests of a task on the base tree expand directories, keep new files and skip empty base names', async () => {
+  const files = {
+    '.gitignore': 'node_modules\n',
+    'src/core/profiles.ts': 'export const profiles = []\n',
+    'test/loop.test.ts': "import { profiles } from '../src/core/profiles.ts'\n",
+    'test/widget.test.ts': "import { widget } from '../src/widget.ts'\n",
+  }
+  const tree = MemoryFileSystem.create({ files: Object.fromEntries(Object.entries(files).map(([path, content]) => [`/${path}`, content])) })
+  const config: RepoConfig = { stack: 'TypeScript', checks: {}, tests: { pattern: '^test/[^/]+\\.test\\.ts$', command: 'node --test {tests}' } }
+  const targeted = baseTargetedTests(config, tree)
+  assert.deepEqual(await targeted(['src/core']), ['test/loop.test.ts'])
+  assert.deepEqual(await targeted(['src/']), ['test/loop.test.ts'])
+  assert.deepEqual(await targeted(['src/widget.ts']), ['test/widget.test.ts'])
+  assert.deepEqual(await targeted(['src/empty/']), [])
+  assert.deepEqual(await targeted(['.gitignore', '.nvmrc']), [])
+  const tasks = [task('config', ['.gitignore', '.nvmrc']), task('feature', ['src/widget.ts', 'test/widget.test.ts'])]
+  assert.equal((await checkPlan({ ...plan, tasks }, [], unprotected, targeted)).tasks.length, 2)
+})
+
+test('a failed listing of the base tree is not kept for the next plan submit', async () => {
+  const tree = MemoryFileSystem.create({ files: { '/src/math.ts': 'export const add = 1\n', '/test/math.test.ts': "import { add } from '../src/math.ts'\n" } })
+  let failures = 1
+  const flaky = {
+    stat: tree.stat.bind(tree),
+    lstat: tree.lstat?.bind(tree),
+    readlink: tree.readlink?.bind(tree),
+    read: tree.read.bind(tree),
+    write: tree.write.bind(tree),
+    mkdir: tree.mkdir.bind(tree),
+    remove: tree.remove.bind(tree),
+    rename: tree.rename.bind(tree),
+    list: async (path: string) => {
+      if (failures-- > 0) throw new Error('transient read error')
+      return tree.list(path)
+    },
+  }
+  const config: RepoConfig = { stack: 'TypeScript', checks: {}, tests: { pattern: '^test/[^/]+\\.test\\.ts$', command: 'node --test {tests}' } }
+  const targeted = baseTargetedTests(config, flaky)
+  await assert.rejects(targeted(['src/math.ts']), /transient read error/)
+  assert.deepEqual(await targeted(['src/math.ts']), ['test/math.test.ts'])
 })
 
 test('a wave holds ready tasks whose files do not overlap, up to the limit', () => {
