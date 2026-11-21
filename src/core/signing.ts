@@ -16,6 +16,13 @@ const isObject = (value: unknown): value is Record<string, unknown> => typeof va
 const pageSize = 100
 
 /**
+ * GitHub's answer for a private repository whose plan has no rulesets and no branch protection. On such a plan no rule
+ * can require signatures, so the answer means no rule.
+ */
+const planLimited = (answer: GitHubAnswer): boolean =>
+  answer.status === 403 && isObject(answer.body) && typeof answer.body.message === 'string' && answer.body.message.startsWith('Upgrade to GitHub Pro')
+
+/**
  * Reads the rulesets and the classic protection that require signed commits on each branch. `api` is the
  * repository's API path, as readCi takes it. `get` resolves for every HTTP answer and rejects only when there is no answer.
  * A rejection is not an answer about the rules, so it goes to the caller unchanged and is not a StopError.
@@ -41,6 +48,7 @@ export async function readSignatureRules(get: (path: string) => Promise<GitHubAn
     for (let page = 1; ; page++) {
       const rulesPath = `${api}/rules/branches/${name}?per_page=${pageSize}&page=${page}`
       const rules = await get(rulesPath)
+      if (planLimited(rules)) break
       if (rules.status !== 200) throw failed(branch, rulesPath, `answered ${rules.status}`, rules.status)
       if (!Array.isArray(rules.body)) throw failed(branch, rulesPath, 'answered 200 without an array of rules')
       for (const rule of rules.body) {
@@ -57,7 +65,7 @@ export async function readSignatureRules(get: (path: string) => Promise<GitHubAn
     if (classic.status === 200) {
       if (!isObject(classic.body) || typeof classic.body.enabled !== 'boolean') throw failed(branch, classicPath, 'answered 200 without a boolean enabled')
       result.push({ branch, rulesets, classic: classic.body.enabled ? 'required' : 'none' })
-    } else if (classic.status === 404) result.push({ branch, rulesets, classic: 'none' })
+    } else if (classic.status === 404 || planLimited(classic)) result.push({ branch, rulesets, classic: 'none' })
     // Decision of the user: the endpoint needs Administration read, so a 403 is an unknown answer, not a stop.
     else if (classic.status === 403) result.push({ branch, rulesets, classic: 'unreadable' })
     else throw failed(branch, classicPath, `answered ${classic.status}`, classic.status)
