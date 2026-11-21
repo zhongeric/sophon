@@ -103,7 +103,7 @@ export type Call = {
 /** What execute() gives at the end of a run. With `attention`, the summary is a new comment, because the user must act (D21). */
 export type RunResult = { passed: boolean; summary: string; attention?: ResultAttention }
 
-/** The ledger keys of the URLs of the result comment and of the last stop comment. */
+/** The ledger keys of the URL of the result comment and of the URLs of the stop comments, by note. */
 const summaryCommentKey = 'summary-comment'
 const stopCommentKey = 'stop-comment'
 type Log = (message: string, error: unknown) => void
@@ -424,16 +424,17 @@ async function finish(ledger: Ledger, { comments, status }: Posts, result: RunRe
 }
 
 /**
- * Shows a stop that waits for the user, and posts `text` as a new comment. The same stop again, also after an admin
- * resume or a D13 restart, posts and edits nothing (D21). Without a client, only the attention record and the state note show the stop.
+ * Shows a stop that waits for the user, and posts `text` as a new comment. A stop with an earlier note, also after an
+ * admin resume or a D13 restart, posts nothing and edits only a status comment that does not show it (D21). Without a client, only the attention record and the state note show the stop.
  */
 async function stop(ledger: Ledger, posts: Posts | undefined, note: string, text: string, issueUrl: string, log: Log): Promise<void> {
   let url: string | null = null
-  if (posts && !(await posts.status.stop({ note, state: 'error' }))) url = ledger.get<string>(stopCommentKey) ?? null
+  const urls = ledger.get<Record<string, string>>(stopCommentKey) ?? {}
+  if (posts && !(await posts.status.stop(note))) url = urls[note] ?? null
   else if (posts) {
     try {
       url = (await posts.comments.create(text)).url
-      ledger.put(stopCommentKey, url)
+      ledger.put(stopCommentKey, { ...urls, [note]: url })
     } catch (error) {
       log('the post of the stop comment failed', error)
     }

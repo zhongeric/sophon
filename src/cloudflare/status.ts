@@ -12,6 +12,7 @@ const bodyKey = 'status-body'
 const shownKey = 'status-shown'
 const stepKey = 'status-step'
 const noticeKey = 'status-notice'
+/** The notes of all stops of the run, so that a repeated stop posts and edits nothing (D21). */
 const errorKey = 'status-error'
 
 export type RunKind = 'development' | 'research' | 'review'
@@ -87,17 +88,17 @@ export function renderStatus(view: StatusView): string {
 export type RunStatus = {
   /** Posts the status comment when the ledger has none, else shows the current state. */
   open(): Promise<void>
-  /** Records a finished step. When the comment does not show `running`, it changes to `running`: one edit after a wake. */
+  /** Records a finished step and shows it with the state `running`. */
   progress(step: string): void
   /** Shows the latest budget notice. */
   notice(text: string): Promise<void>
   /** Shows the state at the end of the call. It edits only when the body changes. */
   settle(shown: Shown): Promise<void>
   /**
-   * Shows a stop that waits for the user. False when the last stop had the same state and note, also after an admin
-   * resume or a D13 restart: then it edits nothing, and the run posts no new comment.
+   * Shows a stop that waits for the user. False when an earlier stop of the run had the same note, also after an admin
+   * resume or a D13 restart: then the run posts and edits nothing.
    */
-  stop(error: { state: string; note: string }): Promise<boolean>
+  stop(note: string): Promise<boolean>
   /** The URL of the status comment, or null when no post succeeded. */
   url(): string | null
 }
@@ -138,7 +139,6 @@ export function runStatus(ledger: Ledger, client: StatusClient, info: RunInfo, l
     open: queue,
     progress(step) {
       ledger.put(stepKey, step)
-      if (shown().state === 'running') return
       ledger.put(shownKey, { state: 'running' })
       void queue()
     },
@@ -150,11 +150,11 @@ export function runStatus(ledger: Ledger, client: StatusClient, info: RunInfo, l
       ledger.put(shownKey, next)
       return queue()
     },
-    async stop(error) {
-      const last = ledger.get<{ state: string; note: string }>(errorKey)
-      if (last?.state === error.state && last.note === error.note) return false
-      ledger.put(errorKey, { note: error.note, state: error.state })
-      ledger.put(shownKey, { cause: error.note, state: 'stopped' } satisfies Shown)
+    async stop(note) {
+      const notes = ledger.get<string[]>(errorKey) ?? []
+      if (notes.includes(note)) return false
+      ledger.put(errorKey, [...notes, note])
+      ledger.put(shownKey, { cause: note, state: 'stopped' } satisfies Shown)
       await queue()
       return true
     },

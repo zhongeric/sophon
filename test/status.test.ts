@@ -49,44 +49,49 @@ test('a run that pauses, stops, waits for a restart, resumes and ends has one st
   await status.open()
   status.progress('intake')
   await status.settle({ cause: 'waits for the answers', state: 'paused' })
-  assert.deepEqual([calls.posts.length, calls.edits.length], [1, 1])
+  assert.deepEqual([calls.posts.length, calls.edits.length], [1, 2])
 
   // A poll that finds the same pause edits nothing.
   status = call()
   await status.open()
   await status.settle({ cause: 'waits for the answers', state: 'paused' })
-  assert.equal(calls.edits.length, 1)
+  assert.equal(calls.edits.length, 2)
 
-  // The wake from the pause edits to running one time, also when more steps finish.
+  // Each step that finishes edits the comment, so that it shows the stage.
   status = call()
   await status.open()
   status.progress('plan')
   status.progress('build')
-  assert.equal(await status.stop({ note: 'GitHub refused the call', state: 'error' }), true)
-  assert.deepEqual([calls.posts.length, calls.edits.length], [1, 3])
+  await status.settle({ state: 'running' })
+  assert.equal(calls.edits.length, 4)
+  assert.match(bodies.get(101)!, /\*\*State:\*\* running\. The last finished step is `build`\./)
+  assert.equal(await status.stop('GitHub refused the call'), true)
+  assert.deepEqual([calls.posts.length, calls.edits.length], [1, 5])
   assert.match(bodies.get(101)!, /\*\*State:\*\* stopped: GitHub refused the call[\s\S]*npm run remote -- resume acme\/app#5/)
 
-  // The same error after an admin resume posts nothing and edits nothing.
+  // The same error after an admin resume posts nothing and edits nothing, because the comment still shows it.
   status = call()
   await status.open()
-  assert.equal(await status.stop({ note: 'GitHub refused the call', state: 'error' }), false)
-  assert.equal(calls.edits.length, 3)
+  assert.equal(await status.stop('GitHub refused the call'), false)
+  assert.equal(calls.edits.length, 5)
 
   status = call()
   await status.open()
   status.progress('ci')
   await status.settle({ at: Date.parse('2026-11-20T12:30:00Z'), cause: 'the job was lost', state: 'restart' })
-  assert.equal(calls.edits.length, 5)
+  assert.equal(calls.edits.length, 7)
   assert.match(bodies.get(101)!, /waits for a restart at 2026-11-20T12:30:00\.000Z: the job was lost/)
 
-  // The same error after a D13 restart also posts nothing and edits nothing.
+  // The same error after a D13 restart posts and edits nothing.
   status = call()
   await status.open()
-  assert.equal(await status.stop({ note: 'GitHub refused the call', state: 'error' }), false)
-  assert.equal(calls.edits.length, 5)
+  assert.equal(await status.stop('GitHub refused the call'), false)
+  assert.deepEqual([calls.posts.length, calls.edits.length], [1, 7])
+  assert.match(bodies.get(101)!, /waits for a restart at 2026-11-20T12:30:00\.000Z: the job was lost/)
 
   status = call()
   await status.open()
+  assert.deepEqual([calls.posts.length, calls.edits.length], [1, 7])
   status.progress('merge')
   await status.settle({ comment: null, passed: true, state: 'ended', summary: '# Development run: READY' })
   assert.equal(calls.posts.length, 1)
@@ -94,6 +99,19 @@ test('a run that pauses, stops, waits for a restart, resumes and ends has one st
   assert.ok(calls.edits.every((edit) => edit.id === 101))
   assert.match(bodies.get(101)!, /\*\*Result:\*\* passed\.[\s\S]*# Development run: READY/)
   assert.equal(status.url(), 'https://github.com/acme/app/issues/5#issuecomment-101')
+})
+
+test('a stop with an earlier note posts and edits nothing, also after a stop with a different note', async () => {
+  const ledger = memoryLedger()
+  const { calls, client } = fakeClient()
+  const call = () => runStatus(ledger, client, info, noLog)
+  await call().open()
+  assert.equal(await call().stop('error A'), true)
+  assert.equal(await call().stop('error B'), true)
+  assert.deepEqual([calls.posts.length, calls.edits.length], [1, 2])
+  assert.equal(await call().stop('error A'), false)
+  await call().open()
+  assert.deepEqual([calls.posts.length, calls.edits.length], [1, 2])
 })
 
 test('the budget notice edits the status comment and stays in it', async () => {

@@ -53,7 +53,7 @@ test('a passed, running, queued or CI-paused run and an answered batch give noth
 
 type Item = { number: number; labels: string[]; pr?: boolean; closed?: boolean }
 
-/** A GitHub stub that answers each issue list with all items of the repository, so that the listing must filter them. */
+/** A GitHub stub that answers each issue list with the open items of the repository that have the label of the query. */
 function world(setup: { installations: Record<number, string[]>; items: Record<string, Item[]>; broken?: string[] }) {
   const page = <T>(url: URL, all: T[]) => {
     const number = Number(url.searchParams.get('page'))
@@ -74,12 +74,10 @@ function world(setup: { installations: Record<number, string[]>; items: Record<s
       const issues = /^\/repos\/([^/]+\/[^/]+)\/issues$/.exec(url.pathname)
       if (issues) {
         assert.equal(url.searchParams.get('state'), 'open')
-        const all = (setup.items[issues[1]!] ?? []).map((item) => ({
-          labels: item.labels.map((name) => ({ name })),
-          number: item.number,
-          state: item.closed ? 'closed' : 'open',
-          ...(item.pr ? { pull_request: { url: 'x' } } : {}),
-        }))
+        const label = url.searchParams.get('labels') ?? ''
+        const all = (setup.items[issues[1]!] ?? [])
+          .filter((item) => !item.closed && item.labels.includes(label))
+          .map((item) => ({ number: item.number, ...(item.pr ? { pull_request: { url: 'x' } } : {}) }))
         return page(url, all) as T
       }
       throw new Error(`stub has no route ${method} ${path}`)

@@ -22,8 +22,7 @@ export type WorkSweep = {
 }
 
 export type Repository = { name: string; owner: { login: string } }
-/** An issue or a PR of the issue list. The sweep reads only `number` and `pull_request`. */
-export type Issue = { number: number; pull_request?: unknown; state?: unknown; labels?: unknown }
+export type Issue = { number: number; pull_request?: unknown }
 type IssueEvent = { event: string; label?: { name: string } | null; actor?: { login: string } | null }
 
 const pageSize = 100

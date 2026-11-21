@@ -11,8 +11,8 @@ import { isInstallation, isIssue, isRecord, isRepository, kinds, pages, reposito
 export type InboxKind = 'question' | Attention['kind']
 /** One thing that the latest run of an issue or a PR needs from the user. `link` is where the user acts. */
 export type InboxEntry = { kind: InboxKind; run: string; reason: string; link: string }
-export type InboxItem = { kind: InboxKind; repository: string; number: number; run: string; reason: string; link: string }
-/** A repository or an installation that the listing could not read. */
+export type InboxItem = InboxEntry & { repository: string; number: number }
+/** A repository or an installation that the listing did not read. */
 export type InboxFailure = { repository: string; reason: string }
 export type Inbox = { items: InboxItem[]; failed: InboxFailure[] }
 
@@ -56,14 +56,8 @@ export type InboxSource = {
   log: (line: string) => void
 }
 
-const labelNames = (issue: Issue): string[] =>
-  Array.isArray(issue.labels)
-    ? issue.labels.flatMap((label: unknown) => (typeof label === 'string' ? [label] : isRecord(label) && typeof label.name === 'string' ? [label.name] : []))
-    : []
-
-/** True for an open issue or PR with the label of `kind`. Only a PR takes a review, as in the work sweep. */
-const isWork = (issue: Issue, kind: WorkKind) =>
-  issue.state !== 'closed' && labelNames(issue).includes(workLabels[kind]) && (kind === 'review') === Boolean(issue.pull_request)
+/** The issue list gives only open items with the label of `kind`. Only a PR takes a review, as in the work sweep. */
+const isWork = (issue: Issue, kind: WorkKind) => (kind === 'review') === Boolean(issue.pull_request)
 
 /**
  * The inbox of all installations of the App: the entries of each open issue and PR with a work label of D18. A failure
@@ -102,7 +96,7 @@ export async function listInbox(source: InboxSource): Promise<Inbox> {
         for (const { number } of issues.filter((issue) => isWork(issue, kind))) {
           try {
             for (const found of await source.entries(kind, owner.login, name, number))
-              inbox.items.push({ kind: found.kind, link: found.link, number, reason: found.reason, repository, run: found.run })
+              inbox.items.push({ ...found, number, repository })
           } catch (error) {
             inbox.failed.push({ reason: `cannot read the ${kind} run of #${number}: ${reasonOf(error)}`, repository })
           }

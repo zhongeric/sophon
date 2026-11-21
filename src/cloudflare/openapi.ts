@@ -102,7 +102,7 @@ export function openApi(origin: string) {
             items: { type: 'array', items: ref('InboxItem') },
             failed: {
               type: 'array',
-              description: 'The repositories or installations that the Worker could not read',
+              description: 'The repositories or installations that the Worker did not read',
               items: { type: 'object', properties: { repository: { type: 'string' }, reason: { type: 'string' } }, required: ['repository', 'reason'] },
             },
           },

@@ -97,7 +97,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     const done = { passed: result.pass, summary: summary(run, result) }
     // The development run that started a review carries its result, so the review needs nothing from the user (D21).
     if (request.stopAtBudget) return done
-    if (!result.pass) return { ...done, attention: { kind: 'failed', reason: 'the review failed' } }
+    if (!result.pass) return { ...done, attention: { kind: 'failed', reason: result.stopped ? 'the run stopped' : 'the review failed' } }
     if (request.ship) return { ...done, attention: { kind: 'ready', reason: 'the PR passed the review and waits for a merge', url: `https://github.com/${request.owner}/${request.repo}/pull/${request.pr}` } }
     return done
   }

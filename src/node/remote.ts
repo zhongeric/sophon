@@ -96,7 +96,7 @@ const isInboxFailure = (value: unknown): value is InboxFailure => hasStrings(val
 
 /**
  * Gives the lines and the exit code for an inbox response: one line for each item and for each repository that the
- * Worker could not read. A failed route, or a body that is not the inbox, gives the raw text and exit code 1.
+ * Worker did not read. A failed route, or a body that is not the inbox, gives the raw text and exit code 1.
  */
 export function inboxOutcome({ ok, text }: { ok: boolean; text: string }): { code: number; text: string } {
   if (!ok) return { code: 1, text }
@@ -207,7 +207,6 @@ async function main(): Promise<number> {
     },
   })
   const [command, target] = positionals
-  // Only inbox takes no target.
   if (values.help || !command || (!target && command !== 'inbox')) {
     console.log(usage)
     return values.help ? 0 : 2
