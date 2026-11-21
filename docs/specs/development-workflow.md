@@ -102,9 +102,13 @@ Each stage below lists who does the work, what the host enforces, and where the 
 - **Rails:** the light loop applies when every matched profile allows it and the diff matches the profile's light
   rule, for example "docs or tests only, no behavior change". Else the full loop applies.
 
-  The full loop is strict or standard (D20). These paths get the strict loop, also without `foundry.toml`:
-  `src/**/*.sol` and `script/**/*.sol` at the root, agent prompts under `agents/`, and rule files named `AGENTS.md`,
-  `CLAUDE.md` or `CONTRIBUTING*` at any directory level. `--full` also selects the strict loop.
+  The full loop is strict or standard (D20). `--full` and these paths select the strict loop, also without
+  `foundry.toml`:
+
+  - `src/**/*.sol` and `script/**/*.sol` at the root
+  - agent prompts under `agents/`
+  - rule files `AGENTS.md`, `CLAUDE.md` and `CONTRIBUTING*` at any level
+
   One strict path selects the strict loop for the whole change. Triage checks deleted paths and old paths of renames.
 
   The host writes `TRIAGE path=light reason=docs-or-tests-only` or `TRIAGE path=full reason=not-docs-or-tests loop=standard files=...`
