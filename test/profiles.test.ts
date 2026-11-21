@@ -224,7 +224,37 @@ test('triage records the matched profiles and the guides of the profiles that go
   assert.deepEqual((await triage(['foundry.toml'], repo('foundry.toml'), false)).guides, [])
   assert.deepEqual((await triage(['README.md'], repo('foundry.toml'), false)).guides, [])
   const many = await triage(['a.json', 'b.json', 'c.json', 'd.json', 'e.json', 'f.json', 'g.json'], repo(), false)
-  assert.equal(triageLine(many), 'TRIAGE path=full reason=not-docs-or-tests files=a.json,b.json,c.json,d.json,e.json,+2 profiles=docs')
+  assert.equal(triageLine(many), 'TRIAGE path=full reason=not-docs-or-tests loop=standard files=a.json,b.json,c.json,d.json,e.json,+2 profiles=docs')
+})
+
+test('triage picks the strict loop for Solidity src/ and script/, agent prompts, rule files and --full, else the standard loop (D20)', async () => {
+  const foundry = repo('foundry.toml')
+  const typescript = repo('package.json', 'tsconfig.json')
+  const loop = async (changed: string[], exists = repo(), full = false) => {
+    const result = await triage(changed, exists, full)
+    return `${result.path} ${result.loop ?? 'no loop'}`
+  }
+  assert.equal(await loop(['src/Vault.sol'], foundry), 'full strict')
+  assert.equal(await loop(['script/Deploy.s.sol'], foundry), 'full strict')
+  // The path alone selects the strict loop: no foundry.toml is necessary.
+  assert.equal(await loop(['src/Vault.sol']), 'full strict')
+  assert.equal(await loop(['agents/patch.md']), 'full strict')
+  assert.equal(await loop(['pkg/CLAUDE.md']), 'full strict')
+  assert.equal(await loop(['pkg/contributing.md']), 'full strict')
+  // One strict path selects the strict loop for the whole change. The list holds deleted paths and old paths of renames,
+  // so a rename of src/Vault.sol to docs/Vault.md is strict.
+  assert.equal(await loop(['src/a.ts', 'src/Vault.sol', 'README.md'], typescript), 'full strict')
+  assert.equal(await loop(['docs/Vault.md', 'src/Vault.sol'], foundry), 'full strict')
+  assert.equal(await loop(['src/a.ts'], typescript), 'full standard')
+  assert.equal(await loop(['test/Vault.t.sol', 'test/helpers/Mock.sol']), 'full standard')
+  assert.equal(await loop(['packages/a/src/A.sol'], foundry), 'full standard')
+  assert.equal(await loop(['README.md'], repo(), true), 'full strict')
+  assert.equal(await loop([]), 'full standard')
+  assert.equal(await loop(['README.md', 'test/Vault.t.sol'], foundry), 'light no loop')
+
+  assert.equal(triageLine(await triage(['src/Vault.sol'], foundry, false)), 'TRIAGE path=full reason=not-docs-or-tests loop=strict files=src/Vault.sol profiles=solidity,solidity-support,docs')
+  assert.equal(triageLine(await triage(['README.md'], repo(), true)), 'TRIAGE path=full reason=full-asked loop=strict profiles=docs')
+  assert.equal(triageLine(await triage([], repo(), false)), 'TRIAGE path=full reason=empty-diff loop=standard profiles=docs')
 })
 
 test('the python profile applies with one of its markers, and Python tests take the light loop only at the root or by name', async () => {

@@ -8,6 +8,7 @@ export type ReviewRoleId =
   | 'rules'
   | 'bugs'
   | 'anti-slop'
+  | 'cleanup'
   | 'late-minimize'
   | 'late-rules'
   | 'late-bugs'
@@ -82,6 +83,16 @@ export const reviewRoles: RoleTable<ReviewRoleId> = {
     tests: false,
     egress: false,
     turnMs: minutes(2),
+  },
+  // The minimize and anti-slop track of the standard loop (D20). It reads both guides, so its turn is longer.
+  cleanup: {
+    id: 'cleanup',
+    guides: [...reviewer, 'minimize.md', 'anti-slop.md', 'shared/ste.md'],
+    stackGuides: false,
+    findings: { track: 'cleanup', prefix: 'clean' },
+    tests: false,
+    egress: false,
+    turnMs: minutes(3),
   },
   'late-minimize': {
     id: 'late-minimize',

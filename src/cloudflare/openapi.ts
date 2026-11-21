@@ -14,7 +14,7 @@ const start = (operationId: string, summary: string, description: string, option
 })
 
 const base = { type: 'string', description: 'The base branch. Default: the default branch of the repository' }
-const full = { type: 'boolean', description: 'The full review loop, also when triage allows the light loop' }
+const full = { type: 'boolean', description: 'The strict review loop, also when triage allows the light or the standard loop' }
 
 /**
  * The OpenAPI description of the admin routes of worker.ts, for the OpenAPI tools of agents and apps. `origin` is the

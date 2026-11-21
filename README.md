@@ -16,23 +16,30 @@ designs and their decisions are in [docs/specs](docs/specs).
 ## The review loop
 
 ```
-freeze ─▶ triage: light or full
+freeze ─▶ triage: light, standard or strict
 
-full:  step 1: minimize │ rules │ bugs ×1-4 │ anti-slop     read-only, at the same time
-       ─▶ gate ─▶ patch ×1-4 by file ─▶ commit
-       ─▶ step 2: late-minimize │ late-rules on the new diff   each on the other model family
-       ─▶ gate ─▶ patch ─▶ commit ─▶ late bugs on every fix ─▶ gate ─▶ patch ─▶ commit
-       ─▶ checks ─▶ intent ─▶ PASS or FAIL
+strict:   step 1: minimize │ rules │ bugs ×1-4 │ anti-slop     read-only, at the same time
+          ─▶ gate ─▶ patch ×1-4 by file ─▶ commit
+          ─▶ step 2: late-minimize │ late-rules on the new diff   each on the other model family
+          ─▶ gate ─▶ patch ─▶ commit ─▶ late bugs on every fix ─▶ gate ─▶ patch ─▶ commit
+          ─▶ checks ─▶ intent ─▶ PASS or FAIL
 
-light: one reviewer that also fixes ─▶ commit ─▶ checks ─▶ PASS or FAIL
+standard: step 1: rules │ bugs ×1-4 │ cleanup                   read-only, at the same time
+          ─▶ gate ─▶ patch ×1-4 by file ─▶ commit
+          ─▶ late bugs on every fix, on the other model family ─▶ gate ─▶ patch ─▶ commit
+          ─▶ checks ─▶ intent ─▶ PASS or FAIL
+
+light:    one reviewer that also fixes ─▶ commit ─▶ checks ─▶ PASS or FAIL
 ```
 
 - **Triage.** A change to docs and tests only takes the light loop. Solidity `src/` and `script/`, agent prompts and
-  rule files (`agents/`, `AGENTS.md`, `CLAUDE.md`) always take the full loop. `--full` forces the full loop.
+  rule files (`agents/`, `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING*`) take the strict loop. `--full` forces the strict
+  loop. All other changes take the standard loop.
 - **Scale.** A diff over 600 lines splits across up to 4 bugs reviewers. Patch agents split the findings by file.
 - **Static rules.** Each profile has mechanical rules, for example a fixed Solidity pragma, or no `.env` file in the
   change. The host checks the added lines and gives each break to the patch agent.
-- **Models.** Step 1 runs on Opus 5.5, with the rules track on Sol. Step 2 swaps the family of each role.
+- **Models.** Step 1 runs on Opus 5.5, with the rules track on Sol. The cleanup track (minimize and anti-slop) runs
+  on Opus 5.5. Each step 2 and late bugs role swaps the family of its step 1 role.
 - **Resume.** Each step's result goes to the run's ledger, so a stopped run continues where it stopped.
 
 ## Rules the host enforces

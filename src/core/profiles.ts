@@ -282,12 +282,15 @@ const python: Profile = {
   },
 }
 
+/** Agent prompts under agents/, and repository rule files at any depth. They change the behavior of agents. */
+const agentFiles = '(agents/|(.*/)?(AGENTS\\.md|CLAUDE\\.md|CONTRIBUTING[^/]*)$)'
+
 const docs: Profile = {
   id: 'docs',
   markers: [],
   files: /\.(mdx?|rst)$/i,
-  /** Agent prompts and repository rule files change the behavior of agents, so they always get the full loop. */
-  light: /^(?!agents\/)(?!(.*\/)?(AGENTS\.md|CLAUDE\.md|CONTRIBUTING[^/]*)$)/i,
+  /** Agent prompts and repository rule files always get the full loop. */
+  light: new RegExp(`^(?!${agentFiles})`, 'i'),
   guides: [],
   forbidden: [],
   planSections: [],
@@ -355,9 +358,19 @@ export function isLight(path: string, active: Profile[]): boolean {
   return governing.length > 0 && governing.every((profile) => profile.light?.test(path) ?? false)
 }
 
+/** The two forms of the full loop (D20). The strict loop adds the minimize, anti-slop, late-minimize and late-rules passes. */
+export type Loop = 'strict' | 'standard'
+
+/** One strict path selects the strict loop for the whole change: Solidity src/ and script/, agent prompts and rule files. */
+const strictPaths = [/^(src|script)\/.*\.sol$/, new RegExp(`^${agentFiles}`, 'i')]
+
+const isStrict = (path: string) => strictPaths.some((pattern) => pattern.test(path))
+
 /** The light or full loop for one change, with the profiles that apply to it. */
 export type Triage = {
   path: 'light' | 'full'
+  /** Only with the full path. A triage record from before D20 has no loop. */
+  loop?: Loop
   reason: 'docs-or-tests-only' | 'not-docs-or-tests' | 'empty-diff' | 'full-asked'
   /** With not-docs-or-tests: the files that need the full loop. */
   files: string[]
@@ -374,16 +387,17 @@ export async function triage(changed: string[], exists: (path: string) => Promis
   const guides = governing.flatMap((profile) => profile.guides)
   const resolved = { profiles: present.map((profile) => profile.id), guides: [...new Set(guides)] }
   const behavior = changed.filter((path) => !isLight(path, present))
-  if (full) return { ...resolved, path: 'full', reason: 'full-asked', files: [] }
-  if (changed.length === 0) return { ...resolved, path: 'full', reason: 'empty-diff', files: [] }
-  if (behavior.length > 0) return { ...resolved, path: 'full', reason: 'not-docs-or-tests', files: behavior }
+  if (full) return { ...resolved, path: 'full', loop: 'strict', reason: 'full-asked', files: [] }
+  if (changed.length === 0) return { ...resolved, path: 'full', loop: 'standard', reason: 'empty-diff', files: [] }
+  if (behavior.length > 0) return { ...resolved, path: 'full', loop: changed.some(isStrict) ? 'strict' : 'standard', reason: 'not-docs-or-tests', files: behavior }
   return { ...resolved, path: 'light', reason: 'docs-or-tests-only', files: [] }
 }
 
 export function triageLine(result: Triage): string {
   const more = result.files.length > 5 ? `,+${result.files.length - 5}` : ''
   const files = result.files.length > 0 ? ` files=${result.files.slice(0, 5).join(',')}${more}` : ''
-  return `TRIAGE path=${result.path} reason=${result.reason}${files} profiles=${result.profiles.join(',') || 'none'}`
+  const loop = result.loop ? ` loop=${result.loop}` : ''
+  return `TRIAGE path=${result.path} reason=${result.reason}${loop}${files} profiles=${result.profiles.join(',') || 'none'}`
 }
 
 /** The path of a `+++` line. Host git uses core.quotePath=false and adds a tab after a path with a space. */

@@ -38,7 +38,7 @@ Options:
   --run <id>             Resume a run; the other options come from its ledger
   --runs-dir <path>      Where runs live (default: <agent-factory>/runs)
   --hotfix               A small hotfix: take every recommendation without asking
-  --full                 The full review loop, also for a docs or tests only change
+  --full                 The strict review loop, also when triage allows the light or the standard loop
   --parallel <n>         At most n builders at the same time (default 3)
   --issue <n>            The issue that the PR closes: the PR body says Closes #<n>. The report stays on the PR.
   --models <path>        JSON that overrides models: { "develop": { "builder": ... }, "review": { "step1": ... } }

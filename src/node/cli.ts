@@ -38,7 +38,7 @@ Options:
   --run <id>             Resume a run; other target options come from its ledger
   --runs-dir <path>      Where runs live (default: <agent-factory>/runs)
   --claude-plan          Sign Claude requests with the nc Claude login instead of ANTHROPIC_API_KEY
-  --full                 Run the full loop, also when triage allows the light loop for a docs or tests only change
+  --full                 Run the strict loop, also when triage allows the light or the standard loop
   --ship                 With --pr, on PASS: push the fixes to the PR branch and mark it ready
   --wait <minutes>       With --pr, how long to wait for answers before the run pauses (default 60)
   --budget <usd>         Cost budget in USD. At the budget, the run asks you to raise it or to stop.
