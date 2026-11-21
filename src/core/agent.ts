@@ -4,6 +4,7 @@ import type { Ledger } from './ledger.ts'
 import type { AgentStore } from './platform.ts'
 import { dispatcher, type Credentials, type Provider } from './providers.ts'
 import type { Role } from './roles.ts'
+import { StopError } from './stop.ts'
 import { subagentLimits } from './subagents.ts'
 import { recordUsage } from './usage.ts'
 import { repoMount } from './workspace.ts'
@@ -174,7 +175,8 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
  * so a resumed run returns it even when the SDK replays the tool call from its receipt. A follow-up turn in the
  * same session uses another request ID and key. A failed turn stays failed in the journal under its request ID, so
  * the next call asks again under a new request ID. Thus a model error, such as an empty credit balance, does not
- * come back on every resume.
+ * come back on every resume. A turn that ends without the submit, also after its nudge, asks again in the same way,
+ * because a replay of its journal ends without the submit too. The second such turn stops the run.
  */
 export async function runTurn<T>(
   host: AgentHost,
@@ -188,8 +190,11 @@ export async function runTurn<T>(
   host.ledger.safePoint?.(spec.turnMs)
   await host.beforeTurn?.()
   const retriesKey = `retries:${spec.id}:${turn.request}`
+  const missedKey = `missed:${spec.id}:${turn.request}`
   const retries = host.ledger.get<number>(retriesKey) ?? 0
+  const missed = host.ledger.get<number>(missedKey) ?? 0
   const request = retries === 0 ? turn.request : `${turn.request}-retry-${retries}`
+  const note = host.ledger.get<string>(`retry-cause:${spec.id}:${turn.request}`) === 'missed' ? missedNote(tool) : retryNote
   const agent = await openAgent(spec, host)
   const ask = async (id: string, text: string) => {
     const started = Date.now()
@@ -202,8 +207,9 @@ export async function runTurn<T>(
     }
   }
   let failed = false
+  let unsubmitted = false
   try {
-    const report = await ask(request, retries === 0 ? prompt : `${retryNote}\n\n${prompt}`)
+    const report = await ask(request, retries === 0 ? prompt : `${note}\n\n${prompt}`)
     failed = report.status === 'failed'
     if (host.ledger.get(turn.key) === undefined) {
       if (report.status !== 'completed') throw new Error(`${spec.id}: turn ${report.status}: ${JSON.stringify(report.error ?? null)}`)
@@ -212,19 +218,35 @@ export async function runTurn<T>(
       // The nudge is a new agent turn, so the safe point and the budget check apply to it too.
       host.ledger.safePoint?.(spec.turnMs)
       await host.beforeTurn?.()
-      failed = (await ask(nudge, `You ended the turn without calling ${tool}. Call tools.${tool} now.`)).status === 'failed'
+      const nudged = await ask(nudge, `You ended the turn without calling ${tool}. Call tools.${tool} now.`)
+      failed = nudged.status === 'failed'
+      unsubmitted = nudged.status === 'completed' && host.ledger.get(turn.key) === undefined
     }
   } finally {
-    if (failed && host.ledger.get(turn.key) === undefined) host.ledger.put(retriesKey, retries + 1)
+    if ((failed || unsubmitted) && host.ledger.get(turn.key) === undefined) {
+      host.ledger.put(retriesKey, retries + 1)
+      host.ledger.put(`retry-cause:${spec.id}:${turn.request}`, failed ? 'failed' : 'missed')
+      if (unsubmitted) host.ledger.put(missedKey, missed + 1)
+    }
     await agent.close()
   }
   const output = host.ledger.get<T>(turn.key)
-  if (output === undefined) throw new Error(`${spec.id} did not call ${tool}`)
+  if (output === undefined) {
+    // Another turn ends the same way, so the run stops instead of a restart (D13).
+    if (unsubmitted && missed + 1 >= maxUnsubmitted) throw new StopError(`${spec.id} did not call ${tool} in ${missed + 1} turns, each with a nudge`)
+    throw new Error(`${spec.id} did not call ${tool}`)
+  }
   return output
 }
 
+/** The turns that end without the submit, each after its nudge, before the run stops. */
+const maxUnsubmitted = 2
+
 /** The start of the prompt that asks again after a failed turn. The failed turn can have stopped before any work. */
 const retryNote = 'Your last turn stopped with an error before it finished. Here is the task again. Keep the work that you already did in this session.'
+
+/** The start of the prompt that asks again after a turn and its nudge ended without the submit. */
+const missedNote = (tool: string) => `Your last turn ended without a call to ${tool}. Here is the task again. Keep the work that you already did in this session, and end with ${tool}.`
 
 /** A submit tool that only the root agent may call, one time, after `check` accepts the input. */
 export function submitOnce(host: AgentHost, key: string, definition: Contracts.HostTool, check: (input: unknown) => Promise<unknown>): HostTools {
