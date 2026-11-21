@@ -156,7 +156,7 @@ async function exists(repo: Tree, path: string): Promise<boolean> {
 }
 
 /** The last path segment without its extension: src/core/agent.ts gives agent. */
-const baseName = (path: string) => path.split('/').at(-1)!.replace(/\.[^.]*$/, '')
+export const baseName = (path: string) => path.split('/').at(-1)!.replace(/\.[^.]*$/, '')
 
 /** The last segment of a Python module. The leading dots of a relative import do not count. */
 const moduleName = (module: string) => module.replace(/^\.+/, '').split('.').at(-1)!

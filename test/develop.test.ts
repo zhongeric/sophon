@@ -729,6 +729,35 @@ test('develop: the planner sees the protected paths, the host refuses a plan tha
   assert.doesNotMatch(output, /PROTECTED PLAN ACCEPTED/)
 })
 
+test('develop: the host refuses a plan that puts a targeted test of a task in another task, and the corrected plan runs', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const turns: Turn[] = []
+  const script = developScript()
+  const task = (id: string, files: string[]) => ({ id, title: id, work: `Build ${id}.`, files, depends_on: [] })
+  const splitPlan = { ...plan, tasks: [task('math', ['src/math.ts']), task('add-test', ['test/add.test.ts'])] }
+  const result = await runDevelop(repo, runsDir(), {
+    runId: 'split-plan',
+    pulls: fakePulls([false, true]).pulls,
+    dispatch: scriptedDispatch((turn) => {
+      if (turn.role !== 'planner' || turn.output !== null) return script(turn)
+      return {
+        cell: [
+          `try { await tools.submit_plan(${JSON.stringify(splitPlan)}); text('SPLIT PLAN ACCEPTED') } catch (error) { text('plan refused: ' + error) }`,
+          `await tools.submit_plan(${JSON.stringify(plan)})`,
+        ].join('\n'),
+      }
+    }, turns),
+  })
+  assert.equal(result.status, 'ready', result.report)
+  const output = turns
+    .filter((turn) => turn.role === 'planner')
+    .map((turn) => turn.output ?? '')
+    .join('\n')
+  // The output is JSON, so the quotes in the refusal can be escaped.
+  assert.match(output, /plan refused:.*task \W*math\W*: its targeted test test\/add\.test\.ts is in task \W*add-test\W*\. Put them in one task\./)
+  assert.doesNotMatch(output, /SPLIT PLAN ACCEPTED/)
+})
+
 test('develop: a blocked builder stops the run with the reason, before any PR', { timeout: 120_000 }, async () => {
   const { repo } = developRepo(undefined, { merge: 'squash' })
   const github = fakePulls()

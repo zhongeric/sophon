@@ -1,7 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { runTurn, submitOnce, type AgentHost, type AgentSpec, type HostTools } from './agent.ts'
-import { callRunTests, checkTails, failureText, isProtected, protectedEntries, runChecksTool, runTestsTool, targetedTests, type CheckResult, type RepoConfig } from './checks.ts'
+import { baseName, callRunTests, checkTails, failureText, isProtected, protectedEntries, runChecksTool, runTestsTool, targetedTests, type CheckResult, type RepoConfig } from './checks.ts'
 import { checkIntake, checkPlan, checkSpec, inScope, submitIntake, submitPlan, submitSpec, type Intake, type Plan, type Spec } from './plan.ts'
 import type { Branch, Checker, Guides } from './platform.ts'
 import { staticFindings, type Profile } from './profiles.ts'
@@ -68,11 +68,49 @@ export async function writeSpec(context: DevelopContext, id: string, model: Mode
   return runTurn(context.host, agent(context, id, developRoles.spec, model, workspace, tools), prompt, 'submit_spec')
 }
 
+async function treeFiles(tree: FileSystem.FileSystem, dir: string): Promise<string[]> {
+  const files: string[] = []
+  for (const name of await tree.list(dir)) {
+    if (name === '.git') continue
+    const path = `${dir.replace(/\/+$/, '')}/${name}`
+    const stat = tree.lstat ? await tree.lstat(path) : await tree.stat(path)
+    if (stat?.kind === 'directory') files.push(...(await treeFiles(tree, path)).map((file) => `${name}/${file}`))
+    else if (stat) files.push(name)
+  }
+  return files
+}
+
+/**
+ * The targeted tests of the files of a task on the base tree, which is a commit, so its files are the committed files.
+ * An entry gives the files inside it. An entry without files is a new file.
+ * It skips paths with an empty base name, such as .gitignore, because an empty base name selects all tests.
+ */
+export function baseTargetedTests(config: RepoConfig, tree: FileSystem.FileSystem): (entries: string[]) => Promise<string[]> {
+  let listed: Promise<string[]> | null = null
+  // A failed listing is not kept, so the next submit lists again.
+  const committedFiles = () =>
+    (listed ??= treeFiles(tree, '/').catch((error: unknown) => {
+      listed = null
+      throw error
+    }))
+  return async (entries) => {
+    const files = await committedFiles()
+    const changed = entries
+      .flatMap((entry) => {
+        const inside = files.filter((path) => inScope(path, [entry]))
+        return inside.length > 0 ? inside : [entry]
+      })
+      .filter((path) => baseName(path) !== '')
+    return targetedTests({ tree, committedFiles }, config, changed)
+  }
+}
+
 /** The planner: one read-only agent that writes the four plan parts, the profile sections and the tasks (D7). */
 export async function plan(context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem, sections: string[], spec: string | null): Promise<Plan> {
   const review = { '/plan-sections.txt': sections.join('\n'), ...(spec ? { '/spec.md': spec } : {}) }
   const workspace = await readerWorkspace(context, tree, review)
-  const tools = submitOnce(context.host, `output:${id}`, submitPlan, async (input) => checkPlan(input, sections, (path) => isProtected(context.config, path)))
+  const targeted = baseTargetedTests(context.config, tree)
+  const tools = submitOnce(context.host, `output:${id}`, submitPlan, async (input) => checkPlan(input, sections, (path) => isProtected(context.config, path), targeted))
   const prompt = [
     'Plan this confirmed ask.',
     '',
