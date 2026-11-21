@@ -75,6 +75,15 @@ test('a classic 403 is unreadable and signs only with signUnknown', async () => 
   assert.equal(commitMode(branches, { signUnknown: false }), 'unsigned')
 })
 
+test('the 403 of a private repository whose plan has no rulesets or branch protection is no rule', async () => {
+  const upgrade = { status: 403, body: { message: 'Upgrade to GitHub Pro or make this repository public to enable this feature.', status: '403' } }
+  const { get, calls } = scripted({ [rules('main')]: upgrade, [classic('main')]: upgrade })
+  const branches = await readSignatureRules(get, api, ['main'])
+  assert.deepEqual(branches, [{ branch: 'main', rulesets: [], classic: 'none' }])
+  assert.equal(commitMode(branches, { signUnknown: true }), 'unsigned')
+  assert.deepEqual(calls, [rules('main'), classic('main')])
+})
+
 // A 429 or a 5xx can go away, so it is not a StopError and the run loop of the Cloudflare host tries the run again.
 for (const status of [403, 429, 500]) {
   test(`a ${status} from the rules endpoint rejects the check`, async () => {
