@@ -21,21 +21,22 @@ const review = { ask: 'Add sub', branch: 'factory/dev-1', full: false, head: 'ab
 
 /** A parent run with one review run, as PULL_REQUESTS gives it. The fake review run goes to `queued` on a resume. */
 function parent() {
-  const fake = { state: 'running', resumes: 0, starts: 0 }
+  const fake = { state: 'running', refuse: false, resumes: 0, starts: 0 }
   const runs: ReviewRuns = {
     async start() {
       fake.starts++
       return { run: 'pr-9-1' }
     },
     async outcome(run) {
-      if (fake.state === 'error') return { error: note, waiting: `review run ${run} stopped: ${note}. Resume it with npm run remote -- resume.` }
+      if (fake.state === 'error') return { error: note }
       if (fake.state === 'passed') return passed
       return { waiting: `review run ${run} is ${fake.state}` }
     },
     async resumeAfterError(run) {
       fake.resumes++
+      if (fake.refuse) return { reason: 'review run pr-9-2 of this PR is running', resumed: false }
       fake.state = 'queued'
-      return { reason: `started review run ${run} again from its ledger after the error` }
+      return { reason: `started review run ${run} again from its ledger after the error`, resumed: true }
     },
   }
   const env = { PULL_REQUESTS: { idFromName: (name: string) => name, get: () => runs } }
@@ -96,4 +97,23 @@ test('a review run that is queued, running or paused pauses its parent without a
     assert.ok(stopped.error instanceof StopError)
     assert.equal(fake.resumes, 0)
   }
+})
+
+test('a refused resume of a review run in error keeps the error record, so that the next poll tries the resume again', async () => {
+  const { call, fake } = parent()
+  fake.state = 'error'
+  assert.ok((await call()).error instanceof StopError)
+  fake.refuse = true
+  for (let poll = 1; poll <= 2; poll++) {
+    const refused = await call()
+    assert.ok(refused.error instanceof PausedError)
+    assert.equal(refused.error.message, 'review run pr-9-2 of this PR is running')
+    assert.equal(refused.outcome?.state, 'paused')
+    assert.equal(fake.resumes, poll)
+  }
+  fake.refuse = false
+  const resumed = await call()
+  assert.ok(resumed.error instanceof PausedError)
+  assert.equal(fake.state, 'queued')
+  assert.equal(fake.resumes, 3)
 })

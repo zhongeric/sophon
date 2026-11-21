@@ -9,7 +9,10 @@ import type { ReviewRequest } from '../core/workflows/develop.ts'
  * A finished review as the development workflow needs it: the fixes as a commit on GitHub. `error` is the note of a
  * review run that waits with `error`, so that the parent run can restart it (D13).
  */
-export type ReviewOutcome = { waiting: string; error?: string } | (LoopResult & { waiting?: undefined; error?: undefined })
+export type ReviewOutcome =
+  | { error: string; waiting?: undefined }
+  | { waiting: string; error?: undefined }
+  | (LoopResult & { waiting?: undefined; error?: undefined })
 
 /**
  * The methods of PullRequestRuns that a pass calls. The types are local, because this file must typecheck with Node
@@ -18,7 +21,7 @@ export type ReviewOutcome = { waiting: string; error?: string } | (LoopResult & 
 export type ReviewRuns = {
   start(request: { ask: string; by: string; full: boolean; owner: string; pr: number; repo: string; ship: boolean; stopAtBudget: boolean; budget?: number }): Promise<{ run: string }>
   outcome(run: string): Promise<ReviewOutcome>
-  resumeAfterError(run: string): Promise<{ reason: string }>
+  resumeAfterError(run: string): Promise<{ reason: string; resumed: boolean }>
 }
 
 /**
@@ -45,7 +48,7 @@ export async function reviewPass<Id>(
   let run = ledger.get<string>(key)
   let outcome = run ? await runs.outcome(run) : undefined
   // The parent must collect the stopped usage and raise the budget before another run can start.
-  if (run && stopped[run] && outcome?.waiting === undefined && outcome?.stopped && review.budget !== undefined && review.budget > earlierUsd) run = undefined
+  if (run && stopped[run] && outcome?.error === undefined && outcome?.waiting === undefined && outcome?.stopped && review.budget !== undefined && review.budget > earlierUsd) run = undefined
   if (!run || !outcome) {
     const budget = review.budget !== undefined ? { budget: review.budget - earlierUsd } : {}
     run = (await runs.start({ ask: review.ask, by: request.by, full: review.full, owner, pr: review.pr, repo, ship: false, stopAtBudget: true, ...budget })).run
@@ -57,8 +60,10 @@ export async function reviewPass<Id>(
       ledger.put(errorKey, true)
       throw new StopError(`review run ${run} stopped: ${outcome.error}`, { transient: true })
     }
-    ledger.put(errorKey, false)
-    throw new PausedError((await runs.resumeAfterError(run)).reason)
+    const resume = await runs.resumeAfterError(run)
+    // A refused resume keeps the record, so that the next poll tries the resume again without a D13 count.
+    if (resume.resumed) ledger.put(errorKey, false)
+    throw new PausedError(resume.reason)
   }
   // A record of an earlier error must not resume a later error without a D13 count.
   if (ledger.get<boolean>(errorKey)) ledger.put(errorKey, false)
