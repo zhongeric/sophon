@@ -337,20 +337,19 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     if (patch1.changed) {
       const range = { from: frozen.head, to: patch1.after }
       const note = 'This is the step 2 pass. The diff is the patch that the step 1 patch agent applied, not the original change.'
-      const findings2 = await settleAll(
+      const step2 = await settleAll(
         (['late-minimize', 'late-rules'] as const).map((id) =>
           step(ledger, `step2.${id}`, () => review(context, `step2.${id}`, reviewRoles[id], input.models.step2[id], range, note)),
         ),
       )
       const host2 = await hostCheck('step2.host', range, 'late-host')
-      const gated = await runGate('step2.gate', familyHeader('Step 2', input.models.step2), [...host2, ...findings2.flat()])
+      const gated = await runGate('step2.gate', familyHeader('Step 2', input.models.step2), [...host2, ...step2.flat()])
       gate2 = gated
       patch2 = await runPatch('step2.patch', gated, () =>
         patch(context, 'step2.patch', input.models.step2.patch, gated.kept, gated.log, `agent-factory: apply step 2 review fixes (${input.runId})`),
       )
     }
 
-    // The step 2 patch is the one commit that no host check saw yet.
     const late = await lateBugs(patch2?.after ?? patch1.after, patch2, 'Step 2 late bugs')
     const steps = [
       findings,
