@@ -8,6 +8,7 @@ import { StopError } from '../core/stop.ts'
 import { parsePrices, zeroTokens, type RunUsage } from '../core/usage.ts'
 import { allowedModelsFrom, codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
 import { reviewAnnouncement } from './announcements.ts'
+import type { ReviewOutcome } from './review.ts'
 import { boxMachine, syncWithSetup } from './box.ts'
 import { ciChecker, reviewChecker } from './checker.ts'
 import { baseConfig } from './config.ts'
@@ -17,7 +18,7 @@ import { workLabels } from './labels.ts'
 import { loopChoices, type PreflightNeeds } from './preflight.ts'
 import { githubRepo, type GitHubRepo, type PullRequest } from './repo.ts'
 import { githubSigning } from './signing.ts'
-import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs, type Call, type RunMachine } from './runs.ts'
+import { answerersOf, credentialsFor, defaultCiTimeoutMinutes, Runs, setupTimeoutMs, type Call, type ResumeResult, type RunMachine } from './runs.ts'
 import { sqlFiles, sqlLedger } from './storage.ts'
 
 export { allowedUsers, type Env } from './runs.ts'
@@ -28,9 +29,6 @@ export { allowedUsers, type Env } from './runs.ts'
  * development run that started it asks with the run totals.
  */
 export type StartRequest = PullRequest & { ship: boolean; by: string; full?: boolean; ask?: string; budget?: number; stopAtBudget?: boolean }
-
-/** A finished review as the development workflow needs it: the fixes as a commit on GitHub. */
-export type ReviewOutcome = { waiting: string } | (LoopResult & { waiting?: undefined })
 
 /** The review runs of one PR. */
 export class PullRequestRuns extends Runs<StartRequest> {
@@ -52,7 +50,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
   outcome(run: string): ReviewOutcome {
     const row = this.row(run)
     if (!row) return { waiting: `no review run ${run}` }
-    if (row.state === 'error') return { waiting: `review run ${run} stopped: ${row.note}. Resume it with npm run remote -- resume.` }
+    if (row.state === 'error') return { error: row.note, waiting: `review run ${run} stopped: ${row.note}. Resume it with npm run remote -- resume.` }
     if (row.state !== 'passed' && row.state !== 'failed') return { waiting: `review run ${run} is ${row.state}${row.note ? `: ${row.note}` : ''}` }
     const ledger = sqlLedger(this.ctx.storage.sql, run)
     // A run that finished before the usage records has no usage and no stop at the budget.
@@ -68,6 +66,18 @@ export class PullRequestRuns extends Runs<StartRequest> {
       stopped: result.stopped ?? false,
       usage: result.usage ?? { tokens: zeroTokens(), unpriced: [], usd: 0 },
     }
+  }
+
+  /** Starts a review run in `error` again, as the admin resume does. Its parent run calls it at each restart and at its admin resume (D13). */
+  async resumeAfterError(run: string): Promise<ResumeResult> {
+    const row = this.row(run)
+    if (!row) return { reason: `no review run ${run}`, resumed: false, state: null }
+    if (row.state !== 'error') return { reason: `review run ${run} is ${row.state}`, resumed: false, state: row.state }
+    const active = this.active()
+    if (active) return { reason: `review run ${active.run} of this PR is ${active.state}`, resumed: false, state: row.state }
+    this.queueAfterError(run)
+    await this.ctx.storage.setAlarm(Date.now())
+    return { reason: `started review run ${run} again from its ledger after the error`, resumed: true, state: row.state }
   }
 
   protected async execute(run: string, request: StartRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call) {

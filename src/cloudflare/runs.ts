@@ -191,15 +191,21 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     if (state === 'queued' && options.afterError && (ledger.get<number>(restartAtKey) ?? 0) > Date.now()) {
       reason = 'started the run again from its ledger after the error'
     } else if (state === 'error' && options.afterError) {
-      ledger.put(preflightKey, false)
-      ledger.put('attempts', 0)
-      ledger.put('restarts', 0)
-      resetJobStarts(ledger)
-      this.setState(latest.run, 'queued', 'resumed after an error')
+      this.queueAfterError(latest.run)
       reason = 'started the run again from its ledger after the error'
     } else if (state !== 'paused') return { reason: notResumed[state], resumed: false, state }
     await this.ctx.storage.setAlarm(Date.now())
     return { reason, resumed: true, state }
+  }
+
+  /** Queues a run in `error` with new counts of attempts, crash restarts and job starts, and a new preflight (D17). */
+  protected queueAfterError(run: string): void {
+    const ledger = sqlLedger(this.ctx.storage.sql, run)
+    ledger.put(preflightKey, false)
+    ledger.put('attempts', 0)
+    ledger.put('restarts', 0)
+    resetJobStarts(ledger)
+    this.setState(run, 'queued', 'resumed after an error')
   }
 
   status() {
