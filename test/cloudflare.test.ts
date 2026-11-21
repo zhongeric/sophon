@@ -129,6 +129,62 @@ test('on Cloudflare, development collects a stopped review before a budget raise
   }
 })
 
+test('on Cloudflare, a development run whose review run waits with error restarts it at most three times, waits with error, and its admin resume resumes the review run (D13)', { timeout: 420_000 }, async () => {
+  const { repo } = developRepo()
+  const issues = { 5: { body: 'Add sub and mul next to add, with tests.', title: 'Add sub and mul' } }
+  const script = developScript()
+  let refused = false
+  const mock = await mockServices(repo, {
+    botLogin: 'factory-bot', issues, name: 'app', owner: 'acme',
+    script: (turn) => {
+      // A refused credential stops the review run at once, so that it waits with error.
+      if (turn.role === 'bugs' && !refused) {
+        refused = true
+        mock.state.ciStatus = 403
+      }
+      return script(turn)
+    },
+  })
+  const worker = await startFor(mock, withMachine(mock))
+  const headers = { authorization: 'Bearer admin', 'content-type': 'application/json' }
+  const on = (issue: number) => mock.state.comments.filter((entry) => entry.issue === issue)
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 200)]))}\nworker:\n${worker.output().slice(-4000)}`
+  const latest = async (issue: number) => ((await (await fetch(`${worker.url}/runs/acme/app/${issue}`, { headers })).json()) as { runs: { run: string; state: string; note: string }[] }).runs
+  const resume = async (issue: number) => (await fetch(`${worker.url}/runs/acme/app/${issue}/resume`, { headers, method: 'POST' })).json()
+  const again = 'started the run again from its ledger after the error'
+  try {
+    const started = await fetch(`${worker.url}/develop/acme/app/5`, { body: '{}', headers, method: 'POST' })
+    assert.equal(started.status, 202)
+    // The admin resume starts each run that waits for its D13 restart at once.
+    for (let restart = 1; restart <= 3; restart++) {
+      await until(async () => {
+        const [run] = await latest(5)
+        return run?.state === 'queued' && run.note.includes(`(restart ${restart} of 3)`) ? true : undefined
+      }, 240_000, describe)
+      assert.deepEqual(await resume(5), { reason: again, resumed: true, state: 'queued' })
+    }
+    await until(async () => ((await latest(5))[0]?.state === 'error' ? true : undefined), 120_000, describe)
+    await until(() => on(5).find((entry) => entry.body.includes('npm run remote -- resume')), 30_000, describe)
+    const stops = on(5).filter((entry) => entry.body.includes('stopped run'))
+    assert.equal(stops.filter((entry) => /\(restart [1-3] of 3\)/.test(entry.body)).length, 3, describe())
+    assert.equal(stops.filter((entry) => entry.body.includes('npm run remote -- resume acme/app#5')).length, 1, describe())
+    assert.equal(stops.length, 4, describe())
+    // The restarts resumed the same review run: none started a new one.
+    const pull = [...mock.state.pulls.keys()][0]
+    assert.ok(pull !== undefined, describe())
+    assert.deepEqual((await latest(pull)).map((run) => run.state), ['error'])
+
+    mock.state.ciStatus = 200
+    assert.deepEqual(await resume(5), { reason: again, resumed: true, state: 'error' })
+    const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 180_000, describe)
+    assert.match(done.body, /^# Development run: READY/, done.body)
+    assert.deepEqual((await latest(pull)).map((run) => run.state), ['passed'])
+  } finally {
+    await worker.stop()
+    await mock.close()
+  }
+})
+
 test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, pushes the fixes, and the close of the PR prunes them', { timeout: 240_000 }, async () => {
   const repo = fixtureRepo()
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
