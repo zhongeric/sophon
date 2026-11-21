@@ -6,7 +6,7 @@ import { step, type Ledger } from '../ledger.ts'
 import { alarmLines, settleAll } from '../planned-stop.ts'
 import type { AgentStore, Checker, Files, Frozen, Guides, Repo, Signing } from '../platform.ts'
 import { branchesSection, pruneBranches, reasonOf, type PruneResult, type PullState } from '../prune.ts'
-import { isLight, profilesById, staticFindings, triage, triageLine, type Triage } from '../profiles.ts'
+import { isLight, profilesById, staticFindings, triage, triageLine, type Loop, type Triage } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
 import { asker, decisionLists, decisions, type Answer, type Channel } from '../questions.ts'
 import { reviewRoles, type ModelChoice } from '../roles.ts'
@@ -15,8 +15,11 @@ import { askQuestions, intent, light, patch, review, splitReview, type LightLog,
 import { StopError } from '../stop.ts'
 import { BudgetStop, budgetGate, checkPriced, resolveBudget, spendOf, usageOf, usageSection, type Prices, type RunUsage } from '../usage.ts'
 
+/** The step 1 reviewers. The strict loop runs minimize and anti-slop, the standard loop runs cleanup in their place (D20). */
+type Step1Role = 'minimize' | 'rules' | 'bugs' | 'anti-slop' | 'cleanup'
+
 export type LoopModels = {
-  step1: Record<'minimize' | 'rules' | 'bugs' | 'anti-slop' | 'patch' | 'questions', ModelChoice>
+  step1: Record<Step1Role | 'patch' | 'questions', ModelChoice>
   step2: Record<'late-minimize' | 'late-rules' | 'late-bugs' | 'patch' | 'intent', ModelChoice>
   /** The one reviewer and fixer of the light loop. */
   light: ModelChoice
@@ -47,6 +50,7 @@ export const defaultModels: LoopModels = {
     rules: sol,
     bugs: { ...opus, thinking: 'high' },
     'anti-slop': opus,
+    cleanup: opus,
     patch: { ...opus, thinking: 'high' },
     questions: opus,
   },
@@ -111,7 +115,7 @@ export type LoopInput = {
   ship?: { pr: number; headRef: string }
   /** The PR head branch that the fixes go to. The signing check reads its rules. */
   headRef?: string
-  /** Run the full loop, also when triage allows the light loop. */
+  /** Run the strict loop, also when triage allows the light or the standard loop. */
   full?: boolean
   /** The cost budget in USD. At the budget, the run posts a notice. At twice the budget, it asks the user to raise it or to stop. */
   budget?: number
@@ -152,8 +156,9 @@ export type LoopResult = { pass: boolean; criteria: Criterion[]; branch: string;
 
 /**
  * The code review loop, with its order and hard rules in code. Triage picks the light
- * loop for a docs or tests only change: one fresh reviewer that also fixes. Else the full loop runs: four read-only
- * reviewers, the gate, patch, a model-swapped second pass on the new diff, and a late bugs pass. On a large diff, the
+ * loop for a docs or tests only change: one fresh reviewer that also fixes. Else one of the two full loops runs (D20).
+ * The strict loop: four read-only reviewers, the gate, patch, a model-swapped second pass on the new diff, and a late
+ * bugs pass. The standard loop: three read-only reviewers, the gate, patch, and the late bugs pass. On a large diff, the
  * bugs review splits across reviewers, and patch agents work on separate files at the same time. The static rules of
  * the matched profiles add host findings before each gate. Checks, the intent check of the full loop, and the PASS
  * criteria come last. Every step is in the ledger, so the same run ID resumes after a crash without repeating
@@ -185,7 +190,10 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   const stack = input.stack ?? input.config.stack
   // Triage also sees deleted files and the old path of each rename, so that a removal of code gets the full loop.
   const touched = await repo.touchedFiles(frozen.base, frozen.head)
-  const triaged = await step(ledger, 'triage', () => triage(touched, async (path) => (await repo.tree.stat(`/${path}`)) !== null, input.full === true))
+  const triageRecord = await step(ledger, 'triage', () => triage(touched, async (path) => (await repo.tree.stat(`/${path}`)) !== null, input.full === true))
+  // A triage record from before D20 has no loop. That run started the strict loop, so its resume keeps it.
+  const loop: Loop | null = triageRecord.path === 'full' ? (triageRecord.loop ?? 'strict') : null
+  const triaged: Triage = loop ? { ...triageRecord, loop } : triageRecord
   const active = profilesById(triaged.profiles)
   const context: RunContext = {
     host: { module: deps.module, store: deps.store, ledger, credentials: deps.credentials, dispatch: deps.dispatch, log: deps.log, beforeTurn: budget.check },
@@ -261,13 +269,12 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
         message: `agent-factory: apply light review fixes (${input.runId})`,
       }),
     )
-    return { current: outcome.after, step2Ran: false, steps: [`- Host findings: ${found.length}`, gateLine('Light gate', gated), patchLine('Light review', outcome)] }
+    return { current: outcome.after, secondPass: false, steps: [`- Host findings: ${found.length}`, gateLine('Light gate', gated), patchLine('Light review', outcome)] }
   }
 
-  const fullLoop = async () => {
-    // Step 1: four read-only reviewers in parallel on the frozen change.
+  // Step 1: read-only reviewers in parallel on the frozen change, then the gate and the patch.
+  const runStep1 = async (roles: readonly Step1Role[]) => {
     const step1Range = { from: frozen.base, to: frozen.head }
-    const step1Roles = ['minimize', 'rules', 'bugs', 'anti-slop'] as const
     const asked = step(ledger, 'step1.questions', () => askQuestions(context, 'step1.questions', input.models.step1.questions, step1Range)).then((list) =>
       questions.post('ask', list),
     )
@@ -276,7 +283,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     asked.catch(() => undefined)
     // The bugs review is the slowest track: on a large diff, the host splits it across reviewers.
     const reviewed = settleAll(
-      step1Roles.map((id) =>
+      roles.map((id) =>
         step(ledger, `step1.${id}`, () => (id === 'bugs' ? splitReview : review)(context, `step1.${id}`, reviewRoles[id], input.models.step1[id], step1Range, '')),
       ),
     )
@@ -286,10 +293,43 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     const step1 = await reviewed
     const host1 = await checked
     await questions.wait('ask')
-    const gate1 = await runGate('step1.gate', familyHeader('Step 1', input.models.step1), [...host1, ...step1.flat()])
+    const ran: (keyof LoopModels['step1'])[] = [...roles, 'patch', 'questions']
+    const models = Object.fromEntries(ran.map((id) => [id, input.models.step1[id]]))
+    const gate1 = await runGate('step1.gate', familyHeader('Step 1', models), [...host1, ...step1.flat()])
     const patch1 = await runPatch('step1.patch', gate1, () =>
       patch(context, 'step1.patch', input.models.step1.patch, gate1.kept, gate1.log, `agent-factory: apply step 1 review fixes (${input.runId})`),
     )
+    const findings = `- Step 1 findings: host=${host1.length}, ${roles.map((id, index) => `${id}=${step1[index]!.length}`).join(', ')}`
+    return { findings, gate1, patch1 }
+  }
+
+  // Late bugs pass over every fix since the freeze. `unchecked` is the one patch commit that no host check saw yet.
+  const lateBugs = async (current: string, unchecked: PatchOutcome | null, label: string) => {
+    if (current === frozen.head) return { current, gate: null, patch: null }
+    const range = { from: frozen.head, to: current }
+    const note =
+      'This is the late bugs pass. The diff holds every fix that the patch agents applied after the review froze the change. Check that each fix is correct and breaks nothing around it.'
+    const bugs = await step(ledger, 'step2.late-bugs', () =>
+      splitReview(context, 'step2.late-bugs', reviewRoles['late-bugs'], input.models.step2['late-bugs'], range, note),
+    )
+    const host3 = unchecked?.changed ? await hostCheck('step2.late-bugs-host', { from: unchecked.before, to: unchecked.after }, 'late-bugs-host') : []
+    const gated = await runGate('step2.late-bugs-gate', familyHeader(label, { 'late-bugs': input.models.step2['late-bugs'] }), [...host3, ...bugs])
+    const patched = await runPatch('step2.late-bugs-patch', gated, () =>
+      patch(context, 'step2.late-bugs-patch', input.models.step2.patch, gated.kept, gated.log, `agent-factory: apply late bugs fixes (${input.runId})`),
+    )
+    return { current: patched.after, gate: gated, patch: patched }
+  }
+
+  // The standard loop (D20): step 1, then the late bugs pass. The late bugs host check sees the step 1 patch.
+  const standardLoop = async () => {
+    const { findings, gate1, patch1 } = await runStep1(['rules', 'bugs', 'cleanup'])
+    const late = await lateBugs(patch1.after, patch1, 'Late bugs')
+    const steps = [findings, gateLine('Step 1 gate', gate1), patchLine('Step 1 patch', patch1), gateLine('Late bugs gate', late.gate), patchLine('Late bugs patch', late.patch)]
+    return { current: late.current, secondPass: patch1.changed, steps }
+  }
+
+  const strictLoop = async () => {
+    const { findings, gate1, patch1 } = await runStep1(['minimize', 'rules', 'bugs', 'anti-slop'])
 
     // Step 2: swapped model family, on the new diff only.
     let gate2: GateResult | null = null
@@ -297,50 +337,30 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     if (patch1.changed) {
       const range = { from: frozen.head, to: patch1.after }
       const note = 'This is the step 2 pass. The diff is the patch that the step 1 patch agent applied, not the original change.'
-      const late = await settleAll(
+      const step2 = await settleAll(
         (['late-minimize', 'late-rules'] as const).map((id) =>
           step(ledger, `step2.${id}`, () => review(context, `step2.${id}`, reviewRoles[id], input.models.step2[id], range, note)),
         ),
       )
       const host2 = await hostCheck('step2.host', range, 'late-host')
-      const gated = await runGate('step2.gate', familyHeader('Step 2', input.models.step2), [...host2, ...late.flat()])
+      const gated = await runGate('step2.gate', familyHeader('Step 2', input.models.step2), [...host2, ...step2.flat()])
       gate2 = gated
       patch2 = await runPatch('step2.patch', gated, () =>
         patch(context, 'step2.patch', input.models.step2.patch, gated.kept, gated.log, `agent-factory: apply step 2 review fixes (${input.runId})`),
       )
     }
 
-    // Late bugs pass over every fix since the freeze.
-    let current = patch2?.after ?? patch1.after
-    let gate3: GateResult | null = null
-    let patch3: PatchOutcome | null = null
-    if (current !== frozen.head) {
-      const range = { from: frozen.head, to: current }
-      const note =
-        'This is the late bugs pass. The diff holds every fix that the patch agents applied after the review froze the change. Check that each fix is correct and breaks nothing around it.'
-      const bugs = await step(ledger, 'step2.late-bugs', () =>
-        splitReview(context, 'step2.late-bugs', reviewRoles['late-bugs'], input.models.step2['late-bugs'], range, note),
-      )
-      // The step 2 patch is the one commit that no host check saw yet.
-      const host3 = patch2?.changed ? await hostCheck('step2.late-bugs-host', { from: patch2.before, to: patch2.after }, 'late-bugs-host') : []
-      const gated = await runGate('step2.late-bugs-gate', familyHeader('Step 2 late bugs', { 'late-bugs': input.models.step2['late-bugs'] }), [...host3, ...bugs])
-      gate3 = gated
-      patch3 = await runPatch('step2.late-bugs-patch', gated, () =>
-        patch(context, 'step2.late-bugs-patch', input.models.step2.patch, gated.kept, gated.log, `agent-factory: apply late bugs fixes (${input.runId})`),
-      )
-      current = patch3.after
-    }
-
+    const late = await lateBugs(patch2?.after ?? patch1.after, patch2, 'Step 2 late bugs')
     const steps = [
-      `- Step 1 findings: host=${host1.length}, ${step1Roles.map((id, index) => `${id}=${step1[index]!.length}`).join(', ')}`,
+      findings,
       gateLine('Step 1 gate', gate1),
       patchLine('Step 1 patch', patch1),
       gateLine('Step 2 gate', gate2),
       patchLine('Step 2 patch', patch2),
-      gateLine('Late bugs gate', gate3),
-      patchLine('Late bugs patch', patch3),
+      gateLine('Late bugs gate', late.gate),
+      patchLine('Late bugs patch', late.patch),
     ]
-    return { current, step2Ran: patch1.changed, steps }
+    return { current: late.current, secondPass: patch1.changed, steps }
   }
 
   const usage = () => {
@@ -376,13 +396,13 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     return result
   }
   const reviewed = async () => {
-    const { current, step2Ran, steps } = triaged.path === 'light' ? await lightLoop() : await fullLoop()
+    const { current, secondPass, steps } = loop === null ? await lightLoop() : loop === 'strict' ? await strictLoop() : await standardLoop()
     const finalChanges = await repo.changedFiles(frozen.base, current)
     deps.log(`running checks on ${finalChanges.length} changed files`)
     const checks = await step(ledger, 'checks', () => deps.checker.checks(finalChanges))
     const verdict =
       triaged.path === 'full' ? await step(ledger, 'intent', () => intent(context, 'intent', input.models.step2.intent, { from: frozen.base, to: current })) : null
-    return { current, step2Ran, steps, checks, verdict }
+    return { current, secondPass, steps, checks, verdict }
   }
   let outcome: Awaited<ReturnType<typeof reviewed>>
   try {
@@ -402,9 +422,9 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     ledger.put('result', { pass: false, criteria, final: current, usage: usageReport.run, stopped: true })
     return end({ pass: false, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: true, pruned })
   }
-  const { current, step2Ran, steps, checks, verdict } = outcome
+  const { current, secondPass, steps, checks, verdict } = outcome
 
-  const criteria = evaluate({ checks, gateLog: deps.files.exists(gateLog), rejections, step2Ran, verdict })
+  const criteria = evaluate({ checks, gateLog: deps.files.exists(gateLog), loop, rejections, secondPass, verdict })
   const pass = criteria.every((criterion) => criterion.ok)
   if (pass && input.ship) {
     const { pr, headRef } = input.ship
@@ -426,22 +446,41 @@ function familyHeader(label: string, models: Record<string, ModelChoice>): strin
   return `# ${label} | model_family=${families} | ${list}`
 }
 
-/** The PASS criteria. A null verdict means the light loop, which has no second pass and no intent check. */
-function evaluate(run: { gateLog: boolean; checks: CheckResult[]; verdict: Verdict | null; rejections: { id: string; accepted: boolean }[]; step2Ran: boolean }): Criterion[] {
+/**
+ * The PASS criteria. A null loop means the light loop, which has no second pass and no intent check. `secondPass` is true
+ * when the step 1 patch changed the code, so that a second pass ran on the fixes.
+ */
+function evaluate(run: {
+  gateLog: boolean
+  checks: CheckResult[]
+  verdict: Verdict | null
+  rejections: { id: string; accepted: boolean }[]
+  loop: Loop | null
+  secondPass: boolean
+}): Criterion[] {
   const failed = run.checks.filter((check) => check.status === 'fail')
   const refused = run.rejections.filter((rejection) => !rejection.accepted)
-  const passes: Criterion[] = run.verdict
-    ? [
-        {
-          name: 'Step 1 and Step 2 ran with context-free reviewers',
-          ok: true,
-          detail: run.step2Ran ? 'each reviewer ran in a new session' : 'step 2 had no new diff: the step 1 patch changed nothing',
-        },
-        { name: 'Step 2 used another model family', ok: true, detail: 'checked before the run started, recorded in the gate log' },
-      ]
-    : [{ name: 'Light loop on a docs or tests only change', ok: true, detail: 'one context-free reviewer that fixes, with writes limited to docs and tests' }]
+  const passes: Record<Loop, Criterion[]> = {
+    strict: [
+      {
+        name: 'Step 1 and Step 2 ran with context-free reviewers',
+        ok: true,
+        detail: run.secondPass ? 'each reviewer ran in a new session' : 'step 2 had no new diff: the step 1 patch changed nothing',
+      },
+      { name: 'Step 2 used another model family', ok: true, detail: 'checked before the run started, recorded in the gate log' },
+    ],
+    standard: [
+      {
+        name: 'Step 1 and the late bugs pass ran with context-free reviewers',
+        ok: true,
+        detail: run.secondPass ? 'each reviewer ran in a new session' : 'the late bugs pass had no new diff: the step 1 patch changed nothing',
+      },
+      { name: 'The late bugs pass used another model family', ok: true, detail: 'checked before the run started, recorded in the gate log' },
+    ],
+  }
+  const light: Criterion = { name: 'Light loop on a docs or tests only change', ok: true, detail: 'one context-free reviewer that fixes, with writes limited to docs and tests' }
   return [
-    ...passes,
+    ...(run.loop ? passes[run.loop] : [light]),
     { name: 'Gate log written', ok: run.gateLog, detail: 'gate-log.txt' },
     {
       name: 'Checks green',

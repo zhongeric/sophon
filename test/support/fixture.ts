@@ -37,11 +37,13 @@ export function withoutKey(repo: string): void {
 }
 
 /**
- * A repository whose feature branch adds a sub() that adds, with a test that catches it. With `light`, a Foundry
- * repository whose feature branch only changes docs and a test, with a Latin abbreviation and a vague test name.
- * The repository has no usable key, so its own commits are unsigned. `config` replaces fields of the base config.
+ * A repository whose feature branch adds a sub() that adds, with a test that catches it: a TypeScript change, which
+ * gets the standard loop. With `strict`, the feature branch also adds an agent prompt, so the change gets the strict
+ * loop. With `light`, a Foundry repository whose feature branch only changes docs and a test, with a Latin abbreviation
+ * and a vague test name. The repository has no usable key, so its own commits are unsigned. `config` replaces fields
+ * of the base config.
  */
-export function fixtureRepo(options: { light?: boolean; config?: Record<string, unknown> } = {}): string {
+export function fixtureRepo(options: { light?: boolean; strict?: boolean; config?: Record<string, unknown> } = {}): string {
   const repo = mkdtempSync(join(tmpdir(), 'factory-repo-'))
   const run = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' })
   const write = (path: string, content: string) => {
@@ -82,6 +84,7 @@ export function fixtureRepo(options: { light?: boolean; config?: Record<string, 
   unlinkSync(join(repo, 'docs/current.md'))
   symlinkSync('v2.md', join(repo, 'docs/current.md'))
   write('test/sub.test.ts', "import assert from 'node:assert/strict'\nimport { test } from 'node:test'\nimport { sub } from '../src/math.ts'\n\ntest('sub', () => assert.equal(sub(5, 3), 2))\n")
+  if (options.strict) write('agents/math.md', 'Check each sign in src/math.ts.\n')
   run('add', '-A')
   commit('add sub')
   return repo
@@ -107,7 +110,7 @@ const openQuestion = {
 }
 
 /**
- * The minimize reviewer tries to write and to submit a made-up quote, the bugs reviewer runs the
+ * The minimize and cleanup reviewers try to write and to submit a made-up quote, the bugs reviewer runs the
  * failing test, and the patch agent tries to change the check config.
  */
 export const script = scriptFor({ tests: true })
@@ -121,12 +124,15 @@ export const script = scriptFor({ tests: true })
 export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBug?: boolean; runQuestion?: boolean; breakFirst?: boolean }): Script {
   const runTests = (code: string) => (options.tests ? [code] : [])
   const runChecks = runTests(`text('checks: ' + (await tools.run_checks({})).map((result) => result.name + '=' + result.status).join(' '))`)
-  const patchLog = `await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'sub returns a - b' }], skipped: [{ id: 'min-001', reason: 'inlining adds nothing' }] })`
-  return ({ role, output }) => {
+  return ({ role, output, request }) => {
   if (output !== null) return { text: 'done' }
+  // The patch log lists each kept finding: the inline finding is clean-001 in the standard loop, min-001 in the strict loop.
+  const inline = request.includes('clean-001') ? 'clean-001' : 'min-001'
+  const patchLog = `await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'sub returns a - b' }], skipped: [{ id: '${inline}', reason: 'inlining adds nothing' }] })`
   const findings = (list: unknown[]) => `await tools.submit_findings({ findings: ${JSON.stringify(list)} }); text('submitted')`
   switch (role) {
     case 'minimize':
+    case 'cleanup':
       return {
         cell: [
           `try { await tools.Write({ file_path: '/repo/src/math.ts', content: 'x' }); text('WRITE ALLOWED') } catch (error) { text('write refused: ' + error) }`,
@@ -144,7 +150,7 @@ export function scriptFor(options: { tests: boolean; holdBug?: boolean; rejectBu
     case 'patch':
       if (options.rejectBug)
         return {
-          cell: `await tools.submit_patch_log({ applied: [], skipped: [{ id: 'bugs-001', reason: 'callers depend on the sum' }, { id: 'min-001', reason: 'inlining adds nothing' }] })`,
+          cell: `await tools.submit_patch_log({ applied: [], skipped: [{ id: 'bugs-001', reason: 'callers depend on the sum' }, { id: '${inline}', reason: 'inlining adds nothing' }] })`,
         }
       return {
         cell: [

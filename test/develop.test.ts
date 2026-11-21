@@ -9,7 +9,9 @@ import type { Signing } from '../src/core/platform.ts'
 import { PausedError, type Channel } from '../src/core/questions.ts'
 import { StopError } from '../src/core/stop.ts'
 import { BudgetStop, recordUsage, zeroTokens, type Prices } from '../src/core/usage.ts'
+import { defaultModels } from '../src/core/workflows/code-review-loop.ts'
 import { develop, type ReviewRequest } from '../src/core/workflows/develop.ts'
+import { resumeInput } from '../src/node/develop.ts'
 import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
 import { fileLedger } from '../src/node/ledger.ts'
@@ -21,6 +23,33 @@ import { probeNetwork, scriptedDispatch, webSearch, type Turn } from './support/
 import { visible, visibleLines, visibleWords } from './support/visible.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
+
+test('develop: a resume fills a missing step1.cleanup model and keeps the recorded models', async () => {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  const input = await developInput(repo, 'old-models')
+  const { cleanup: _cleanup, ...step1 } = input.models.review.step1
+  const recorded = {
+    ...input,
+    models: {
+      develop: { ...input.models.develop, builder: { ...input.models.develop.builder, thinking: 'low' as const } },
+      review: { ...input.models.review, step1: { ...step1, patch: { ...step1.patch, thinking: 'low' as const } } },
+    },
+  }
+  const ledger = fileLedger(join(dir, input.runId, 'state.json'))
+  ledger.put('input', recorded)
+  ledger.put('repo', repo)
+
+  const resumed = resumeInput(dir, input.runId)
+  assert.equal(resumed.repo, repo)
+  assert.deepEqual(resumed.input, {
+    ...recorded,
+    models: {
+      ...recorded.models,
+      review: { ...recorded.models.review, step1: { ...recorded.models.review.step1, cleanup: defaultModels.step1.cleanup } },
+    },
+  })
+})
 
 test('develop: intake, plan, parallel builders on their own branches, draft PR, a CI repair, the review loop, a ready PR', { timeout: 120_000 }, async () => {
   const { repo, origin } = developRepo()

@@ -11,7 +11,7 @@ Drives the Cloudflare Worker without the GitHub webhook.
 
 Commands:
   start <pr>        Start a review run on the PR (--ship: on PASS, push the fixes to the PR branch and mark it ready;
-                    --full: the full loop, also when triage allows the light loop)
+                    --full: the strict loop, also when triage allows the light or the standard loop)
   develop <issue>   Start a development run on the issue: its title and body are the ask (--base <branch>,
                     --hotfix, --full, --parallel <n>, as in npm run develop)
   research <issue>  Start a research run on the program issue: its title and body are the program (--base <branch>,

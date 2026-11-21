@@ -10,7 +10,7 @@ import { commentChannel, PausedError, type Channel } from '../core/questions.ts'
 import type { ModelChoice } from '../core/roles.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget, parsePrices } from '../core/usage.ts'
-import { allowedModelsFrom } from '../core/workflows/code-review-loop.ts'
+import { allowedModelsFrom, mergeModels } from '../core/workflows/code-review-loop.ts'
 import { defaultResearchModels, research, researchProviders, type ResearchInput, type ResearchModels } from '../core/workflows/research.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
 import { credential } from './credentials.ts'
@@ -140,7 +140,7 @@ function waiting(channel: Channel, waitMs: number): Channel {
   }
 }
 
-/** The recorded input of a run. A run of part 1 recorded fewer roles, so the new roles get the default models. */
+/** The recorded input of a run. An older run recorded fewer roles, so the new roles get the default models. */
 export function resumeInput(runsDir: string, runId: string): { input: ResearchInput; repo: string } {
   const path = join(runsDir, runId, 'state.json')
   if (!existsSync(path)) throw new StopError(`no run ${runId} in ${runsDir}`)
@@ -148,7 +148,7 @@ export function resumeInput(runsDir: string, runId: string): { input: ResearchIn
   const input = ledger.get<ResearchInput>('input')
   const repo = ledger.get<string>('repo')
   if (!input || !repo) throw new StopError(`run ${runId} has no recorded input`)
-  return { input: { ...input, models: { ...defaultResearchModels, ...input.models } }, repo }
+  return { input: { ...input, models: { ...defaultResearchModels, ...input.models, review: mergeModels(input.models.review ?? {}) } }, repo }
 }
 
 type Values = Record<string, string | boolean | undefined>

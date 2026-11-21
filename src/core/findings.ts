@@ -4,7 +4,7 @@ import { isRule, rules, type Rule } from './questions.ts'
 
 export const severities = ['critical', 'high', 'medium', 'low', 'info'] as const
 export type Severity = (typeof severities)[number]
-export type Track = 'minimize' | 'rules' | 'bugs' | 'anti-slop' | 'intent'
+export type Track = 'minimize' | 'rules' | 'bugs' | 'anti-slop' | 'cleanup' | 'intent'
 
 export type Finding = {
   id: string

@@ -215,14 +215,15 @@ test('on Cloudflare, /review runs the loop in a Durable Object, asks on the PR, 
     const status = (await (await fetch(`${worker.url}/runs/acme/app/7`, { headers: { authorization: 'Bearer admin' } })).json()) as { runs: { state: string }[] }
     assert.equal(status.runs[0]?.state, 'passed')
     assert.equal((await fetch(`${worker.url}/runs/acme/app/7`)).status, 401)
-    const providers = new Set(mock.state.turns.filter((turn) => turn.role === 'late-minimize').map((turn) => turn.provider))
+    // A TypeScript change takes the standard loop: late bugs runs on the other model family.
+    const providers = new Set(mock.state.turns.filter((turn) => turn.role === 'late-bugs').map((turn) => turn.provider))
     assert.deepEqual(providers, new Set(['codex']))
     const report = await (await fetch(`${worker.url}/runs/acme/app/7/report`, { headers: { authorization: 'Bearer admin' } })).text()
-    assert.match(report, /Step 1 findings: host=0, minimize=1, rules=0, bugs=1, anti-slop=0/)
+    assert.match(report, /Step 1 findings: host=0, rules=0, bugs=1, cleanup=1/)
     // The config has tests, so the run tests on the build machine: the agents that run tests get run_tests, not the text that CI runs them.
     const told = (role: string) => mock.state.turns.some((turn) => turn.role === role && turn.request.includes('This run has no run_tests tool'))
     const offered = (role: string) => mock.state.turns.some((turn) => turn.role === role && turn.request.includes('Run specific test files of /repo'))
-    assert.deepEqual([told('patch'), told('bugs'), told('minimize')], [false, false, false])
+    assert.deepEqual([told('patch'), told('bugs'), told('cleanup')], [false, false, false])
     assert.deepEqual([offered('patch'), offered('bugs')], [true, true])
 
     // The sweep keeps the fix branch while the PR is open. The close of the PR prunes it, but never the head branch outside factory/.
@@ -555,10 +556,10 @@ test('on Cloudflare, deleted source files and the old paths of renamed source fi
     const done = await until(() => mock.state.comments.find((entry) => entry.body.startsWith('### agent-factory:')), 120_000, describe)
     assert.match(done.body, /agent-factory: PASS/, done.body)
     const report = await (await fetch(`${worker.url}/runs/acme/app/7/report`, { headers: { authorization: 'Bearer admin' } })).text()
-    assert.match(report, /TRIAGE path=full reason=not-docs-or-tests files=[^\n`]*src\/math\.ts/)
-    assert.match(report, /TRIAGE path=full reason=not-docs-or-tests files=[^\n`]*src\/removed\.ts/)
+    assert.match(report, /TRIAGE path=full reason=not-docs-or-tests loop=standard files=[^\n`]*src\/math\.ts/)
+    assert.match(report, /TRIAGE path=full reason=not-docs-or-tests loop=standard files=[^\n`]*src\/removed\.ts/)
     assert.match(report, /Step 1 patch: commit [0-9a-f]{12} \(2 patch agents at the same time\); applied: host-001 .*; host-002 /)
-    assert.ok(mock.state.turns.some((turn) => turn.role === 'minimize'))
+    assert.ok(mock.state.turns.some((turn) => turn.role === 'cleanup'))
     assert.ok(!mock.state.turns.some((turn) => turn.role === 'light'))
   } finally {
     await worker.stop()

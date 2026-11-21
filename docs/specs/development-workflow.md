@@ -102,12 +102,21 @@ Each stage below lists who does the work, what the host enforces, and where the 
 - **Rails:** the light loop applies when every matched profile allows it and the diff matches the profile's light
   rule, for example "docs or tests only, no behavior change". Else the full loop applies.
 
-  Solidity `src/` and `script/` always get the full loop.
-  Agent prompts under `agents/` and rule files named `AGENTS.md`, `CLAUDE.md` or `CONTRIBUTING*` also get the full loop.
-  The rule files can be at any directory level. Triage checks deleted paths and old paths of renames.
+  The full loop is strict or standard (D20). `--full` and these paths select the strict loop, also without
+  `foundry.toml`:
 
-  The host writes `TRIAGE path=light reason=docs-or-tests-only` (or `path=full reason=...`) in the gate log and the PR description.
+  - `src/**/*.sol` and `script/**/*.sol` at the root
+  - agent prompts under `agents/`
+  - rule files `AGENTS.md`, `CLAUDE.md` and `CONTRIBUTING*` at any level
+
+  One strict path selects the strict loop for the whole change. Triage checks deleted paths and old paths of renames.
+
+  The host writes `TRIAGE path=light reason=docs-or-tests-only` or `TRIAGE path=full reason=not-docs-or-tests loop=standard files=...`
+  in the gate log and the PR description. A resumed run whose triage record has no loop runs the strict loop.
   The host checks triage again at freeze.
+- **Standard loop:** each other full-path change, also an empty diff. Step 1 runs bugs, rules and cleanup (the minimize
+  and anti-slop guides in one track). Then the gate, the patch, late bugs on every fix, the checks and the intent check.
+  It has no late-minimize and no late-rules pass.
 - **Light loop:** one context-free reviewer that also fixes, on Opus 5.5. It makes only anti-slop and STE fixes,
   and applies or rejects the host findings. The host refuses its writes outside docs and tests, so the change cannot
   grow into behavior. No step 2, no intent check. Checks must be green.
@@ -345,7 +354,7 @@ Each decision records a conflict between two rules, and the choice.
 | --- | --- | --- |
 | D1 | **Findings filter.** A scoring gate that keeps only the findings above a score, or a filter that keeps every finding with real evidence. | **No scoring gate.** The evidence check filters. Patch agents apply or reject every finding. The rejection of a critical or high finding is a `run` question with the recommendation "Do not accept" (D11), so the rejection fails the run. Reviewers mark findings that need the user's decision, each with a D11 rule. Triage uses profile rules, not a score. |
 | D2 | **Evidence track.** Four tracks with the evidence rule in each, or a fifth Evidence reviewer. | Four tracks. The host's evidence check (real quotes at real lines) is stronger than a fifth agent. |
-| D3 | **Models.** Which models, and how the passes get variance. | Step 1 spreads the tracks over the two families: Rules on Sol, Minimize, Bugs, Anti-slop and Patch on Opus 5.5. Each step 2 role swaps family. Fable 5.2 costs more for each token, thus no default role uses it. A models file or `MODELS` can give it a role. The host refuses models outside the allowed list. `ALLOWED_MODELS` replaces the list. |
+| D3 | **Models.** Which models, and how the passes get variance. | Step 1 spreads the tracks over the two families: Rules on Sol, Minimize, Bugs, Anti-slop, Cleanup and Patch on Opus 5.5. Each step 2 role swaps family. Fable 5.2 costs more for each token, thus no default role uses it. A models file or `MODELS` can give it a role. The host refuses models outside the allowed list. `ALLOWED_MODELS` replaces the list. |
 | D4 | **Draft during review.** "Never draft" against "draft until PASS". | Draft while the run works, ready after PASS. |
 | D5 | **Audit-fix PRs in `src/`.** "Two passes" against the full Solidity rules. | The stricter Solidity rules win. |
 | D6 | **Local test scope.** The loop runs touched tests only. The evm-cortex rules want the full suite, Slither and coverage before every PR. | Touched tests locally, the full suite in CI. The evm-cortex pre-PR list is a CI requirement of the `solidity` profile. |

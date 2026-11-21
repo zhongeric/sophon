@@ -97,6 +97,16 @@ test('research CLI: a resume of a part 1 run fills in the new roles with the def
   assert.deepEqual(input.models, { ...defaultResearchModels, surveyor: sol })
 })
 
+test('research CLI: a resume fills a missing step1.cleanup model and keeps the recorded review models', () => {
+  const dir = runsDir()
+  const { cleanup: _cleanup, ...step1 } = defaultResearchModels.review.step1
+  const review = { ...defaultResearchModels.review, step1: { ...step1, patch: { ...step1.patch, thinking: 'low' as const } } }
+  mkdirSync(join(dir, 'r2'))
+  writeFileSync(join(dir, 'r2', 'state.json'), JSON.stringify({ input: { runId: 'r2', program: 'p', base: 'b', baseRef: 'main', source: 's', models: { ...defaultResearchModels, review } }, repo: '/notebook' }))
+  const { input } = resumeInput(dir, 'r2')
+  assert.deepEqual(input.models.review, { ...review, step1: { ...review.step1, cleanup: defaultResearchModels.review.step1.cleanup } })
+})
+
 test('research CLI: a new run keeps --budget as the budget before the intake, so the intake recommends it and its cap replaces it', async () => {
   const { repo } = notebook()
   const { input } = await newInput({ repo, program: 'Find quiet dwarf galaxies in the deep fields.' }, 10)

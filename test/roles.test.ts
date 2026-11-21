@@ -30,6 +30,13 @@ test('the review and development roles keep their guides and rails, and get no e
     rules: { guides: [...reviewer, 'rules.md', 'shared/ste.md'], stackGuides: true, findings: { track: 'rules', prefix: 'rules' }, tests: false, egress: false },
     bugs: { guides: [...reviewer, 'bugs.md'], stackGuides: true, findings: { track: 'bugs', prefix: 'bugs' }, tests: true, egress: false },
     'anti-slop': { guides: [...reviewer, 'anti-slop.md', 'shared/ste.md'], stackGuides: false, findings: { track: 'anti-slop', prefix: 'anti' }, tests: false, egress: false },
+    cleanup: {
+      guides: [...reviewer, 'minimize.md', 'anti-slop.md', 'shared/ste.md'],
+      stackGuides: false,
+      findings: { track: 'cleanup', prefix: 'clean' },
+      tests: false,
+      egress: false,
+    },
     'late-minimize': { guides: [...reviewer, 'minimize.md', 'late-pass.md'], stackGuides: false, findings: { track: 'minimize', prefix: 'late-min' }, tests: false, egress: false },
     'late-rules': {
       guides: [...reviewer, 'rules.md', 'late-pass.md', 'shared/ste.md'],
