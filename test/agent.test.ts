@@ -8,6 +8,7 @@ import { AgentRuntime, type Contracts } from 'nanocode-ts'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import { openAgent, runTurn, submitOnce, type AgentHost, type AgentSpec } from '../src/core/agent.ts'
 import { runLock, type Egress } from '../src/core/egress.ts'
+import { StopError } from '../src/core/stop.ts'
 import { BudgetStop, usageOf } from '../src/core/usage.ts'
 import { createWorkspace } from '../src/core/workspace.ts'
 import { fileLedger } from '../src/node/ledger.ts'
@@ -73,6 +74,38 @@ test('a turn that failed on a model error asks again under a new request ID when
   assert.ok(turns.length > 0)
   assert.match(turns[0]!.request, /Your last turn stopped with an error/)
   assert.equal(second.ledger.get('retries:note:task'), 1)
+})
+
+test('a turn that ends without its submit, also after the nudge, asks again under a new request ID, and the second such turn stops the run', async () => {
+  const run = resumeSetup()
+  const turns: Turn[] = []
+  let submits = false
+  const dispatch = scriptedDispatch((turn) => (submits && turn.output === null ? { cell: "await tools.submit_note({ note: 'done' }); text('submitted')" } : { text: 'done' }), turns)
+
+  // The turn and its nudge end without the submit. A plain error lets the next attempt of the run ask again.
+  const first = run.host(dispatch)
+  const missed = await runTurn(first, await run.spec(first), 'Write a note.', 'submit_note').catch((error: unknown) => error)
+  assert.ok(missed instanceof Error && !(missed instanceof StopError), String(missed))
+  assert.match(missed.message, /note did not call submit_note$/)
+  assert.equal(first.ledger.get('retries:note:task'), 1)
+
+  // A replay of the journal would end the same way, so the next call asks under a new request ID.
+  submits = true
+  const asked = turns.length
+  const second = run.host(dispatch)
+  assert.deepEqual(await runTurn(second, await run.spec(second), 'Write a note.', 'submit_note'), { note: 'done' })
+  assert.match(turns[asked]!.request, /Your last turn ended without a call to submit_note/)
+
+  // Two such turns stop the run, so that D13 does not restart a run that ends the same way each time.
+  const other = resumeSetup()
+  const never = scriptedDispatch(() => ({ text: 'done' }), [])
+  for (const expected of [/note did not call submit_note$/, /note did not call submit_note in 2 turns/]) {
+    const host = other.host(never)
+    const error = await runTurn(host, await other.spec(host), 'Write a note.', 'submit_note').catch((caught: unknown) => caught)
+    assert.ok(error instanceof Error, String(error))
+    assert.match(error.message, expected)
+    assert.equal(error instanceof StopError, expected.source.includes('2 turns'))
+  }
 })
 
 const changedLine = 'note: the prompt of turn task changed, so the turn continues with the prompt of its journal'
