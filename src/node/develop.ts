@@ -123,14 +123,15 @@ async function main(): Promise<number> {
   }
 }
 
-function resumeInput(runsDir: string, runId: string): { input: DevelopInput; repo: string } {
+/** A run from before a new review role uses its default model. */
+export function resumeInput(runsDir: string, runId: string): { input: DevelopInput; repo: string } {
   const path = join(runsDir, runId, 'state.json')
   if (!existsSync(path)) throw new StopError(`no run ${runId} in ${runsDir}`)
   const ledger = fileLedger(path)
   const input = ledger.get<DevelopInput>('input')
   const repo = ledger.get<string>('repo')
   if (!input || !repo) throw new StopError(`run ${runId} has no recorded input`)
-  return { input, repo }
+  return { input: { ...input, models: { ...input.models, review: mergeModels(input.models.review) } }, repo }
 }
 
 type Values = Record<string, string | boolean | undefined>
@@ -165,11 +166,12 @@ async function newInput(values: Values): Promise<{ input: DevelopInput; repo: st
   return { input, repo }
 }
 
-main().then(
-  (code) => process.exit(code),
-  (error: unknown) => {
-    if (error instanceof StopError) console.error(`stop: ${error.message}`)
-    else console.error(error)
-    process.exit(2)
-  },
-)
+if (fileURLToPath(import.meta.url) === process.argv[1])
+  main().then(
+    (code) => process.exit(code),
+    (error: unknown) => {
+      if (error instanceof StopError) console.error(`stop: ${error.message}`)
+      else console.error(error)
+      process.exit(2)
+    },
+  )

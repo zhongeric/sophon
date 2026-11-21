@@ -18,8 +18,6 @@ import { BudgetStop, budgetGate, checkPriced, resolveBudget, spendOf, usageOf, u
 /** The step 1 reviewers. The strict loop runs minimize and anti-slop, the standard loop runs cleanup in their place (D20). */
 type Step1Role = 'minimize' | 'rules' | 'bugs' | 'anti-slop' | 'cleanup'
 
-const step1Roles: Record<Loop, readonly Step1Role[]> = { strict: ['minimize', 'rules', 'bugs', 'anti-slop'], standard: ['rules', 'bugs', 'cleanup'] }
-
 export type LoopModels = {
   step1: Record<Step1Role | 'patch' | 'questions', ModelChoice>
   step2: Record<'late-minimize' | 'late-rules' | 'late-bugs' | 'patch' | 'intent', ModelChoice>
@@ -324,14 +322,14 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
 
   // The standard loop (D20): step 1, then the late bugs pass. The late bugs host check sees the step 1 patch.
   const standardLoop = async () => {
-    const { findings, gate1, patch1 } = await runStep1(step1Roles.standard)
+    const { findings, gate1, patch1 } = await runStep1(['rules', 'bugs', 'cleanup'])
     const late = await lateBugs(patch1.after, patch1, 'Late bugs')
     const steps = [findings, gateLine('Step 1 gate', gate1), patchLine('Step 1 patch', patch1), gateLine('Late bugs gate', late.gate), patchLine('Late bugs patch', late.patch)]
     return { current: late.current, secondPass: patch1.changed, steps }
   }
 
   const strictLoop = async () => {
-    const { findings, gate1, patch1 } = await runStep1(step1Roles.strict)
+    const { findings, gate1, patch1 } = await runStep1(['minimize', 'rules', 'bugs', 'anti-slop'])
 
     // Step 2: swapped model family, on the new diff only.
     let gate2: GateResult | null = null
@@ -339,13 +337,13 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     if (patch1.changed) {
       const range = { from: frozen.head, to: patch1.after }
       const note = 'This is the step 2 pass. The diff is the patch that the step 1 patch agent applied, not the original change.'
-      const late = await settleAll(
+      const findings2 = await settleAll(
         (['late-minimize', 'late-rules'] as const).map((id) =>
           step(ledger, `step2.${id}`, () => review(context, `step2.${id}`, reviewRoles[id], input.models.step2[id], range, note)),
         ),
       )
       const host2 = await hostCheck('step2.host', range, 'late-host')
-      const gated = await runGate('step2.gate', familyHeader('Step 2', input.models.step2), [...host2, ...late.flat()])
+      const gated = await runGate('step2.gate', familyHeader('Step 2', input.models.step2), [...host2, ...findings2.flat()])
       gate2 = gated
       patch2 = await runPatch('step2.patch', gated, () =>
         patch(context, 'step2.patch', input.models.step2.patch, gated.kept, gated.log, `agent-factory: apply step 2 review fixes (${input.runId})`),

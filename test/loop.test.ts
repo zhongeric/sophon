@@ -127,6 +127,19 @@ test('a TypeScript change takes the standard loop: bugs, rules and cleanup, the 
   assert.match(result.report, /^## Intent$/m)
 })
 
+test('--full sends a TypeScript change to the strict loop', async () => {
+  const repo = fixtureRepo()
+  const input = { ...(await loopInput(repo, 'full')), full: true }
+  const turns: Turn[] = []
+  const result = await runLoop(repo, 'full', runsDir(), { dispatch: scriptedDispatch(script, turns), input })
+
+  assert.equal(result.pass, true, result.report)
+  for (const role of ['minimize', 'rules', 'bugs', 'anti-slop', 'late-minimize', 'late-rules', 'late-bugs']) assert.ok(turns.some((turn) => turn.role === role), `${role} did not run`)
+  assert.ok(!turns.some((turn) => turn.role === 'cleanup'))
+  assert.match(result.report, /^- Triage: `TRIAGE path=full reason=full-asked loop=strict profiles=/m)
+  assert.match(result.report, /^- Step 2 gate: kept 0 of 0$/m)
+})
+
 test('a resumed run whose triage record has no loop, from before D20, runs the strict loop', async () => {
   const repo = fixtureRepo()
   const dir = runsDir()

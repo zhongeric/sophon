@@ -38,8 +38,8 @@ light:    one reviewer that also fixes ─▶ commit ─▶ checks ─▶ PASS o
 - **Scale.** A diff over 600 lines splits across up to 4 bugs reviewers. Patch agents split the findings by file.
 - **Static rules.** Each profile has mechanical rules, for example a fixed Solidity pragma, or no `.env` file in the
   change. The host checks the added lines and gives each break to the patch agent.
-- **Models.** Step 1 runs on Opus 5.5, with the rules track on Sol. The cleanup track (minimize and anti-slop) runs
-  on Opus 5.5. Each step 2 and late bugs role swaps the family of its step 1 role.
+- **Models.** Step 1 runs on Opus 5.5, with the rules track on Sol. Each step 2 and late bugs role swaps the family
+  of its step 1 role.
 - **Resume.** Each step's result goes to the run's ledger, so a stopped run continues where it stopped.
 
 ## Rules the host enforces

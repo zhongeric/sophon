@@ -364,8 +364,6 @@ export type Loop = 'strict' | 'standard'
 /** One strict path selects the strict loop for the whole change: Solidity src/ and script/, agent prompts and rule files. */
 const strictPaths = [/^(src|script)\/.*\.sol$/, new RegExp(`^${agentFiles}`, 'i')]
 
-const isStrict = (path: string) => strictPaths.some((pattern) => pattern.test(path))
-
 /** The light or full loop for one change, with the profiles that apply to it. */
 export type Triage = {
   path: 'light' | 'full'
@@ -389,7 +387,7 @@ export async function triage(changed: string[], exists: (path: string) => Promis
   const behavior = changed.filter((path) => !isLight(path, present))
   if (full) return { ...resolved, path: 'full', loop: 'strict', reason: 'full-asked', files: [] }
   if (changed.length === 0) return { ...resolved, path: 'full', loop: 'standard', reason: 'empty-diff', files: [] }
-  if (behavior.length > 0) return { ...resolved, path: 'full', loop: changed.some(isStrict) ? 'strict' : 'standard', reason: 'not-docs-or-tests', files: behavior }
+  if (behavior.length > 0) return { ...resolved, path: 'full', loop: changed.some((path) => strictPaths.some((pattern) => pattern.test(path))) ? 'strict' : 'standard', reason: 'not-docs-or-tests', files: behavior }
   return { ...resolved, path: 'light', reason: 'docs-or-tests-only', files: [] }
 }
 
