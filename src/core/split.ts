@@ -66,16 +66,19 @@ const fileOf = (finding: Finding) => {
   return location && 'path' in location ? location.path : finding.location
 }
 
+/** A finding that gets a patch agent for its file: a bug that is not info. Each agent costs about the same (D22). */
+const ownsFile = (finding: Finding) => finding.track === 'bugs' && finding.severity !== 'info'
+
 /**
- * Splits the kept findings across patch agents that work at the same time. The findings in one file go to one agent,
- * which owns that file. An info finding goes to the agent that owns its file, and the other info findings go
- * together to one agent of their own. Above `maxPatchGroups`, the two groups with the fewest findings merge, until
- * the count is correct. The info group does not merge.
+ * Splits the kept findings across patch agents that work at the same time. The bug findings in one file go to one
+ * agent, which owns that file. Each other finding goes to the agent that owns its file, and the rest go together to
+ * one agent of their own (D22). Above `maxPatchGroups`, the two groups with the fewest findings merge, until the count
+ * is correct. The group of the rest does not merge.
  */
 export function patchGroups(kept: Finding[]): PatchGroup[] {
   const owner = new Map<string, PatchGroup>()
   const groups: PatchGroup[] = []
-  for (const finding of kept.filter((item) => item.severity !== 'info')) {
+  for (const finding of kept.filter(ownsFile)) {
     const file = fileOf(finding)
     let group = owner.get(file)
     if (!group) {
@@ -85,17 +88,17 @@ export function patchGroups(kept: Finding[]): PatchGroup[] {
     }
     group.findings.push(finding)
   }
-  const info: PatchGroup = { findings: [], files: [] }
-  for (const finding of kept.filter((item) => item.severity === 'info')) {
+  const rest: PatchGroup = { findings: [], files: [] }
+  for (const finding of kept.filter((item) => !ownsFile(item))) {
     const file = fileOf(finding)
     const group = owner.get(file)
     if (group) group.findings.push(finding)
     else {
-      info.findings.push(finding)
-      if (!info.files.includes(file)) info.files.push(file)
+      rest.findings.push(finding)
+      if (!rest.files.includes(file)) rest.files.push(file)
     }
   }
-  const limit = maxPatchGroups - (info.findings.length > 0 ? 1 : 0)
+  const limit = maxPatchGroups - (rest.findings.length > 0 ? 1 : 0)
   while (groups.length > limit) {
     const [first, second] = [...groups.keys()].sort((a, b) => groups[a]!.findings.length - groups[b]!.findings.length || a - b)
     const [keep, merge] = first! < second! ? [first!, second!] : [second!, first!]
@@ -104,7 +107,7 @@ export function patchGroups(kept: Finding[]): PatchGroup[] {
   }
   const order = new Map(kept.map((finding, index) => [finding.id, index]))
   const sorted = (group: PatchGroup) => ({ ...group, findings: group.findings.sort((a, b) => order.get(a.id)! - order.get(b.id)!) })
-  return [...groups, ...(info.findings.length > 0 ? [info] : [])].map(sorted)
+  return [...groups, ...(rest.findings.length > 0 ? [rest] : [])].map(sorted)
 }
 
 /**

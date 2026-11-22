@@ -228,9 +228,9 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
     },
     pulls: options.pulls,
     checker: (branch) => commandChecker(branch, input.config, localMachine(worktreePath(branchesDir, branch.name))),
-    async review({ runId, ask, head, branch, full, pr, budget, base }) {
+    async review({ runId, ask, head, branch, full, pr, budget, base, from }) {
       // A base merge moves the merge base of the change, so the review gets the current one (D16).
-      const source = { repo: options.repo, base: base ?? input.base, head }
+      const source = { repo: options.repo, base: base ?? input.base, head, ...(from === undefined ? {} : { from }) }
       const run = await nodeRun({ config: input.config, runId, runsDir: options.runsDir, source })
       run.ledger.put('git', source)
       const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, headRef: branch, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}), ...(budget !== undefined ? { budgetOverride: budget } : {}), stopAtBudget: true }

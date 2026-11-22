@@ -132,3 +132,19 @@ test('reviewPass returns the failed checks of the review run outcome', async () 
   const result = await reviewPass(env, request, progressLedger(memoryLedger()), review)
   assert.deepEqual(result.failedChecks, failedChecks)
 })
+
+test('reviewPass starts a review run with from only when the pass reviews the changes after an earlier pass (D22)', async () => {
+  const starts: Parameters<ReviewRuns['start']>[0][] = []
+  const runs: ReviewRuns = {
+    start: async (start) => {
+      starts.push(start)
+      return { run: `pr-9-${starts.length}` }
+    },
+    outcome: async () => passed,
+    resumeAfterError: async () => assert.fail('a finished review run gets no resume'),
+  }
+  const env = { PULL_REQUESTS: { idFromName: (name: string) => name, get: () => runs } }
+  await reviewPass(env, request, progressLedger(memoryLedger()), review)
+  await reviewPass(env, request, progressLedger(memoryLedger()), { ...review, runId: 'dev-1-review-2', from: 'abc0' })
+  assert.deepEqual(starts.map((start) => start.from), [undefined, 'abc0'])
+})

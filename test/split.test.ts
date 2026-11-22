@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import type { Finding, Severity } from '../src/core/findings.ts'
+import type { Finding, Severity, Track } from '../src/core/findings.ts'
 import { bugsShards, diffFiles, diffOf, fileOwners, maxBugsShards, maxPatchGroups, patchGroups } from '../src/core/split.ts'
 
 /** A diff that adds `lines` lines to each file. */
@@ -42,9 +42,11 @@ test('the count of bugs reviewers has a limit, and each file goes to exactly one
   assert.deepEqual(shards.flat().sort(), Object.keys(sizes).sort())
 })
 
+/** The track of a finding comes from the prefix of its ID, as the reviewers give it. */
+const tracks: Record<string, Track> = { anti: 'anti-slop', bugs: 'bugs', clean: 'cleanup', min: 'minimize', rules: 'rules' }
 const finding = (id: string, location: string, severity: Severity): Finding => ({
   id,
-  track: 'bugs',
+  track: tracks[id.slice(0, id.indexOf('-'))]!,
   location,
   severity,
   title: id,
@@ -71,7 +73,23 @@ test('patch groups follow the files of the findings, and info findings join the 
   assert.deepEqual(ids(patchGroups(kept.filter((item) => item.severity === 'info'))), [['anti-001', 'anti-002', 'anti-003']])
 })
 
-test('above the limit, the smallest patch groups merge, and the info group stays on its own', () => {
+test('a finding of another track than bugs gets no agent of its own: it joins the owner of its file, or the group of the rest', () => {
+  const kept = [
+    finding('bugs-001', 'src/a.ts:3', 'high'),
+    finding('rules-001', 'src/b.ts:1', 'high'),
+    finding('clean-001', 'src/a.ts:9', 'low'),
+    finding('min-001', 'src/c.ts:4', 'medium'),
+    finding('anti-001', 'src/b.ts:2', 'medium'),
+    finding('bugs-002', 'src/d.ts:5', 'info'),
+  ]
+  const groups = patchGroups(kept)
+  assert.deepEqual(ids(groups), [['bugs-001', 'clean-001'], ['rules-001', 'min-001', 'anti-001', 'bugs-002']])
+  assert.deepEqual(groups.map((group) => group.files), [['src/a.ts'], ['src/b.ts', 'src/c.ts', 'src/d.ts']])
+  // Without a bug finding, one agent applies all findings.
+  assert.deepEqual(ids(patchGroups(kept.filter((item) => item.track !== 'bugs'))), [['rules-001', 'clean-001', 'min-001', 'anti-001']])
+})
+
+test('above the limit, the smallest patch groups merge, and the group of the rest stays on its own', () => {
   const kept = [
     ...Array.from({ length: 6 }, (_, index) => finding(`bugs-00${index + 1}`, `src/f${index}.ts:1`, 'medium')),
     finding('bugs-007', 'src/f0.ts:9', 'medium'),

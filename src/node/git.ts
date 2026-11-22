@@ -34,12 +34,16 @@ export type GitCommits = { unsigned: boolean }
 /** Unsigned mode turns off the signature of the user git config. Signed mode keeps that config. */
 const signature = (commits: GitCommits): string[] => (commits.unsigned ? ['-c', 'commit.gpgsign=false'] : [])
 
-/** Freezes the review target: a worktree of `head` on its own branch, and the merge base with `base`. */
-export async function freeze(repo: string, base: string, head: string, tree: string, branch: string): Promise<Frozen> {
+/**
+ * Freezes the review target: a worktree of `head` on its own branch, and the merge base with `base`. With `from`, the
+ * pass reviews only the changes after that commit (D22).
+ */
+export async function freeze(repo: string, base: string, head: string, tree: string, branch: string, from?: string): Promise<Frozen> {
   const headSha = (await git(repo, 'rev-parse', '--verify', `${head}^{commit}`)).trim()
   const baseSha = (await git(repo, 'merge-base', base, headSha)).trim()
+  const scope = from === undefined ? {} : { from: (await git(repo, 'rev-parse', '--verify', `${from}^{commit}`)).trim() }
   if (!existsSync(tree)) await git(repo, 'worktree', 'add', '-b', branch, tree, headSha)
-  return { base: baseSha, head: headSha, branch, location: `worktree ${tree}` }
+  return { base: baseSha, head: headSha, branch, location: `worktree ${tree}`, ...scope }
 }
 
 export function diff(tree: string, from: string, to: string): Promise<string> {
@@ -88,7 +92,8 @@ export async function currentCommit(tree: string): Promise<string> {
   return (await git(tree, 'rev-parse', 'HEAD')).trim()
 }
 
-export type GitSource = { repo: string; base: string; head: string }
+/** `from`: the head of an earlier pass, when a pass reviews only the changes after it (D22). */
+export type GitSource = { repo: string; base: string; head: string; from?: string }
 
 /**
  * A local git repository: the review runs in a worktree of its own, on branch `branch`. A resumed run after a release
@@ -108,7 +113,7 @@ export function gitRepo(source: GitSource, tree: string, branch: string, commits
     }
   return {
     tree: diskFileSystem(tree),
-    freeze: () => freeze(source.repo, source.base, source.head, tree, branch),
+    freeze: () => freeze(source.repo, source.base, source.head, tree, branch, source.from),
     diff: inTree((from: string, to: string) => diff(tree, from, to)),
     changedFiles: inTree((from: string, to: string) => changedFiles(tree, from, to)),
     touchedFiles: inTree((from: string, to: string) => touchedFiles(tree, from, to)),

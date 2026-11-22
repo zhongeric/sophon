@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict'
+import { writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { test } from 'node:test'
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { sqlBranches } from '../src/cloudflare/branches.ts'
 import { github } from '../src/cloudflare/github.ts'
+import { githubRepo } from '../src/cloudflare/repo.ts'
 import { systemClock } from '../src/core/clock.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import { hasConflictMarkers } from '../src/core/merge.ts'
@@ -164,4 +167,42 @@ test('Cloudflare branches: a base merge stops when GitHub has a commit that the 
   await git(origin, 'update-ref', 'refs/heads/factory/dev-x', foreign)
   await assert.rejects(branch.mergeCommit(baseHead, 'merge main'), /not the pushed head/)
   assert.equal((await git(origin, 'rev-parse', 'refs/heads/factory/dev-x')).trim(), foreign)
+})
+
+test('Cloudflare review repo: the freeze of a pass with from adds a commit with the files at from, so that only the later changes are between it and the head (D22)', async (t) => {
+  const { repo, origin } = developRepo()
+  const write = (path: string, text: string) => writeFileSync(join(repo, path), text)
+  const commit = async (message: string) => {
+    await git(repo, 'add', '-A')
+    await git(repo, 'commit', '-q', '-m', message)
+    return (await git(repo, 'rev-parse', 'HEAD')).trim()
+  }
+  await git(repo, 'checkout', '-q', '-b', 'feature')
+  write('src/math.ts', 'export const add = (a: number, b: number) => a + b\n')
+  write('src/a.ts', 'a\n')
+  const from = await commit('the head of the first pass')
+  // The repair changes a file of the first pass, adds a file and renames a file of the base.
+  write('src/a.ts', 'a, repaired\n')
+  write('src/b.ts', 'b\n')
+  await git(repo, 'mv', 'test/add.test.ts', 'test/sum.test.ts')
+  await commit('repair')
+  await git(repo, 'push', '-q', 'origin', 'feature')
+  const mock = await mockServices(origin, {
+    botLogin: 'factory-bot',
+    name: 'app',
+    owner: 'acme',
+    pr: 7,
+    script: () => {
+      throw new Error('this test has no model turns')
+    },
+  })
+  t.after(() => mock.close())
+  const review = githubRepo({ branch: 'factory/pr-7-x', from, gh: github('token', mock.url), ledger: memoryLedger(), log: () => {}, pull: { owner: 'acme', repo: 'app', pr: 7 }, runId: 'pr-7-x', sql: sqlHost() })
+  const frozen = await review.freeze()
+  assert.ok(frozen.from)
+  const touched = async (start: string, end: string) => (await review.touchedFiles(start, end)).sort()
+  assert.deepEqual(await touched(frozen.from, frozen.head), ['src/a.ts', 'src/b.ts', 'test/add.test.ts', 'test/sum.test.ts'])
+  assert.deepEqual(await touched(frozen.base, frozen.from), ['src/a.ts', 'src/math.ts'])
+  assert.deepEqual(await touched(frozen.base, frozen.head), ['src/a.ts', 'src/b.ts', 'src/math.ts', 'test/add.test.ts', 'test/sum.test.ts'])
+  assert.match(await review.diff(frozen.from, frozen.head), /^-a\n\+a, repaired$/m)
 })

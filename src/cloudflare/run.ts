@@ -27,9 +27,10 @@ export { allowedUsers, type Env } from './runs.ts'
 /**
  * `ask` replaces the PR title and body as the original ask, for a review that the development workflow starts.
  * `budget` is the cost budget in USD. With `stopAtBudget`, the run stops at the budget without a question, because the
- * development run that started it asks with the run totals.
+ * development run that started it asks with the run totals. With `from`, the run reviews only the changes after that
+ * commit, the head of an earlier pass of the development run (D22).
  */
-export type StartRequest = PullRequest & { ship: boolean; by: string; full?: boolean; ask?: string; budget?: number; stopAtBudget?: boolean }
+export type StartRequest = PullRequest & { ship: boolean; by: string; full?: boolean; ask?: string; budget?: number; stopAtBudget?: boolean; from?: string }
 
 /** The review runs of one PR. */
 export class PullRequestRuns extends Runs<StartRequest> {
@@ -97,7 +98,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     const log = (line: string) => console.log(`[${request.owner}/${request.repo}#${request.pr} ${run}] ${line}`)
     const sql = Sql.create(this.ctx.storage)
     const { clock } = this
-    const repo = githubRepo({ branch, clock, gh, ledger, log, pull, runId: run, sql })
+    const repo = githubRepo({ branch, clock, from: request.from, gh, ledger, log, pull, runId: run, sql })
     const signing = githubSigning(gh, request.owner, request.repo)
     const ci = ciChecker({ branch, clock, gh, ledger, pull, repo, timeoutMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000 })
     const machine = input.config.tests || hasCi(input.config) ? await call.machine() : undefined

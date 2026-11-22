@@ -307,10 +307,12 @@ test('develop: a failed intent check gets a repair round and a second review pas
   const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), second), pulls: github.pulls, review, runId: 'intent' })
   assert.equal(result.status, 'ready', result.report)
   assert.deepEqual(repairRounds(second), [])
-  // The second pass reviewed the head of the repair.
+  // The second pass reviewed the head of the repair, and only the changes after the head of the first pass (D22).
   assert.deepEqual(requests.map((request) => request.runId), ['intent-review-1', 'intent-review-2'])
   assert.notEqual(requests[1]!.head, requests[0]!.head)
   assert.equal(requests[1]!.head, github.state.shas.at(-1))
+  assert.deepEqual(requests.map((request) => request.from), [undefined, requests[0]!.head])
+  assert.match(result.report, new RegExp(`^- Pass 2: PASS, \`TRIAGE path=full\`, the changes after ${requests[0]!.head.slice(0, 12)}, no fixes$`, 'm'))
   const ledger = fileLedger(join(dir, 'intent', 'state.json'))
   for (const key of ['step:repair.1', 'ci:ci.repair.1', 'step:review.2']) assert.ok(ledger.get(key), key)
   for (const key of ['step:repair.2', 'ci:ci.repair.2']) assert.equal(ledger.get(key), undefined, key)
@@ -519,14 +521,15 @@ test('develop: a refused rejection of a high finding goes to the fixer with the 
   assert.equal(requests.length, 2)
 })
 
-test('develop: a base that moves without a conflict gets a merge commit and CI again, no new review pass, and the run merges the new head', { timeout: 240_000 }, async () => {
+test('develop: a base that moves without a conflict, also on a file of the change, gets a merge commit and CI again, no new review pass, and the run merges the new head', { timeout: 240_000 }, async () => {
   const { repo, origin } = developRepo(undefined, { merge: 'squash' })
   const dir = runsDir()
   const github = fakePulls([true])
   const requests: ReviewRequest[] = []
   const review = scriptedReview([[]], requests)
   const input = await developInput(repo, 'base-clean')
-  const base = pushBase(origin, { 'docs/base.md': '# Base\n' })
+  // The base adds src/sub.ts as the builder does, so the merge brings a file of the change without a conflict.
+  const base = pushBase(origin, { 'docs/base.md': '# Base\n', 'src/sub.ts': sources.sub })
   // The run pauses at the CI of the base merge. The resume replays the base check and merges the base no second time.
   await assert.rejects(runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), input, pulls: pauseAtCi(github.pulls, 2), review, runId: 'base-clean' }), PausedError)
   const turns: Turn[] = []
@@ -534,7 +537,7 @@ test('develop: a base that moves without a conflict gets a merge commit and CI a
   assert.equal(result.status, 'ready', result.report)
   assert.deepEqual(turns, [])
 
-  // One base merge with two parents, CI on its head, and the merge at that head. The merge brought no file of the change.
+  // One base merge with two parents, CI on its head, and the merge at that head. A clean merge gets no review pass (D22).
   assert.equal(github.state.shas.length, 2)
   const [built, head] = github.state.shas as [string, string]
   assert.deepEqual(parents(origin, head), [built, base])
@@ -542,12 +545,13 @@ test('develop: a base that moves without a conflict gets a merge commit and CI a
   assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
   assert.deepEqual(requests.map((request) => [request.head, request.base]), [[built, input.base]])
   const ledger = fileLedger(join(dir, 'base-clean', 'state.json'))
-  assert.deepEqual(ledger.get('step:base-check.1'), { result: { point: 'ready', base, moved: true, merge: { files: ['docs/base.md'], conflicts: [], change: ['src/mul.ts', 'src/sub.ts', 'test/ops.test.ts'] } } })
+  assert.deepEqual(ledger.get('step:base-check.1'), { result: { point: 'ready', base, moved: true, merge: { files: ['docs/base.md', 'src/sub.ts'], conflicts: [] } } })
   for (const key of ['step:base-check.2', 'step:base-check.3', 'ci:ci.base.1']) assert.ok(ledger.get(key), key)
   assert.equal(ledger.get('step:base-check.4'), undefined)
-  assert.match(result.report, new RegExp(`^## Base merges\\n\\n- Before ready: ${base.slice(0, 12)}, clean\\. Files: docs/base\\.md\\n`, 'm'))
+  assert.match(result.report, new RegExp(`^## Base merges\\n\\n- Before ready: ${base.slice(0, 12)}, clean\\. Files: docs/base\\.md, src/sub\\.ts\\n`, 'm'))
   assert.match(result.report, new RegExp(`^## Merge tries\\n\\n- Try 1: merged as ${mergeCommit}\\n`, 'm'))
   assert.match(result.report, /^- \[x\] CI green on the head: /m)
+  assert.match(result.report, /^- \[x\] Review loop PASS on the head, at least 1 pass: pass 1: PASS$/m)
 
   // A resume of the finished run makes no new base merge and no new merge call, also when the base moved again.
   pushBase(origin, { 'docs/later.md': '# Later\n' })
@@ -587,6 +591,8 @@ test('develop: a base merge with a conflict on a file of the change gets a repai
   assert.equal(hasConflictMarkers(show('src/sub.ts')), false)
   assert.equal(show('docs/base.md'), '# Base\n')
   assert.deepEqual(requests.map((request) => [request.head, request.base]), [[built, (await developInput(repo, 'x')).base], [head, base]])
+  // The changes after the first pass hold the base changes of the merge, so the new pass reviews the whole change (D22).
+  assert.deepEqual(requests.map((request) => request.from), [undefined, undefined])
   assert.match(result.report, /^- \[x\] Review loop PASS on the head, at least 1 pass: pass 1: PASS, pass 2: PASS$/m)
   assert.deepEqual(github.state.merges, [{ pr: 9, method: 'squash', sha: head }])
   assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
@@ -670,7 +676,7 @@ test('develop: CI red only on the merge with a moved base gets the base merge be
 
   const ledger = fileLedger(join(dir, 'base-repair', 'state.json'))
   assert.deepEqual(ledger.get('step:base-check.repair.1'), {
-    result: { point: 'repair', round: 1, base, moved: true, merge: { files: ['test/base.test.ts'], conflicts: [], change: ['src/mul.ts', 'src/sub.ts', 'test/ops.test.ts'] } },
+    result: { point: 'repair', round: 1, base, moved: true, merge: { files: ['test/base.test.ts'], conflicts: [] } },
   })
   for (const key of ['step:base-check.1', 'step:base-check.2']) assert.equal(ledger.get<{ result: { moved: boolean } }>(key)?.result.moved, false, key)
   for (const key of ['step:base-check.repair.2', 'step:base-check.3', 'step:finish-merge.repair.1', 'step:repair.2']) assert.equal(ledger.get(key), undefined, key)

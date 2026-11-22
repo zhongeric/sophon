@@ -127,6 +127,41 @@ test('a TypeScript change takes the standard loop: bugs, rules and cleanup, the 
   assert.match(result.report, /^## Intent$/m)
 })
 
+test('a pass with from reviews only the changes after it, and the checks and the intent check read the whole change (D22)', async () => {
+  const repo = fixtureRepo()
+  const run = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'pipe' }).toString().trim()
+  const base = run('merge-base', 'main', 'feature')
+  const from = run('rev-parse', 'feature')
+  // The repair after the earlier pass changes only src/math.ts.
+  writeFileSync(join(repo, 'src/math.ts'), `${readFileSync(join(repo, 'src/math.ts'), 'utf8')}\nexport const zero = 0\n`)
+  run('-c', 'commit.gpgsign=false', 'commit', '-q', '-am', 'repair')
+  const head = run('rev-parse', 'feature')
+  const checked: string[][] = []
+  const turns: Turn[] = []
+  const result = await runLoop(repo, 'scoped', runsDir(), {
+    checker: (real) => ({
+      ...real,
+      checks: (files) => {
+        checked.push([...files].sort())
+        return real.checks(files)
+      },
+    }),
+    dispatch: scriptedDispatch(script, turns),
+    from,
+  })
+
+  assert.equal(result.pass, true, result.report)
+  assert.match(readFileSync(join(result.dir, 'gate-log.txt'), 'utf8'), /^TRIAGE path=full reason=not-docs-or-tests loop=standard files=src\/math\.ts /)
+  const request = (role: string) => turns.find((turn) => turn.role === role)?.request ?? ''
+  for (const role of ['rules', 'bugs', 'cleanup']) {
+    assert.ok(request(role).includes(`from ${from.slice(0, 12)} to ${head.slice(0, 12)}`), role)
+    assert.match(request(role), /This pass reviews only the changes after an earlier review pass of this change\./, role)
+  }
+  assert.ok(request('intent').includes(`- Final diff: /review/diff.patch, from ${base.slice(0, 12)} to `))
+  assert.deepEqual(checked, [['docs/current.md', 'src/math.ts', 'test/sub.test.ts']])
+  assert.match(result.report, new RegExp(`^- Reviewed: ${from.slice(0, 12)}\\.\\.${head.slice(0, 12)}, the changes after an earlier pass \\(the change starts at ${base.slice(0, 12)}\\)$`, 'm'))
+})
+
 test('--full sends a TypeScript change to the strict loop', async () => {
   const repo = fixtureRepo()
   const input = { ...(await loopInput(repo, 'full')), full: true }

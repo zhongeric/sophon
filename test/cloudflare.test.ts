@@ -588,7 +588,7 @@ test('on Cloudflare, deleted source files and the old paths of renamed source fi
       if (role === 'questions') return { cell: 'await tools.submit_questions({ questions: [] })' }
       if (role === 'intent') return { cell: 'await tools.submit_verdict({ satisfied: true, gaps: [], summary: "The change removes source files" })' }
       if (role === 'patch') {
-        // The two host findings are in two files, so two patch agents get one each.
+        // The two host findings are not bugs, so one patch agent gets both (D22).
         const fixes = [
           { id: 'host-001', path: 'docs/v2.md', content: lightFixed.docs, change: 'wrote for example' },
           { id: 'host-002', path: 'test/Vault.t.sol', content: lightFixed.test, change: 'renamed the test' },
@@ -613,7 +613,7 @@ test('on Cloudflare, deleted source files and the old paths of renamed source fi
     const report = await (await fetch(`${worker.url}/runs/acme/app/7/report`, { headers: { authorization: 'Bearer admin' } })).text()
     assert.match(report, /TRIAGE path=full reason=not-docs-or-tests loop=standard files=[^\n`]*src\/math\.ts/)
     assert.match(report, /TRIAGE path=full reason=not-docs-or-tests loop=standard files=[^\n`]*src\/removed\.ts/)
-    assert.match(report, /Step 1 patch: commit [0-9a-f]{12} \(2 patch agents at the same time\); applied: host-001 .*; host-002 /)
+    assert.match(report, /Step 1 patch: commit [0-9a-f]{12}; applied: host-001 .*; host-002 /)
     assert.ok(mock.state.turns.some((turn) => turn.role === 'cleanup'))
     assert.ok(!mock.state.turns.some((turn) => turn.role === 'light'))
   } finally {
