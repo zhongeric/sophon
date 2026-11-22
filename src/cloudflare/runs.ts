@@ -3,7 +3,7 @@ import type { Ledger } from '../core/ledger.ts'
 import { callBudget, PlannedStop } from '../core/planned-stop.ts'
 import { failedChecksText } from '../core/preflight.ts'
 import { apiKeyCredential, type Credential, type Credentials, type Provider } from '../core/providers.ts'
-import type { Comments } from '../core/questions.ts'
+import { PausedError, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { afterError, alarmBudgetMs, countRestart, initCounters, preflightKey, progressLedger, restartAtKey } from './alarm.ts'
 import { containerBox, httpBox, type Box, type SyncStore } from './box.ts'
@@ -13,6 +13,7 @@ import type { DevelopmentRuns } from './develop.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { githubAccess, type InstallationTokens } from './github-app.ts'
 import { hasOpenJobs, jobRunner, resetJobStarts, type JobRunner } from './jobs.ts'
+import { runEntries, type InboxEntry } from './inbox.ts'
 import { addLabel } from './labels.ts'
 import { preflight, PreflightFailed, type PreflightNeeds } from './preflight.ts'
 import type { State } from './prune.ts'
@@ -20,6 +21,7 @@ import type { ResearchRuns } from './research.ts'
 import type { PullRequestRuns } from './run.ts'
 import type { ScanBoxes } from './scan.ts'
 import { createTables, sqlFiles, sqlLedger } from './storage.ts'
+import { runStatus, stageLedger, statusKeys, type RunStatus } from './status.ts'
 import { sqlSyncs } from './syncs.ts'
 
 export type Env = {
@@ -94,7 +96,12 @@ export type Call = {
    * a turn that did not finish runs when the turn runs again.
    */
   machine(): Promise<RunMachine>
+  /** Puts a notice that needs no answer, for example the budget notice, into the status comment (D21). */
+  notice(text: string): Promise<void>
 }
+
+/** The end of execute(). `needsUser` is true when the user must act on the result: a new comment carries the summary (D21). */
+export type RunResult = { passed: boolean; summary: string; needsUser: boolean }
 
 /** While a run works, its alarm stays this far ahead, so that a run whose isolate died restarts from its ledger. */
 const heartbeatMs = 60_000
@@ -151,10 +158,15 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
   protected abstract readonly label: string
   protected abstract runName(request: Request, stamp: string): string
   protected abstract announcement(run: string, request: Request): string
-  /** Runs the work, or resumes it from the ledger. Returns whether it passed, and the comment for the end of the run. */
-  protected abstract execute(run: string, request: Request, ledger: Ledger, gh: GitHub, comments: Comments, call: Call): Promise<{ passed: boolean; summary: string }>
+  /** Runs the work, or resumes it from the ledger. Returns whether it passed, and the summary for the end of the run. */
+  protected abstract execute(run: string, request: Request, ledger: Ledger, gh: GitHub, comments: Comments, call: Call): Promise<RunResult>
   /** What the preflight of the run checks (D17). `gh` is undefined when the GitHub access check failed. */
   protected abstract preflightNeeds(request: Request, ledger: Ledger, gh: GitHub | undefined): Promise<PreflightNeeds>
+
+  /** True for a run that a parent run started: the parent reports to the user, so this run posts only its status comment. */
+  protected reportsToParent(_request: Request): boolean {
+    return false
+  }
 
   /** The build machine of this object: MACHINE_URL in local tests, else the object's Cloudflare Container. */
   protected box(syncs: SyncStore): Box {
@@ -214,6 +226,17 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     return { runs, result: latest ? (sqlLedger(this.ctx.storage.sql, latest.run).get('result') ?? null) : null }
   }
 
+  /** The items of the latest run that wait for the user, for the inbox (D21). A run that reports to its parent run gives none. */
+  inbox(): InboxEntry[] {
+    const latest = this.ctx.storage.sql.exec<RunRow>('select * from factory_runs order by created desc limit 1').toArray()[0]
+    if (!latest || this.reportsToParent(JSON.parse(latest.request) as Request)) return []
+    const batches = this.ctx.storage.sql
+      .exec<{ key: string }>("select key from factory_ledger where run = ? and key like 'posted:%'", latest.run)
+      .toArray()
+      .map((row) => row.key.slice('posted:'.length))
+    return runEntries(latest, sqlLedger(this.ctx.storage.sql, latest.run), batches)
+  }
+
   /** The state and the ship flag of a run, for the prune of its branches, or null when this object has no such run. */
   runState(run: string): { state: State; ship: boolean } | null {
     const row = this.row(run)
@@ -236,11 +259,22 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     await this.ctx.storage.setAlarm(Date.now() + heartbeatMs)
     const request = JSON.parse(row.request) as Request
     const budgetMs = alarmBudgetMs(this.env.ALARM_BUDGET_SECONDS)
-    const ledger = callBudget(progressLedger(sqlLedger(this.ctx.storage.sql, row.run)), { budgetMs, startedAt })
-    const call = this.call(row.run, ledger, startedAt + budgetMs)
-    const target = `${request.owner}/${request.repo}#${this.number(request)}`
+    const stored = sqlLedger(this.ctx.storage.sql, row.run)
     // Without a client, the run cannot post: a failed GitHub setup goes only to the state note.
-    let comments: Comments | undefined
+    const shown: { status?: RunStatus } = {}
+    const track = (gh: GitHub): RunStatus =>
+      (shown.status ??= runStatus({
+        comments: githubComments(gh, request.owner, request.repo, this.number(request)),
+        header: this.announcement(row.run, request),
+        ledger: stored,
+        log: (line, error) => console.error(`[${row.run}] ${line}`, error),
+        quiet: this.reportsToParent(request),
+      }))
+    // Each finished step edits the status comment with its stage (D21).
+    const ledger = callBudget(stageLedger(progressLedger(stored), (stage) => shown.status?.stage(stage)), { budgetMs, startedAt })
+    const notice = async (text: string) => shown.status?.update({ notice: text })
+    const call = this.call(row.run, ledger, startedAt + budgetMs, notice)
+    const target = `${request.owner}/${request.repo}#${this.number(request)}`
     let app = false
     let next: number | null = null
     try {
@@ -253,7 +287,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
             env: this.env,
             needs: (gh) => {
               // An error of the needs, for example a fork PR, takes the normal error path, which posts with this client.
-              if (gh) comments = githubComments(gh, request.owner, request.repo, this.number(request))
+              if (gh) track(gh)
               return this.preflightNeeds(request, ledger, gh)
             },
             owner: request.owner,
@@ -264,39 +298,50 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       if (due) ledger.put(preflightKey, true)
       app = access.app
       const posts = githubComments(access.gh, request.owner, request.repo, this.number(request))
-      comments = posts
+      const status = track(access.gh)
       initCounters(ledger)
       if (row.state === 'running') countRestart(ledger)
       this.setState(row.run, 'running', '')
       // The ledger records the attempt also when it failed, so that a failed add does not repeat at each alarm.
       const log = (error: unknown) => console.error(`[${row.run}] the add of the label ${this.label} failed`, error)
       await once(ledger, 'label', () => addLabel({ gh: access.gh, log, name: this.label, number: this.number(request), owner: request.owner, repo: request.repo }))
-      await once(ledger, 'announced', () => posts.post(this.announcement(row.run, request)))
+      // A paused run that polls keeps its view, so that the poll edits nothing.
+      await status.update(row.state === 'paused' ? { cause: row.note, state: 'paused' } : { state: 'running' })
       const result = await this.execute(row.run, request, ledger, access.gh, posts, call)
       this.setState(row.run, result.passed ? 'passed' : 'failed', '')
       await this.killJobs(row.run, ledger, call)
-      await once(ledger, 'summary', () => posts.post(result.summary))
+      const state = result.passed ? 'passed' : 'failed'
+      if (result.needsUser) {
+        await once(ledger, 'summary', async () => ledger.put(statusKeys.summary, (await posts.post(result.summary)).url))
+        const link = ledger.get<string>(statusKeys.summary)
+        await status.update({ state, ...(link ? { link } : {}) })
+      } else await status.update({ details: result.summary, state })
     } catch (error) {
       if (error instanceof PreflightFailed) {
         // A failed prerequisite does not fix itself, so the run waits for the admin resume without a D13 restart (D17).
         this.setState(row.run, 'error', error.message)
         const text = `agent-factory did not start run \`${row.run}\`: the preflight found failed checks.\n\n<details><summary>Failed checks</summary>\n\n${failedChecksText(error.failed)}\n\n</details>\n\nAfter you fix them, continue the run with \`npm run remote -- resume ${target}\`.`
-        if (error.gh) await githubComments(error.gh, request.owner, request.repo, this.number(request)).post(text).catch(() => undefined)
+        // Before the first post, the status comment carries the failed checks.
+        await (shown.status ?? (error.gh ? track(error.gh) : undefined))?.error(error.message, text)
       } else {
         const outcome = afterError(ledger, error, { now: Date.now(), pauseSeconds: this.env.PAUSE_POLL_SECONDS })
         if (error instanceof PlannedStop) console.log(`[${row.run}] planned stop after ${Math.round((Date.now() - startedAt) / 1_000)} s of wall time`)
         if (outcome.attempts !== null) console.error(`[${row.run}] attempt ${outcome.attempts} failed`, error)
         this.setState(row.run, outcome.state, outcome.note)
         next = outcome.next
-        if (outcome.state === 'error' || outcome.restart !== null) {
-          await this.killJobs(row.run, ledger, call)
+        if (outcome.state === 'error' || outcome.restart !== null) await this.killJobs(row.run, ledger, call)
+        // Planned stops and attempt retries do not change the status comment.
+        if (outcome.state === 'error') {
           const hint = error instanceof GitHubError ? (app ? ' Check the permissions of the GitHub App.' : ' Check the permissions of GITHUB_TOKEN.') : ''
-          // A run that starts again by itself needs nothing from the user (D13).
-          const ask = outcome.restart !== null ? '' : `${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${target}\`.`
-          await comments?.post(`agent-factory stopped run \`${row.run}\`: ${sentence(outcome.note)}${ask}`).catch(() => undefined)
-        }
+          const text = `agent-factory stopped run \`${row.run}\`: ${sentence(outcome.note)}${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${target}\`.`
+          await shown.status?.error(outcome.note, text)
+        } else if (outcome.restart !== null && outcome.next !== null) {
+          // A run that starts again by itself needs nothing from the user, so only the status comment shows the restart (D13).
+          await shown.status?.update({ cause: outcome.note, restartAt: new Date(outcome.next).toISOString(), state: 'waiting' })
+        } else if (error instanceof PausedError) await shown.status?.update({ cause: outcome.note, state: 'paused' })
       }
     } finally {
+      await shown.status?.settle()
       clearInterval(heartbeat)
       this.busy = false
     }
@@ -305,7 +350,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
   }
 
   /** The call of a run: the machine and its job runner start on the first use, because a run without a box has no machine. */
-  private call(run: string, ledger: Ledger, deadline: number): Call {
+  private call(run: string, ledger: Ledger, deadline: number, notice: (text: string) => Promise<void>): Call {
     let machine: Promise<RunMachine> | undefined
     const start = async (): Promise<RunMachine> => {
       const syncs = sqlSyncs(this.ctx.storage.sql, run)
@@ -317,6 +362,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     return {
       deadline,
       machine: () => (machine ??= start()),
+      notice,
     }
   }
 

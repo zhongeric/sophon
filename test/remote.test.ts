@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { parseRepo, parseTarget, pruneOutcome, remoteRequest, resumeOutcome } from '../src/node/remote.ts'
+import { inboxOutcome, parseRepo, parseTarget, pruneOutcome, remoteRequest, resumeOutcome } from '../src/node/remote.ts'
 
 test('a PR or an issue is owner/repo#number or its GitHub URL', () => {
   assert.deepEqual(parseTarget('acme/app#7'), { owner: 'acme', pr: 7, repo: 'app' })
@@ -103,4 +103,50 @@ test('the other commands keep their requests', () => {
   assert.deepEqual(remoteRequest('resume', 'acme/app#7', {}), { method: 'POST', path: '/runs/acme/app/7/resume' })
   assert.deepEqual(remoteRequest('prune', 'acme/app', {}), { method: 'POST', path: '/prune/acme/app' })
   assert.throws(() => remoteRequest('toString', 'acme/app#7', {}), /unknown command toString/)
+})
+
+test('inbox sends GET /inbox with no target, and refuses a target and --budget', () => {
+  assert.deepEqual(remoteRequest('inbox', undefined, {}), { method: 'GET', path: '/inbox' })
+  assert.throws(() => remoteRequest('inbox', 'acme/app#7', {}), { message: /inbox takes no target/, name: 'StopError' })
+  assert.throws(() => remoteRequest('inbox', undefined, { budget: '5' }), /only start, develop and research take --budget/)
+  assert.throws(() => remoteRequest('status', undefined, {}), { message: /status needs a target/, name: 'StopError' })
+})
+
+test('inbox prints one line for each item and each skipped entry', () => {
+  const body = JSON.stringify({
+    items: [
+      { cause: 'the questions intake wait for your /answer', kind: 'question', link: 'https://github.com/acme/app/issues/5#issuecomment-1', number: 5, repository: 'acme/app' },
+      { cause: 'PR #10 is ready and waits for your merge', kind: 'ready', link: '', number: 9, repository: 'acme/app' },
+    ],
+    skipped: [{ reason: 'HTTP 500', what: 'installation 1' }],
+  })
+  assert.deepEqual(inboxOutcome({ ok: true, text: body }), {
+    code: 0,
+    text: [
+      'question acme/app#5: the questions intake wait for your /answer https://github.com/acme/app/issues/5#issuecomment-1',
+      'ready acme/app#9: PR #10 is ready and waits for your merge',
+      'skipped installation 1: HTTP 500',
+    ].join('\n'),
+  })
+})
+
+test('inbox prints that nothing waits for you when both lists are empty', () => {
+  assert.deepEqual(inboxOutcome({ ok: true, text: '{"items":[],"skipped":[]}' }), { code: 0, text: 'nothing waits for you' })
+})
+
+test('inbox exits 1 and prints the raw text when the route fails or the body is not the inbox', () => {
+  const text = 'the inbox needs the GitHub App: GITHUB_APP_ID is not set'
+  assert.deepEqual(inboxOutcome({ ok: false, text }), { code: 1, text })
+  for (const body of [
+    'not json',
+    'null',
+    '[]',
+    '{"items":[]}',
+    '{"items":[null],"skipped":[]}',
+    '{"items":[{"kind":"other","repository":"acme/app","number":5,"cause":"x","link":""}],"skipped":[]}',
+    '{"items":[{"kind":"error","repository":"acme/app","number":"5","cause":"x","link":""}],"skipped":[]}',
+    '{"items":[{"kind":"error","repository":"acme/app","number":5,"cause":"x"}],"skipped":[]}',
+    '{"items":[],"skipped":[{"what":"installation 1"}]}',
+  ])
+    assert.deepEqual(inboxOutcome({ ok: true, text: body }), { code: 1, text: body })
 })

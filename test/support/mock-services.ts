@@ -68,6 +68,8 @@ export async function mockServices(
   const state = {
     turns,
     comments: [] as MockComment[],
+    /** Each edit of a comment, with the new body, so that a test can count the edits of a status comment. */
+    edits: [] as { id: number; body: string }[],
     pulls,
     /** The refs that the host set, with their commits. */
     refs: new Map<string, string>(),
@@ -416,6 +418,15 @@ export async function mockServices(
       const comments = new RegExp(`^(GET|POST) ${api}/issues/(\\d+)/comments$`).exec(route)
       if (comments?.[1] === 'GET') return json(response, 200, page(url, state.comments.filter((entry) => entry.issue === Number(comments[2]))))
       if (comments?.[1] === 'POST') return json(response, 201, comment(options.botLogin, string(input().body, 'body'), Number(comments[2])))
+      const edited = new RegExp(`^PATCH ${api}/issues/comments/(\\d+)$`).exec(route)
+      if (edited) {
+        const entry = state.comments.find((candidate) => candidate.id === Number(edited[1]))
+        if (!entry) return json(response, 404, { message: 'Not Found' })
+        entry.body = string(input().body, 'body')
+        entry.updated_at = new Date(Math.max(Date.now(), Date.parse(entry.created_at) + 1)).toISOString()
+        state.edits.push({ body: entry.body, id: entry.id })
+        return json(response, 200, entry)
+      }
       if (route.startsWith(`GET ${api}/git/commits/`)) {
         const sha = url.pathname.split('/').at(-1)!
         return json(response, 200, { sha, tree: { sha: text(['rev-parse', `${sha}^{tree}`]) } })

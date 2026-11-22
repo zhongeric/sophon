@@ -72,7 +72,7 @@ export class ResearchRuns extends Runs<ResearchRequest> {
     }
     const result = await research(input, {
       branches: sqlBranches({ gh, ledger, log, owner, repo, run, sql }),
-      channel: commentChannel({ answerers: answerersOf(this.env, config.answerers), comments, pollMs: 0, waitMs: 0 }),
+      channel: commentChannel({ answerers: answerersOf(this.env, config.answerers), comments, notice: call.notice, pollMs: 0, waitMs: 0 }),
       checker,
       // A new directory for each step key, so that no file of an earlier command is in it. Only the last one stays. A replay
       // of the step, for example after a pause on its job, keeps the directory of the key.
@@ -111,7 +111,9 @@ export class ResearchRuns extends Runs<ResearchRequest> {
       review: (review) => reviewPass(this.env, request, ledger, review),
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
-    return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
+    // The user merges the dossier PR of a ready run (D21).
+    const needsUser = result.status !== 'ready' || result.pr !== null
+    return { needsUser, passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
   }
 
   protected async preflightNeeds(_request: ResearchRequest, ledger: Ledger): Promise<PreflightNeeds> {

@@ -46,6 +46,11 @@ export class PullRequestRuns extends Runs<StartRequest> {
     return reviewAnnouncement(run, request.by)
   }
 
+  /** A review that a development or research run started has the ask of its parent, and the parent reports to the user. */
+  protected override reportsToParent(request: StartRequest) {
+    return request.ask !== undefined
+  }
+
   /** The result of a review run, with its fixes as a commit on GitHub, or what the run waits for. */
   outcome(run: string): ReviewOutcome {
     const row = this.row(run)
@@ -95,7 +100,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     const ci = ciChecker({ branch, gh, ledger, pull, repo, timeoutMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000 })
     const machine = input.config.tests || hasCi(input.config) ? await call.machine() : undefined
     const result = await codeReviewLoop(input, {
-      channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, pollMs: 0, waitMs: 0 }),
+      channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, notice: call.notice, pollMs: 0, waitMs: 0 }),
       checker: machine ? machineChecker(machine, run, repo, input.config, ci, log) : ci,
       credentials: credentialsFor(this.env, providersOf(input.models)),
       files: sqlFiles(this.ctx.storage.sql, run),
@@ -109,7 +114,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
       signing: { apply: signing.apply, check: (branches) => signing.check([...branches, branch]) },
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
-    return { passed: result.pass, summary: summary(run, result) }
+    return { needsUser: !this.reportsToParent(request) && !result.pass, passed: result.pass, summary: summary(run, result) }
   }
 
   /** The base config, when it is not recorded, says whether the run tests on the build container. A fork PR stops here. */

@@ -120,9 +120,9 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 - **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
   fixes stay on `factory/<run>`. The run deletes it at its end after `--ship` or a closed PR.
 - **Models:** `--models file.json` sets the model of each role.
-- **Budget:** `--budget <usd>` sets a soft limit on the spend of a run. At the budget, the run posts a notice and
-  continues. At two times the budget, it asks you to raise the budget or stop, and `/answer recommended` raises it to
-  two times the spend. Prices come from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`,
+- **Budget:** `--budget <usd>` sets a soft limit on the spend of a run. At the budget, the run gives a notice (on
+  Cloudflare, in its status comment) and continues. At two times the budget, it asks you to raise the budget or stop,
+  and `/answer recommended` raises it to two times the spend. Prices come from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`,
   `cached_input`, `cache_write`, `output`). Each report shows the usage of each step.
 - **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
 - **Commits:** the host commits unsigned, unless a GitHub rule requires signed commits on a branch that the run pushes.
@@ -149,8 +149,9 @@ as a secret to use budgets. The `secret` of a research credential is the name of
 `npx wrangler secret put <NAME>`. It cannot be a host secret or a Worker setting.
 
 `npm run remote` starts and follows runs. It reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from
-`.secrets/cloudflare.env`. For other tools, `https://<worker>/openapi.json` describes the same routes. A run that stops on
-an error that can pass starts again by itself after 30 minutes, at most three times.
+`.secrets/cloudflare.env`. For other tools, `https://<worker>/openapi.json` describes the same routes. Each run keeps
+one status comment on its issue or PR, and edits it at each change. It posts a new comment only when you must act. A
+run that stops on an error that can pass starts again by itself after 30 minutes, at most three times.
 
 ```bash
 npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full, --budget)
@@ -159,6 +160,7 @@ npm run remote -- research acme/app#45   # a research run on a program issue (--
 npm run remote -- resume acme/app#45     # wake a paused run, or start a run that stopped on an error
 npm run remote -- status acme/app#45     # or report
 npm run remote -- prune acme/app         # delete the merged, applied and stranded factory/* branches
+npm run remote -- inbox                  # the questions, stops, failures and PRs to merge that wait for you (needs the App)
 npm run metrics                          # CPU, memory and network of each build container
 ```
 
@@ -173,10 +175,9 @@ ignores the comment, issue and PR events of its own bot.
 
 A Durable Object holds the ledger, the repository tree and the agent sessions of each run. Alarms drive the run and
 resume it after a crash. Development and research runs run their commands, and review runs with tests run their
-tests, in a Cloudflare Container that has no secrets. Commits and pushes go through the GitHub API.
-The object keeps the sync state of each container directory in SQL, so after a restart the next sync sends only the
-changed files and does not run the setup again.
-A development PR says `Closes #<issue>`.
+tests, in a Cloudflare Container that has no secrets. Commits and pushes go through the GitHub API. The object keeps
+the sync state of each container directory in SQL, so after a restart the next sync sends only the changed files and
+does not run the setup again. A development PR says `Closes #<issue>`.
 
 ## Layout
 

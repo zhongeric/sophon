@@ -5,7 +5,7 @@ import { parseParallel } from '../core/plan.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget } from '../core/usage.ts'
 
-const usage = `Usage: npm run remote -- <command> <number or repo> [options]
+const usage = `Usage: npm run remote -- <command> [<number or repo>] [options]
 
 Drives the Cloudflare Worker without the GitHub webhook.
 
@@ -22,11 +22,13 @@ Commands:
   report <number>   Print the report of the latest run
   prune <repo>      Delete the factory/* branches that are merged, applied or stranded, and print each deleted,
                     kept and failed branch (exit 0 also with failed deletes)
+  inbox             Print the items on all repositories of the GitHub App that wait for you: open questions, failed,
+                    blocked and stopped runs, and ready PRs to merge
 
 <pr>, <issue> and <number> are owner/repo#123, or a GitHub PR or issue URL. <repo> is owner/repo, or its GitHub URL.
 
-start, develop and research also take --budget <usd>, the cost budget of the run in USD. At the budget, the run asks
-on the PR or issue to raise the budget or to stop.
+start, develop and research also take --budget <usd>, the cost budget of the run in USD. At the budget, the run puts
+a notice into its status comment. At two times the budget, it asks on the PR or issue to raise the budget or to stop.
 
 Environment: FACTORY_URL and ADMIN_TOKEN, or the same keys in .secrets/cloudflare.env.`
 
@@ -80,6 +82,42 @@ export function pruneOutcome({ ok, text }: { ok: boolean; text: string }): { cod
   return { code: 0, text: lines.length > 0 ? lines.join('\n') : 'no factory/* branches' }
 }
 
+const inboxKinds = ['question', 'failed', 'blocked', 'error', 'ready']
+
+/**
+ * Gives the lines and the exit code for an inbox response: one line for each item and each skipped entry. A failed
+ * route, or a body without the two valid lists, gives the raw text and exit code 1.
+ */
+export function inboxOutcome({ ok, text }: { ok: boolean; text: string }): { code: number; text: string } {
+  if (!ok) return { code: 1, text }
+  let body: unknown
+  try {
+    body = JSON.parse(text)
+  } catch {
+    return { code: 1, text }
+  }
+  const fields = (value: unknown): Record<string, unknown> | null => (typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null)
+  const list = (key: string): Record<string, unknown>[] | null => {
+    const value = fields(body)?.[key]
+    if (!Array.isArray(value)) return null
+    const entries = value.map(fields)
+    return entries.every((entry) => entry !== null) ? entries : null
+  }
+  const [items, skipped] = [list('items'), list('skipped')]
+  if (!items || !skipped) return { code: 1, text }
+  const lines: string[] = []
+  for (const { kind, repository, number, cause, link } of items) {
+    if (typeof kind !== 'string' || !inboxKinds.includes(kind) || typeof repository !== 'string' || !Number.isInteger(number) || typeof cause !== 'string' || typeof link !== 'string')
+      return { code: 1, text }
+    lines.push(`${kind} ${repository}#${String(number)}: ${cause}${link ? ` ${link}` : ''}`)
+  }
+  for (const { what, reason } of skipped) {
+    if (typeof what !== 'string' || typeof reason !== 'string') return { code: 1, text }
+    lines.push(`skipped ${what}: ${reason}`)
+  }
+  return { code: 0, text: lines.length > 0 ? lines.join('\n') : 'nothing waits for you' }
+}
+
 /**
  * Gives the text and the exit code for a resume response.
  * A body without a boolean `resumed` gives the raw text and exit code 1.
@@ -127,9 +165,14 @@ export type RemoteOptions = { base?: string; budget?: string; full?: boolean; ho
 export type RemoteRequest = { body?: string; method: 'GET' | 'POST'; path: string }
 
 /** Checks the options of a command and gives its request to the Worker. A bad option stops before any network call. */
-export function remoteRequest(command: string, target: string, options: RemoteOptions): RemoteRequest {
+export function remoteRequest(command: string, target: string | undefined, options: RemoteOptions): RemoteRequest {
   if (options.budget !== undefined && command !== 'start' && command !== 'develop' && command !== 'research')
     throw new StopError('only start, develop and research take --budget')
+  if (command === 'inbox') {
+    if (target !== undefined) throw new StopError('inbox takes no target: it lists all repositories of the GitHub App')
+    return { method: 'GET', path: '/inbox' }
+  }
+  if (target === undefined) throw new StopError(`${command} needs a target\n\n${usage}`)
   if (command === 'research')
     for (const flag of ['hotfix', 'full', 'ship'] as const) if (options[flag]) throw new StopError(`research does not take --${flag}`)
   if (command === 'prune') {
@@ -168,7 +211,7 @@ async function main(): Promise<number> {
     },
   })
   const [command, target] = positionals
-  if (values.help || !command || !target) {
+  if (values.help || !command || (!target && command !== 'inbox')) {
     console.log(usage)
     return values.help ? 0 : 2
   }
@@ -178,6 +221,11 @@ async function main(): Promise<number> {
   if (request.body !== undefined) headers['content-type'] = 'application/json'
   const response = await fetch(`${factory}${request.path}`, { body: request.body, headers, method: request.method })
   const text = await response.text()
+  if (command === 'inbox') {
+    const outcome = inboxOutcome({ ok: response.ok, text })
+    console.log(outcome.text)
+    return outcome.code
+  }
   if (command === 'prune') {
     const outcome = pruneOutcome({ ok: response.ok, text })
     console.log(outcome.text)

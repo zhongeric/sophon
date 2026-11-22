@@ -1,16 +1,19 @@
-// The start comments of the runs. This module has no runtime imports, so that a Node test can import it.
+// The first line of the status comment of each run (D21). This module has no runtime imports, so that a Node test can import it.
 
-/** The one-line start comment of a development run on an issue. */
+const header = (kind: string, run: string, by: string) =>
+  `agent-factory ${kind} run \`${run}\` for \`${by}\`. Questions come here. Answer them with a \`/answer\` comment.`
+
+/** The header of the status comment of a development run on an issue. */
 export function developAnnouncement(run: string, by: string): string {
-  return `agent-factory started development run \`${run}\` for \`${by}\`. Questions come here. Answer them with a \`/answer\` comment.`
+  return header('development', run, by)
 }
 
-/** The one-line start comment of a research run on an issue. */
+/** The header of the status comment of a research run on an issue. */
 export function researchAnnouncement(run: string, by: string): string {
-  return `agent-factory started research run \`${run}\` for \`${by}\`. Questions come here. Answer them with a \`/answer\` comment.`
+  return header('research', run, by)
 }
 
-/** The one-line start comment of a review run on a PR. */
+/** The header of the status comment of a review run on a PR. */
 export function reviewAnnouncement(run: string, by: string): string {
-  return `agent-factory started review run \`${run}\` for \`${by}\`. Questions come here. Answer them with a \`/answer\` comment.`
+  return header('review', run, by)
 }

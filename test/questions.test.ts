@@ -306,6 +306,25 @@ test('the PR channel posts a notice as one comment, without the questions marker
   assert.deepEqual(bodies, ['The run spent about $10.00 of its budget of $10.00.'])
 })
 
+test('the PR channel with the notice option gives the notice to it and posts no comment', async () => {
+  const bodies: string[] = []
+  const notices: string[] = []
+  const comments = {
+    async post(body: string) {
+      bodies.push(body)
+      return { url: 'https://github.com/o/r/pull/7#issuecomment-2', at: '2026-11-13T10:00:00Z' }
+    },
+    list: async () => [],
+  }
+  const notice = async (text: string) => void notices.push(text)
+  const channel = commentChannel({ answerers: ['maintainer'], comments, notice, pollMs: 1, waitMs: 0 })
+  await channel.notice?.('run-1', 'The run spent about $10.00 of its budget of $10.00.')
+  assert.deepEqual([bodies, notices], [[], ['The run spent about $10.00 of its budget of $10.00.']])
+  // Question batches still go to a new comment.
+  await channel.post('run-1', 'ask', questions)
+  assert.deepEqual(bodies, [`@maintainer\n\n${render('run-1', 'ask', questions)}`])
+})
+
 test('the file channel writes each notice to notices.md in the run directory', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'factory-questions-'))
   const channel = fileChannel(dir)
