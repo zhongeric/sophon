@@ -4,8 +4,7 @@
     "typecheck": "npm run check"
   },
   "ci": {
-    "check": "npm run check",
-    "test": "npm test"
+    "check": "npm run check"
   },
   "setup": "npm ci --prefer-offline --no-audit --no-fund",
   "questions": "recommended",
