@@ -7,7 +7,6 @@ import {
   unitInputs,
   unitsDir,
   unitsFiles,
-  unitsManifest,
   type InputFile,
   type ScanBoxes,
   type SweepJobs,
@@ -48,7 +47,7 @@ export type SweepContext = {
 
 /**
  * The result of one sweep. `plan` is the artifact of the plan output, `table` the artifact of the candidate table
- * (JSON {"candidates": [...]}), null when the sweep failed. `reason` and `tail` are empty when the sweep passed.
+ * (JSON {"candidates": [...]}), null when the sweep failed. `reason` is empty when the sweep passed.
  */
 export type SweepResult = {
   plan: string
@@ -59,16 +58,14 @@ export type SweepResult = {
   trials: number
   table: string | null
   reason: string
-  tail: string
 }
 
-type Planned = { plan: string; targets: string[]; units: PlanUnit[]; reason: string; tail: string }
+type Planned = { plan: string; command: string; targets: string[]; units: PlanUnit[]; reason: string }
 
 /**
- * Stage 7 for one frozen prereg at one commit (section 2 of docs/specs/research-workflow.md): plan on a clean box,
- * the fetches on scan boxes with egress, the units on scan boxes without egress, then merge on a new clean box with
- * the units directory. A scan box never gets the holdout file or a holdout target (RG1). The trial count is the sum over
- * done units of their target count and their tls_passes (RG5). Each fetch and each unit is a ledger step.
+ * Stage 7 (section 2 of docs/specs/research-workflow.md). A scan box never gets the holdout file or a holdout target
+ * (RG1). The trial count is the sum over done units of their target count and their tls_passes (RG5). Each fetch and
+ * each unit is a ledger step.
  */
 export async function runSweep(context: SweepContext): Promise<SweepResult> {
   const { ledger, config, prereg } = context
@@ -80,15 +77,15 @@ export async function runSweep(context: SweepContext): Promise<SweepResult> {
     const box = await context.cleanBox(`${key}.plan`)
     const run = await context.meter(`${key}.plan`, box, () => runSweepPlan(config, box, prereg.path))
     const plan = await context.artifacts.put(new TextEncoder().encode(run.output), { source: { command: run.command }, media_type: 'text/plain', labels })
-    if (run.problem !== null) return { plan, targets: [], units: [], reason: `sweep plan: ${run.problem}`, tail: run.tail }
+    if (run.problem !== null) return { plan, command: run.command, targets: [], units: [], reason: `sweep plan: ${run.problem}` }
     const refused = holdoutRefusal(run.json.targets, context.holdoutTargets)
-    if (refused !== null) return { plan, targets: [], units: [], reason: `sweep plan: ${refused}`, tail: '' }
+    if (refused !== null) return { plan, command: run.command, targets: [], units: [], reason: `sweep plan: ${refused}` }
     await context.notice(run.json.units.reduce((sum, unit) => sum + unit.expected_seconds, 0), run.json.units.length)
-    return { plan, targets: run.json.targets, units: run.json.units, reason: '', tail: '' }
+    return { plan, command: run.command, targets: run.json.targets, units: run.json.units, reason: '' }
   })
-  const result: SweepResult = { plan: planned.plan, units: planned.units.length, retries: 0, failedUnits: [], failedTargets: [], trials: 0, table: null, reason: planned.reason, tail: planned.tail }
+  const result: SweepResult = { plan: planned.plan, units: planned.units.length, retries: 0, failedUnits: [], failedTargets: [], trials: 0, table: null, reason: planned.reason }
   if (planned.reason) return result
-  if (planned.units.length === 0) return { ...result, table: await table(context, []) }
+  if (planned.units.length === 0) return { ...result, table: await table(context, [], 'sweep plan', planned.command) }
 
   const jobs: SweepJobs = { ledger, boxes: context.boxes, store: context.store, config, runId: context.runId, commit: context.commit, prereg, log: context.log }
   if (context.wait) jobs.wait = context.wait
@@ -112,21 +109,21 @@ export async function runSweep(context: SweepContext): Promise<SweepResult> {
   const results = [...ran, ...blocked.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   const targetCount = new Map(planned.units.map((unit) => [unit.id, unit.targets.length]))
   result.retries = [...fetches, ...ran].reduce((sum, job) => sum + Math.max(0, job.attempts - 1), 0)
-  result.failedUnits = unitsManifest(results).units.flatMap((unit) => (unit.status === 'failed' ? [{ id: unit.id, reason: unit.reason ?? '' }] : []))
+  result.failedUnits = results.flatMap((unit) => (unit.status === 'failed' ? [{ id: unit.id, reason: unit.reason ?? '' }] : []))
   result.trials = results.reduce((sum, unit) => sum + (unit.status === 'done' ? (targetCount.get(unit.id) ?? 0) + (unit.tls_passes ?? 0) : 0), 0)
 
   await context.check()
   const merged = await step(ledger, `${key}.merge`, async () => {
     const box = await context.cleanBox(`${key}.merge`, await unitsFiles(results, context.store))
     const run = await context.meter(`${key}.merge`, box, () => runSweepMerge(config, box, prereg.path, unitsDir))
-    if (run.problem !== null) return { table: null, reason: `sweep merge: ${run.problem}`, tail: run.tail }
-    return { table: await table(context, run.json.candidates, run.command), reason: '', tail: '' }
+    if (run.problem !== null) return { table: null, reason: `sweep merge: ${run.problem}` }
+    return { table: await table(context, run.json.candidates, 'sweep merge', run.command), reason: '' }
   })
   return { ...result, ...merged }
 }
 
-/** Keeps the candidate table as a run artifact. The same candidates give the same ID. */
-function table(context: SweepContext, candidates: Record<string, unknown>[], command = 'sweep merge'): Promise<string> {
-  const labels = { hypothesis: context.prereg.hypothesis, command: 'sweep merge' }
+/** Keeps the candidate table as a run artifact. The same candidates give the same ID. `label` is the step that made the table. */
+function table(context: SweepContext, candidates: Record<string, unknown>[], label: 'sweep plan' | 'sweep merge', command: string): Promise<string> {
+  const labels = { hypothesis: context.prereg.hypothesis, command: label }
   return context.artifacts.put(new TextEncoder().encode(`${JSON.stringify({ candidates })}\n`), { source: { command }, media_type: 'application/json', labels })
 }

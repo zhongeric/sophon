@@ -250,7 +250,7 @@ as profile guides do today.
   The units of a stage 6 fan-out and of the stage 7 sweep run on them. A sweep `fetch` runs in a pool of its own, and
   reaches the network only through the host egress. The sweep data files go to the R2 bucket `SWEEP_DATA`. The scan
   slots on Cloudflare have no egress yet, because the installed Worker types do not have the outbound HTTP interception
-  of Containers. Thus a sweep config stops at the start there. Local runs the units on the local machine, in the same
+  of Containers. Thus a sweep config stops at the start there (RG11). Local runs the units on the local machine, in the same
   pools, with an egress proxy on 127.0.0.1 and a directory for the data files. Local has no network isolation.
   - The first attempt of a unit runs in a lane of the pool, so that the next unit uses the same box. A retry runs on a
     new box.
@@ -304,6 +304,7 @@ as profile guides do today.
 | RG8 | Large sweeps on a rented machine | Not in R0. The sweep runs on scan boxes (section 7). A remote box for a rented machine is a later change. |
 | RG9 | Programs in one notebook share the holdout | After the first outcome, the holdout is not blind to later programs. The dossier reports the count of holdout tests across the notebook. |
 | RG10 | Web search and the holdout | Web search runs at the provider, so the lock cannot refuse the holdout to it, and the egress does not log it (RD9). The report says that the holdout lock does not bind web search. |
+| RG11 | Sweep egress on Cloudflare | The Cloudflare scan slots have no egress, because the installed Worker types do not have the outbound HTTP interception of Containers. Until they have it, a sweep config stops at the start on Cloudflare, and stage 7 runs only locally. |
 
 ## 11. Build plan
 

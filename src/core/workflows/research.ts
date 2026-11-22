@@ -466,8 +466,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   // 0. Intake: no survey before the user confirms the program and sets the cost cap.
   const intook = await step(ledger, 'intake', () => researchIntake(context, 'intake', models.intake))
   state.intake = intook
-  // Without a price for each model, and for a fan-out config also CONTAINER_PRICES, a cap cannot work, so the question recommends no cap.
-  // The intake comes before stage 6 runs plan, so the compute cost is not known yet. Stage 6 posts the estimate as a budget notice.
+  // Without a price for each model, and for a fan-out or sweep config also CONTAINER_PRICES, a cap cannot work, so the question recommends no cap.
   const modelsPriced = researchModelIds(models).every((model) => model in prices)
   const notes = [
     ...(modelsPriced ? [] : ['MODEL_PRICES has no price for some models of this run, and a cap needs a price for each model.']),

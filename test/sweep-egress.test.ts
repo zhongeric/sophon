@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
+import { request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -46,7 +47,10 @@ test('requests that wait at the same time get different slots, and a slow rate w
 
 type Call = { url: string; headers: Headers }
 
-function setup(answer: (call: Call) => Promise<Response> = async () => new Response('row 1', { headers: { 'content-type': 'text/csv', 'set-cookie': 'x=1' } })) {
+function setup(
+  answer: (call: Call) => Promise<Response> = async () => new Response('row 1', { headers: { 'content-type': 'text/csv', 'set-cookie': 'x=1' } }),
+  limit?: () => Promise<void>,
+) {
   const calls: Call[] = []
   const lines: string[] = []
   const stored = new Map<string, Uint8Array>()
@@ -75,7 +79,10 @@ function setup(answer: (call: Call) => Promise<Response> = async () => new Respo
       },
     },
     log: (line) => lines.push(line),
-    limit: async () => void limited++,
+    limit: async () => {
+      limited++
+      await limit?.()
+    },
   })
   return { handler, calls, lines, stored, artifacts, limited: () => limited }
 }
@@ -98,6 +105,24 @@ test('a proxy path goes to the https URL with the credential header, and the bod
   assert.equal(run.limited(), 1)
   assert.equal(run.lines.length, 1)
   assert.match(run.lines[0] ?? '', /^sweep fetch: egress GET https:\/\/archive\.example\.org\/data\/T-1\.csv\?band=r&x=1 200 artifact /)
+})
+
+test('each redirect hop waits for the limiter', async () => {
+  let now = 0
+  const starts: number[] = []
+  const run = setup(
+    async (call) => {
+      starts.push(now)
+      return call.url.endsWith('/data/start') ? new Response(null, { status: 302, headers: { location: '/data/final' } }) : new Response('row 1')
+    },
+    rateLimiter(5, { now: () => now, wait: async (ms) => void (now += ms) }),
+  )
+  const response = await run.handler(get('archive.example.org/data/start'))
+  assert.equal(response.status, 200)
+  assert.equal(await response.text(), 'row 1')
+  assert.deepEqual(run.calls.map(({ url }) => url), ['https://archive.example.org/data/start', 'https://archive.example.org/data/final'])
+  assert.deepEqual(starts, [0, 200])
+  assert.equal(run.limited(), 2)
 })
 
 test('a host not in the list and a locked holdout URL give 403, a bad path 400, and an upstream error 502, without the secret', async () => {
@@ -134,13 +159,52 @@ test('the Node server forwards a real request to the handler and does not keep t
   })
   try {
     const base = await server.url()
-    assert.match(base, /^http:\/\/127\.0\.0\.1:\d+$/)
+    assert.match(base, /^http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{64}$/)
     assert.equal(await server.url(), base)
     const response = await fetch(`${base}/archive.example.org/data/T-1?band=r`)
     assert.equal(response.status, 201)
     assert.equal(response.headers.get('x-artifact-id'), 'abc')
     assert.equal(await response.text(), 'forwarded')
     assert.deepEqual(seen, ['GET /archive.example.org/data/T-1?band=r'])
+  } finally {
+    await server.close()
+  }
+})
+
+test('the Node server refuses a request without the token, and does not forward hop-by-hop headers', async () => {
+  const seen: Headers[] = []
+  const server = sweepEgressServer(async (request) => {
+    seen.push(request.headers)
+    return new Response(await request.text())
+  })
+  try {
+    const base = await server.url()
+    const origin = new URL(base).origin
+    for (const path of ['/archive.example.org/data', `/${'0'.repeat(64)}/archive.example.org/data`, `${new URL(base).pathname}x/archive.example.org/data`]) {
+      const response = await fetch(`${origin}${path}`)
+      assert.equal(response.status, 403, path)
+      assert.match(await response.text(), /no valid token/)
+    }
+    assert.equal(seen.length, 0)
+    // fetch refuses these headers itself, so a plain node:http client sends them.
+    const reply = await new Promise<{ status?: number; body: string }>((done, fail) => {
+      const call = request(`${base}/archive.example.org/data`, {
+        method: 'POST',
+        headers: { connection: 'keep-alive, x-hop', 'keep-alive': 'timeout=5', 'transfer-encoding': 'chunked', expect: '100-continue', 'x-hop': '1', 'x-keep': '1' },
+      })
+      call.on('continue', () => call.end('payload'))
+      call.on('response', (response) => {
+        let body = ''
+        response.on('data', (chunk: Buffer) => (body += chunk.toString()))
+        response.on('end', () => done({ status: response.statusCode, body }))
+      })
+      call.on('error', fail)
+    })
+    assert.equal(reply.status, 200)
+    assert.equal(reply.body, 'payload')
+    const headers = seen[0]
+    for (const name of ['connection', 'keep-alive', 'x-hop', 'content-length', 'transfer-encoding', 'expect']) assert.equal(headers?.get(name), null, name)
+    assert.equal(headers?.get('x-keep'), '1')
   } finally {
     await server.close()
   }

@@ -92,7 +92,7 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
 - `env` lists extra environment variables for the checks. `guides` mounts reference material at `/guides/<name>`.
 - `answerers` limits who can answer questions. `research` configures a research notebook. Its commands print a JSON
   last line, `research.timeouts` gives their timeouts in ms, `plan`, `fetch`, `unit` and `merge` fan out stage 6 in a
-  pool of `--parallel` units (default 32), and `research.sweep` runs stage 7 ([spec, 6.3](docs/specs/research-workflow.md#63-the-domain-in-the-notebook)).
+  pool of `--parallel` units (default 32), and `research.sweep` runs stage 7, only locally ([spec, 6.3](docs/specs/research-workflow.md#63-the-domain-in-the-notebook), RG11).
 - Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
   file that no test imports gets the test files that have its base name as a word. The `run_checks` of builders,
   patch agents and light agents runs only the checks. Their targeted tests run one time, when they submit their log.
@@ -125,7 +125,8 @@ npm run review -- --run <id>                     # resume a run, also with npm r
   times the spend. `MODEL_PRICES` is JSON with the USD per million tokens of each model ID (`input`, `cached_input`,
   `cache_write`, `output`). `CONTAINER_PRICES` is `{"vcpu_second": <usd>, "gib_second": <usd>, "instances": {"<type>": <override of both>}}`. Reports show the usage.
 - **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
-- **Commits:** unsigned, unless a GitHub rule requires signed commits on a run branch. Then signing must work without a prompt.
+- **Commits:** the host commits unsigned, unless a GitHub rule requires signed commits on a branch that the run pushes.
+  Then signing must work without a prompt.
 
 ## Cloudflare
 
@@ -144,9 +145,8 @@ done
 ```
 
 `ALLOWED_USERS` is the GitHub logins, comma-separated, that can start runs and answer questions. Set `MODEL_PRICES`,
-and `CONTAINER_PRICES` for a fan-out or sweep config, as secrets to use budgets. The `secret` of a research credential
-is the name of a Worker secret that you set with `npx wrangler secret put <NAME>`. It cannot be a host secret or a Worker
-setting. The R2 bucket `SWEEP_DATA` (an optional `r2_buckets` entry in `wrangler.jsonc`) keeps the sweep data files.
+and `CONTAINER_PRICES` for a fan-out config, as secrets to use budgets. The `secret` of a research credential is the
+name of a Worker secret that you set with `npx wrangler secret put <NAME>`. It cannot be a host secret or a Worker setting.
 
 `npm run remote` starts and follows runs. It reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from
 `.secrets/cloudflare.env`. For other tools, `https://<worker>/openapi.json` describes the same routes. A run that stops on

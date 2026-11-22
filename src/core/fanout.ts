@@ -292,7 +292,7 @@ export type SweepJobs = {
 }
 
 /** One sweep fetch. `id` is the part of its slot names and of its ledger key (sweepFetchId). */
-export type SweepTarget = { target: string; id: string }
+type SweepTarget = { target: string; id: string }
 
 /**
  * The job ID of the sweep fetch of a target: stable, different for each target, and valid in a slot name for any
@@ -301,8 +301,8 @@ export type SweepTarget = { target: string; id: string }
 export const sweepFetchId = async (target: string): Promise<string> => `t_${(await artifactId(new TextEncoder().encode(target))).slice(0, 32)}`
 
 /** The ledger steps of the sweep. They differ from the stage 6 keys, and a new commit or a new prereg gives new keys. */
-export const sweepFetchKey = (sweep: Pick<SweepJobs, 'commit' | 'prereg'>, id: string) => `sweep-fetch.${sweep.commit}.${sweep.prereg.sha256}.${id}`
-export const sweepUnitKey = (sweep: Pick<SweepJobs, 'commit' | 'prereg'>, unit: string) => `sweep-unit.${sweep.commit}.${sweep.prereg.sha256}.${unit}`
+const sweepFetchKey = (sweep: Pick<SweepJobs, 'commit' | 'prereg'>, id: string) => `sweep-fetch.${sweep.commit}.${sweep.prereg.sha256}.${id}`
+const sweepUnitKey = (sweep: Pick<SweepJobs, 'commit' | 'prereg'>, unit: string) => `sweep-unit.${sweep.commit}.${sweep.prereg.sha256}.${unit}`
 
 /** The pool parts of the sweep. Fetch slots and unit slots differ, so a box that ran an egress job never runs a unit. */
 const sweepPool = (runId: string, kind: 'fetch' | 'unit') => `${poolPart(runId).slice(0, 58)}-${kind === 'fetch' ? 'fetch' : 'sweep'}`

@@ -25,8 +25,11 @@ export function rateLimiter(rate: number, clock: LimiterClock = realClock): () =
   }
 }
 
-/** What the sweep egress gets from the host. `limit` is a rateLimiter. `agent` is the name in the log lines. */
-export type SweepEgressOptions = { egress: Egress; host: EgressHost; log(line: string): void; limit(): Promise<void>; agent?: string }
+/** What the sweep egress gets from the host. `limit` is a rateLimiter. */
+export type SweepEgressOptions = { egress: Egress; host: EgressHost; log(line: string): void; limit(): Promise<void> }
+
+/** The name in the log lines. */
+const agent = 'sweep fetch'
 
 const plainHost = /^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/
 
@@ -34,21 +37,26 @@ const answer = (status: number, message: string) => new Response(`${message}\n`,
 
 /**
  * The handler of the egress proxy of sweep fetch jobs (section 6.3 of docs/specs/research-workflow.md). A request to
- * `<proxy>/<host>/<path>?<query>` goes to `https://<host>/<path>?<query>` through egressFetch, after the limiter.
- * A malformed path gives 400, a refusal of the egress 403, and an upstream error 502. Messages never contain a secret.
+ * `<proxy>/<host>/<path>?<query>` goes to `https://<host>/<path>?<query>` through egressFetch. Each upstream request,
+ * also each redirect hop, waits for the limiter. A malformed path gives 400, a refusal of the egress 403, and an
+ * upstream error 502. Messages never contain a secret.
  */
 export function sweepEgressHandler(options: SweepEgressOptions): (request: Request) => Promise<Response> {
-  const send = egressFetch(options.agent ?? 'sweep fetch', { ...options.egress, max_bytes: artifactSizeLimit }, options.host, options.log)
+  const upstream = options.host.fetch ?? fetch
+  const limited: typeof fetch = async (input, init) => {
+    await options.limit()
+    return upstream(input, init)
+  }
+  const send = egressFetch(agent, { ...options.egress, max_bytes: artifactSizeLimit }, { ...options.host, fetch: limited }, options.log)
   return async (request) => {
     const { pathname, search } = new URL(request.url)
     const [, host = '', ...path] = pathname.split('/')
     const target = `https://${host}/${path.join('/')}${search}`
     if (!plainHost.test(host) || !URL.canParse(target)) {
       const message = `egress: the path must be /<host>/<path>, not ${pathname}`
-      options.log(`${options.agent ?? 'sweep fetch'}: egress ${request.method} ${JSON.stringify(pathname)} 400 ${message}`)
+      options.log(`${agent}: egress ${request.method} ${JSON.stringify(pathname)} 400 ${message}`)
       return answer(400, message)
     }
-    await options.limit()
     const body = request.method === 'GET' || request.method === 'HEAD' ? undefined : new Uint8Array(await request.arrayBuffer())
     let response: Response
     try {
