@@ -1,6 +1,6 @@
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../ci.ts'
-import type { FailedCheck, MergeMethod, RepoConfig } from '../checks.ts'
+import type { FailedFinalCheck, MergeMethod, RepoConfig } from '../checks.ts'
 import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { alarmLines, settleAll } from '../planned-stop.ts'
@@ -109,7 +109,7 @@ const defaultParallel = 3
 
 type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failures: string }
 /** A review pass. Records of older runs have no usage, which counts as zero, and no failed criteria or failed checks. */
-type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage; failed?: Criterion[]; failedChecks?: FailedCheck[] }
+type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage; failed?: Criterion[]; failedChecks?: FailedFinalCheck[] }
 /**
  * The cause of a repair round. `from` is 'CI' or 'review pass N', `short` is one line for the prompt and the report,
  * `text` is /review/repair.txt, `logs` is /review/ci-failure.txt when CI failed, and `report` is
@@ -382,7 +382,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         const remaining = limit === undefined ? {} : { budget: 2 * limit - budget.spent() + (state.stoppedReview?.usage?.usd ?? 0) }
         const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, base, branch: branchName, full: input.full === true, pr: state.pr!.number, ...remaining })
         const failed = loop.criteria.filter((criterion) => !criterion.ok)
-        const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage, failed, failedChecks: loop.failedChecks ?? [] }
+        const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage, failed, failedChecks: loop.failedChecks }
         if (!loop.stopped) return result
         ledger.put(stoppedKey, result)
         state.stoppedReview = result

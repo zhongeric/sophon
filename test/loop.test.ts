@@ -386,10 +386,22 @@ test('a resumed run whose fix branch the prune deleted returns its result withou
   const closed = (real: Repo): Repo => ({ ...real, pullState: async () => 'closed' })
   const first = await runLoop(repo, 'ended', dir, { dispatch: scriptedDispatch(scriptFor({ rejectBug: true, tests: true }), []), input, repo: closed })
   assert.equal(hasBranch(repo, 'factory/ended'), false)
+  assert.ok(first.failedChecks.length > 0)
 
   const turns: Turn[] = []
   const second = await runLoop(repo, 'ended', dir, { dispatch: scriptedDispatch(script, turns), input, repo: closed })
   assert.deepEqual(second, first)
+  assert.deepEqual(turns, [])
+
+  // An older ended record has no failedChecks field.
+  const ledger = fileLedger(join(first.dir, 'state.json'))
+  const recorded = ledger.get<Record<string, unknown>>('ended')
+  assert.ok(recorded)
+  const { failedChecks: _failedChecks, ...old } = recorded
+  ledger.put('ended', old)
+  const third = await runLoop(repo, 'ended', dir, { dispatch: scriptedDispatch(script, turns), input, repo: closed })
+  assert.deepEqual(third, { ...first, failedChecks: [] })
+  assert.deepEqual(third.failedChecks, [])
   assert.deepEqual(turns, [])
 })
 

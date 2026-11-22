@@ -15,7 +15,7 @@ function memoryLedger(): Ledger {
 
 const options = { now: 1_000, pauseSeconds: undefined }
 const note = 'step1.patch.1 did not call submit_patch_log'
-const passed: LoopResult = { branch: 'factory/pr-9-1', criteria: [], final: 'abc', pass: true, report: 'PASS', stopped: false, usage: { tokens: zeroTokens(), unpriced: [], usd: 0 } }
+const passed: LoopResult = { branch: 'factory/pr-9-1', criteria: [], final: 'abc', pass: true, report: 'PASS', stopped: false, failedChecks: [], usage: { tokens: zeroTokens(), unpriced: [], usd: 0 } }
 const request = { by: 'maintainer', owner: 'acme', repo: 'app' }
 const review = { ask: 'Add sub', branch: 'factory/dev-1', full: false, head: 'abc', pr: 9, runId: 'dev-1-review-1' }
 

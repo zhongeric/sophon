@@ -302,8 +302,8 @@ test('develop: a failed intent check gets a repair round and a second review pas
 })
 
 test('develop: a ci command that fails in the final checks of a review pass gives the fixer the end of its output, and the run merges', { timeout: 240_000 }, async () => {
-  // The ci command fails while the flag exists and test/rounds.txt does not. The bugs reviewer of each pass creates the
-  // flag, so the submit gates of the builders pass, the final checks of pass 1 fail, and the repair of the fixer passes.
+  // The ci command fails while the flag exists and test/rounds.txt does not. The bugs reviewer creates the flag after the
+  // builders submit, so only the final checks of pass 1 fail.
   const flag = join(mkdtempSync(join(tmpdir(), 'factory-flag-')), 'flag')
   const output = `console.log('the start' + ' of the output'); console.log('filler line\\n'.repeat(500)); console.log('the cause: test/rounds.txt is missing')`
   const command = `if [ -e '${flag}' ] && [ ! -e test/rounds.txt ]; then node -e "${output}"; exit 1; fi`
@@ -962,7 +962,7 @@ async function runBudget(
     if (!pass) throw new Error('no scripted review pass left')
     const usage = { tokens: zeroTokens(), usd: pass.usd, unpriced: [] }
     const report = '- Triage: `TRIAGE path=full`'
-    return { pass: !pass.stopped, criteria: [], branch: 'factory/review', final: request.head, report, usage, stopped: pass.stopped }
+    return { pass: !pass.stopped, criteria: [], branch: 'factory/review', final: request.head, report, usage, stopped: pass.stopped, failedChecks: [] }
   }
   return { ...(await develop(input, { ...deps, review })), github }
 }

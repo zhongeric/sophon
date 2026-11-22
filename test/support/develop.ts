@@ -279,7 +279,7 @@ export function scriptedReview(passes: Criterion[][], requests: ReviewRequest[])
     if (!failed) throw new Error('no scripted review pass left')
     const criteria = [{ name: 'Checks green', ok: true, detail: 'smoke=pass' }, ...failed]
     const usage = { tokens: zeroTokens(), usd: 0, unpriced: [] }
-    return { pass: failed.length === 0, criteria, branch: 'factory/review', final: request.head, report: '- Triage: `TRIAGE path=full`', usage, stopped: false }
+    return { pass: failed.length === 0, criteria, branch: 'factory/review', final: request.head, report: '- Triage: `TRIAGE path=full`', usage, stopped: false, failedChecks: [] }
   }
 }
 
