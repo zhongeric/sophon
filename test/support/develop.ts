@@ -71,6 +71,10 @@ export const sources = {
     `import assert from 'node:assert/strict'\nimport { test } from 'node:test'\nimport { mul } from '../src/mul.ts'\nimport { sub } from '../src/sub.ts'\n\ntest('sub and mul', () => {\n  assert.equal(sub(5, 3), 2)\n  assert.equal(mul(2, 3), ${product})\n})\n`,
   /** The test that the tests builder submits after the refusal: it passes, but does not test mul yet. */
   subTest: "import assert from 'node:assert/strict'\nimport { test } from 'node:test'\nimport { sub } from '../src/sub.ts'\n\ntest('sub', () => {\n  assert.equal(sub(5, 3), 2)\n})\n",
+  /** A test that a base brings: it fails with `sub`, because sub(5) of one number is NaN there. */
+  baseTest: "import assert from 'node:assert/strict'\nimport { test } from 'node:test'\nimport { sub } from '../src/sub.ts'\n\ntest('sub of one number', () => {\n  assert.equal(sub(5), 5)\n})\n",
+  /** `sub` that passes `baseTest`. */
+  subOfOne: 'export function sub(a: number, b = 0): number {\n  return a - b\n}\n',
 }
 
 const intake = { title: 'Add sub and mul', summary: 'Adds sub() and mul() next to add(), with tests.', slug: 'add-sub-mul', passes: 1, reason: 'Two small functions.', questions: [] }
@@ -127,9 +131,13 @@ const wrongProduct = {
  * prompt names it. With `askScope`, the intake turn raises one user question about the scope. The fixer of a base merge conflict shows
  * /review/repair.txt, writes the files of `resolved` without conflict markers, checkpoints and submits.
  * With `checkFlag`, the bugs reviewer creates that file. When the prompt names /review/check-failure.txt, the fixer shows it.
- * With `blockRepair`, the fixer of that repair round submits a blocked log and changes nothing.
+ * With `blockRepair`, the fixer of that repair round submits a blocked log and changes nothing. With `reproduce`, the
+ * fixer of a repair round shows /review/repair.txt, runs the test `test` (it fails), writes `fix` to src/sub.ts, runs the
+ * test again (it passes), checkpoints and submits.
  */
-export function developScript(options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean; resolved?: Record<string, string>; checkFlag?: string; blockRepair?: number } = {}): Script {
+export function developScript(
+  options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean; resolved?: Record<string, string>; checkFlag?: string; blockRepair?: number; reproduce?: { test: string; fix: string } } = {},
+): Script {
   return ({ role, output, request }) => {
     if (output !== null) return { text: 'done' }
     switch (role) {
@@ -170,6 +178,20 @@ export function developScript(options: { blockSub?: boolean; reviewFix?: boolean
         }
         if (round && Number(round) === options.blockRepair)
           return { cell: `await tools.submit_build_log({ summary: 'not repaired', changes: [], tests: [], blocked: 'the failure does not occur here' })` }
+        if (round && options.reproduce) {
+          const { test, fix } = options.reproduce
+          const summary = `repair ${round}: sub of one number`
+          return {
+            cell: [
+              `text('repair.txt: ' + await tools.Read({ file_path: '/review/repair.txt' }))`,
+              `text('before the fix: ' + JSON.stringify(await tools.run_tests({ tests: [${JSON.stringify(test)}] })))`,
+              `await tools.Write({ file_path: '/repo/src/sub.ts', content: ${JSON.stringify(fix)} })`,
+              `text('after the fix: ' + JSON.stringify(await tools.run_tests({ tests: [${JSON.stringify(test)}] })))`,
+              `await tools.checkpoint({ message: 'repair ${round}' })`,
+              `await tools.submit_build_log(${JSON.stringify({ summary, changes: [{ path: 'src/sub.ts', why: summary }], tests: [test], blocked: '' })})`,
+            ].join('\n'),
+          }
+        }
         if (round) {
           const summary = `repair ${round}: mul(2, 3) is 6`
           const changes = ['test/ops.test.ts', 'test/rounds.txt'].map((path) => ({ path, why: summary }))
