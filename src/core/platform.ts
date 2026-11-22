@@ -111,7 +111,7 @@ export type PullRequests = {
   merge(pr: number, options: { method: MergeMethod; sha: string }): Promise<MergeResult>
   comment(pr: number, body: string): Promise<void>
   ci(sha: string): Promise<CiJob[]>
-  /** The end of the log of a failed job, for the agent that fixes it. */
+  /** The failure blocks and the end of the log of a failed job, for the agent that fixes it. */
   failureLog(job: CiJob): Promise<string>
   /**
    * Starts the failed jobs of Actions run `run` again, as a new attempt. It needs Actions write. A 403 of GitHub is a

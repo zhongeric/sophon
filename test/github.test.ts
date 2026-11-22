@@ -307,6 +307,19 @@ test('the CI of a commit gives the attempt of each Actions run, and no attempt f
   )
 })
 
+test('the failure log of a run keeps a not ok block far from the end of each failed job log, and the end', async () => {
+  const passes = (from: number, count: number) => Array.from({ length: count }, (_, index) => `ok ${from + index} - a test passes\n`).join('')
+  const failure = 'not ok 793 - the runs keep their invariants\n  seed: 4242\n'
+  const log = `${passes(1, 100)}${failure}${passes(794, 400)}# fail 1\n`
+  const { calls, stub } = stubbed({ jobs: [{ id: 5, name: 'test', conclusion: 'failure' }, { id: 6, name: 'lint', conclusion: 'success' }] })
+  const pulls = githubPulls({ ...stub, raw: async () => new Response(log) }, 'acme', 'app', 'main')
+  const text = await pulls.failureLog({ name: 'CI', run: 12, url: 'https://ci.example/12', created: '2026-11-01T00:00:00Z', done: true, ok: false })
+  assert.deepEqual(calls.map((call) => call.path), ['/repos/acme/app/actions/runs/12/jobs?per_page=100'])
+  assert.ok(log.indexOf(failure) < log.length - text.length)
+  assert.ok(text.startsWith(`### test\n${failure}`))
+  assert.ok(text.endsWith('# fail 1\n'))
+})
+
 test('a branch delete accepts a ref that is not there, but not a refused delete', async () => {
   const ref = '/repos/acme/app/git/refs/heads/factory/dev-x'
   const missing = stubbed(new GitHubError(422, 'Reference does not exist'), new GitHubError(404, 'Not Found'))

@@ -1359,6 +1359,29 @@ test('Node GitHub: failureLog returns a link when gh fails', async () => {
   }
 })
 
+test('Node GitHub: failureLog keeps a not ok block far from the end of a long log, and the end', async () => {
+  const dir = runsDir()
+  const passes = (from: number, count: number) => Array.from({ length: count }, (_, index) => `test\tRun npm test\tok ${from + index} - a test passes\n`).join('')
+  const failure = 'test\tRun npm test\tnot ok 793 - the runs keep their invariants\ntest\tRun npm test\t  seed: 4242\n'
+  const log = `${passes(1, 100)}${failure}${passes(794, 400)}test\tRun npm test\t# fail 1\n`
+  writeFileSync(join(dir, 'log'), log)
+  writeFileSync(join(dir, 'gh'), `#!/bin/sh\ncat "${join(dir, 'log')}"\n`, { mode: 0o755 })
+  const path = process.env.PATH
+  process.env.PATH = `${dir}:${path ?? ''}`
+  try {
+    const job = { name: 'CI', run: 12, url: 'https://ci.example/12', created: new Date().toISOString(), done: true, ok: false }
+    // watchCi writes this text to /review/ci-failure.txt.
+    const text = await ghPullRequests(dir, 'main').failureLog(job)
+    assert.ok(log.indexOf(failure) < log.length - text.length)
+    assert.ok(text.startsWith(failure))
+    assert.ok(text.endsWith('# fail 1\n'))
+    assert.ok(text.length <= 6_000)
+  } finally {
+    if (path === undefined) delete process.env.PATH
+    else process.env.PATH = path
+  }
+})
+
 test('Node GitHub: rerunFailedJobs posts the rerun of the failed jobs, and a 403 of gh is a refusal result', async () => {
   const dir = runsDir()
   const calls = join(dir, 'calls')

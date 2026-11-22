@@ -50,3 +50,54 @@ export async function readCi(get: <T>(path: string) => Promise<T>, api: string, 
     })),
   ]
 }
+
+const failureMarker = /not ok|##\[error\]|FAIL|Error:/
+const blockLines = 40
+const endReserve = 2_000
+const endMark = '[... end of the log]\n'
+
+/**
+ * The failure blocks of a CI log and then the end of the log, in `budget` characters plus one cut note. `node --test`
+ * prints the `not ok` block of a failed test early and the summary at the end, so the end alone does not show the
+ * failure. A block starts at a line with a marker and stops before the next marker line or after 40 lines. The end
+ * keeps 2,000 characters, and the block space that the blocks do not use.
+ */
+export function failureExcerpt(log: string, budget: number): string {
+  if (log.length <= budget) return log
+  const lines = log.split('\n')
+  const offsets: number[] = []
+  let offset = 0
+  for (const line of lines) {
+    offsets.push(offset)
+    offset += line.length + 1
+  }
+  const marked = lines.flatMap((line, index) => (failureMarker.test(line) ? [index] : []))
+  const blocks = marked.map((first, index) => ({
+    start: offsets[first] ?? 0,
+    text: `${lines.slice(first, Math.min(first + blockLines, marked[index + 1] ?? lines.length)).join('\n')}\n`,
+  }))
+  const kept: string[] = []
+  let used = 0
+  let cut = 0
+  const endStart = () => log.length - (budget - used - endMark.length)
+  for (const [index, block] of blocks.entries()) {
+    // A block in the end of the log is in the excerpt already, and so are the blocks after it.
+    if (block.start >= endStart()) break
+    const room = budget - endReserve - endMark.length - used
+    if (block.text.length > room) {
+      // When the first block is longer than the block space, keep its first lines, so that the excerpt names the failure.
+      const head = kept.length === 0 && room > 1 ? block.text.slice(0, room) : ''
+      const text = head.includes('\n') ? head.slice(0, head.lastIndexOf('\n') + 1) : head && `${head.slice(0, -1)}\n`
+      kept.push(text)
+      used += text.length
+      const end = endStart()
+      cut = blocks.slice(text ? index + 1 : index).filter((later) => later.start < end).length
+      break
+    }
+    kept.push(block.text)
+    used += block.text.length
+  }
+  if (used === 0 && cut === 0) return log.slice(-budget)
+  const note = cut === 0 ? '' : `[${cut} more failure ${cut === 1 ? 'block' : 'blocks'} cut]\n`
+  return `${kept.join('')}${note}${endMark}${log.slice(endStart())}`
+}
