@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import { cleanBox, type Box, type BoxResult, type JobState } from '../src/cloudflare/box.ts'
 import { jobRunner, resetJobStarts, type JobRecord } from '../src/cloudflare/jobs.ts'
+import { systemClock } from '../src/core/clock.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import { PausedError } from '../src/core/questions.ts'
 
@@ -53,11 +54,14 @@ function fakeBox(ledger: Ledger) {
 function clock() {
   const time = { now: 0, sleeps: 0, after: () => {} }
   const options = {
-    now: () => time.now,
-    sleep: async (ms: number) => {
-      time.now += ms
-      time.sleeps += 1
-      time.after()
+    clock: {
+      ...systemClock,
+      now: () => time.now,
+      sleep: async (ms: number) => {
+        time.now += ms
+        time.sleeps += 1
+        time.after()
+      },
     },
   }
   return { options, time }
@@ -152,7 +156,7 @@ test('a wait job polls until its end, and the next call kills the wait jobs of e
   assert.deepEqual(open(ledger), [])
 
   // The jobs of a call that died: a wait job of a turn, and a pause job of a host step.
-  const never = { now: () => 0, sleep: () => new Promise<void>(() => {}) }
+  const never = { clock: { ...systemClock, now: () => 0, sleep: () => new Promise<void>(() => {}) } }
   const died = jobRunner(fake.box, ledger, never)
   void died.wait(['bash', '-c', 'npm test'], { cwd: 'work/x', env: {}, timeoutMs: 60_000 })
   await assert.rejects(died.pause('clean/1:make', make, pauseOptions(0)), pauses)
@@ -267,4 +271,32 @@ test('a wait job ends by the deadline of the runner, and no job starts with less
   // Without a deadline, the job keeps its own timeout.
   assert.deepEqual(await jobRunner(box, ledger, options).wait(make, wait), done)
   assert.deepEqual(timeouts, [30_000, 600_000])
+})
+
+test('an injected uuid gives the call ID and the job IDs, and the default gives random UUIDs', async () => {
+  const ledger = memoryLedger()
+  const fake = fakeBox(ledger)
+  const { options, time } = clock()
+  time.after = () => {
+    for (const id of fake.states.keys()) fake.states.set(id, { result: done, state: 'done' })
+  }
+  let count = 0
+  const runner = jobRunner(fake.box, ledger, { clock: { ...options.clock, uuid: () => `id-${++count}` } })
+  const wait = { cwd: 'work/a', env: {}, timeoutMs: 60_000 }
+  assert.deepEqual(await runner.wait(make, wait), done)
+  assert.deepEqual(await runner.wait(make, wait), done)
+  assert.deepEqual(
+    fake.recorded.map((record) => record && { call: record.call, id: record.id }),
+    [
+      { call: 'id-1', id: 'job-id-2' },
+      { call: 'id-1', id: 'job-id-3' },
+    ],
+  )
+
+  fake.recorded.length = 0
+  assert.deepEqual(await jobRunner(fake.box, ledger, options).wait(make, wait), done)
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+  const [record] = fake.recorded
+  assert.match(record?.call ?? '', uuid)
+  assert.match(record?.id.slice('job-'.length) ?? '', uuid)
 })

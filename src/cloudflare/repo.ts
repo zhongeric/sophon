@@ -1,5 +1,6 @@
 import type { Contracts } from 'nanocode-ts'
 import { SqlFileSystem } from 'nanocode-ts/bash'
+import { systemClock, type Clock } from '../core/clock.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Frozen, Repo } from '../core/platform.ts'
 import type { PullState } from '../core/prune.ts'
@@ -39,9 +40,12 @@ export function githubRepo(options: {
   ledger: Ledger
   runId: string
   branch: string
+  /** The time of the tree scopes. Default: systemClock. */
+  clock?: Clock
   log(line: string): void
 }): GitHubRepo {
   const { gh, pull, ledger } = options
+  const clock = options.clock ?? systemClock
   const api = `/repos/${pull.owner}/${pull.repo}`
   let scope = ledger.get<string>('tree-scope') ?? `tree:${options.runId}`
   let tree = SqlFileSystem.create(options.sql, { scope })
@@ -78,7 +82,7 @@ export function githubRepo(options: {
       const files = await changedFiles()
 
       // A crashed freeze leaves a partial tree: start each attempt in a fresh scope.
-      scope = `tree:${options.runId}:${Date.now()}`
+      scope = `tree:${options.runId}:${clock.now()}`
       ledger.put('tree-scope', scope)
       tree = SqlFileSystem.create(options.sql, { scope })
       git = treeGit(tree)

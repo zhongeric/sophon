@@ -1,3 +1,5 @@
+import { systemClock } from '../core/clock.ts'
+
 /** The GitHub REST and GraphQL calls that the Cloudflare host makes, signed with one token. */
 export type GitHub = {
   json<T>(method: string, path: string, body?: unknown): Promise<T>
@@ -39,19 +41,21 @@ const gitObjectPath = /^\/repos\/[^/]+\/[^/]+\/git\/(blobs|trees|commits|refs)(\
 type GitHubOptions = {
   /** Waits between tries. Tests replace it so that they do not wait in real time. */
   sleep?: (ms: number) => Promise<void>
+  /** The clock in milliseconds, for the wait until a rate-limit reset. */
+  now?: () => number
 }
 
 const backoff = (tryNumber: number) => backoffMs * 2 ** (tryNumber - 1)
 
 /** The wait in milliseconds that a rate-limit answer gives, or undefined when the answer is not a rate limit. */
-function rateLimitWait(response: Response, tryNumber: number): number | undefined {
+function rateLimitWait(response: Response, tryNumber: number, now: () => number): number | undefined {
   if (response.status !== 403 && response.status !== 429) return undefined
   const retryAfter = response.headers.get('retry-after')
   const exhausted = response.headers.get('x-ratelimit-remaining') === '0'
   if (retryAfter === null && !exhausted) return undefined
   if (retryAfter === null && exhausted) {
     const reset = Number(response.headers.get('x-ratelimit-reset'))
-    if (Number.isFinite(reset)) return Math.max(backoff(tryNumber), reset * 1_000 - Date.now())
+    if (Number.isFinite(reset)) return Math.max(backoff(tryNumber), reset * 1_000 - now())
   }
   // The minimum wait is the backoff, also when retry-after gives 0 seconds.
   const seconds = Number(retryAfter ?? '')
@@ -62,7 +66,8 @@ function rateLimitWait(response: Response, tryNumber: number): number | undefine
 export type GitHubToken = string | (() => Promise<string>)
 
 export function github(token: GitHubToken, api = 'https://api.github.com', fetcher: typeof fetch = fetch, options: GitHubOptions = {}): GitHub {
-  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const sleep = options.sleep ?? systemClock.sleep
+  const now = options.now ?? systemClock.now
   const headers = (accept: string, bearer: string) => ({
     accept,
     authorization: `Bearer ${bearer}`,
@@ -88,7 +93,7 @@ export function github(token: GitHubToken, api = 'https://api.github.com', fetch
         continue
       }
       if (response.ok) return response
-      const wait = rateLimitWait(response, tryNumber)
+      const wait = rateLimitWait(response, tryNumber, now)
       const rateLimited = wait !== undefined
       const transient = rateLimited ? wait <= maxRateLimitWaitMs : repeatable && transientStatuses.has(response.status)
       if (!transient || last) {

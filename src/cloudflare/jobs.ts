@@ -1,3 +1,4 @@
+import { systemClock, type Clock } from '../core/clock.ts'
 import type { Ledger } from '../core/ledger.ts'
 import { PausedError } from '../core/questions.ts'
 import type { Box, BoxResult, JobOptions } from './box.ts'
@@ -62,19 +63,17 @@ export const hasOpenJobs = (ledger: Ledger): boolean => (ledger.get<string[]>(op
 
 /**
  * The jobs of one alarm call on `box`, in the ledger of the run. `deadline` is the end of the call budget: the command
- * of a turn ends by then, so that the agent has time to submit before Cloudflare stops the call (D12). `now` and
- * `sleep` are for tests.
+ * of a turn ends by then, so that the agent has time to submit before Cloudflare stops the call (D12).
  */
 export function jobRunner(
   box: Box,
   ledger: Ledger,
-  options: { deadline?: number; now?: () => number; sleep?: (ms: number) => Promise<void>; pollMs?: number } = {},
+  options: { deadline?: number; clock?: Clock; pollMs?: number } = {},
 ): JobRunner {
   const deadline = options.deadline
-  const now = options.now ?? Date.now
-  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const { now, sleep, uuid } = options.clock ?? systemClock
   const pollMs = options.pollMs ?? 5_000
-  const call = crypto.randomUUID()
+  const call = uuid()
   const describe = (record: JobRecord) => `\`${record.argv.join(' ')}\` in ${record.cwd || '/'}`
   const save = (record: JobRecord) => {
     ledger.put(recordKey(record.id), record)
@@ -83,7 +82,7 @@ export function jobRunner(
   }
   /** Starts a job. `key` is the pause key of a pause-mode job. */
   const start = async (argv: string[], mode: JobRecord['mode'], { cwd, env, timeoutMs }: JobOptions, key?: string) => {
-    const record: JobRecord = { argv, call, cwd, id: `job-${crypto.randomUUID()}`, mode, state: 'open' }
+    const record: JobRecord = { argv, call, cwd, id: `job-${uuid()}`, mode, state: 'open' }
     save(record)
     if (key !== undefined) ledger.put(pauseKey(key), record.id)
     await box.startJob(record.id, argv, { cwd, env, timeoutMs })

@@ -1,5 +1,6 @@
 import { readCi } from '../core/ci.ts'
 import type { CheckResult } from '../core/checks.ts'
+import { systemClock, type Clock } from '../core/clock.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Checker } from '../core/platform.ts'
 import { PausedError } from '../core/questions.ts'
@@ -12,17 +13,18 @@ import type { GitHubRepo, PullRequest } from './repo.ts'
  * Actions workflow runs and the commit statuses of that commit. CI runs the full suite, so the run never runs
  * tests itself.
  */
-export function ciChecker(options: { gh: GitHub; pull: PullRequest; repo: GitHubRepo; ledger: Ledger; branch: string; timeoutMs: number }): Checker {
+export function ciChecker(options: { gh: GitHub; pull: PullRequest; repo: Pick<GitHubRepo, 'publish'>; ledger: Ledger; branch: string; timeoutMs: number; clock?: Clock }): Checker {
   const api = `/repos/${options.pull.owner}/${options.pull.repo}`
+  const clock = options.clock ?? systemClock
   return {
     tests: null,
     async checks(): Promise<CheckResult[]> {
       const sha = await options.repo.publish()
       const startedKey = `ci-started:${sha}`
-      const started = options.ledger.get<number>(startedKey) ?? Date.now()
+      const started = options.ledger.get<number>(startedKey) ?? clock.now()
       options.ledger.put(startedKey, started)
       const results = await readCi((path) => options.gh.json('GET', path), api, sha)
-      const waited = Date.now() - started
+      const waited = clock.now() - started
       if (results.length === 0 && waited < options.timeoutMs) throw new PausedError(`waiting for CI to start on ${sha.slice(0, 12)} (${options.branch})`)
       if (results.length === 0)
         return [

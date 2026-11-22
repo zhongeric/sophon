@@ -1,3 +1,4 @@
+import type { Clock } from '../core/clock.ts'
 import { checkProviders, failedChecksText, type FailedCheck } from '../core/preflight.ts'
 import type { Credential, Provider } from '../core/providers.ts'
 import type { ModelChoice } from '../core/roles.ts'
@@ -34,6 +35,8 @@ type PreflightOptions = {
   container: boolean
   credential: (provider: Provider) => Credential
   needs: (gh: GitHub | undefined) => Promise<PreflightNeeds>
+  /** The clock of the GitHub client. Default: systemClock. */
+  clock?: Clock
 }
 
 const reason = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/\.$/, '')
@@ -49,7 +52,7 @@ export async function preflight(options: PreflightOptions): Promise<{ gh: GitHub
   const transient: string[] = []
   let access: { gh: GitHub; app: boolean } | undefined
   try {
-    const found = await githubAccess(env, owner, repo, options.tokens)
+    const found = await githubAccess(env, owner, repo, options.tokens, options.clock)
     await found.gh.json('GET', `/repos/${owner}/${repo}`)
     access = found
   } catch (error) {

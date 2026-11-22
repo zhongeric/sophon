@@ -1,5 +1,6 @@
 import type { Contracts } from 'nanocode-ts'
 import { failedChecks, type CheckResult, type FailedFinalCheck, type RepoConfig } from '../checks.ts'
+import type { Clock } from '../clock.ts'
 import { assignIds, type Finding } from '../findings.ts'
 import { acceptRejection, findingQuestion, gate, rejectionQuestion, settle, type GateResult } from '../gate.ts'
 import { step, type Ledger } from '../ledger.ts'
@@ -144,6 +145,8 @@ export type LoopDeps = {
   dispatch?: Contracts.RuntimeOptions['dispatch']
   /** USD per million tokens of each model, from MODEL_PRICES. Default: no prices. */
   prices?: Prices
+  /** The time of the agent turns. Default: systemClock. */
+  clock?: Clock
   log(line: string): void
 }
 
@@ -207,7 +210,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   const triaged: Triage = loop ? { ...triageRecord, loop } : triageRecord
   const active = profilesById(triaged.profiles)
   const context: RunContext = {
-    host: { module: deps.module, store: deps.store, ledger, credentials: deps.credentials, dispatch: deps.dispatch, log: deps.log, beforeTurn: budget.check },
+    host: { module: deps.module, store: deps.store, ledger, credentials: deps.credentials, dispatch: deps.dispatch, log: deps.log, beforeTurn: budget.check, clock: deps.clock },
     repo,
     frozen,
     config: input.config,

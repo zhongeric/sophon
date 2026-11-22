@@ -3,6 +3,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { systemClock } from '../src/core/clock.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import { github, GitHubError, refusedCredential, type GitHub } from '../src/cloudflare/github.ts'
 import { deleteRemoteBranch } from '../src/cloudflare/branches.ts'
@@ -150,6 +151,20 @@ test('an exhausted rate limit waits until the reset, with the backoff as the min
     assert.equal(calls.length, 2)
     assert.deepEqual(waits, [wait])
   }
+})
+
+test('an exhausted rate limit waits until the reset by the injected clock', async () => {
+  const waits: number[] = []
+  const steps = [answer(403, {}, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1700000005' }), answer(200, { ok: true })]
+  const fetcher: typeof fetch = async () => steps.shift() ?? assert.fail('no scripted answer left')
+  const client = github('token', 'https://api.test', fetcher, {
+    now: () => 1_700_000_000_000,
+    sleep: async (ms) => {
+      waits.push(ms)
+    },
+  })
+  assert.deepEqual(await client.json('GET', '/repos/acme/app'), { ok: true })
+  assert.deepEqual(waits, [5_000])
 })
 
 test('retry-after takes precedence over an exhausted rate-limit reset', async (t) => {
@@ -321,6 +336,18 @@ test('the PR state of a GitHub repo is merged for a merge time, closed for a clo
   const repo = stubbedRepo(stub)
   assert.deepEqual([await repo.pullState(7), await repo.pullState(7), await repo.pullState(7)], ['open', 'merged', 'closed'])
   assert.deepEqual(calls.map((call) => `${call.method} ${call.path}`), Array(3).fill('GET /repos/acme/app/pulls/7'))
+})
+
+test('the freeze of a GitHub repo gives its tree scope the time of the injected clock', async () => {
+  const { stub } = stubbed({ head: { sha: 'head-sha', ref: 'feature' }, base: { ref: 'main' } }, { merge_base_commit: { sha: 'base-sha' } }, [])
+  const entries = new Map<string, unknown>()
+  const ledger: Ledger = { get: <T>(key: string) => entries.get(key) as T | undefined, put: (key, value) => void entries.set(key, value) }
+  const { sql } = sqliteStore(':memory:', join(mkdtempSync(join(tmpdir(), 'factory-github-')), 'agents'))
+  const clock = { ...systemClock, now: () => 1234 }
+  const repo = githubRepo({ branch: 'factory/pr-7-x', clock, gh: stub, ledger, log: () => {}, pull: { owner: 'acme', repo: 'app', pr: 7 }, runId: 'pr-7-x', sql })
+  // The stub gives no tarball, so the freeze fails after it records the scope.
+  await repo.freeze().catch(() => {})
+  assert.equal(ledger.get<string>('tree-scope'), 'tree:pr-7-x:1234')
 })
 
 test('a GitHub repo deletes its fix branch on GitHub, accepts an absent branch, and its release does nothing', async () => {

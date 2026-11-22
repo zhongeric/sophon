@@ -1,9 +1,11 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { constants, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { deflateSync, inflateSync } from 'node:zlib'
 import { commandResult, type BoxResult, type JobState } from '../../src/cloudflare/box.ts'
 import { probeOutputTokens } from '../../src/core/preflight.ts'
 import type { Provider } from '../../src/core/providers.ts'
@@ -48,18 +50,149 @@ export async function mockServices(
     app?: { slug: string; installed: boolean; expiresInSeconds?: number }
     /** The text of each page that the egress route answers, by path. */
     pages?: (path: string) => string
+    /** The clock of the GitHub times, for a simulation with a fake clock. Default: Date.now. */
+    now?: () => number
+    /** The author and committer date of each commit that the mock makes, so that a simulation gets the same commit IDs each time. */
+    gitDate?: string
+    /** A fault for a request, by its headers: the mock answers with this status and these headers, and does nothing else. */
+    fault?: (headers: IncomingHttpHeaders) => { status: number; headers?: Record<string, string> } | undefined
+    /**
+     * The outputs of the git reads of fixed commits, by command. Mocks over repositories with the same git config can
+     * share one map, so that a simulation runs git less. Default: a map for this mock only.
+     */
+    gitCache?: Map<string, Buffer>
   },
 ) {
+  const now = options.now ?? (() => Date.now())
+  const dated: Record<string, string> = options.gitDate ? { GIT_AUTHOR_DATE: options.gitDate, GIT_COMMITTER_DATE: options.gitDate } : {}
   const git = (args: string[], input?: Buffer, env: Record<string, string> = {}) =>
     execFileSync('git', args, { cwd: repo, env: { ...process.env, ...env }, input, maxBuffer: 64 * 1024 * 1024, stdio: 'pipe' })
   const text = (args: string[], input?: Buffer, env?: Record<string, string>) => git(args, input, env).toString().trim()
+  /** The git directory, so that shaOf reads loose refs and objects without a git process. Null when `repo` is not a repository. */
+  const gitDir = ((): string | null => {
+    if (process.env.GIT_DIR === undefined && existsSync(join(repo, '.git', 'HEAD'))) return join(repo, '.git')
+    try {
+      return text(['rev-parse', '--absolute-git-dir'])
+    } catch {
+      return null
+    }
+  })()
+  const objectPath = (sha: string) => (gitDir === null ? '' : join(gitDir, 'objects', sha.slice(0, 2), sha.slice(2)))
+  const hex = /^[0-9a-f]{40}$/
+  const commits = new Set<string>()
+  /** True when `sha` is a loose commit object. False also for a packed object: then git must look. */
+  const looseCommit = (sha: string) => {
+    if (commits.has(sha)) return true
+    if (gitDir === null || !hex.test(sha)) return false
+    try {
+      if (inflateSync(readFileSync(objectPath(sha))).subarray(0, 7).toString('latin1') !== 'commit ') return false
+    } catch {
+      return false
+    }
+    commits.add(sha)
+    return true
+  }
+  /**
+   * The commit of a 40-hex ID or of a branch from the loose files, or null when no ref has the name. Undefined when git
+   * must resolve the name: another ref kind, packed refs, a symbolic ref, a worktree, or the reftable format. The names
+   * go in the order of rev-parse.
+   */
+  const looseSha = (ref: string): string | null | undefined => {
+    if (hex.test(ref)) return looseCommit(ref) ? ref : undefined
+    if (gitDir === null || !/^[\w./-]+$/.test(ref) || /^[0-9a-f]+$/.test(ref) || ref.includes('..') || ref.startsWith('/')) return undefined
+    if (['packed-refs', 'reftable', 'commondir'].some((name) => existsSync(join(gitDir, name)))) return undefined
+    for (const name of [ref, `refs/${ref}`, `refs/tags/${ref}`, `refs/heads/${ref}`, `refs/remotes/${ref}`, `refs/remotes/${ref}/HEAD`]) {
+      let sha: string
+      try {
+        sha = readFileSync(join(gitDir, name), 'utf8').trim()
+      } catch (error) {
+        if (['ENOENT', 'ENOTDIR', 'EISDIR'].includes(error instanceof Error ? String(Reflect.get(error, 'code')) : '')) continue
+        return undefined
+      }
+      return name.startsWith('refs/heads/') && looseCommit(sha) ? sha : undefined
+    }
+    return null
+  }
   const shaOf = (ref: string) => {
+    const loose = looseSha(ref)
+    if (loose !== undefined) return loose
     try {
       return text(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`])
     } catch {
       return null
     }
   }
+  const cache = options.gitCache ?? new Map<string, Buffer>()
+  /**
+   * A git read whose output does not change, because each of its `revisions` is a 40-hex ID of a loose object here.
+   * When a revision is a name, the read runs each time.
+   */
+  const fixed = (args: string[], revisions: string[]) => {
+    if (gitDir === null || !revisions.every((sha) => hex.test(sha) && existsSync(objectPath(sha)))) return git(args)
+    const key = args.join('\0')
+    let output = cache.get(key)
+    if (!output) {
+      output = git(args)
+      cache.set(key, output)
+    }
+    return output
+  }
+  /** Writes a loose object file, when the repository does not have it. */
+  const writeObject = (sha: string, file: Buffer) => {
+    if (existsSync(objectPath(sha))) return
+    mkdirSync(dirname(objectPath(sha)), { recursive: true })
+    writeFileSync(objectPath(sha), file)
+  }
+  /** The IDs of a tree and of each tree in it, from the loose objects. Null when one of them is not loose. */
+  const treesOf = (sha: string): string[] | null => {
+    let raw: Buffer
+    try {
+      raw = inflateSync(readFileSync(objectPath(sha)))
+    } catch {
+      return null
+    }
+    const found = [sha]
+    for (let at = raw.indexOf(0) + 1; at < raw.length; ) {
+      const space = raw.indexOf(0x20, at)
+      const end = raw.indexOf(0, space)
+      if (raw.subarray(at, space).toString('latin1') === '40000') {
+        const inner = treesOf(raw.subarray(end + 1, end + 21).toString('hex'))
+        if (!inner) return null
+        found.push(...inner)
+      }
+      at = end + 21
+    }
+    return found
+  }
+  /**
+   * A git write whose output and objects depend only on `key`, for mocks that share a gitCache and have fixed commit
+   * dates. The first mock runs git. The next mocks write the same loose objects without a git process, after the same
+   * check of the `inputs` that git makes.
+   */
+  const written = (key: string, inputs: string[], write: () => string, objects: (output: string) => string[] | null): string => {
+    if (gitDir === null || !options.gitCache || !options.gitDate) return write()
+    const cacheKey = `write\0${options.gitDate}\0${key}`
+    const stored = cache.get(cacheKey)
+    if (stored && inputs.every((sha) => hex.test(sha) && existsSync(objectPath(sha)))) {
+      const { files, output } = JSON.parse(stored.toString()) as { files: [string, string][]; output: string }
+      for (const [sha, file] of files) writeObject(sha, Buffer.from(file, 'base64'))
+      return output
+    }
+    const output = write()
+    const shas = objects(output)
+    if (shas) cache.set(cacheKey, Buffer.from(JSON.stringify({ files: shas.map((sha) => [sha, readFileSync(objectPath(sha)).toString('base64')]), output })))
+    return output
+  }
+  /** Writes a blob as `git hash-object -w --stdin` does. With a shared gitCache, it runs no git process. */
+  const blob = (content: Buffer): string => {
+    if (gitDir === null || !options.gitCache) return text(['hash-object', '-w', '--stdin'], content)
+    const object = Buffer.concat([Buffer.from(`blob ${content.length}\0`), content])
+    const sha = createHash('sha1').update(object).digest('hex')
+    writeObject(sha, deflateSync(object))
+    return sha
+  }
+  /** The commit of a ref, or the ref itself when it names no commit, so that git gives its usual answer. */
+  const commitOf = (ref: string) => shaOf(ref) ?? ref
   const turns: Turn[] = []
   const dispatch = scriptedDispatch(options.script, turns)
   const pulls = new Map<number, Pull>()
@@ -109,7 +242,7 @@ export async function mockServices(
   let installationTokens = 0
   const comment = (login: string, body: string, issue = options.pr ?? 0): MockComment => {
     const id = ++ids
-    const at = new Date(Date.now() + id).toISOString()
+    const at = new Date(now() + id).toISOString()
     const kind = pulls.has(issue) ? 'pull' : 'issues'
     const created = { body, created_at: at, html_url: `https://github.com/${options.owner}/${options.name}/${kind}/${issue}#issuecomment-${id}`, id, issue, updated_at: at, user: { login } }
     state.comments.push(created)
@@ -118,7 +251,9 @@ export async function mockServices(
   const api = `/repos/${options.owner}/${options.name}`
   const statusOf = { A: 'added', M: 'modified', D: 'removed', R: 'renamed', C: 'copied' } as Record<string, string>
   const changes = (from: string, to: string) =>
-    text(['diff', '--name-status', from, to])
+    fixed(['diff', '--name-status', from, to], [from, to])
+      .toString()
+      .trim()
       .split('\n')
       .filter(Boolean)
       .map((line) => {
@@ -141,7 +276,9 @@ export async function mockServices(
   })
   /** The entries of a directory at a ref, as the contents API lists them: the root, or the directory at `dir`. */
   const entriesAt = (ref: string, dir?: string) =>
-    text(['ls-tree', ref, ...(dir ? ['--', `${dir}/`] : [])])
+    fixed(['ls-tree', commitOf(ref), ...(dir ? ['--', `${dir}/`] : [])], [commitOf(ref)])
+      .toString()
+      .trim()
       .split('\n')
       .filter(Boolean)
       .map((line) => {
@@ -259,6 +396,12 @@ export async function mockServices(
     }
     state.requests.push(route)
     state.authorizations.push({ authorization: request.headers.authorization ?? '', route })
+    const fault = options.fault?.(request.headers)
+    if (fault) {
+      response.writeHead(fault.status, { 'content-type': 'application/json', ...fault.headers })
+      response.end(JSON.stringify({ message: `fault ${fault.status}` }))
+      return
+    }
     try {
       if (route === 'POST /v1/messages' || route === 'POST /v1/responses') {
         const reply = await dispatch(
@@ -311,7 +454,7 @@ export async function mockServices(
       if (route === `GET ${api}/installation`) return options.app?.installed ? json(response, 200, { id: 42 }) : json(response, 404, { message: 'Not Found' })
       if (options.app && route === 'GET /app') return json(response, 200, { slug: options.app.slug })
       if (options.app?.installed && route === 'POST /app/installations/42/access_tokens') {
-        const expires_at = new Date(Date.now() + (options.app.expiresInSeconds ?? 3_600) * 1_000).toISOString()
+        const expires_at = new Date(now() + (options.app.expiresInSeconds ?? 3_600) * 1_000).toISOString()
         return json(response, 201, { expires_at, token: `ghs_installation${++installationTokens}` })
       }
       // The installed App has one installation, 42, with this repository only.
@@ -346,7 +489,8 @@ export async function mockServices(
         const pull = pulls.get(Number(pullRoute[1]))!
         if (!pullRoute[2]) return json(response, 200, view(Number(pullRoute[1]), pull))
         const head = shaOf(pull.head)!
-        return json(response, 200, page(url, changes(text(['merge-base', 'main', head]), head)))
+        const main = commitOf('main')
+        return json(response, 200, page(url, changes(fixed(['merge-base', main, head], [main, head]).toString().trim(), head)))
       }
       const mergeRoute = new RegExp(`^PUT ${api}/pulls/(\\d+)/merge$`).exec(route)
       if (mergeRoute && pulls.has(Number(mergeRoute[1]))) {
@@ -360,7 +504,7 @@ export async function mockServices(
         if (sha !== shaOf(pull.head)) return json(response, 409, { message: 'Head branch was modified. Review and try the merge again.' })
         if (pull.draft) return json(response, 405, { message: 'Pull Request is still a draft' })
         // Every method merges as a squash: the tests read only the tree on main.
-        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
+        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot', ...dated }
         const commit = text(['commit-tree', `${sha}^{tree}`, '-p', shaOf('main')!, '-m', `${pull.title} (#${number})`], undefined, identity)
         git(['update-ref', 'refs/heads/main', commit])
         pull.merged = commit
@@ -377,13 +521,13 @@ export async function mockServices(
       if (route.startsWith(`GET ${api}/compare/`)) {
         const [from = '', to = ''] = decodeURIComponent(url.pathname.slice(`${api}/compare/`.length)).split('...')
         const head = shaOf(to)!
-        const base = text(['merge-base', shaOf(from)!, head])
+        const base = fixed(['merge-base', shaOf(from)!, head], [shaOf(from)!, head]).toString().trim()
         return json(response, 200, { files: changes(shaOf(from)!, head), merge_base_commit: { sha: base } })
       }
       if (route.startsWith(`GET ${api}/tarball/`)) {
         const sha = url.pathname.split('/').at(-1)!
         response.writeHead(200, { 'content-type': 'application/x-gzip' })
-        response.end(git(['archive', '--format=tar.gz', `--prefix=${options.owner}-${options.name}-${sha.slice(0, 7)}/`, sha]))
+        response.end(fixed(['archive', '--format=tar.gz', `--prefix=${options.owner}-${options.name}-${sha.slice(0, 7)}/`, sha], [sha]))
         return
       }
       if (route === `GET ${api}/contents`) {
@@ -392,15 +536,15 @@ export async function mockServices(
       }
       if (route.startsWith(`GET ${api}/contents/`)) {
         const path = decodeURIComponent(url.pathname.slice(`${api}/contents/`.length))
-        const ref = url.searchParams.get('ref')!
-        const listing = text(['ls-tree', ref, '--', path])
+        const ref = commitOf(url.searchParams.get('ref')!)
+        const listing = fixed(['ls-tree', ref, '--', path], [ref]).toString().trim()
         // The fixture repositories have no workflow files, and the Node tests share them, so the mock lists one.
         if (path === '.github/workflows' && !state.workflows) return json(response, 404, { message: 'Not Found' })
         if (path === '.github/workflows' && !listing) return json(response, 200, [{ name: 'ci.yml', path: '.github/workflows/ci.yml', type: 'file' }])
         if (!listing) return json(response, 404, { message: 'Not Found' })
         // A directory gives the array of its entries, as on GitHub.
         if (request.headers.accept !== 'application/vnd.github.raw' && listing.split(/\s/)[1] === 'tree') return json(response, 200, entriesAt(ref, path))
-        const content = git(['show', `${ref}:${path}`])
+        const content = fixed(['show', `${ref}:${path}`], [ref])
         if (request.headers.accept === 'application/vnd.github.raw') {
           response.writeHead(200, { 'content-type': 'application/octet-stream' })
           response.end(content)
@@ -436,13 +580,13 @@ export async function mockServices(
         const entry = state.comments.find((candidate) => candidate.id === Number(edited[1]))
         if (!entry) return json(response, 404, { message: 'Not Found' })
         entry.body = string(input().body, 'body')
-        entry.updated_at = new Date(Math.max(Date.now(), Date.parse(entry.created_at) + 1)).toISOString()
+        entry.updated_at = new Date(Math.max(now(), Date.parse(entry.created_at) + 1)).toISOString()
         state.edits.push({ body: entry.body, id: entry.id })
         return json(response, 200, entry)
       }
       if (route.startsWith(`GET ${api}/git/commits/`)) {
         const sha = url.pathname.split('/').at(-1)!
-        return json(response, 200, { sha, tree: { sha: text(['rev-parse', `${sha}^{tree}`]) } })
+        return json(response, 200, { sha, tree: { sha: fixed(['rev-parse', `${sha}^{tree}`], [sha]).toString().trim() } })
       }
       if (route.startsWith(`GET ${api}/git/matching-refs/heads/`)) {
         const prefix = decodeURIComponent(url.pathname.slice(`${api}/git/matching-refs/`.length))
@@ -459,7 +603,7 @@ export async function mockServices(
         const sha = shaOf(`refs/heads/${name}`)
         return sha ? json(response, 200, { object: { sha }, ref: `refs/heads/${name}` }) : json(response, 404, { message: 'Not Found' })
       }
-      if (route === `POST ${api}/git/blobs`) return json(response, 201, { sha: text(['hash-object', '-w', '--stdin'], Buffer.from(string(input().content, 'content'), 'base64')) })
+      if (route === `POST ${api}/git/blobs`) return json(response, 201, { sha: blob(Buffer.from(string(input().content, 'content'), 'base64')) })
       if (route === `POST ${api}/git/trees`) {
         const fields = input()
         const base_tree = string(fields.base_tree, 'base_tree')
@@ -468,20 +612,25 @@ export async function mockServices(
           const entry = object(value, `tree[${position}]`)
           return { mode: string(entry.mode, 'mode'), path: string(entry.path, 'path'), sha: entry.sha === null ? null : string(entry.sha, 'sha'), type: string(entry.type, 'type') }
         })
-        const index = join(mkdtempSync(join(tmpdir(), 'factory-index-')), 'index')
-        const env = { GIT_INDEX_FILE: index }
-        git(['read-tree', base_tree], undefined, env)
-        for (const entry of tree)
-          git(entry.sha ? ['update-index', '--add', '--cacheinfo', `${entry.mode},${entry.sha},${entry.path}`] : ['update-index', '--force-remove', entry.path], undefined, env)
-        const sha = text(['write-tree'], undefined, env)
-        rmSync(index, { force: true })
+        const inputs = [base_tree, ...tree.flatMap((entry) => (entry.sha ? [entry.sha] : []))]
+        const sha = written(JSON.stringify(['tree', base_tree, tree]), inputs, () => {
+          const index = join(mkdtempSync(join(tmpdir(), 'factory-index-')), 'index')
+          const env = { GIT_INDEX_FILE: index }
+          git(['read-tree', base_tree], undefined, env)
+          for (const entry of tree)
+            git(entry.sha ? ['update-index', '--add', '--cacheinfo', `${entry.mode},${entry.sha},${entry.path}`] : ['update-index', '--force-remove', entry.path], undefined, env)
+          const result = text(['write-tree'], undefined, env)
+          rmSync(index, { force: true })
+          return result
+        }, treesOf)
         return json(response, 201, { sha })
       }
       if (route === `POST ${api}/git/commits`) {
         const fields = input()
         const [message, parents, tree] = [string(fields.message, 'message'), strings(fields.parents, 'parents'), string(fields.tree, 'tree')]
-        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
-        return json(response, 201, { sha: text(['commit-tree', tree, ...parents.flatMap((parent) => ['-p', parent]), '-m', message], undefined, identity) })
+        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot', ...dated }
+        const commit = () => text(['commit-tree', tree, ...parents.flatMap((parent) => ['-p', parent]), '-m', message], undefined, identity)
+        return json(response, 201, { sha: written(JSON.stringify(['commit', tree, parents, message]), [tree, ...parents], commit, (sha) => [sha]) })
       }
       if (route === `POST ${api}/merges`) {
         // A merge commit of head into the branch base, from a real 3-way merge: 204 when the branch has head, 409 for a conflict.
@@ -500,7 +649,7 @@ export async function mockServices(
         } catch {
           return json(response, 409, { message: 'Merge conflict' })
         }
-        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
+        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot', ...dated }
         const commit = text(['commit-tree', tree, '-p', into, '-p', from, '-m', message], undefined, identity)
         git(['update-ref', `refs/heads/${base}`, commit])
         state.refs.set(`refs/heads/${base}`, commit)
@@ -535,7 +684,7 @@ export async function mockServices(
       }
       if (route === `GET ${api}/actions/runs` && state.ciStatus !== 200) return json(response, state.ciStatus, { message: 'Resource not accessible by personal access token' })
       if (route === `GET ${api}/actions/runs`) {
-        const created_at = new Date().toISOString()
+        const created_at = new Date(now()).toISOString()
         const run = (id: number, conclusion: string) => ({ conclusion, created_at, event: 'push', html_url: `https://github.com/ci/${id}`, id, name: 'CI', status: 'completed', workflow_id: 1 })
         // An earlier failed run of the same workflow and event, then its successful rerun: only the latest counts.
         return json(response, 200, { total_count: 2, workflow_runs: Number(url.searchParams.get('page') ?? 1) === 1 ? [run(1, 'failure'), run(2, 'success')] : [] })

@@ -1,6 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../ci.ts'
 import type { FailedFinalCheck, MergeMethod, RepoConfig } from '../checks.ts'
+import { systemClock, type Clock } from '../clock.ts'
 import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { alarmLines, settleAll } from '../planned-stop.ts'
@@ -87,6 +88,8 @@ export type DevelopDeps = {
   review(request: ReviewRequest): Promise<LoopResult>
   /** How long to look for CI before the run pauses, how often, and how long CI can take to start. */
   ci: { waitMs: number; pollMs: number; startMs: number }
+  /** The time of the CI waits and of the agent turns. Default: systemClock. */
+  clock?: Clock
   log(line: string): void
 }
 
@@ -184,6 +187,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     checkPriced([...Object.values(input.models.develop).map((choice) => choice.model), ...loopModelIds(input.models.review)], prices)
 
   const { ledger, branches, pulls } = deps
+  const clock = deps.clock ?? systemClock
   const models = input.models.develop
   // What the report shows. Each stage fills its part.
   const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, signing: null, head: null, pr: null, built: [], repairs: [], cis: [], reviews: [], stoppedReview: null, baseMerges: [], mergeTries: [], reruns: [] }
@@ -209,7 +213,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const view = await branches.view(input.base)
   const active = profilesById(await step(ledger, 'profiles', async () => (await presentProfiles(async (path) => (await view.stat(`/${path}`)) !== null)).map((profile) => profile.id)))
   const context: DevelopContext = {
-    host: { module: deps.module, store: deps.store, ledger, credentials: deps.credentials, dispatch: deps.dispatch, log: deps.log, beforeTurn: budget.check },
+    host: { module: deps.module, store: deps.store, ledger, credentials: deps.credentials, dispatch: deps.dispatch, log: deps.log, beforeTurn: budget.check, clock: deps.clock },
     config: input.config,
     guides: deps.guides,
     stackGuides: [...new Set(active.flatMap((profile) => profile.guides))],
@@ -365,7 +369,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const publish = async (point: string) => {
     const sha = await step(ledger, `head.${point}`, async () => {
       return step(ledger, `push.${point}`, async () => {
-        const at = Date.now()
+        const at = clock.now()
         const pushed = await branches.push(dev)
         ledger.put(`pushed-at:${pushed}`, at)
         return pushed
@@ -375,7 +379,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     return sha
   }
   const waitCi = async (name: string, sha: string, after?: Map<number, number>): Promise<Ci> => {
-    const result = await watchCi(ledger, pulls, deps.ci, name, sha, after)
+    const result = await watchCi(ledger, pulls, deps.ci, clock, name, sha, after)
     state.cis.push(result)
     return result
   }
@@ -763,20 +767,20 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
  * is not recorded, so a resumed run looks again. After a rerun, `after` gives the failed attempt of each run that ran
  * again, and only a newer attempt of each counts. The push does not apply then.
  */
-async function watchCi(ledger: Ledger, pulls: PullRequests, timing: DevelopDeps['ci'], name: string, sha: string, after?: Map<number, number>): Promise<Ci> {
+async function watchCi(ledger: Ledger, pulls: PullRequests, timing: DevelopDeps['ci'], clock: Clock, name: string, sha: string, after?: Map<number, number>): Promise<Ci> {
   const recorded = ledger.get<Ci>(`ci:${name}`)
   if (recorded) return recorded
   const startedKey = `ci-started:${sha}`
-  const started = ledger.get<number>(startedKey) ?? Date.now()
+  const started = ledger.get<number>(startedKey) ?? clock.now()
   ledger.put(startedKey, started)
   const pushedAt = ledger.get<number>(`pushed-at:${sha}`) ?? 0
-  const deadline = Date.now() + timing.waitMs
+  const deadline = clock.now() + timing.waitMs
   for (;;) {
     const jobs = await pulls.ci(sha)
     const fresh = jobs.some((job) => Date.parse(job.created) >= pushedAt - clockSkewMs)
     const ready = after
       ? [...after].every(([run, attempt]) => jobs.some((job) => job.run === run && (job.attempt ?? 1) > attempt))
-      : fresh || Date.now() - pushedAt >= ciGraceMs
+      : fresh || clock.now() - pushedAt >= ciGraceMs
     if (jobs.length > 0 && jobs.every((job) => job.done) && ready) {
       const failed = jobs.filter((job) => !job.ok)
       const logs = await Promise.all(failed.map(async (job) => `## ${job.name}\n${job.url}\n\n${await pulls.failureLog(job)}`))
@@ -784,12 +788,12 @@ async function watchCi(ledger: Ledger, pulls: PullRequests, timing: DevelopDeps[
       ledger.put(`ci:${name}`, ci)
       return ci
     }
-    if (jobs.length === 0 && Date.now() - started >= timing.startMs) return { sha, state: 'none', jobs: [], failures: '' }
-    if (Date.now() >= deadline) {
+    if (jobs.length === 0 && clock.now() - started >= timing.startMs) return { sha, state: 'none', jobs: [], failures: '' }
+    if (clock.now() >= deadline) {
       const pending = jobs.filter((job) => !job.done).map((job) => job.name)
       throw new PausedError(`waiting for CI on ${sha.slice(0, 12)}${pending.length ? `: ${pending.join(', ')}` : ' to start'}`)
     }
-    await new Promise((resolve) => setTimeout(resolve, timing.pollMs))
+    await clock.sleep(timing.pollMs)
   }
 }
 

@@ -1,4 +1,5 @@
 import { AgentRuntime, Contracts } from 'nanocode-ts'
+import { systemClock, type Clock } from './clock.ts'
 import { checkEgress, egressFetch, type Egress, type EgressHost } from './egress.ts'
 import type { Ledger } from './ledger.ts'
 import type { AgentStore } from './platform.ts'
@@ -42,6 +43,8 @@ export type AgentHost = {
   beforeTurn?: () => Promise<void>
   /** The artifacts, the lock and the secrets of the egress. Only an agent with an egress uses it. */
   egress?: EgressHost
+  /** The time of the drive waits and of the turn timing. Default: systemClock. */
+  clock?: Clock
   log(line: string): void
 }
 
@@ -160,7 +163,7 @@ export async function openAgent(spec: AgentSpec, host: AgentHost): Promise<Agent
         } else if (driven.idle) {
           throw new Error(`${spec.id}: turn ${requestId} is neither pending nor finished`)
         } else if (driven.waiting) {
-          await new Promise((resolve) => setTimeout(resolve, driveWaitMs))
+          await (host.clock ?? systemClock).sleep(driveWaitMs)
         }
       }
     },
@@ -196,12 +199,13 @@ export async function runTurn<T>(
   const request = retries === 0 ? turn.request : `${turn.request}-retry-${retries}`
   const note = host.ledger.get<string>(`retry-cause:${spec.id}:${turn.request}`) === 'missed' ? missedNote(tool) : retryNote
   const agent = await openAgent(spec, host)
+  const clock = host.clock ?? systemClock
   const ask = async (id: string, text: string) => {
-    const started = Date.now()
+    const started = clock.now()
     try {
       return await agent.ask(id, text)
     } finally {
-      const used = Date.now() - started
+      const used = clock.now() - started
       if (spec.turnMs !== undefined && used > spec.turnMs)
         host.log(`${spec.id}: warning: turn ${id} took ${Math.round(used / 1000)} s, more than the turn time of ${Math.round(spec.turnMs / 1000)} s`)
     }
