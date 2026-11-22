@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../../src/core/ci.ts'
-import type { MergeMethod } from '../../src/core/checks.ts'
-import type { MergeResult, PullRequests, Signing } from '../../src/core/platform.ts'
+import type { FailedFinalCheck, MergeMethod } from '../../src/core/checks.ts'
+import type { Branch, MergeResult, PullRequests, Signing } from '../../src/core/platform.ts'
 import { PausedError, type Channel } from '../../src/core/questions.ts'
 import { zeroTokens, type Prices } from '../../src/core/usage.ts'
 import { defaultModels, type Criterion } from '../../src/core/workflows/code-review-loop.ts'
@@ -117,8 +117,9 @@ const wrongProduct = {
  * With `askScope`, the intake agent raises one user question about the scope. The fixer of a base merge conflict shows
  * /review/repair.txt, writes the files of `resolved` without conflict markers, checkpoints and submits.
  * With `checkFlag`, the bugs reviewer creates that file. When the prompt names /review/check-failure.txt, the fixer shows it.
+ * With `blockRepair`, the fixer of that repair round submits a blocked log and changes nothing.
  */
-export function developScript(options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean; resolved?: Record<string, string>; checkFlag?: string } = {}): Script {
+export function developScript(options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean; resolved?: Record<string, string>; checkFlag?: string; blockRepair?: number } = {}): Script {
   return ({ role, output, request }) => {
     if (output !== null) return { text: 'done' }
     switch (role) {
@@ -151,6 +152,8 @@ export function developScript(options: { blockSub?: boolean; reviewFix?: boolean
             ].join('\n'),
           }
         }
+        if (round && Number(round) === options.blockRepair)
+          return { cell: `await tools.submit_build_log({ summary: 'not repaired', changes: [], tests: [], blocked: 'the failure does not occur here' })` }
         if (round) {
           const summary = `repair ${round}: mul(2, 3) is 6`
           const changes = ['test/ops.test.ts', 'test/rounds.txt'].map((path) => ({ path, why: summary }))
@@ -207,9 +210,11 @@ export function developScript(options: { blockSub?: boolean; reviewFix?: boolean
  * PRs and CI in memory. `ci` gives the result of each pushed commit in order: the first is red, the next ones green.
  * With `stale`, the first look at each commit finds only an old finished job, as when another branch ran CI on it.
  * While `state.noCi` is true, no commit has CI. `merge` gives the result of each merge call, or throws: by default
- * the merge succeeds with `mergeCommit`.
+ * the merge succeeds with `mergeCommit`. `rerun` gives the result of each rerun request in order: the new attempt
+ * passes, fails, or GitHub refuses it with 403. By default the new attempt fails. `state.reruns` has the run of each request.
  */
-export function fakePulls(ci: boolean[] = [false], options: { stale?: boolean; merge?: (call: MergeCall) => MergeResult } = {}) {
+export function fakePulls(ci: boolean[] = [false], options: { stale?: boolean; merge?: (call: MergeCall) => MergeResult; rerun?: RerunOutcome[] } = {}) {
+  const outcomes = [...(options.rerun ?? [])]
   const state = {
     opened: [] as { head: string; title: string; body: string }[],
     ready: [] as number[],
@@ -218,6 +223,9 @@ export function fakePulls(ci: boolean[] = [false], options: { stale?: boolean; m
     shas: [] as string[],
     looks: {} as Record<string, number>,
     noCi: false,
+    reruns: [] as number[],
+    /** The latest attempt of each run that ran again, and whether it passed. */
+    attempts: {} as Record<number, { attempt: number; ok: boolean }>,
   }
   const pulls: PullRequests = {
     async open(options) {
@@ -239,13 +247,25 @@ export function fakePulls(ci: boolean[] = [false], options: { stale?: boolean; m
       if (state.noCi) return []
       if (!state.shas.includes(sha)) state.shas.push(sha)
       state.looks[sha] = (state.looks[sha] ?? 0) + 1
-      const job = (created: string, name: string) => ({ created, done: true, name, ok: ci[state.shas.indexOf(sha)] ?? true, run: 1, url: `https://ci.example/${sha}` })
-      const old = job(new Date(Date.now() - 3_600_000).toISOString(), 'CI (push, another branch)')
+      // Each commit has its own runs: the run of the push, and the old run of another branch.
+      const index = state.shas.indexOf(sha)
+      const job = (created: string, name: string, run: number): CiJob => {
+        const rerun = state.attempts[run]
+        return { created, done: true, name, ok: rerun?.ok ?? ci[index] ?? true, run, url: `https://ci.example/${sha}`, attempt: rerun?.attempt ?? 1 }
+      }
+      const old = job(new Date(Date.now() - 3_600_000).toISOString(), 'CI (push, another branch)', 1_000 + index)
       if (options.stale && state.looks[sha] === 1) return [old]
-      return [...(options.stale ? [old] : []), job(new Date().toISOString(), 'CI (pull_request)')]
+      return [...(options.stale ? [old] : []), job(new Date().toISOString(), 'CI (pull_request)', index + 1)]
     },
     async failureLog() {
       return 'test/ops.test.ts: no test of mul(2, 3)'
+    },
+    async rerunFailedJobs(run) {
+      state.reruns.push(run)
+      const outcome = outcomes.shift() ?? 'fail'
+      if (outcome === 403) return { started: false, reason: 'Resource not accessible by integration' }
+      state.attempts[run] = { attempt: (state.attempts[run]?.attempt ?? 1) + 1, ok: outcome === 'pass' }
+      return { started: true }
     },
   }
   return { pulls, state }
@@ -270,20 +290,26 @@ export function pauseAtCi(pulls: PullRequests, nth: number): PullRequests {
 
 /**
  * Review passes that the test gives in place of the review loop, in order: each item is the failed criteria of a pass,
- * and an empty list is a PASS. A pass makes no fixes. Each request goes to `requests`.
+ * and an empty list is a PASS. An item with `checks` also fails 'Checks green' on these final checks. A pass makes no
+ * fixes. Each request goes to `requests`.
  */
-export function scriptedReview(passes: Criterion[][], requests: ReviewRequest[]): DevelopDeps['review'] {
+export function scriptedReview(passes: (Criterion[] | { failed?: Criterion[]; checks: FailedFinalCheck[] })[], requests: ReviewRequest[]): DevelopDeps['review'] {
   return async (request) => {
     requests.push(request)
-    const failed = passes.shift()
-    if (!failed) throw new Error('no scripted review pass left')
-    const criteria = [{ name: 'Checks green', ok: true, detail: 'smoke=pass' }, ...failed]
+    const item = passes.shift()
+    if (!item) throw new Error('no scripted review pass left')
+    const { failed, checks } = Array.isArray(item) ? { failed: item, checks: [] } : { failed: item.failed ?? [], checks: item.checks }
+    const green = checks.length === 0 ? { name: 'Checks green', ok: true, detail: 'smoke=pass' } : { name: 'Checks green', ok: false, detail: `failed: ${checks.map((check) => check.name).join(', ')}` }
+    const criteria = [green, ...failed]
     const usage = { tokens: zeroTokens(), usd: 0, unpriced: [] }
-    return { pass: failed.length === 0, criteria, branch: 'factory/review', final: request.head, report: '- Triage: `TRIAGE path=full`', usage, stopped: false, failedChecks: [] }
+    const pass = criteria.every((criterion) => criterion.ok)
+    return { pass, criteria, branch: 'factory/review', final: request.head, report: '- Triage: `TRIAGE path=full`', usage, stopped: false, failedChecks: checks }
   }
 }
 
 export type MergeCall = { pr: number; method: MergeMethod; sha: string }
+/** The result of a rerun request in fakePulls: the new attempt passes or fails, or GitHub refuses the request with 403. */
+export type RerunOutcome = 'pass' | 'fail' | 403
 export const mergeCommit = 'c0ffee'.padEnd(40, '0')
 
 export async function developInput(repo: string, runId: string, options: { issue?: number } = {}): Promise<DevelopInput> {
@@ -304,6 +330,7 @@ export async function developInput(repo: string, runId: string, options: { issue
  * Runs the development workflow on the Node platform, with a scripted model, fake PRs and CI, and memory channels. The
  * repository has no usable key. `signing` wraps the signing of the Node platform. With `keep`, the local deletes and the
  * worktree removal do nothing, so that a test can read a worktree after the run. `review` replaces the review loop.
+ * With `remoteCommits`, each push gives a new commit with the tree of the local head, as the Worker does.
  */
 export async function runDevelop(
   repo: string,
@@ -318,6 +345,7 @@ export async function runDevelop(
     signing?: (signing: Signing) => Signing
     keep?: boolean
     review?: DevelopDeps['review']
+    remoteCommits?: boolean
   },
 ) {
   withoutKey(repo)
@@ -336,7 +364,16 @@ export async function runDevelop(
     reviewChannel: async () => memoryChannel().channel,
     runsDir,
   })
-  const branches = options.keep ? { ...deps.branches, deleteLocal: async () => {}, release: async () => {} } : deps.branches
+  const kept = options.keep ? { ...deps.branches, deleteLocal: async () => {}, release: async () => {} } : deps.branches
+  const branches = options.remoteCommits
+    ? {
+        ...kept,
+        async push(branch: Branch) {
+          const local = await kept.push(branch)
+          return execFileSync('git', ['commit-tree', `${local}^{tree}`, '-p', local, '-m', 'remote'], { cwd: repo }).toString().trim()
+        },
+      }
+    : kept
   const signed = options.signing ? { ...deps, signing: options.signing(deps.signing) } : deps
   return { ...(await develop(input, { ...signed, branches, review: options.review ?? deps.review })), dir: deps.dir }
 }

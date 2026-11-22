@@ -42,5 +42,16 @@ export function githubPulls(gh: GitHub, owner: string, repo: string, baseRef: st
         logs.push(`### ${failed.name}\n${(await (await gh.raw(`${api}/actions/jobs/${failed.id}/logs`, 'application/vnd.github+json')).text()).slice(-logTailChars)}`)
       return logs.join('\n\n') || `No failed job log: see ${job.url}`
     },
+    async rerunFailedJobs(run) {
+      try {
+        await gh.json('POST', `${api}/actions/runs/${run}/rerun-failed-jobs`)
+        return { started: true }
+      } catch (error) {
+        // Without Actions write, GitHub refuses the rerun with 403. That refusal is a result, so it never stops the run as
+        // a refused credential. A rate limit stays an error.
+        if (!(error instanceof GitHubError) || error.status !== 403 || error.rateLimited) throw error
+        return { started: false, reason: error.message }
+      }
+    },
   }
 }
