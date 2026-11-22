@@ -5,7 +5,7 @@ import { systemClock, type Clock } from '../clock.ts'
 import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { alarmLines, settleAll } from '../planned-stop.ts'
-import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
+import { frozenAsk, inScope, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
 import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeRefusal, PullRequests, RerunStart, Signing } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
 import { branchesSection, pruneBranches, reasonOf, type BranchFacts, type BranchRun, type PruneResult } from '../prune.ts'
@@ -127,9 +127,9 @@ type Review = { pass: boolean; head: string; final: string; branch: string; repo
  * `text` is /review/repair.txt, `logs` is /review/ci-failure.txt when CI failed, and `report` is
  * /review/review-report.md when a review pass failed. `checks` is /review/check-failure.txt when final checks of a
  * review pass failed. `conflicts` are the files that conflict in a base merge. `rerunnable` holds the failed checks
- * that a rerun can pass.
+ * that a rerun can pass. `merged` is the base merge before the round of a red CI (D16), with the files that it brought.
  */
-type Cause = { from: string; short: string; text: string; logs: string | null; report: string | null; checks: string | null; conflicts?: string[]; rerunnable?: Rerunnable }
+type Cause = { from: string; short: string; text: string; logs: string | null; report: string | null; checks: string | null; conflicts?: string[]; merged?: { base: string; files: string[] }; rerunnable?: Rerunnable }
 /** The failed checks of a cause on the head `head` (D14): a red CI, or the failed final checks of review pass `pass`. */
 type Rerunnable = { head: string; ci: Ci } | { head: string; pass: number; review: Review }
 /** A rerun of a failed CI job or final check on a head (D14). */
@@ -138,8 +138,10 @@ type Repair = { round: number; cause: Cause; log: BuildLog }
 type BasePoint = 'ready' | 'merge'
 /** The result of a base merge, and `change`: the paths of the change before it, from the merge base to the head. */
 type BaseMerge = { files: string[]; conflicts: string[]; change: string[] }
+/** Where a base check runs: before ready, before the merge, or before repair round `round` of a red CI (D16). */
+type BaseAt = { point: BasePoint } | { point: 'repair'; round: number }
 /** A base check (D16). `merge` is null when the base did not move or the run used its base merges. */
-type BaseCheck = { point: BasePoint; base: string; moved: boolean; merge: BaseMerge | null }
+type BaseCheck = BaseAt & { base: string; moved: boolean; merge: BaseMerge | null }
 /** A merge try as the ledger records it. A refusal of a ledger from before D16 has no kind. */
 type RecordedMerge = { merged: true; sha: string } | { merged: false; reason: string; kind?: MergeRefusal }
 
@@ -439,7 +441,32 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   let mergeBase = input.base
   const taskFiles = [...new Set(planned.tasks.flatMap((task) => task.files))]
 
-  // One round of the repair budget. A base merge with a conflict also gives the fixer the files that conflict.
+  // D16. The base checks of the run. Each one is a ledger step with its base merge, so that a resume never merges again.
+  // A ledger from before D16 marked the PR ready without a base check, so its resume does not change the reviewed PR.
+  const baseChecks = ledger.get('base-merge-workflow') === true || !ledger.get('step:ready')
+  if (baseChecks) ledger.put('base-merge-workflow', true)
+  const mergeMessage = `agent-factory: merge ${input.baseRef} (${input.runId})`
+  const baseCheck = async (name: string, at: BaseAt): Promise<BaseCheck> => {
+    const check = await step(ledger, name, async (): Promise<BaseCheck> => {
+      const base = await branches.remoteHead(input.baseRef)
+      const moved = (await dev.mergeBaseWith(base)) !== base
+      if (!moved || state.baseMerges.length >= baseMergeLimit) return { ...at, base, moved, merge: null }
+      const change = await dev.touchedFiles(mergeBase, await dev.head())
+      const merged = await dev.mergeCommit(base, mergeMessage)
+      return { ...at, base, moved, merge: { ...merged, change } }
+    })
+    if (check.merge) state.baseMerges.push(check)
+    return check
+  }
+  // The checks before ready and before the merge count in base-check.<n>. A check before a repair round has its own name.
+  let checks = 0
+  const checkBase = (point: BasePoint): Promise<BaseCheck> => {
+    checks += 1
+    return baseCheck(`base-check.${checks}`, { point })
+  }
+
+  // One round of the repair budget. A base merge with a conflict also gives the fixer the files that conflict. Before the
+  // round of a red CI, the fixer can change the files of the task that the merge brings, because the fix can need them.
   const repair = async (cause: Cause, merge?: BaseMerge): Promise<BuildLog> => {
     const round = state.repairs.length + 1
     const log = await step(ledger, `repair.${round}`, () =>
@@ -452,7 +479,10 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         active,
         checker: deps.checker(dev),
         base: mergeBase,
-        ...(merge ? { baseFiles: merge.files.filter((path) => !merge.conflicts.includes(path)) } : {}),
+        ...(merge && merge.conflicts.length > 0 ? {
+          baseFiles: merge.files.filter((path) => !merge.conflicts.includes(path)),
+          editableBaseFiles: cause.merged ? merge.files.filter((path) => inScope(path, taskFiles)) : [],
+        } : {}),
         review: {
           '/ask.md': input.ask,
           '/plan.md': planText,
@@ -542,13 +572,24 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     return null
   }
 
+  // The end of a run whose base merge did not finish: before ready, the run fails with the PR draft. Before the merge,
+  // the PR stays ready and the host does not merge.
+  const unmerged = (point: BasePoint, shown: Criterion[], reason: string) =>
+    point === 'ready' ? finish('failed', shown, `${sentence(reason)}. The PR stays draft.`) : finish('ready', shown, `Not merged: ${reason}. The PR stays ready for your review. You merge.`)
+  // Before the merge, an error of the base merge or of its push leaves the PR ready. A pause or a stop stays an error.
+  const thrown = (point: BasePoint, error: unknown) => point === 'ready' || error instanceof PausedError || error instanceof BudgetStop || error instanceof StopError
+
   // Runs until CI and the review passes hold on the head, or the budget is used. It returns the end of a blocked run.
-  const repairLoop = async (): Promise<DevelopResult | null> => {
+  // `point` is the base check that runs the loop. Before ready, the PR is draft.
+  const repairLoop = async (point: BasePoint = 'ready'): Promise<DevelopResult | null> => {
+    // The PR on GitHub at the merge point is still the head of the passed criteria, so an end there shows them.
+    const shown = () => (point === 'ready' ? [] : criteria)
     // The cause that a rerun after a blocked fixer leaves for the next round.
     let carried: Cause | null = null
     for (;;) {
       if (ci.state === 'none') return finish('blocked', [], noCi(ci.sha), true)
       let cause: Cause
+      let red = false
       if (carried) {
         cause = carried
         carried = null
@@ -556,6 +597,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         // The rerun comes before the check of the budget, so a flaky job uses no round.
         if (await rerunCi()) continue
         cause = ciCause(ci)
+        red = true
       } else if (state.reviews.length < routed.passes || state.reviews.at(-1)?.pass !== true || unreviewed !== null) {
         const pass = state.reviews.length + 1
         const review = await reviewPass(pass, head, mergeBase)
@@ -584,15 +626,53 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         unrepaired = cause
         return null
       }
+      const round = state.repairs.length + 1
+      // D16. GitHub tests the merge of the PR with the base, so the round of a red CI starts with the base that moved. A
+      // ledger from before this check started the round without it, so its resume does not merge under that round.
+      const name = `base-check.repair.${round}`
+      const started = ledger.get(`step:repair.${round}`) !== undefined || ledger.get(`step:local-head.repair.${round}`) !== undefined
+      let merge: BaseMerge | undefined
+      if (red && baseChecks && (ledger.get(`step:${name}`) !== undefined || !started)) {
+        let checked: BaseCheck
+        try {
+          checked = await baseCheck(name, { point: 'repair', round })
+        } catch (error) {
+          if (thrown(point, error)) throw error
+          return unmerged(point, shown(), `the base merge failed: ${reasonOf(error)}`)
+        }
+        if (checked.merge) {
+          merge = checked.merge
+          mergeBase = checked.base
+          cause = afterBaseMerge(cause, checked.base, merge)
+        }
+      }
       // The local head before the round. On the Worker, the pushed head of the cause is another SHA.
-      const before = await step(ledger, `local-head.repair.${state.repairs.length + 1}`, () => dev.head())
-      const log = await repair(cause)
+      const before = await step(ledger, `local-head.repair.${round}`, () => dev.head())
+      const log = await repair(cause, merge)
       if (log.blocked.trim()) {
-        const rest = await afterBlock(cause, state.repairs.length, before)
+        // A clean base merge alone can fix a red CI. When the fixer left the merge commit as it was, CI tests it.
+        if (merge && merge.conflicts.length === 0) {
+          const untouched = await step(ledger, `blocked.${round}`, async () => {
+            const pending = await dev.pending()
+            return (await dev.head()) === before && pending.changed.length === 0 && pending.removed.length === 0
+          })
+          if (!untouched) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
+          head = await publish(`repair.${round}`)
+          if (merge.files.some((path) => merge.change.includes(path))) unreviewed = 'a base merge after the last pass'
+          ci = await waitCi(`ci.repair.${round}`, head)
+          continue
+        }
+        // After a base merge, the tree of the round is not the tree that CI tested, so no rerun.
+        const rest = merge ? undefined : await afterBlock(cause, state.repairs.length, before)
         if (rest === undefined) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
         carried = rest
         continue
       }
+      if (merge && merge.conflicts.length > 0) {
+        const marked = await step(ledger, `finish-merge.repair.${round}`, () => dev.finishMerge(merge.conflicts, mergeMessage))
+        if (marked.length > 0) return unmerged(point, shown(), `the conflict markers remain in ${marked.join(', ')}`)
+      }
+      // The push takes the base merge and the fix together, so CI runs one time after the round.
       head = await publish(`repair.${state.repairs.length}`)
       unreviewed = 'a repair after the last pass'
       ci = await waitCi(`ci.repair.${state.repairs.length}`, head)
@@ -647,31 +727,6 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   // When the budget is used, the run ends failed with the last cause.
   if (!passed(criteria)) return finish('failed', criteria, `${unrepaired ? `${sentence(used(unrepaired))}. ` : ''}The PR stays draft.`)
 
-  // D16. The base checks of the run. Each one is a ledger step with its base merge, so that a resume never merges again.
-  // A ledger from before D16 marked the PR ready without a base check, so its resume does not change the reviewed PR.
-  const baseChecks = ledger.get('base-merge-workflow') === true || !ledger.get('step:ready')
-  if (baseChecks) ledger.put('base-merge-workflow', true)
-  let checks = 0
-  const checkBase = async (point: BasePoint): Promise<BaseCheck> => {
-    checks += 1
-    const check = await step(ledger, `base-check.${checks}`, async (): Promise<BaseCheck> => {
-      const base = await branches.remoteHead(input.baseRef)
-      const moved = (await dev.mergeBaseWith(base)) !== base
-      if (!moved || state.baseMerges.length >= baseMergeLimit) return { point, base, moved, merge: null }
-      const change = await dev.touchedFiles(mergeBase, await dev.head())
-      const merged = await dev.mergeCommit(base, `agent-factory: merge ${input.baseRef} (${input.runId})`)
-      return { point, base, moved, merge: { ...merged, change } }
-    })
-    if (check.merge) state.baseMerges.push(check)
-    return check
-  }
-  // The end of a run whose base merge did not finish: before ready, the run fails with the PR draft. Before the merge,
-  // the PR stays ready and the host does not merge.
-  const unmerged = (point: BasePoint, shown: Criterion[], reason: string) =>
-    point === 'ready' ? finish('failed', shown, `${sentence(reason)}. The PR stays draft.`) : finish('ready', shown, `Not merged: ${reason}. The PR stays ready for your review. You merge.`)
-  // Before the merge, an error of the base merge or of its push leaves the PR ready. A pause or a stop stays an error.
-  const thrown = (point: BasePoint, error: unknown) => point === 'ready' || error instanceof PausedError || error instanceof BudgetStop || error instanceof StopError
-
   // Merges the base while it moves, up to the limit of the run. After each merge: a conflict round when needed, the
   // push, CI, the repair loop and the criteria. It returns the end of the run, or null when the run goes on.
   const settle = async (point: BasePoint): Promise<DevelopResult | null> => {
@@ -700,7 +755,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         }
         const log = await repair(cause, merge)
         if (log.blocked.trim()) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
-        const marked = await step(ledger, `finish-merge.${n}`, () => dev.finishMerge(merge.conflicts, `agent-factory: merge ${input.baseRef} (${input.runId})`))
+        const marked = await step(ledger, `finish-merge.${n}`, () => dev.finishMerge(merge.conflicts, mergeMessage))
         if (marked.length > 0) return unmerged(point, shown, `the conflict markers remain in ${marked.join(', ')}`)
       }
       try {
@@ -711,7 +766,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
       }
       if (merge.conflicts.length > 0 || merge.files.some((path) => merge.change.includes(path))) unreviewed = 'a base merge after the last pass'
       ci = await waitCi(`ci.base.${n}`, head)
-      const ended = await repairLoop()
+      const ended = await repairLoop(point)
       if (ended) return ended
       criteria = await judge()
       if (!passed(criteria)) return unmerged(point, criteria, unrepaired ? used(unrepaired) : 'a criterion failed after the base merge')
@@ -817,6 +872,7 @@ function repairPrompt(round: number, cause: Cause): string {
     `Repair round ${round} of ${repairRounds}. The cause: ${cause.from}, ${cause.short}.`,
     '',
     '- The causes: /review/repair.txt',
+    ...(cause.merged ? [`- The host merged the base ${cause.merged.base.slice(0, 12)} into the branch before this round. The files of the merge: ${cause.merged.files.join(', ') || 'none'}.`] : []),
     ...(cause.conflicts ? [`- The files that conflict: ${cause.conflicts.join(', ')}. The merge of the base is in progress in /repo.`] : []),
     ...(cause.logs === null ? [] : ['- The CI logs: /review/ci-failure.txt']),
     ...(cause.checks === null ? [] : ['- The output of the failed checks: /review/check-failure.txt']),
@@ -825,7 +881,7 @@ function repairPrompt(round: number, cause: Cause): string {
     '- The ask: /review/ask.md',
     '',
     cause.conflicts
-      ? 'Keep the changes of both sides in each file that conflicts, and remove the conflict markers. Checkpoint, then call submit_build_log one time.'
+      ? `Keep the changes of both sides in each file that conflicts, and remove the conflict markers.${cause.merged ? ' Then fix the cause, not the check.' : ''} Checkpoint, then call submit_build_log one time.`
       : 'Fix the cause, not the check. Checkpoint, then call submit_build_log one time.',
   ].join('\n')
 }
@@ -841,6 +897,29 @@ function mergeCause(base: string, conflicts: string[]): Cause {
     report: null,
     checks: null,
     conflicts,
+  }
+}
+
+/**
+ * A red CI whose round starts after a base merge (D16). The cause keeps the CI failure, names the merge and its files,
+ * and gets the files that conflict.
+ */
+function afterBaseMerge(cause: Cause, base: string, merge: BaseMerge): Cause {
+  const conflicts = merge.conflicts.length > 0
+  return {
+    ...cause,
+    text: [
+      cause.text,
+      `# The host merged the base ${base.slice(0, 12)} into the branch before this round`,
+      '',
+      'CI tests the merge of the PR with the base, so the cause can come from the files of the merge:',
+      '',
+      ...merge.files.map((path) => `- ${path}`),
+      '',
+      ...(conflicts ? [`The files that conflict: ${merge.conflicts.join(', ')}. The merge is in progress. Your checkpoint commits it.`, ''] : []),
+    ].join('\n'),
+    merged: { base, files: merge.files },
+    ...(conflicts ? { conflicts: merge.conflicts } : {}),
   }
 }
 
@@ -1066,8 +1145,8 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
           '## Base merges',
           '',
           ...state.baseMerges.map(
-            ({ point, base, merge }) =>
-              `- Before ${point === 'ready' ? 'ready' : 'the merge'}: ${base.slice(0, 12)}, ${merge?.conflicts.length ? `conflict in ${merge.conflicts.join(', ')}` : 'clean'}. Files: ${merge?.files.join(', ') || 'none'}`,
+            (check) =>
+              `- Before ${check.point === 'repair' ? `repair round ${check.round}` : check.point === 'ready' ? 'ready' : 'the merge'}: ${check.base.slice(0, 12)}, ${check.merge?.conflicts.length ? `conflict in ${check.merge.conflicts.join(', ')}` : 'clean'}. Files: ${check.merge?.files.join(', ') || 'none'}`,
           ),
           '',
         ]
