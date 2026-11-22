@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { parseRepoConfig } from '../src/core/checks.ts'
-import { loadResearchDomain, parseResearchConfig, type ResearchConfig, type ResearchFiles } from '../src/core/research.ts'
+import { fansOut, fillCommand, loadResearchDomain, parseResearchConfig, type ResearchConfig, type ResearchFiles } from '../src/core/research.ts'
 import { StopError } from '../src/core/stop.ts'
 
 const source = '.agent-factory.json on main'
@@ -105,10 +106,46 @@ test('analyze is an optional command that uses only {prereg}', () => {
   rejects(commands({ analyze: 'run {prereg} {partition}' }), 'research.commands.analyze', /placeholder \{partition\}, but only \{prereg\} are permitted/)
 })
 
+const fanOut = { plan: 'python -m search.plan {prereg}', fetch: 'python -m search.fetch {prereg} {target}', unit: 'python -m search.unit {prereg} {unit}', merge: 'python -m search.merge {prereg} {units}' }
+
+test('the example of section 6.3 in the spec parses, and it fans out', () => {
+  const spec = readFileSync(new URL('../docs/specs/research-workflow.md', import.meta.url), 'utf8')
+  const section = spec.slice(spec.indexOf('### 6.3 '))
+  const json = /```json\n([\s\S]*?)\n```/.exec(section)?.[1]
+  assert.ok(json, 'section 6.3 has no JSON example')
+  const parsed = parse((JSON.parse(json) as { research: unknown }).research)
+  assert.deepEqual(parsed?.commands, { ...example.commands, analyze: 'python -m search.analyze {prereg}', ...fanOut })
+  assert.equal(parsed && fansOut(parsed), true)
+})
+
+test('plan, fetch, unit and merge are optional together, each with its own placeholders, and the config then fans out', () => {
+  const parsed = parse(commands(fanOut))
+  assert.deepEqual(parsed?.commands, { ...example.commands, ...fanOut })
+  assert.equal(parsed && fansOut(parsed), true)
+  assert.equal(fansOut(parseResearchConfig(example, source)), false)
+  for (const name of ['plan', 'fetch', 'unit', 'merge']) assert.equal(name in (parse(example)?.commands ?? {}), false)
+  const permitted: [string, string][] = [['plan', '\\{prereg\\}'], ['fetch', '\\{prereg\\} and \\{target\\}'], ['unit', '\\{prereg\\} and \\{unit\\}'], ['merge', '\\{prereg\\} and \\{units\\}']]
+  for (const [name, only] of permitted) {
+    rejects(commands({ ...fanOut, [name]: '' }), `research.commands.${name}`, /non-empty string/)
+    rejects(commands({ ...fanOut, [name]: 'run {prereg} {partition}' }), `research.commands.${name}`, new RegExp(`placeholder \\{partition\\}, but only ${only} are permitted`))
+  }
+  rejects(commands({ ...fanOut, known: 'run {target}' }), 'research.commands.known', /placeholder \{target\}, but only \{prereg\} are permitted/)
+})
+
+test('one to three of plan, fetch, unit and merge is an error that names the present and the missing commands', () => {
+  rejects(commands({ plan: fanOut.plan }), 'research.commands', /has plan but not fetch, unit, merge: give all of plan, fetch, unit and merge, or none of them/)
+  rejects(commands({ fetch: fanOut.fetch, merge: fanOut.merge }), 'research.commands', /has fetch, merge but not plan, unit/)
+  rejects(commands({ ...fanOut, unit: undefined }), 'research.commands', /has plan, fetch, merge but not unit/)
+})
+
+test('fillCommand replaces only the given placeholders, one time, and keeps a shell ${VAR}', () => {
+  assert.equal(fillCommand('run {prereg} {units} ${prereg} {other}', { prereg: "'{units}'", units: "'u'" }), "run '{units}' 'u' ${prereg} {other}")
+})
+
 test('timeouts are optional positive integers of milliseconds for the domain commands', () => {
   const { timeouts: _, ...without } = example
   assert.equal('timeouts' in (parse(without) ?? {}), false)
-  const all = { known: 1, inject: 2, evaluate: 3, reproduce: 4, analyze: 5 }
+  const all = { known: 1, inject: 2, evaluate: 3, reproduce: 4, analyze: 5, plan: 6, fetch: 7, unit: 8, merge: 9 }
   assert.deepEqual(parse(research({ timeouts: all }))?.timeouts, all)
   assert.deepEqual(parse(research({ timeouts: { inject: 60_000 } }))?.timeouts, { inject: 60_000 })
   assert.deepEqual(parse(research({ timeouts: {} }))?.timeouts, {})
@@ -116,6 +153,8 @@ test('timeouts are optional positive integers of milliseconds for the domain com
   assert.deepEqual(parse(research({ timeouts: { evaluate: 1_000 } }))?.timeouts, { evaluate: 1_000 })
   assert.deepEqual(parse(research({ timeouts: { analyze: 600_000 } }))?.timeouts, { analyze: 600_000 })
   rejects(research({ timeouts: { analyze: 0 } }), 'research.timeouts.analyze', /must be a positive integer of milliseconds/)
+  assert.deepEqual(parse(research({ timeouts: { unit: 1_800_000 } }))?.timeouts, { unit: 1_800_000 })
+  for (const name of ['plan', 'fetch', 'unit', 'merge']) rejects(research({ timeouts: { [name]: 1.5 } }), `research.timeouts.${name}`, /must be a positive integer of milliseconds/)
   for (const value of [0, -1, 1.5, '1000', null, Number.MAX_SAFE_INTEGER + 1])
     rejects(research({ timeouts: { known: value } }), 'research.timeouts.known', /must be a positive integer of milliseconds/)
   rejects(research({ timeouts: 60_000 }), 'research.timeouts', /must be an object/)

@@ -49,6 +49,8 @@ export type Env = {
   MODELS?: string
   /** JSON with the USD per million tokens of each model ID, for the Usage section and the cost budget. See README.md. */
   MODEL_PRICES?: string
+  /** JSON with the USD per vCPU second and GiB second of the containers, for the Usage section and the cost budget. See README.md. */
+  CONTAINER_PRICES?: string
   CI_TIMEOUT_MINUTES?: string
   PAUSE_POLL_SECONDS?: string
   /** The wall time in seconds that one alarm call plans for. A turn starts only when it fits, and its commands end by then. Default: 780. */

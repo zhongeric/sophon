@@ -347,6 +347,21 @@ test('a clean box copies only the tree, runs no setup, and runs its commands in 
   assert.deepEqual(commands, ['bash -c cat a.txt && pwd -P'])
 })
 
+test('a clean box writes the extra files into its directory after the tree', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'factory-clean-'))
+  const tree = MemoryFileSystem.create({ files: { '/a.txt': 'a' } })
+  const files = [
+    { data: new TextEncoder().encode('{"units": []}'), path: '.agent-factory/units/units.json' },
+    { data: new TextEncoder().encode('out'), path: '.agent-factory/units/u1/out/x.json' },
+  ]
+  await cleanBox(localBox(root, []), tree, 'clean-1', () => {}, undefined, files)
+  const dir = join(root, 'clean-1')
+
+  assert.equal(readFileSync(join(dir, 'a.txt'), 'utf8'), 'a')
+  assert.equal(readFileSync(join(dir, '.agent-factory/units/units.json'), 'utf8'), '{"units": []}')
+  assert.equal(readFileSync(join(dir, '.agent-factory/units/u1/out/x.json'), 'utf8'), 'out')
+})
+
 test('a clean box reads the exact bytes of a file, and refuses a path outside its directory or a missing file', async () => {
   const root = mkdtempSync(join(tmpdir(), 'factory-clean-'))
   const tree = MemoryFileSystem.create({ files: { '/a.txt': 'a' } })

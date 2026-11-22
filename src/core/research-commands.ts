@@ -1,5 +1,5 @@
 import { commandOptions, quote, setupOnce, type Machine, type RepoConfig } from './checks.ts'
-import type { ResearchConfig } from './research.ts'
+import { fillCommand, type ResearchConfig } from './research.ts'
 
 /** The domain commands of stages 6 and 11 (section 6.3 of docs/specs/research-workflow.md). */
 export type DomainCommand = 'known' | 'inject' | 'reproduce' | 'analyze'
@@ -18,6 +18,35 @@ export type DomainRun = { name: DomainCommand; command: string; exit_code: numbe
   | { json: DomainJson; problem: null }
   | { json: null; problem: string }
 )
+
+/**
+ * One run of plan or fetch. `problem` and `tail` are set exactly when the run failed or its last line is not valid.
+ * `tail` is the end of the output under a line that names the command, as in a failed calibration.
+ */
+export type CommandRun<Name extends string, Json> = { name: Name; command: string; exit_code: number | null; output: string } & (
+  | { json: Json; problem: null }
+  | { json: null; problem: string; tail: string }
+)
+
+/** One unit of a plan. The ID is a part of a scan slot name and a directory name. */
+export type PlanUnit = { id: string; targets: string[]; expected_seconds: number }
+
+/** The last line of plan: the targets to fetch and the units that use them. */
+export type Plan = { targets: string[]; units: PlanUnit[] }
+
+export type PlanRun = CommandRun<'plan', Plan>
+
+/** The last line of fetch and of unit: the data files that they write, by path relative to the checkout. */
+export type FileOutputs = { outputs: DomainOutputs }
+
+export type FetchRun = CommandRun<'fetch', FileOutputs>
+
+/**
+ * The manifest of the units directory that merge reads in place of {units}:
+ * - `<units>/<unit id>/<output path>`: each output file of each done unit.
+ * - `<units>/units.json`: this manifest, with each unit of the plan. `reason` tells why a failed unit failed.
+ */
+export type UnitsManifest = { units: { id: string; status: 'done' | 'failed'; attempts: number; reason?: string }[] }
 
 export type Calibration = { recall: number | null; threshold: number; outputs: DomainOutputs } & (
   | { pass: true }
@@ -60,8 +89,10 @@ function readsPrefix(item: unknown): string | null {
   return ['', '.', '..'].includes(parts.at(-1)!) ? `${segments.join('/')}/` : segments.join('/')
 }
 
-/** Parses the last non-empty line of the output by the contract of the command, or gives the problem. */
-function parseDomainOutput(name: DomainCommand, output: string): { json: DomainJson; problem: null } | { json: null; problem: string } {
+type Parsed<Json> = { json: Json; problem: null } | { json: null; problem: string }
+
+/** Parses the last non-empty line of the output as a JSON object with `parse`, which puts each problem into `problems`. */
+function parseLastLine<Json>(name: string, output: string, parse: (value: Record<string, unknown>, problems: string[]) => Json): Parsed<Json> {
   const line = output.split('\n').map((item) => item.trim()).filter((item) => item !== '').at(-1)
   if (line === undefined) return { json: null, problem: `${name} printed nothing, but its last line must be a JSON object` }
   let value: unknown
@@ -72,6 +103,31 @@ function parseDomainOutput(name: DomainCommand, output: string): { json: DomainJ
   }
   if (!isObject(value)) return { json: null, problem: `the last line of ${name} is not a JSON object` }
   const problems: string[] = []
+  const json = parse(value, problems)
+  if (problems.length > 0) return { json: null, problem: `the last line of ${name}: ${problems.join(', ')}` }
+  return { json, problem: null }
+}
+
+/**
+ * The outputs of a last line. With `files`, each path must also be relative to the checkout without . or .. segments,
+ * because the host writes the file at that path.
+ */
+function parseOutputs(value: unknown, problems: string[], files = false): DomainOutputs {
+  const outputs: DomainOutputs = {}
+  if (!isObject(value)) problems.push('outputs must be an object of path to SHA-256 hex')
+  else
+    for (const [path, hash] of Object.entries(value)) {
+      if (path.trim() === '') problems.push('an output path is empty')
+      else if (files && (path.includes('\\') || path.split('/').some((segment) => ['', '.', '..'].includes(segment))))
+        problems.push(`the output path ${path} must be relative, with / and without empty, . or .. segments`)
+      else if (typeof hash !== 'string' || !sha256Hex.test(hash.toLowerCase())) problems.push(`the hash of ${path} is not SHA-256 hex`)
+      else outputs[path] = hash.toLowerCase()
+    }
+  return outputs
+}
+
+/** The DomainJson of one object by the contract of the command. Each problem goes into `problems`. */
+function domainJson(name: DomainCommand, value: Record<string, unknown>, problems: string[]): DomainJson {
   let recall: number | null = null
   if (name === 'known') {
     if (typeof value.recall === 'number' && Number.isFinite(value.recall) && value.recall >= 0 && value.recall <= 1) recall = value.recall
@@ -84,16 +140,68 @@ function parseDomainOutput(name: DomainCommand, output: string): { json: DomainJ
     if (prefixes.length < items.length) problems.push('reads must be a list of non-empty path prefixes in the repository')
     else reads = prefixes
   }
-  const outputs: DomainOutputs = {}
-  if (!isObject(value.outputs)) problems.push('outputs must be an object of path to SHA-256 hex')
+  return { recall, outputs: parseOutputs(value.outputs, problems), reads }
+}
+
+const unitId = /^[A-Za-z0-9_-]{1,64}$/
+
+/** A list of non-empty strings without repeats, or null with the problem in `problems`. */
+function names(value: unknown, key: string, problems: string[]): string[] | null {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string' && item.trim() !== '')) {
+    problems.push(`${key} must be a list of non-empty strings`)
+    return null
+  }
+  const repeated = value.filter((item, index) => value.indexOf(item) !== index)
+  if (repeated.length > 0) problems.push(`${key} repeats ${[...new Set(repeated)].join(', ')}`)
+  return value
+}
+
+/** The Plan of the last line of plan. Each problem goes into `problems`. */
+function planJson(value: Record<string, unknown>, problems: string[]): Plan {
+  const targets = names(value.targets, 'targets', problems) ?? []
+  const units: PlanUnit[] = []
+  const ids = new Set<string>()
+  if (!Array.isArray(value.units)) problems.push('units must be a list')
   else
-    for (const [path, hash] of Object.entries(value.outputs)) {
-      if (path.trim() === '') problems.push('an output path is empty')
-      else if (typeof hash !== 'string' || !sha256Hex.test(hash.toLowerCase())) problems.push(`the hash of ${path} is not SHA-256 hex`)
-      else outputs[path] = hash.toLowerCase()
+    for (const [index, item] of value.units.entries()) {
+      const at = `units[${index}]`
+      if (!isObject(item)) {
+        problems.push(`${at} must be an object`)
+        continue
+      }
+      const { id, expected_seconds: seconds } = item
+      if (typeof id !== 'string' || !unitId.test(id)) problems.push(`${at}.id must match ${unitId.source}, because it is a part of a scan slot name and a directory name`)
+      else if (ids.has(id)) problems.push(`${at}.id repeats the unit ID ${id}`)
+      else ids.add(id)
+      const unitTargets = names(item.targets, `${at}.targets`, problems)
+      const unknown = (unitTargets ?? []).filter((target) => !targets.includes(target))
+      if (unknown.length > 0) problems.push(`${at}.targets has ${unknown.join(', ')}, which is not in targets`)
+      if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) problems.push(`${at}.expected_seconds must be a finite positive number`)
+      if (typeof id === 'string' && unitTargets !== null && typeof seconds === 'number') units.push({ id, targets: unitTargets, expected_seconds: seconds })
     }
-  if (problems.length > 0) return { json: null, problem: `the last line of ${name}: ${problems.join(', ')}` }
-  return { json: { recall, outputs, reads }, problem: null }
+  return { targets, units }
+}
+
+/** The FileOutputs of the last line of fetch or unit. Each problem goes into `problems`. */
+const fileOutputs = (value: Record<string, unknown>, problems: string[]): FileOutputs => ({ outputs: parseOutputs(value.outputs, problems, true) })
+
+/** Parses the last line of a unit on a scan box. The caller checks the exit code first. */
+export const parseUnitOutput = (output: string): Parsed<FileOutputs> => parseLastLine('unit', output, fileOutputs)
+
+/** The known part and the inject part of the last line of merge, each by the contract of that command. */
+function mergeParts(value: Record<string, unknown>, problems: string[]): Record<'known' | 'inject', DomainJson> {
+  const part = (name: 'known' | 'inject'): DomainJson => {
+    const given = value[name]
+    if (!isObject(given)) {
+      problems.push(`${name} must be an object`)
+      return { recall: null, outputs: {}, reads: null }
+    }
+    const own: string[] = []
+    const json = domainJson(name, given, own)
+    problems.push(...own.map((item) => `in ${name}, ${item}`))
+    return json
+  }
+  return { known: part('known'), inject: part('inject') }
 }
 
 /** The analyze command of a hypothesis with its {prereg} placeholder: the config command, else the fixed entry point in analysis/<id>/. */
@@ -114,6 +222,16 @@ export async function runDomainCommand(
   const [name, preregPath] = args
   const template = args[0] === 'analyze' ? analyzeCommand(config.research, args[2]) : config.research.commands[args[0]]
   const command = template.replaceAll('{prereg}', quote(preregPath))
+  const { exit_code, output, problem } = await runOnMachine(config, machine, name, command)
+  if (problem !== null) return { name, command, exit_code, output, json: null, problem }
+  return { name, command, exit_code, output, ...parseLastLine(name, output, (value, problems) => domainJson(name, value, problems)) }
+}
+
+/**
+ * Runs the setup one time for each machine, then the command with the check environment and the timeout of
+ * research.timeouts for `name`, else that of the checks. `problem` is set when the setup or the command failed.
+ */
+async function runOnMachine(config: RepoConfig, machine: Machine, name: DomainCommand | 'plan' | 'fetch' | 'merge', command: string) {
   const options = commandOptions(config)
   let setup = setups.get(machine)
   if (!setup) {
@@ -121,14 +239,67 @@ export async function runDomainCommand(
     setups.set(machine, setup)
   }
   const failed = await setup()
-  if (failed) return { name, command, exit_code: failed.exit_code, output: failed.output, json: null, problem: exitProblem(`the setup ${config.setup}`, failed.exit_code) }
-  const { exit_code, output } = await machine.run(command, { ...options, timeoutMs: config.research.timeouts?.[name] ?? options.timeoutMs })
-  if (exit_code !== 0) return { name, command, exit_code, output, json: null, problem: exitProblem(name, exit_code) }
-  return { name, command, exit_code, output, ...parseDomainOutput(name, output) }
+  if (failed) return { exit_code: failed.exit_code, output: failed.output, problem: exitProblem(`the setup ${config.setup}`, failed.exit_code) }
+  const { exit_code, output } = await machine.run(command, { ...options, timeoutMs: config.research?.timeouts?.[name] ?? options.timeoutMs })
+  return { exit_code, output, problem: exit_code === 0 ? null : exitProblem(name, exit_code) }
+}
+
+/** The command of a fan-out config, or an error when the config does not fan out. */
+function fanOutTemplate(config: RepoConfig, name: 'plan' | 'fetch' | 'unit' | 'merge'): string {
+  const template = config.research?.commands[name]
+  if (template === undefined) throw new Error(`the research config has no ${name} command`)
+  return template
+}
+
+/** Runs plan for one frozen prereg on a machine, as runDomainCommand runs a domain command. Zero units is a valid plan. */
+export async function runPlan(config: RepoConfig, machine: Machine, preregPath: string): Promise<PlanRun> {
+  const command = fillCommand(fanOutTemplate(config, 'plan'), { prereg: quote(preregPath) })
+  return lastLineRun('plan', command, await runOnMachine(config, machine, 'plan', command), planJson)
+}
+
+/** Runs fetch for one target of the plan on a machine, as runDomainCommand runs a domain command. */
+export async function runFetch(config: RepoConfig, machine: Machine, preregPath: string, target: string): Promise<FetchRun> {
+  const command = fillCommand(fanOutTemplate(config, 'fetch'), { prereg: quote(preregPath), target: quote(target) })
+  return lastLineRun('fetch', command, await runOnMachine(config, machine, 'fetch', command), fileOutputs)
+}
+
+/** A CommandRun from a finished command and the parser of its last line. */
+function lastLineRun<Name extends 'plan' | 'fetch', Json>(
+  name: Name,
+  command: string,
+  ran: { exit_code: number | null; output: string; problem: string | null },
+  parse: (value: Record<string, unknown>, problems: string[]) => Json,
+): CommandRun<Name, Json> {
+  const run = { name, command, exit_code: ran.exit_code, output: ran.output }
+  const parsed = ran.problem === null ? parseLastLine(name, ran.output, parse) : { json: null, problem: ran.problem }
+  return parsed.problem === null ? { ...run, json: parsed.json, problem: null } : { ...run, json: null, problem: parsed.problem, tail: tails([run]) }
+}
+
+/**
+ * The shell command of one unit on a scan box. A scan box is a new machine, thus the setup of the config runs first in
+ * the same command. The caller gives the timeout of the unit.
+ */
+export function unitCommand(config: RepoConfig, preregPath: string, unit: string): string {
+  const command = fillCommand(fanOutTemplate(config, 'unit'), { prereg: quote(preregPath), unit: quote(unit) })
+  return config.setup ? `(${config.setup}\n) && ${command}` : command
+}
+
+/**
+ * Runs merge on a machine, with {units} as the path of the units directory (UnitsManifest). Its last line has a known
+ * part and an inject part, each by the contract of that command. The result is a known run and an inject run of the
+ * same command, exit code and output, for calibrationVerdict. When merge fails, both runs fail with its problem.
+ */
+export async function runMerge(config: RepoConfig, machine: Machine, preregPath: string, unitsDir: string): Promise<{ known: DomainRun; inject: DomainRun }> {
+  const command = fillCommand(fanOutTemplate(config, 'merge'), { prereg: quote(preregPath), units: quote(unitsDir) })
+  const { exit_code, output, problem } = await runOnMachine(config, machine, 'merge', command)
+  const parsed = problem === null ? parseLastLine('merge', output, mergeParts) : { json: null, problem }
+  const run = (name: 'known' | 'inject'): DomainRun =>
+    parsed.problem === null ? { name, command, exit_code, output, json: parsed.json[name], problem: null } : { name, command, exit_code, output, json: null, problem: parsed.problem }
+  return { known: run('known'), inject: run('inject') }
 }
 
 /** The tails of the runs, about failureTailChars together, each under a line that names its command. */
-function tails(runs: DomainRun[]): string {
+function tails(runs: { name: string; command: string; exit_code: number | null; output: string }[]): string {
   const chars = Math.floor(failureTailChars / Math.max(runs.length, 1))
   return runs.map((run) => `--- ${run.name}: ${run.command} (exit code ${run.exit_code})\n${run.output.slice(-chars)}`).join('\n')
 }

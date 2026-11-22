@@ -10,10 +10,15 @@ import { StopError } from '../src/core/stop.ts'
 import {
   budgetGate,
   BudgetStop,
+  checkContainerPriced,
   checkPriced,
   clearBudget,
+  computeCost,
+  computeOf,
   costOf,
+  finishCompute,
   parseBudget,
+  parseContainerPrices,
   parsePrices,
   recordUsage,
   resolveBudget,
@@ -21,6 +26,8 @@ import {
   usageOf,
   usageSection,
   zeroTokens,
+  startCompute,
+  type ContainerPrices,
   type Prices,
   type UsageRow,
 } from '../src/core/usage.ts'
@@ -170,7 +177,7 @@ function spentTen(options: { notice?: boolean } = {}) {
   const prices: Prices = { m1: { input: 1e6, cached_input: 0, cache_write: 0, output: 0 } }
   const { channel, posted, replies, notices, events } = scriptedChannel({}, options.notice ?? true)
   const logs: string[] = []
-  const gate = (more: { extraRows?: () => UsageRow[]; recommend?: boolean; stopAtBudget?: boolean } = {}, on: Ledger = ledger) =>
+  const gate = (more: { extraRows?: () => UsageRow[]; recommend?: boolean; stopAtBudget?: boolean; containerPrices?: ContainerPrices } = {}, on: Ledger = ledger) =>
     budgetGate({ ledger: on, channel, runId: 'run-1', prices, log: (line) => void logs.push(line), ...more })
   return { ledger, posted, replies, notices, events, logs, gate }
 }
@@ -476,3 +483,103 @@ function fileLedgerCopy(ledger: Ledger, keys = ['budget']): Ledger {
   for (const key of keys) copy.put(key, ledger.get(key))
   return fileLedger(path)
 }
+
+const standard4 = { type: 'standard-4', vcpu: 4, gib: 12 }
+const containerPrices: ContainerPrices = { vcpu_second: 0.00002, gib_second: 0.0000025 }
+
+test('CONTAINER_PRICES needs both non-negative prices, and an instance entry needs both too', () => {
+  assert.equal(parseContainerPrices(undefined), undefined)
+  assert.equal(parseContainerPrices(' '), undefined)
+  assert.deepEqual(parseContainerPrices(JSON.stringify(containerPrices)), containerPrices)
+  const override = { ...containerPrices, instances: { 'standard-4': { vcpu_second: 0.00001, gib_second: 0 } } }
+  assert.deepEqual(parseContainerPrices(JSON.stringify(override)), override)
+  const stops = (setting: string, message: RegExp) =>
+    assert.throws(() => parseContainerPrices(setting), (error) => error instanceof StopError && /^CONTAINER_PRICES/.test(error.message) && message.test(error.message))
+  stops('{vcpu', /not valid JSON/)
+  stops('[]', /must be a JSON object/)
+  stops('3', /must be a JSON object/)
+  stops(JSON.stringify({ ...containerPrices, memory: 1 }), /memory is not a known key/)
+  stops(JSON.stringify({ gib_second: 0 }), /vcpu_second must be a non-negative number/)
+  stops(JSON.stringify({ ...containerPrices, gib_second: -1 }), /gib_second must be a non-negative number/)
+  stops(JSON.stringify({ ...containerPrices, vcpu_second: '1' }), /vcpu_second must be a non-negative number/)
+  stops(JSON.stringify({ ...containerPrices, vcpu_second: 1e999 }), /vcpu_second must be a non-negative number/)
+  stops(JSON.stringify({ ...containerPrices, instances: [] }), /instances must be an object/)
+  stops(JSON.stringify({ ...containerPrices, instances: { big: 1 } }), /instances\.big must be an object/)
+  stops(JSON.stringify({ ...containerPrices, instances: { big: { vcpu_second: 1, gib_second: 1, disk: 1 } } }), /instances\.big\.disk is not a known key/)
+  stops(JSON.stringify({ ...containerPrices, instances: { big: { vcpu_second: 1 } } }), /instances\.big\.gib_second must be a non-negative number/)
+})
+
+test('checkContainerPriced stops a run without CONTAINER_PRICES', () => {
+  checkContainerPriced(containerPrices)
+  assert.throws(() => checkContainerPriced(undefined), (error) => error instanceof StopError && /budget and a fan-out config, but CONTAINER_PRICES is not set/.test(error.message))
+})
+
+test('computeCost bills vCPU and GiB seconds, with the price of the instance type when it has one, and nothing for the local machine', () => {
+  assert.ok(Math.abs(computeCost(100, standard4, containerPrices) - 100 * (4 * 0.00002 + 12 * 0.0000025)) < 1e-15)
+  const override = { ...containerPrices, instances: { 'standard-4': { vcpu_second: 0.001, gib_second: 0 } } }
+  assert.ok(Math.abs(computeCost(100, standard4, override) - 0.4) < 1e-15)
+  assert.ok(Math.abs(computeCost(100, { type: 'basic', vcpu: 1, gib: 1 }, override) - 100 * 0.0000225) < 1e-15)
+  assert.equal(computeCost(100, null, override), 0)
+})
+
+test('a repeated start keeps the first start time, and the first finish stays', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'factory-usage-')), 'state.json')
+  const ledger = fileLedger(path)
+  startCompute(ledger, 'unit.c1.u1.1', 'unit u1', standard4, 1_000)
+  startCompute(ledger, 'plan', 'plan', null, 2_000)
+  // A replay after a pause starts the same keys again.
+  const resumed = fileLedger(path)
+  startCompute(resumed, 'unit.c1.u1.1', 'unit u1', standard4, 50_000)
+  finishCompute(resumed, 'unit.c1.u1.1', 61_000)
+  finishCompute(resumed, 'unit.c1.u1.1', 90_000)
+  finishCompute(resumed, 'missing', 90_000)
+  assert.deepEqual(computeOf(resumed, 12_000), [
+    { step: 'unit u1', instance: standard4, seconds: 60 },
+    { step: 'plan', instance: null, seconds: 10 },
+  ])
+  assert.deepEqual(computeOf(fileLedger(path), 12_000), computeOf(resumed, 12_000))
+})
+
+test('the Usage section shows the compute rows with USD, or with seconds and no price, and only when there are rows', () => {
+  const ledger = memoryLedger()
+  recordUsage(ledger, 'a', 'm1', [call('r1', 1, { input_tokens: 1000, output_tokens: 100 })])
+  startCompute(ledger, 'unit', 'unit u1', standard4, 0)
+  finishCompute(ledger, 'unit', 100_000)
+  startCompute(ledger, 'known', 'known', null, 0)
+  finishCompute(ledger, 'known', 30_400)
+  const rows = usageOf(ledger).agents
+  const prices: Prices = { m1: price }
+  const plain = usageSection(rows, prices)
+  assert.deepEqual(usageSection(rows, prices, undefined, { rows: [], prices: containerPrices }), plain)
+
+  const priced = usageSection(rows, prices, undefined, { rows: computeOf(ledger), prices: containerPrices })
+  assert.deepEqual(priced.slice(0, plain.length), plain)
+  const section = priced.join('\n')
+  assert.match(section, /\| Step \| Instance \| Seconds \| USD \|/)
+  assert.match(section, /\| unit u1 \| standard-4 \| 100 \| \$0\.0110 \|/)
+  assert.match(section, /\| known \| local \| 30 \| \$0\.0000 \|/)
+  assert.match(section, /\| \*\*Total\*\* \| {2}\| 130 \| \$0\.0110 \|/)
+
+  const unpriced = usageSection(rows, prices, { limit: 5, spent: 1 }, { rows: computeOf(ledger) }).join('\n')
+  assert.match(unpriced, /CONTAINER_PRICES is not set/)
+  assert.match(unpriced, /\| unit u1 \| standard-4 \| 100 \| no price \|/)
+  assert.match(unpriced, /\| \*\*Total\*\* \| {2}\| 130 \| no price \|\n\nBudget: \$5\.00\./)
+})
+
+test('with CONTAINER_PRICES, the gate counts the compute USD toward the notice and lists compute steps', async () => {
+  const { ledger, notices, gate } = spentTen()
+  // 4 vCPU at $1 per vCPU-second for 1 second: $4.
+  const expensive: ContainerPrices = { vcpu_second: 1, gib_second: 0 }
+  startCompute(ledger, 'unit', 'unit u1', standard4, 0)
+  finishCompute(ledger, 'unit', 1_000)
+  startCompute(ledger, 'known', 'known', null, 0)
+  finishCompute(ledger, 'known', 60_000)
+  resolveBudget(ledger, 12)
+  assert.equal(gate().spent(), 10)
+  await gate().check()
+  assert.equal(notices.length, 0)
+  assert.equal(gate({ containerPrices: expensive }).spent(), 14)
+  await gate({ containerPrices: expensive }).check()
+  assert.equal(notices.length, 1)
+  assert.match(notices[0] ?? '', /^The run spent about \$14\.00 of its budget of \$12\.00\..* The most expensive steps: a \$10\.00, unit u1 \$4\.00\.$/)
+})

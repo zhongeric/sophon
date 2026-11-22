@@ -7,7 +7,7 @@ import type { Branch } from '../core/platform.ts'
 import { commentChannel, type Comments } from '../core/questions.ts'
 import type { ResearchDomain } from '../core/research.ts'
 import { StopError } from '../core/stop.ts'
-import { parsePrices } from '../core/usage.ts'
+import { parseContainerPrices, parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
 import { cutReport } from '../core/workflows/develop.ts'
 import { defaultResearchModels, research, researchProviders, type ResearchInput, type ResearchModels } from '../core/workflows/research.ts'
@@ -24,6 +24,7 @@ import { loopChoices, type PreflightNeeds } from './preflight.ts'
 import { githubPulls } from './pulls.ts'
 import { reviewPass } from './review.ts'
 import { answerersOf, credentialsFor, Runs, setupTimeoutMs, type Call } from './runs.ts'
+import { scanPool, standard4 } from './scan-pool.ts'
 import { sqlFiles } from './storage.ts'
 import { encodePath } from './trees.ts'
 
@@ -75,8 +76,8 @@ export class ResearchRuns extends Runs<ResearchRequest> {
       channel: commentChannel({ answerers: answerersOf(this.env, config.answerers), comments, pollMs: 0, waitMs: 0 }),
       checker,
       // A new directory for each step key, so that no file of an earlier command is in it. Only the last one stays. A replay
-      // of the step, for example after a pause on its job, keeps the directory of the key.
-      async cleanBox(commit, key) {
+      // of the step, for example after a pause on its job, keeps the directory of the key and its files.
+      async cleanBox(commit, key, files) {
         const dirKey = `clean-dir:${key}`
         let dir = ledger.get<string>(dirKey)
         if (dir === undefined) {
@@ -90,9 +91,11 @@ export class ResearchRuns extends Runs<ResearchRequest> {
           ledger.put(dirKey, dir)
         }
         const tree = await commitTree({ ledger, run, sql }, commit)
-        return cleanBox(box, tree, dir, log, { deadline: call.deadline, key, ledger, runner: jobs })
+        return cleanBox(box, tree, dir, log, { deadline: call.deadline, key, ledger, runner: jobs }, files)
       },
+      compute: { runBox: standard4 },
       config,
+      containerPrices: parseContainerPrices(this.env.CONTAINER_PRICES),
       credentials: credentialsFor(this.env, researchProviders(input.models)),
       domain,
       egress: {
@@ -109,6 +112,7 @@ export class ResearchRuns extends Runs<ResearchRequest> {
       prices: parsePrices(this.env.MODEL_PRICES),
       pulls: githubPulls(gh, owner, repo, input.baseRef),
       review: (review) => reviewPass(this.env, request, ledger, review),
+      scanBoxes: scanPool(this.env.SCAN_BOXES),
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
     return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }

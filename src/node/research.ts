@@ -9,7 +9,7 @@ import { defaultEndpoints, type Credentials } from '../core/providers.ts'
 import { commentChannel, PausedError, type Channel } from '../core/questions.ts'
 import type { ModelChoice } from '../core/roles.ts'
 import { StopError } from '../core/stop.ts'
-import { parseBudget, parsePrices } from '../core/usage.ts'
+import { parseBudget, parseContainerPrices, parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels } from '../core/workflows/code-review-loop.ts'
 import { defaultResearchModels, research, researchProviders, type ResearchInput, type ResearchModels } from '../core/workflows/research.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
@@ -40,7 +40,8 @@ Options:
   --base <branch>        The branch to read the config from and to branch from (default: main)
   --run <id>             Resume a run; the other options come from its ledger
   --runs-dir <path>      Where runs live (default: <agent-factory>/runs)
-  --parallel <n>         At most n surveyors or preregistrars at the same time (default 3)
+  --parallel <n>         At most n surveyors or preregistrars (default 3), or units of a fan-out (default 32), at
+                         the same time
   --models <path>        JSON that overrides models: { "surveyor": ..., "generators": [..., ...], "skeptic": ... }
   --claude-plan          Sign Claude requests with the nc Claude login instead of ANTHROPIC_API_KEY
   --wait <minutes>       How long to wait for answers before the run pauses (default 60)
@@ -51,7 +52,8 @@ Questions go to the terminal when it is interactive, else to a file in the run d
 go to the PR. A paused run exits with status 3; resume it with --run <id>.
 
 Environment: ANTHROPIC_API_KEY, OPENAI_API_KEY, the secrets that the research config names, ALLOWED_MODELS (model
-IDs, comma-separated), MODEL_PRICES (JSON: USD per million tokens of each model ID, see README.md).`
+IDs, comma-separated), MODEL_PRICES (JSON: USD per million tokens of each model ID, see README.md), CONTAINER_PRICES
+(JSON: USD per vCPU second and GiB second of the scan containers).`
 
 async function main(): Promise<number> {
   const { values } = parseArgs({
@@ -77,6 +79,7 @@ async function main(): Promise<number> {
   const budget = values.budget !== undefined ? parseBudget(values.budget) : undefined
   const waitMs = parseWait(values.wait ?? String(defaultWaitMinutes))
   const prices = parsePrices(process.env.MODEL_PRICES)
+  const containerPrices = parseContainerPrices(process.env.CONTAINER_PRICES)
   const runsDir = resolve(values['runs-dir'] ?? fileURLToPath(new URL('../../runs/', import.meta.url)))
   const started = values.run ? resumeInput(runsDir, values.run) : await newInput(values, budget)
   const { repo } = started
@@ -91,6 +94,7 @@ async function main(): Promise<number> {
   const run = gh(repo)
   const deps = await nodeResearch({
     channel: interactive ? terminal : waiting(fileChannel(dir), waitMs),
+    ...(containerPrices ? { containerPrices } : {}),
     credentials,
     input,
     log: (line) => console.error(`[${new Date().toTimeString().slice(0, 8)}] ${line}`),

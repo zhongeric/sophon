@@ -4,8 +4,23 @@ import type { Machine, RepoConfig } from '../checks.ts'
 import { mergeHypotheses, type Dossier, type NumberedHypothesis, type Objection } from '../claims.ts'
 import type { BuildLog } from '../develop-steps.ts'
 import { checkEgress, type EgressHost } from '../egress.ts'
+import {
+  defaultUnitParallel,
+  runUnits,
+  treeInputs,
+  unitConflicts,
+  unitInputs,
+  unitKey,
+  unitsDir,
+  unitsFiles,
+  holdoutRefusal,
+  type InputFile,
+  type ScanBoxes,
+  type UnitConflict,
+} from '../fanout.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { route, routeQuestions } from '../plan.ts'
+import { PlannedStop } from '../planned-stop.ts'
 import type { AgentStore, Branch, Branches, Checker, Files, Guides, PullRequests } from '../platform.ts'
 import { pool } from '../pool.ts'
 import { freezePrereg, type Prereg } from '../prereg.ts'
@@ -19,9 +34,13 @@ import {
   needsRecalibration,
   preregThreshold,
   runDomainCommand,
+  runFetch,
+  runMerge,
+  runPlan,
   type DomainOutputs,
   type DomainRun,
   type HashMismatch,
+  type PlanUnit,
 } from '../research-commands.ts'
 import {
   analyst,
@@ -46,10 +65,31 @@ import {
   type ResearchIntake,
   type VetRound,
 } from '../research-steps.ts'
-import type { ResearchDomain } from '../research.ts'
+import { fansOut, type ResearchDomain } from '../research.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
-import { BudgetStop, belowBudget, budgetGate, checkPriced, clearBudget, parseBudget, resolveBudget, usageOf, usageSection, type Prices, type RunUsage, type UsageRow } from '../usage.ts'
+import {
+  BudgetStop,
+  belowBudget,
+  budgetGate,
+  checkContainerPriced,
+  checkPriced,
+  clearBudget,
+  computeCost,
+  computeOf,
+  finishCompute,
+  formatUsd,
+  parseBudget,
+  resolveBudget,
+  startCompute,
+  usageOf,
+  usageSection,
+  type ContainerPrices,
+  type InstanceSpec,
+  type Prices,
+  type RunUsage,
+  type UsageRow,
+} from '../usage.ts'
 import {
   checkAllowedModels,
   checkFamilySwap,
@@ -105,7 +145,7 @@ export type ResearchInput = {
   models: ResearchModels
   /** The models that the run accepts. Default: defaultAllowedModels. */
   allowedModels?: string[]
-  /** At most this many surveyors or preregistrars at the same time. */
+  /** At most this many surveyors or preregistrars (default 3), and units of a fan-out (default 32), at the same time. */
   parallel?: number
   /** The cost budget in USD before the intake. The cap that the user gives at intake replaces it. */
   budget?: number
@@ -135,12 +175,19 @@ export type ResearchDeps = {
   /**
    * A machine on a new checkout of a commit, outside every branch worktree, for the calibration and the reproduction.
    * `key` names the step. A platform that resumes a step in a later call can give the same checkout for the same key.
+   * The platform writes `files` into the new checkout, for example the units directory of merge.
    */
-  cleanBox(commit: string, key: string): Promise<ResearchBox>
+  cleanBox(commit: string, key: string, files?: InputFile[]): Promise<ResearchBox>
   /** Runs the code review loop on a commit of the run branch. */
   review(request: ReviewRequest): Promise<LoopResult>
   domain: ResearchDomain
   egress: EgressHost
+  /** The boxes of the units of a fan-out config. A fan-out config without them stops the run. */
+  scanBoxes?: ScanBoxes
+  /** USD per vCPU second and GiB second, from CONTAINER_PRICES. */
+  containerPrices?: ContainerPrices
+  /** With it, the run meters each domain command on a run box of this instance (null: the local machine). */
+  compute?: { runBox: InstanceSpec | null }
   log(line: string): void
 }
 
@@ -236,8 +283,22 @@ type ReportState = {
 }
 
 /**
+ * The fan-out of one calibration round. `plan` and `fetch` hold artifact IDs for command output and data files.
+ * `conflicts` holds each second result of a unit of the round.
+ */
+type FanOutRound = {
+  plan: string
+  fetch: string[]
+  units: { id: string; status: 'done' | 'failed'; attempts: number; reason?: string }[]
+  failed: string[]
+  retries: number
+  conflicts: UnitConflict[]
+}
+
+/**
  * One calibration round on a clean checkout. `known` and `inject` hold artifact IDs for command output and declared files.
- * `reads` holds the reads lists of known and inject, each null when the command did not give one.
+ * `reads` holds the reads lists of known and inject, each null when the command did not give one. `fanout` is set
+ * only for a fan-out config.
  */
 type CalibrationRound = {
   round: number
@@ -251,7 +312,12 @@ type CalibrationRound = {
   pass: boolean
   reason: string
   tail: string
+  fanout?: FanOutRound
 }
+
+/** The ledger record of the last plan, for the cost cap question of a later intake. */
+type PlanRecord = { commit: string; hypothesis: string; round: number; units: number; seconds: number }
+const planKey = 'plan'
 
 /** One analyze run on a clean checkout of `head`. `command` is the artifact ID of its output, `files` of each declared output file. */
 type AnalysisRun = { round: number; head: string; pass: boolean; outputs: DomainOutputs; command: string; files: string[]; reason: string; tail: string }
@@ -287,11 +353,17 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   } catch (error) {
     throw new StopError(error instanceof Error ? error.message : String(error))
   }
+  const fanOut = fansOut(domain.config)
+  if (fanOut && !deps.scanBoxes) throw new StopError('the research config has plan, fetch, unit and merge, but this platform gives no scan boxes for the units')
   const prices = deps.prices ?? {}
   // After the intake, the recorded budget is the cap, so that a resume keeps the cap or a later raise.
   const capped = ledger.get<Cap>(capKey)
   const recordedBudget = capped ? (capped.usd ?? undefined) : input.budget
-  if (resolveBudget(ledger, recordedBudget, input.budgetOverride) !== undefined) checkPriced(researchModelIds(models), prices)
+  const checkPrices = () => {
+    checkPriced(researchModelIds(models), prices)
+    if (fanOut) checkContainerPriced(deps.containerPrices)
+  }
+  if (resolveBudget(ledger, recordedBudget, input.budgetOverride) !== undefined) checkPrices()
   const state: ReportState = {
     input,
     intake: null,
@@ -313,6 +385,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   // The review pass keeps its usage in its own ledger, so its rows count here as extra rows.
   const budget = budgetGate({
     channel: deps.channel,
+    containerPrices: deps.containerPrices,
     extraRows: () => spentPasses().map(reviewRow),
     ledger,
     log: deps.log,
@@ -358,7 +431,8 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   }
   const finish: Finish = async (status, note) => {
     const limit = budget.limit()
-    const usage = usageSection([...usageOf(ledger).agents, ...spentPasses().map(reviewRow)], prices, limit === undefined ? undefined : { limit, spent: budget.spent() })
+    const spent = limit === undefined ? undefined : { limit, spent: budget.spent() }
+    const usage = usageSection([...usageOf(ledger).agents, ...spentPasses().map(reviewRow)], prices, spent, { rows: computeOf(ledger), prices: deps.containerPrices })
     const report = renderReport(state, status, note, decisions(ledger), usage)
     deps.files.write('report.md', report)
     // A resumed run can end with another result. The PR then gets the new report, but never the same report again.
@@ -383,14 +457,20 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   // 0. Intake: no survey before the user confirms the program and sets the cost cap.
   const intook = await step(ledger, 'intake', () => researchIntake(context, 'intake', models.intake))
   state.intake = intook
-  // Without a price for each model, a cap cannot work, so the question recommends no cap.
-  const priced = researchModelIds(models).every((model) => model in prices)
-  const [confirm, capAsk] = hostQuestions(intook, priced ? (budget.limit() ?? defaultCap) : undefined)
+  // Without a price for each model, and for a fan-out config also CONTAINER_PRICES, a cap cannot work, so the question recommends no cap.
+  const modelsPriced = researchModelIds(models).every((model) => model in prices)
+  const notes = [
+    ...(modelsPriced ? [] : ['MODEL_PRICES has no price for some models of this run, and a cap needs a price for each model.']),
+    ...(fanOut && !deps.containerPrices ? ['CONTAINER_PRICES is not set, and a cap with a fan-out config needs it.'] : []),
+    ...(fanOut ? [planNote(ledger.get<PlanRecord>(planKey), deps)] : []),
+  ]
+  const priced = modelsPriced && (!fanOut || deps.containerPrices !== undefined)
+  const [confirm, capAsk] = hostQuestions(intook, priced ? (budget.limit() ?? defaultCap) : undefined, notes)
   const answers = await ask('intake', [...intook.questions, confirm, capAsk])
   if (route(asDevelopIntake(intook), answers).stop) return finish('stopped', 'You stopped the run at intake.')
   if (!capped) {
     const first = answers.find((answer) => answer.id === capAsk.id)?.answer ?? noCap
-    const cap = await askUntil('cap', capAsk, first, (text) => parseCap(text, researchModelIds(models), prices))
+    const cap = await askUntil('cap', capAsk, first, (text) => parseCap(text, checkPrices))
     applyCap(ledger, cap)
     ledger.put(capKey, { usd: cap ?? null } satisfies Cap)
   }
@@ -753,16 +833,23 @@ const calibrationLine = (hypothesis: string, calibration: CalibrationRound) =>
 
 const analysisLine = (hypothesis: string, run: AnalysisRun) => `Analysis round ${run.round} of ${hypothesis} failed: ${oneLine(run.reason)}`
 
-/** Keeps the output of a domain command in the run store. */
-function keep(deps: ResearchDeps, run: DomainRun, hypothesis: string, round: number): Promise<string> {
+/** Keeps the output of a command in the run store. */
+function keep(deps: ResearchDeps, run: { name: string; command: string; output: string }, hypothesis: string, round: number): Promise<string> {
   const labels = { hypothesis, command: run.name, round: String(round) }
   return deps.egress.artifacts.put(new TextEncoder().encode(run.output), { source: { command: run.command }, media_type: 'text/plain', labels })
 }
 
-/** Keeps each declared output before another command can replace or remove it. */
-async function keepOutputs(deps: ResearchDeps, box: ResearchBox, run: DomainRun, hypothesis: string, round: number): Promise<{ run: DomainRun; artifacts: string[] }> {
-  const artifacts = [await keep(deps, run, hypothesis, round)]
-  for (const [path, hash] of Object.entries(run.json?.outputs ?? {})) {
+/** Keeps each declared output file of a command. `problem` names the first file that is missing or has another hash. */
+async function keepFiles(
+  deps: ResearchDeps,
+  box: ResearchBox,
+  run: { name: string; command: string },
+  outputs: DomainOutputs,
+  hypothesis: string,
+  round: number,
+): Promise<{ artifacts: string[]; problem: string | null }> {
+  const artifacts: string[] = []
+  for (const [path, hash] of Object.entries(outputs)) {
     try {
       const bytes = await box.read(path)
       if ((await artifactId(bytes)) !== hash) throw new Error(`the file does not match SHA-256 ${hash}`)
@@ -772,10 +859,48 @@ async function keepOutputs(deps: ResearchDeps, box: ResearchBox, run: DomainRun,
         labels: { hypothesis, command: run.name, round: String(round), path },
       }))
     } catch (error) {
-      return { run: { ...run, json: null, problem: `${run.name} output ${path}: ${error instanceof Error ? error.message : String(error)}` }, artifacts }
+      return { artifacts, problem: `${run.name} output ${path}: ${error instanceof Error ? error.message : String(error)}` }
     }
   }
-  return { run, artifacts }
+  return { artifacts, problem: null }
+}
+
+/** Keeps the output and each declared output file before another command can replace or remove them. */
+async function keepOutputs(deps: ResearchDeps, box: ResearchBox, run: DomainRun, hypothesis: string, round: number): Promise<{ run: DomainRun; artifacts: string[] }> {
+  const output = await keep(deps, run, hypothesis, round)
+  const files = await keepFiles(deps, box, run, run.json?.outputs ?? {}, hypothesis, round)
+  const artifacts = [output, ...files.artifacts]
+  return files.problem === null ? { run, artifacts } : { run: { ...run, json: null, problem: files.problem }, artifacts }
+}
+
+/**
+ * Runs a command on a run box under a compute entry `key`, when the platform meters run boxes. A planned stop keeps
+ * the entry open, because the next call continues the same work.
+ */
+async function metered<T>(deps: ResearchDeps, key: string, run: () => Promise<T>): Promise<T> {
+  if (!deps.compute) return run()
+  startCompute(deps.ledger, key, key, deps.compute.runBox)
+  let stopped = false
+  try {
+    return await run()
+  } catch (error) {
+    stopped = error instanceof PlannedStop
+    throw error
+  } finally {
+    if (!stopped) finishCompute(deps.ledger, key)
+  }
+}
+
+/** The expected compute cost of `seconds` of units on the scan boxes. */
+function computeEstimate(seconds: number, deps: ResearchDeps): string {
+  if (!deps.containerPrices || !deps.scanBoxes) return 'unknown, because CONTAINER_PRICES is not set'
+  return `about ${formatUsd(computeCost(seconds, deps.scanBoxes.instance, deps.containerPrices))}`
+}
+
+/** The note of the cost cap question about the compute cost of the units. */
+function planNote(plan: PlanRecord | undefined, deps: ResearchDeps): string {
+  if (!plan) return 'The compute cost is unknown until stage 6 runs plan.'
+  return `The last plan (${plan.hypothesis}, calibration round ${plan.round}) has ${plan.units} units of ${plan.seconds} expected seconds. The expected compute cost is ${computeEstimate(plan.seconds, deps)}.`
 }
 
 /**
@@ -790,12 +915,14 @@ async function calibrate(stages: Stages, analysis: Analysis): Promise<Calibratio
   const calibration = await step(deps.ledger, key, async (): Promise<CalibrationRound> => {
     const threshold = preregThreshold(new TextDecoder().decode(await branch.tree.read(`/${path}`)))
     const head = await branch.head()
+    if (fansOut(deps.domain.config)) return fanOutRound(stages, analysis, { key, round, head, threshold })
     const box = await deps.cleanBox(head, key)
     // A new copy runs known again. Reuse its snapshot only on that copy, because inject can change its files.
-    const knownRun = await runDomainCommand(deps.config, box, 'known', path)
+    const knownRun = await metered(deps, `${key}.known`, () => runDomainCommand(deps.config, box, 'known', path))
     const knownId = await artifactId(new TextEncoder().encode(JSON.stringify(knownRun)))
     const known = await step(deps.ledger, `${key}.known.${box.id}.${knownId}`, async () => keepOutputs(deps, box, knownRun, hypothesis, round))
-    const inject = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'inject', path), hypothesis, round)
+    const injectRun = await metered(deps, `${key}.inject`, () => runDomainCommand(deps.config, box, 'inject', path))
+    const inject = await keepOutputs(deps, box, injectRun, hypothesis, round)
     const verdict = calibrationVerdict(known.run, inject.run, threshold)
     return {
       round,
@@ -813,6 +940,95 @@ async function calibrate(stages: Stages, analysis: Analysis): Promise<Calibratio
   return calibration
 }
 
+/** The plan and the fetched data of one fan-out round. `reason` and `tail` are set when plan or a fetch failed. */
+type Planned = { plan: string; fetch: string[]; fetched: Record<string, DomainOutputs>; units: PlanUnit[]; reason: string; tail: string }
+
+/**
+ * Stage 6 of a fan-out config: plan and fetch on one clean checkout, the units on the scan boxes, then merge on a new
+ * clean checkout with the units directory. A scan box never gets the holdout file or a holdout target (RG1).
+ */
+async function fanOutRound(stages: Stages, analysis: Analysis, at: { key: string; round: number; head: string; threshold: number }): Promise<CalibrationRound> {
+  const { deps, input } = stages
+  const { ledger } = deps
+  const { key, round, head, threshold } = at
+  const { hypothesis, path, sha256 } = analysis.freeze
+  const boxes = deps.scanBoxes
+  if (!boxes) throw new StopError('the research config has plan, fetch, unit and merge, but this platform gives no scan boxes for the units')
+  const planned = await step(ledger, `${key}.plan`, async (): Promise<Planned> => {
+    const box = await deps.cleanBox(head, `${key}.plan`)
+    const planRun = await metered(deps, `${key}.plan`, () => runPlan(deps.config, box, path))
+    const plan = await keep(deps, planRun, hypothesis, round)
+    if (planRun.problem !== null) return { plan, fetch: [], fetched: {}, units: [], reason: planRun.problem, tail: planRun.tail }
+    const refused = holdoutRefusal(planRun.json.targets, deps.domain.holdout.targets)
+    if (refused !== null) return { plan, fetch: [], fetched: {}, units: [], reason: refused, tail: '' }
+    const fetch: string[] = []
+    const fetched: Record<string, DomainOutputs> = {}
+    for (const target of planRun.json.targets) {
+      const fetchRun = await metered(deps, `${key}.fetch.${target}`, () => runFetch(deps.config, box, path, target))
+      fetch.push(await keep(deps, fetchRun, hypothesis, round))
+      if (fetchRun.problem !== null) return { plan, fetch, fetched, units: [], reason: `fetch ${target}: ${fetchRun.problem}`, tail: fetchRun.tail }
+      const files = await keepFiles(deps, box, fetchRun, fetchRun.json.outputs, hypothesis, round)
+      fetch.push(...files.artifacts)
+      if (files.problem !== null) return { plan, fetch, fetched, units: [], reason: `fetch ${target}: ${files.problem}`, tail: '' }
+      fetched[target] = fetchRun.json.outputs
+    }
+    const { units } = planRun.json
+    const seconds = units.reduce((sum, unit) => sum + unit.expected_seconds, 0)
+    const notice = `The plan of ${hypothesis}, calibration round ${round}, has ${units.length} units of ${seconds} expected seconds. The expected compute cost is ${computeEstimate(seconds, deps)}.`
+    deps.log(`budget notice: ${notice}`)
+    // The notice only informs, and the run log has it, so a failed post does not stop the run.
+    try {
+      await deps.channel.notice?.(input.runId, notice)
+    } catch (error) {
+      deps.log(`budget notice failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    ledger.put(planKey, { commit: head, hypothesis, round, units: units.length, seconds } satisfies PlanRecord)
+    return { plan, fetch, fetched, units, reason: '', tail: '' }
+  })
+  const fanout: FanOutRound = { plan: planned.plan, fetch: planned.fetch, units: [], failed: [], retries: 0, conflicts: [] }
+  if (planned.reason) {
+    return { round, head, recall: null, threshold, known: [], inject: [], outputs: {}, reads: { known: null, inject: null }, pass: false, reason: planned.reason, tail: planned.tail, fanout }
+  }
+  let commitFiles: Promise<InputFile[]> | undefined
+  const files = () => (commitFiles ??= deps.branches.view(head).then((tree) => treeInputs(tree, [deps.domain.config.holdout])))
+  const prereg = { hypothesis, path, sha256 }
+  const results = await runUnits(planned.units, {
+    ledger,
+    boxes,
+    artifacts: deps.egress.artifacts,
+    config: deps.config,
+    runId: input.runId,
+    commit: head,
+    prereg,
+    round,
+    parallel: input.parallel ?? defaultUnitParallel,
+    inputs: unitInputs(files, planned.fetched, deps.egress.artifacts),
+    log: deps.log,
+  })
+  const keys = new Set(planned.units.map((unit) => unitKey({ commit: head, prereg }, unit.id)))
+  fanout.units = results.map((result) => ({ id: result.id, status: result.status, attempts: result.attempts, ...(result.reason !== undefined ? { reason: result.reason } : {}) }))
+  fanout.failed = results.filter((result) => result.status === 'failed').map((result) => result.id)
+  fanout.retries = results.reduce((sum, result) => sum + Math.max(0, result.attempts - 1), 0)
+  fanout.conflicts = unitConflicts(ledger).filter((conflict) => keys.has(conflict.key))
+  const box = await deps.cleanBox(head, `${key}.merge`, await unitsFiles(results, deps.egress.artifacts))
+  const merged = await metered(deps, `${key}.merge`, () => runMerge(deps.config, box, path, unitsDir))
+  const known = await keepOutputs(deps, box, merged.known, hypothesis, round)
+  const inject = await keepOutputs(deps, box, merged.inject, hypothesis, round)
+  const verdict = calibrationVerdict(known.run, inject.run, threshold)
+  return {
+    round,
+    head,
+    recall: verdict.recall,
+    threshold,
+    known: known.artifacts,
+    inject: inject.artifacts,
+    outputs: verdict.outputs,
+    reads: { known: known.run.json?.reads ?? null, inject: inject.run.json?.reads ?? null },
+    ...(verdict.pass ? { pass: true, reason: '', tail: '' } : { pass: false, reason: verdict.reason, tail: verdict.tail }),
+    fanout,
+  }
+}
+
 /**
  * Stage 6: analyze on a new clean checkout of the run branch head, after a calibration passed. Its outputs must not
  * give another hash for a path of the final calibration. As with the calibration, no output file goes on the run branch.
@@ -825,7 +1041,8 @@ async function runAnalysis(stages: Stages, analysis: Analysis): Promise<Analysis
   const run = await step(deps.ledger, key, async (): Promise<AnalysisRun> => {
     const head = await branch.head()
     const box = await deps.cleanBox(head, key)
-    const kept = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'analyze', path, hypothesis), hypothesis, round)
+    const analyzeRun = await metered(deps, `${key}.analyze`, () => runDomainCommand(deps.config, box, 'analyze', path, hypothesis))
+    const kept = await keepOutputs(deps, box, analyzeRun, hypothesis, round)
     const verdict = analysisVerdict(kept.run, finalCalibration(analysis).outputs)
     const [command = '', ...files] = kept.artifacts
     return {
@@ -854,7 +1071,8 @@ async function reproduce(stages: Stages, analyses: Analysis[], head: string): Pr
     const expected = { ...calibration.outputs, ...finalAnalysis(analysis).outputs }
     const result = await step(deps.ledger, `reproduce.${hypothesis}.${head}`, async (): Promise<Reproduction> => {
       box ??= deps.cleanBox(head, `reproduce.${head}`)
-      const run = await runDomainCommand(deps.config, await box, 'reproduce', path)
+      const machine = await box
+      const run = await metered(deps, `reproduce.${hypothesis}.${head.slice(0, 12)}`, () => runDomainCommand(deps.config, machine, 'reproduce', path))
       const verdict = compareReproduction(expected, run)
       const artifact = await keep(deps, run, hypothesis, calibration.round)
       return { head, pass: verdict.pass, mismatches: verdict.mismatches, missing: verdict.missing, reason: verdict.pass ? '' : verdict.reason, artifact }
@@ -902,9 +1120,9 @@ const capId = (intake: ResearchIntake) => `Q${intake.questions.length + 2}`
 
 /**
  * The questions of the host after the questions of the agent: confirm the program (rule scope), and the cost cap (rule
- * spend). An undefined cap recommends no cap.
+ * spend). An undefined cap recommends no cap. `notes` go into the why of the cap question.
  */
-function hostQuestions(intake: ResearchIntake, cap: number | undefined): [Question, Question] {
+function hostQuestions(intake: ResearchIntake, cap: number | undefined, notes: string[]): [Question, Question] {
   const [confirm] = routeQuestions(asDevelopIntake(intake))
   const recommended = cap === undefined ? noCap : `${cap} USD`
   return [
@@ -914,7 +1132,7 @@ function hostQuestions(intake: ResearchIntake, cap: number | undefined): [Questi
       question: 'What is the cost cap of this run?',
       why: [
         'At the cap, the host posts a notice, and the run continues. At twice the cap, the host asks you to raise the cap or to stop the run. Write a USD number for another cap.',
-        ...(cap === undefined ? ['MODEL_PRICES has no price for some models of this run, and a cap needs a price for each model.'] : []),
+        ...notes,
       ].join(' '),
       options: cap === undefined ? [noCap] : [recommended, noCap],
       recommendation: recommended,
@@ -924,13 +1142,13 @@ function hostQuestions(intake: ResearchIntake, cap: number | undefined): [Questi
   ]
 }
 
-/** The cap in USD, or undefined for no cap. A cap needs a positive USD number and a price for each model. */
-function parseCap(answer: string, models: string[], prices: Prices): Parsed<number | undefined> {
+/** The cap in USD, or undefined for no cap. A cap needs a positive USD number, and `checkPrices` must accept the prices. */
+function parseCap(answer: string, checkPrices: () => void): Parsed<number | undefined> {
   const text = answer.trim()
   if (/^no\b/i.test(text)) return { value: undefined }
   try {
     const cap = parseBudget(text.replace(/^\$\s*/, '').replace(/\s*usd$/i, ''))
-    checkPriced(models, prices)
+    checkPrices()
     return { value: cap }
   } catch (error) {
     if (error instanceof StopError) return { error: error.message }
@@ -1068,16 +1286,24 @@ function reproductionLines(reproduction: Reproduction): string[] {
   return [`${at} FAIL${listed.length > 0 ? '' : `: ${oneLine(reproduction.reason)}`}`, ...listed]
 }
 
+function fanOutLines(fanout: FanOutRound): string[] {
+  const failed = fanout.units.filter((unit) => unit.status === 'failed')
+  return [
+    `  - Fan-out: plan output ${fanout.plan}, ${fanout.units.length} units, ${fanout.retries} retries, ${failed.length > 0 ? `failed units: ${failed.map((unit) => `${unit.id} (${oneLine(unit.reason ?? '')})`).join(', ')}` : 'no failed unit'}`,
+    ...fanout.conflicts.map((conflict) => `  - Second result of unit ${conflict.unit}: SHA-256 ${conflict.second}. The run kept the first result, SHA-256 ${conflict.first}.`),
+  ]
+}
+
 function analysisLines(analysis: Analysis): string[] {
   const { hypothesis } = analysis.freeze
   return [
     `## Analysis of ${hypothesis}`,
     '',
     ...analysis.builds.map((log, index) => `- Build${index > 0 ? ` fix ${index}` : ''}: ${log.blocked.trim() ? `blocked: ${log.blocked.trim()}` : oneLine(log.summary)}`),
-    ...analysis.calibrations.map(
-      (calibration) =>
-        `- Calibration round ${calibration.round} at ${calibration.head.slice(0, 12)}: ${calibration.pass ? 'PASS' : 'FAIL'}, known recall ${calibration.recall ?? 'none'}, threshold ${calibration.threshold}, known output ${calibration.known.join(', ')}, inject output ${calibration.inject.join(', ')}${calibration.pass ? '' : `. ${oneLine(calibration.reason)}`}`,
-    ),
+    ...analysis.calibrations.flatMap((calibration) => [
+      `- Calibration round ${calibration.round} at ${calibration.head.slice(0, 12)}: ${calibration.pass ? 'PASS' : 'FAIL'}, known recall ${calibration.recall ?? 'none'}, threshold ${calibration.threshold}, known output ${calibration.known.join(', ')}, inject output ${calibration.inject.join(', ')}${calibration.pass ? '' : `. ${oneLine(calibration.reason)}`}`,
+      ...(calibration.fanout ? fanOutLines(calibration.fanout) : []),
+    ]),
     ...analysis.runs.map(
       (run) =>
         `- Analysis round ${run.round} at ${run.head.slice(0, 12)}: ${run.pass ? 'PASS' : 'FAIL'}, analyze output ${run.command}, output files ${run.files.join(', ') || 'none'}${run.pass ? '' : `. ${oneLine(run.reason)}`}`,

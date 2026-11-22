@@ -22,7 +22,23 @@ type UsageRecord = { agents: Record<string, AgentUsage>; total: Tokens }
 
 type BudgetState = { limit?: number; given?: number; round: number }
 
+/** The size of one container instance, as the platform rents it. */
+export type InstanceSpec = { type: string; vcpu: number; gib: number }
+
+/** USD per vCPU-second and per GiB-second. An `instances` entry replaces both prices for that instance type. */
+export type ContainerPrices = { vcpu_second: number; gib_second: number; instances?: Record<string, ContainerPrice> }
+type ContainerPrice = { vcpu_second: number; gib_second: number }
+
+/** One metered command. A null instance is the local machine, which costs nothing. Times are epoch milliseconds. */
+export type ComputeEntry = { step: string; instance: InstanceSpec | null; startedAt: number; endedAt?: number }
+
+/** One compute row of the Usage section. */
+export type ComputeRow = { step: string; instance: InstanceSpec | null; seconds: number }
+
+type ComputeRecord = { entries: Record<string, ComputeEntry> }
+
 const usageKey = 'usage'
+const computeKey = 'compute'
 const budgetKey = 'budget'
 const priceFields = ['input', 'cached_input', 'cache_write', 'output'] as const
 
@@ -56,6 +72,42 @@ export function parsePrices(setting: string | undefined): Prices {
   return prices
 }
 
+/** Reads CONTAINER_PRICES. Unset gives undefined. An invalid setting stops the run, as MODEL_PRICES does. */
+export function parseContainerPrices(setting: string | undefined): ContainerPrices | undefined {
+  if (setting === undefined || setting.trim() === '') return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(setting)
+  } catch (error) {
+    throw new StopError(`CONTAINER_PRICES is not valid JSON: ${(error as Error).message}`)
+  }
+  if (!isObject(parsed)) throw new StopError('CONTAINER_PRICES must be a JSON object with vcpu_second, gib_second and optional instances')
+  const unknown = (entry: Record<string, unknown>, allowed: string[], prefix: string) => {
+    const extra = Object.keys(entry).find((key) => !allowed.includes(key))
+    if (extra !== undefined) throw new StopError(`CONTAINER_PRICES: ${prefix}${extra} is not a known key`)
+  }
+  const pair = (entry: Record<string, unknown>, prefix: string): ContainerPrice => {
+    const price = (field: 'vcpu_second' | 'gib_second'): number => {
+      const value = entry[field]
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0)
+        throw new StopError(`CONTAINER_PRICES: ${prefix}${field} must be a non-negative number of USD per ${field === 'vcpu_second' ? 'vCPU' : 'GiB'}-second`)
+      return value
+    }
+    return { vcpu_second: price('vcpu_second'), gib_second: price('gib_second') }
+  }
+  unknown(parsed, ['vcpu_second', 'gib_second', 'instances'], '')
+  const prices: ContainerPrices = pair(parsed, '')
+  if (parsed.instances === undefined) return prices
+  if (!isObject(parsed.instances)) throw new StopError('CONTAINER_PRICES: instances must be an object of instance types')
+  const instances: Record<string, ContainerPrice> = {}
+  for (const [type, entry] of Object.entries(parsed.instances)) {
+    if (!isObject(entry)) throw new StopError(`CONTAINER_PRICES: instances.${type} must be an object with vcpu_second and gib_second`)
+    unknown(entry, ['vcpu_second', 'gib_second'], `instances.${type}.`)
+    instances[type] = pair(entry, `instances.${type}.`)
+  }
+  return { ...prices, instances }
+}
+
 /** Reads a budget in USD from a CLI argument or a request body. */
 export function parseBudget(value: unknown): number {
   const budget = typeof value === 'number' ? value : typeof value === 'string' && value.trim() !== '' ? Number(value) : Number.NaN
@@ -67,6 +119,45 @@ export function parseBudget(value: unknown): number {
 export function checkPriced(models: string[], prices: Prices): void {
   const missing = [...new Set(models)].filter((model) => !(model in prices))
   if (missing.length > 0) throw new StopError(`the run has a budget, but MODEL_PRICES has no price for: ${missing.join(', ')}`)
+}
+
+/** A budget with a fan-out config needs CONTAINER_PRICES. The caller decides when this applies. */
+export function checkContainerPriced(prices: ContainerPrices | undefined): void {
+  if (prices === undefined) throw new StopError('the run has a budget and a fan-out config, but CONTAINER_PRICES is not set')
+}
+
+/** The USD of `seconds` of wall time on `instance`. The local machine (null) costs nothing. */
+export function computeCost(seconds: number, instance: InstanceSpec | null, prices: ContainerPrices): number {
+  if (instance === null) return 0
+  const price = prices.instances?.[instance.type] ?? prices
+  return seconds * (instance.vcpu * price.vcpu_second + instance.gib * price.gib_second)
+}
+
+/**
+ * Records the start of a metered command under `key`. A second start keeps the first time, so that a replay after a
+ * pause does not lose the seconds before the pause.
+ */
+export function startCompute(ledger: Ledger, key: string, step: string, instance: InstanceSpec | null, at = Date.now()): void {
+  const record = computeRecord(ledger)
+  if (record.entries[key]) return
+  ledger.put(computeKey, { entries: { ...record.entries, [key]: { step, instance, startedAt: at } } } satisfies ComputeRecord)
+}
+
+/** Records the end of a metered command. The first end stays, so that a replay does not add seconds. */
+export function finishCompute(ledger: Ledger, key: string, at = Date.now()): void {
+  const record = computeRecord(ledger)
+  const entry = record.entries[key]
+  if (!entry || entry.endedAt !== undefined) return
+  ledger.put(computeKey, { entries: { ...record.entries, [key]: { ...entry, endedAt: at } } } satisfies ComputeRecord)
+}
+
+/** The compute rows of the run. An entry without an end counts until `now`, because its container still runs. */
+export function computeOf(ledger: Ledger, now = Date.now()): ComputeRow[] {
+  return Object.values(computeRecord(ledger).entries).map((entry) => ({
+    step: entry.step,
+    instance: entry.instance,
+    seconds: Math.max(0, ((entry.endedAt ?? now) - entry.startedAt) / 1000),
+  }))
 }
 
 export function costOf(tokens: Tokens, price: ModelPrice): number {
@@ -150,10 +241,18 @@ export function spendOf(ledger: Ledger, prices: Prices): { usd: number; unpriced
   return { usd, unpriced: [...unpriced] }
 }
 
-const formatUsd = (usd: number) => `$${usd.toFixed(usd < 1 ? 4 : 2)}`
+export const formatUsd = (usd: number) => `$${usd.toFixed(usd < 1 ? 4 : 2)}`
 
-/** The Markdown lines of the Usage section of a report. */
-export function usageSection(rows: UsageRow[], prices: Prices, budget?: { limit: number; spent: number }): string[] {
+/**
+ * The Markdown lines of the Usage section of a report. `compute` adds a table of the metered containers. Without
+ * compute rows, the section has only the model table.
+ */
+export function usageSection(
+  rows: UsageRow[],
+  prices: Prices,
+  budget?: { limit: number; spent: number },
+  compute?: { rows: ComputeRow[]; prices?: ContainerPrices | undefined },
+): string[] {
   let total = zeroTokens()
   let usd = 0
   const unpriced = new Set<string>()
@@ -176,7 +275,30 @@ export function usageSection(rows: UsageRow[], prices: Prices, budget?: { limit:
     '| --- | --- | ---: | ---: | ---: | ---: | ---: |',
     ...lines,
     tableRow('**Total**', '', total, `${formatUsd(usd)}${unpriced.size > 0 ? ` (${unpriced.size} ${unpriced.size === 1 ? 'model' : 'models'} without a price)` : ''}`),
+    ...(compute && compute.rows.length > 0 ? computeTable(compute.rows, compute.prices) : []),
     ...(budget ? ['', `Budget: ${formatUsd(budget.limit)}. Spent: ${formatUsd(budget.spent)}.`] : []),
+  ]
+}
+
+function computeTable(rows: ComputeRow[], prices: ContainerPrices | undefined): string[] {
+  let seconds = 0
+  let usd = 0
+  const lines = rows.map((row) => {
+    const cost = prices ? computeCost(row.seconds, row.instance, prices) : undefined
+    seconds += row.seconds
+    usd += cost ?? 0
+    return `| ${row.step} | ${row.instance?.type ?? 'local'} | ${Math.round(row.seconds)} | ${cost === undefined ? 'no price' : formatUsd(cost)} |`
+  })
+  return [
+    '',
+    prices
+      ? 'The compute USD values are estimates from the wall seconds and the prices in CONTAINER_PRICES. The local machine costs nothing.'
+      : 'CONTAINER_PRICES is not set, so the compute rows show only the wall seconds.',
+    '',
+    '| Step | Instance | Seconds | USD |',
+    '| --- | --- | ---: | ---: |',
+    ...lines,
+    `| **Total** |  | ${Math.round(seconds)} | ${prices ? formatUsd(usd) : 'no price'} |`,
   ]
 }
 
@@ -240,21 +362,30 @@ export function budgetGate(options: {
   recommend?: boolean
   /** Stop at the budget without a notice or a question, as in a nested review pass. */
   stopAtBudget?: boolean
+  /** With prices, the compute rows of the ledger count as spend. */
+  containerPrices?: ContainerPrices | undefined
 }) {
   const { ledger, prices } = options
   const ask = asker(ledger, options.channel, options.runId, options.log, { decisions: false })
   const extra = () => options.extraRows?.() ?? []
-  const spent = () => spendOf(ledger, prices).usd + extra().reduce((sum, row) => sum + (row.usd ?? 0), 0)
+  const compute = (): { step: string; usd: number }[] => {
+    const container = options.containerPrices
+    return container ? computeOf(ledger).map((row) => ({ step: row.step, usd: computeCost(row.seconds, row.instance, container) })) : []
+  }
+  const spent = () =>
+    spendOf(ledger, prices).usd + extra().reduce((sum, row) => sum + (row.usd ?? 0), 0) + compute().reduce((sum, row) => sum + row.usd, 0)
   const limit = () => budgetState(ledger).limit
   let pending: Promise<void> | undefined
 
-  /** The three most expensive steps by USD. Rows without a price do not show. */
+  /** The three most expensive steps by USD, of models and of compute. Rows without a price do not show. */
   const costliest = () => {
     const rows = [...usageOf(ledger).agents, ...extra()].flatMap((row) => {
       const price = prices[row.model]
       const usd = row.usd ?? (price ? costOf(row.tokens, price) : undefined)
       return usd === undefined ? [] : [{ step: row.step, usd }]
     })
+    // The local machine costs nothing, so its steps do not show.
+    rows.push(...compute().filter((row) => row.usd > 0))
     const top = rows.sort((a, b) => b.usd - a.usd).slice(0, 3)
     return top.length > 0 ? ` The most expensive steps: ${top.map((row) => `${row.step} ${formatUsd(row.usd)}`).join(', ')}.` : ''
   }
@@ -343,6 +474,10 @@ export function budgetGate(options: {
 
 function usageRecord(ledger: Ledger): UsageRecord {
   return ledger.get<UsageRecord>(usageKey) ?? { agents: {}, total: zeroTokens() }
+}
+
+function computeRecord(ledger: Ledger): ComputeRecord {
+  return ledger.get<ComputeRecord>(computeKey) ?? { entries: {} }
 }
 
 function budgetState(ledger: Ledger): BudgetState {
