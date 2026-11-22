@@ -243,6 +243,7 @@ test('with ci and no tests, the host refuses a patch log while a ci command fail
   assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 \(sub returns a - b\); skipped: clean-001 \(inlining adds nothing\)$/m)
   // On Node, the final checks also run ci.
   assert.match(result.report, /ci sub/)
+  assert.deepEqual(result.failedChecks, [])
 })
 
 test('a patch agent that changed no files runs no ci', async () => {
@@ -253,6 +254,22 @@ test('a patch agent that changed no files runs no ci', async () => {
 
   assert.deepEqual(calls, [])
   assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(callers depend on the sum\); clean-001 \(inlining adds nothing\)$/m)
+})
+
+test('a ci command that fails in the final checks gives the failed check with the end of its output', async () => {
+  const repo = fixtureRepo()
+  const command = `node -e "console.log('START ' + 'filler '.repeat(1000)); console.log('the cause is at the end'); process.exit(1)"`
+  const input = await ciInput(repo, 'ci-final-fail', { long: command })
+  const result = await runLoop(repo, 'ci-final-fail', runsDir(), { input, dispatch: scriptedDispatch(scriptFor({ rejectBug: true, tests: false }), []) })
+
+  assert.equal(result.pass, false, result.report)
+  assert.deepEqual(result.criteria.find((criterion) => criterion.name === 'Checks green')?.detail, 'failed: ci long')
+  assert.deepEqual(result.failedChecks?.map(({ name, command }) => ({ name, command })), [{ name: 'ci long', command }])
+  const output = result.failedChecks?.[0]?.output ?? ''
+  assert.equal(output.length, 4_000)
+  assert.match(output, /the cause is at the end\n$/)
+  assert.doesNotMatch(output, /START/)
+  assert.deepEqual(fileLedger(join(result.dir, 'state.json')).get<{ failedChecks: unknown }>('result')?.failedChecks, result.failedChecks)
 })
 
 test('a failed setup at the ci gate accepts the log, and the report says that the tests did not run', async () => {

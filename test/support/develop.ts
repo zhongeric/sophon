@@ -116,12 +116,14 @@ const wrongProduct = {
  * `reviewFix`: then the bugs reviewer finds the missing mul test and the patch agent adds it.
  * With `askScope`, the intake agent raises one user question about the scope. The fixer of a base merge conflict shows
  * /review/repair.txt, writes the files of `resolved` without conflict markers, checkpoints and submits.
+ * With `checkFlag`, the bugs reviewer creates that file. When the prompt names /review/check-failure.txt, the fixer shows it.
  */
-export function developScript(options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean; resolved?: Record<string, string> } = {}): Script {
+export function developScript(options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean; resolved?: Record<string, string>; checkFlag?: string } = {}): Script {
   return ({ role, output, request }) => {
     if (output !== null) return { text: 'done' }
     switch (role) {
       case 'bugs':
+        if (options.checkFlag) writeFileSync(options.checkFlag, '')
         return { cell: `await tools.submit_findings({ findings: ${JSON.stringify(options.reviewFix ? [wrongProduct] : [])} }); text('submitted')` }
       case 'patch':
         return {
@@ -152,9 +154,11 @@ export function developScript(options: { blockSub?: boolean; reviewFix?: boolean
         if (round) {
           const summary = `repair ${round}: mul(2, 3) is 6`
           const changes = ['test/ops.test.ts', 'test/rounds.txt'].map((path) => ({ path, why: summary }))
+          const checkFailure = request.slice(request.lastIndexOf('Repair round')).includes('/review/check-failure.txt')
           return {
             cell: [
               `text('repair.txt: ' + await tools.Read({ file_path: '/review/repair.txt' }))`,
+              ...(checkFailure ? [`text('check-failure.txt: ' + await tools.Read({ file_path: '/review/check-failure.txt' }))`] : []),
               `await tools.Write({ file_path: '/repo/test/ops.test.ts', content: ${JSON.stringify(sources.test(6))} })`,
               `await tools.Write({ file_path: '/repo/test/rounds.txt', content: 'repair round ${round}\\n' })`,
               `await tools.checkpoint({ message: 'repair ${round}' })`,

@@ -1,6 +1,6 @@
 import { Sql } from 'nanocode-ts/cloudflare'
 import module from 'nanocode-ts/nanocode_wasm.wasm'
-import { commandChecker, hasCi, type RepoConfig } from '../core/checks.ts'
+import { commandChecker, hasCi, type FailedCheck, type RepoConfig } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Checker } from '../core/platform.ts'
 import { commentChannel, commentLimit, type Comments } from '../core/questions.ts'
@@ -53,13 +53,14 @@ export class PullRequestRuns extends Runs<StartRequest> {
     if (row.state === 'error') return { error: row.note }
     if (row.state !== 'passed' && row.state !== 'failed') return { waiting: `review run ${run} is ${row.state}${row.note ? `: ${row.note}` : ''}` }
     const ledger = sqlLedger(this.ctx.storage.sql, run)
-    // A run that finished before the usage records has no usage and no stop at the budget.
-    const result = ledger.get<{ pass: boolean; criteria: LoopResult['criteria']; final: string; usage?: RunUsage; stopped?: boolean }>('result')!
+    // A run that finished before the usage records has no usage and no stop at the budget, and an older run has no failed checks.
+    const result = ledger.get<{ pass: boolean; criteria: LoopResult['criteria']; final: string; usage?: RunUsage; stopped?: boolean; failedChecks?: FailedCheck[] }>('result')!
     const published = ledger.get<{ local: string; sha: string }>('published')
     const headSha = ledger.get<{ headSha: string }>('snapshot')!.headSha
     return {
       branch: `factory/${run}`,
       criteria: result.criteria,
+      failedChecks: result.failedChecks ?? [],
       final: published?.local === result.final ? published.sha : headSha,
       pass: result.pass,
       report: sqlFiles(this.ctx.storage.sql, run).read('report.md') ?? '',
