@@ -35,7 +35,7 @@ light:    one reviewer that also fixes ─▶ commit ─▶ checks ─▶ PASS o
 - **Triage.** A change to docs and tests only takes the light loop. Solidity `src/` and `script/`, agent prompts and
   rule files (`agents/`, `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING*`) take the strict loop. `--full` forces the strict
   loop. All other changes take the standard loop.
-- **Scale.** A diff over 600 lines splits across up to 4 bugs reviewers. Patch agents split the findings by file.
+- **Scale.** A diff over 600 lines splits across up to 4 bugs reviewers. Patch agents split the bug findings by file.
 - **Static rules.** Each profile has mechanical rules, for example a fixed Solidity pragma, or no `.env` file in the
   change. The host checks the added lines and gives each break to the patch agent.
 - **Models.** Step 1 runs on Opus 5.5, with the rules track on Sol. Each step 2 and late bugs role swaps the family

@@ -90,10 +90,10 @@ function mkdirAll(tree: SqlFileSystem.SqlFileSystem): SqlFileSystem.SqlFileSyste
 }
 
 /** The most files that the compare of GitHub lists. */
-const compareFileLimit = 300
+export const compareFileLimit = 300
 
 /** Every path that a file of a compare touches: its path, and the old path of a rename. */
-const comparePaths = (files: ChangedFile[]) => [...new Set(files.flatMap((file) => [...(file.previous_filename ? [file.previous_filename] : []), file.filename]))]
+export const comparePaths = (files: ChangedFile[]) => [...new Set(files.flatMap((file) => [...(file.previous_filename ? [file.previous_filename] : []), file.filename]))]
 
 /** A file of a compare as name-status pairs, as `nameStatus` gives them: a rename gives its old path as a deletion. */
 const compareStatus = (file: ChangedFile): [string, string][] =>

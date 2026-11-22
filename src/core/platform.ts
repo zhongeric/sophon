@@ -5,8 +5,11 @@ import type { CheckResult, MergeMethod } from './checks.ts'
 import type { SigningRecord } from './signing.ts'
 import type { PullState } from './prune.ts'
 
-/** The frozen review target. `base` and `head` are commit IDs that `Repo.diff` accepts. */
-export type Frozen = { base: string; head: string; branch: string; location: string }
+/**
+ * The frozen review target. `base` and `head` are commit IDs that `Repo.diff` accepts. `from` is a commit between
+ * them when a pass reviews only the changes after an earlier pass (D22).
+ */
+export type Frozen = { base: string; head: string; branch: string; location: string; from?: string }
 
 /** The repository of one run: its working tree and its commits. Each platform has its own. */
 export type Repo = {

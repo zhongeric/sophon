@@ -54,6 +54,9 @@ function spec(context: RunContext, id: string, role: Role, model: ModelChoice, w
   }
 }
 
+/** The start of the reviewed changes: `from` when a pass reviews only the changes after an earlier pass (D22). */
+export const reviewedFrom = (frozen: Frozen) => frozen.from ?? frozen.base
+
 async function reviewInputs(context: RunContext, range: Range) {
   const patch = await context.repo.diff(range.from, range.to)
   const changed = await context.repo.changedFiles(range.from, range.to)
@@ -549,7 +552,7 @@ export async function light(
   options: { kept: Finding[]; gateLog: string[]; message: string; allow(path: string): boolean },
 ): Promise<PatchOutcome<LightLog>> {
   const before = await editBase(context, id)
-  const range = { from: context.frozen.base, to: context.frozen.head }
+  const range = { from: reviewedFrom(context.frozen), to: context.frozen.head }
   const inputs = await reviewInputs(context, range)
   const review = { ...inputs.files, '/host-findings.json': JSON.stringify(options.kept, null, 2), '/gate-log.txt': options.gateLog.join('\n') }
   const repo = allowFiles(guard(context.repo.tree, (path) => isProtected(context.config, path)), options.allow)

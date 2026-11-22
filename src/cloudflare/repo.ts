@@ -5,7 +5,7 @@ import type { Ledger } from '../core/ledger.ts'
 import type { Frozen, Repo } from '../core/platform.ts'
 import type { PullState } from '../core/prune.ts'
 import { StopError } from '../core/stop.ts'
-import { deleteRemoteBranch } from './branches.ts'
+import { compareFileLimit, comparePaths, deleteRemoteBranch } from './branches.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { stateOf } from './prune.ts'
 import { base64, encodePath, nameStatus, restoreFromGitHub, treeGit, treeWriter, writeTarball, type ChangedFile } from './trees.ts'
@@ -40,6 +40,8 @@ export function githubRepo(options: {
   ledger: Ledger
   runId: string
   branch: string
+  /** The head of an earlier pass on GitHub, when a pass reviews only the changes after it (D22). */
+  from?: string
   /** The time of the tree scopes. Default: systemClock. */
   clock?: Clock
   log(line: string): void
@@ -101,17 +103,45 @@ export function githubRepo(options: {
       await git('add', '-A')
       await git('commit', '-q', '-m', `merge base ${mergeBase}`)
       const localBase = await head()
+      const toHead = async (path: string) => {
+        const entry = byPath.get(path)
+        await (entry ? treeWriter(tree).restore(entry) : remove(path))
+      }
+      // A pass that reviews only the changes after `from` (D22) gets a commit with the files as they are at `from`.
+      // The other files are the same there as at the head. A compare that cannot list all files gives the whole change.
+      let later: ChangedFile[] = []
+      if (options.from !== undefined) {
+        const listed = (await gh.json<{ files?: ChangedFile[] }>('GET', `${api}/compare/${options.from}...${view.head.sha}`)).files ?? []
+        if (listed.length < compareFileLimit) later = listed
+        else options.log(`the changes after ${options.from.slice(0, 12)} touch ${compareFileLimit} or more files: the pass reviews the whole change`)
+      }
+      const from = later.length > 0 ? options.from : undefined
+      let localFrom: string | undefined
+      if (from !== undefined) {
+        const changedLater = new Set(comparePaths(later))
+        for (const path of comparePaths(files)) if (!changedLater.has(path)) await toHead(path)
+        for (const file of later) {
+          if (file.status === 'renamed') await restoreFromGitHub(gh, api, tree, file.previous_filename!, from)
+          if (file.status === 'added' || file.status === 'copied' || file.status === 'renamed') await remove(file.filename)
+          else await restoreFromGitHub(gh, api, tree, file.filename, from)
+        }
+        await git('add', '-A')
+        if ((await git('status', '--porcelain')).trim() !== '') await git('commit', '-q', '-m', `from ${from}`)
+        localFrom = await head()
+      }
       for (const file of files) {
         if (file.status === 'renamed') await remove(file.previous_filename!)
         const entry = byPath.get(file.filename)
         if (file.status === 'removed' || !entry) await remove(file.filename)
         else await treeWriter(tree).restore(entry)
       }
+      for (const path of comparePaths(later)) await toHead(path)
       await git('add', '-A')
       if ((await git('status', '--porcelain')).trim() !== '') await git('commit', '-q', '-m', `head ${view.head.sha}`)
       const localHead = await head()
       ledger.put('snapshot', { headSha: view.head.sha, headRef: view.head.ref, mergeBase, localBase, localHead } satisfies Snapshot)
-      return { base: localBase, head: localHead, branch: options.branch, location: `${pull.owner}/${pull.repo}#${pull.pr} at ${view.head.sha.slice(0, 12)}` }
+      const reviewed = localFrom === undefined ? {} : { from: localFrom }
+      return { base: localBase, head: localHead, branch: options.branch, location: `${pull.owner}/${pull.repo}#${pull.pr} at ${view.head.sha.slice(0, 12)}`, ...reviewed }
     },
 
     diff: (from, to) => git('diff', '--no-color', `${from}..${to}`),

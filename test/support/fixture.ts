@@ -233,7 +233,8 @@ export async function loopInput(repo: string, runId: string): Promise<LoopInput>
 /**
  * Runs the loop on the fixture with the Node platform, a scripted model, and by default a channel that takes every
  * recommendation. `signing` wraps the signing of the Node platform. `repo` can replace methods of the Node repo, for example
- * the GitHub calls. `checker` wraps the checker of the Node platform.
+ * the GitHub calls. `checker` wraps the checker of the Node platform. With `from`, the run reviews only the changes after
+ * that commit, as a later pass of a development run does (D22).
  */
 export async function runLoop(
   repo: string,
@@ -248,11 +249,13 @@ export async function runLoop(
     signing?: (signing: Signing) => Signing
     repo?: (repo: Repo) => Repo
     checker?: (checker: Checker) => Checker
+    from?: string
   },
 ) {
   const given = options.input ?? (await loopInput(repo, runId))
   const input = options.budget === undefined ? given : { ...given, budget: options.budget }
-  const run = await nodeRun({ config: input.config, runId, runsDir, source: gitSource(repo) })
+  const source = options.from === undefined ? gitSource(repo) : { ...gitSource(repo), from: options.from }
+  const run = await nodeRun({ config: input.config, runId, runsDir, source })
   const result = await codeReviewLoop(input, {
     ...run,
     checker: options.checker ? options.checker(run.checker) : run.checker,

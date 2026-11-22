@@ -19,7 +19,7 @@ export type ReviewOutcome =
  * types for its tests, and run.ts needs the Worker types.
  */
 export type ReviewRuns = {
-  start(request: { ask: string; by: string; full: boolean; owner: string; pr: number; repo: string; ship: boolean; stopAtBudget: boolean; budget?: number }): Promise<{ run: string }>
+  start(request: { ask: string; by: string; full: boolean; owner: string; pr: number; repo: string; ship: boolean; stopAtBudget: boolean; budget?: number; from?: string }): Promise<{ run: string }>
   outcome(run: string): Promise<ReviewOutcome>
   resumeAfterError(run: string): Promise<{ reason: string; resumed: boolean }>
 }
@@ -51,7 +51,8 @@ export async function reviewPass<Id>(
   if (run && stopped[run] && outcome?.error === undefined && outcome?.waiting === undefined && outcome?.stopped && review.budget !== undefined && review.budget > earlierUsd) run = undefined
   if (!run || !outcome) {
     const budget = review.budget !== undefined ? { budget: review.budget - earlierUsd } : {}
-    run = (await runs.start({ ask: review.ask, by: request.by, full: review.full, owner, pr: review.pr, repo, ship: false, stopAtBudget: true, ...budget })).run
+    const scope = review.from === undefined ? {} : { from: review.from }
+    run = (await runs.start({ ask: review.ask, by: request.by, full: review.full, owner, pr: review.pr, repo, ship: false, stopAtBudget: true, ...budget, ...scope })).run
     ledger.put(key, run)
     outcome = await runs.outcome(run)
   }

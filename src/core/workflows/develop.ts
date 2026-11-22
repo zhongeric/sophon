@@ -63,8 +63,9 @@ export type DevelopInput = {
 /**
  * `budget` is what remains up to twice the development budget, so that the review loop stops where the development gate
  * pauses. `branch` is the PR head branch. `base` is the current merge base of the change (D16). Default: the base of the input.
+ * `from` is the head after the last pass: the pass reviews only the changes after it (D22). Default: the whole change.
  */
-export type ReviewRequest = { runId: string; ask: string; head: string; branch: string; full: boolean; pr: number; budget?: number; base?: string }
+export type ReviewRequest = { runId: string; ask: string; head: string; branch: string; full: boolean; pr: number; budget?: number; base?: string; from?: string }
 
 /** What the platform supplies. */
 export type DevelopDeps = {
@@ -120,8 +121,11 @@ const clockSkewMs = 30_000
 const defaultParallel = 3
 
 type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failures: string }
-/** A review pass. Records of older runs have no usage, which counts as zero, and no failed criteria or failed checks. */
-type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage; failed?: Criterion[]; failedChecks?: FailedFinalCheck[] }
+/**
+ * A review pass. Records of older runs have no usage, which counts as zero, and no failed criteria or failed checks.
+ * `from` is the start of the reviewed changes when the pass reviewed only the changes after the last pass (D22).
+ */
+type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage; failed?: Criterion[]; failedChecks?: FailedFinalCheck[]; from?: string }
 /**
  * The cause of a repair round. `from` is 'CI' or 'review pass N', `short` is one line for the prompt and the report,
  * `text` is /review/repair.txt, `logs` is /review/ci-failure.txt when CI failed, and `report` is
@@ -136,8 +140,8 @@ type Rerunnable = { head: string; ci: Ci } | { head: string; pass: number; revie
 type Rerun = { check: string; head: string; result: 'flaky' | 'failed' | 'refused'; reason?: string }
 type Repair = { round: number; cause: Cause; log: BuildLog }
 type BasePoint = 'ready' | 'merge'
-/** The result of a base merge, and `change`: the paths of the change before it, from the merge base to the head. */
-type BaseMerge = { files: string[]; conflicts: string[]; change: string[] }
+/** The result of a base merge. Records from before D22 also have `change`, which the run does not read. */
+type BaseMerge = { files: string[]; conflicts: string[] }
 /** Where a base check runs: before ready, before the merge, or before repair round `round` of a red CI (D16). */
 type BaseAt = { point: BasePoint } | { point: 'repair'; round: number }
 /** A base check (D16). `merge` is null when the base did not move or the run used its base merges. */
@@ -393,7 +397,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   // A pass gets the budget up to twice the run budget and stops there without a question. That stop is not a finished
   // step: the budget gate of this run then asks with the run totals, or raises the budget in a hotfix run.
   // After a raise, or on a resume with a higher budget, the same pass runs again with the new remaining budget.
-  const reviewPass = async (pass: number, at: string, base: string): Promise<Review> => {
+  const reviewPass = async (pass: number, at: string, base: string, from: string | null): Promise<Review> => {
     const stoppedKey = `review-stopped.${pass}`
     const review = await step(ledger, `review.${pass}`, async (): Promise<Review> => {
       state.stoppedReview = ledger.get<Review>(stoppedKey) ?? null
@@ -403,9 +407,10 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         // already counts the spend of its stopped attempt, so that spend is not taken from the remaining budget.
         const limit = budget.limit()
         const remaining = limit === undefined ? {} : { budget: 2 * limit - budget.spent() + (state.stoppedReview?.usage?.usd ?? 0) }
-        const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, base, branch: branchName, full: input.full === true, pr: state.pr!.number, ...remaining })
+        const scope = from === null ? {} : { from }
+        const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, base, branch: branchName, full: input.full === true, pr: state.pr!.number, ...scope, ...remaining })
         const failed = loop.criteria.filter((criterion) => !criterion.ok)
-        const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage, failed, failedChecks: loop.failedChecks }
+        const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage, failed, failedChecks: loop.failedChecks, ...scope }
         if (!loop.stopped) return result
         ledger.put(stoppedKey, result)
         state.stoppedReview = result
@@ -433,8 +438,16 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   let head = pushed
   // The CI of the last checked commit. It checks the head only when its sha is the head.
   let ci = await waitCi('ci.build.0', head)
-  // Why the head needs a new review pass, or null: a repair or a base merge after the last pass.
+  // Why the head needs a new review pass, or null: a repair or a base merge with conflicts after the last pass. A clean
+  // base merge needs no pass, because CI tests it (D22).
   let unreviewed: string | null = null
+  // The head after the last review pass and its fixes. A pass after a repair reviews only the changes after it (D22).
+  // Null when a base merge brought base changes after it: then the next pass reviews the whole change.
+  let reviewedAt: string | null = null
+  // A clean base merge on a reviewed head brings only base changes, so the next scoped pass starts after it.
+  const afterCleanMerge = () => {
+    reviewedAt = reviewedAt !== null && unreviewed === null ? head : null
+  }
   // The cause that remains when the budget is used.
   let unrepaired: Cause | null = null
   // The start of the files of the change: the merge base with the base branch, which a base merge moves (D16).
@@ -451,9 +464,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
       const base = await branches.remoteHead(input.baseRef)
       const moved = (await dev.mergeBaseWith(base)) !== base
       if (!moved || state.baseMerges.length >= baseMergeLimit) return { ...at, base, moved, merge: null }
-      const change = await dev.touchedFiles(mergeBase, await dev.head())
-      const merged = await dev.mergeCommit(base, mergeMessage)
-      return { ...at, base, moved, merge: { ...merged, change } }
+      return { ...at, base, moved, merge: await dev.mergeCommit(base, mergeMessage) }
     })
     if (check.merge) state.baseMerges.push(check)
     return check
@@ -598,9 +609,11 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         if (await rerunCi()) continue
         cause = ciCause(ci)
         red = true
-      } else if (state.reviews.length < routed.passes || state.reviews.at(-1)?.pass !== true || unreviewed !== null) {
+      } else if (state.reviews.length < routed.passes || state.reviews.at(-1)?.pass !== true || unreviewed !== null || ledger.get(`step:review.${state.reviews.length + 1}`) !== undefined) {
+        // A ledger from before D22 can have a pass after a clean base merge. The replay runs it again from the ledger.
         const pass = state.reviews.length + 1
-        const review = await reviewPass(pass, head, mergeBase)
+        // A planned pass reviews the whole change. A pass after a repair reviews only the changes after the last pass (D22).
+        const review = await reviewPass(pass, head, mergeBase, pass > routed.passes && reviewedAt !== head ? reviewedAt : null)
         unreviewed = null
         if (review.final !== review.head) {
           await step(ledger, `merge.review.${pass}`, async () => {
@@ -609,6 +622,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
           })
           head = await publish(`review.${pass}`)
         }
+        reviewedAt = head
         if (review.pass) continue
         // When only checks failed, they run again first. When they pass, the pass counts as passed.
         const rest = onlyChecks(review) ? await rerunChecks(review, head) : null
@@ -658,7 +672,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
           })
           if (!untouched) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
           head = await publish(`repair.${round}`)
-          if (merge.files.some((path) => merge.change.includes(path))) unreviewed = 'a base merge after the last pass'
+          afterCleanMerge()
           ci = await waitCi(`ci.repair.${round}`, head)
           continue
         }
@@ -672,8 +686,10 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         const marked = await step(ledger, `finish-merge.repair.${round}`, () => dev.finishMerge(merge.conflicts, mergeMessage))
         if (marked.length > 0) return unmerged(point, shown(), `the conflict markers remain in ${marked.join(', ')}`)
       }
-      // The push takes the base merge and the fix together, so CI runs one time after the round.
+      // The push takes the base merge and the fix together, so CI runs one time after the round. Then the changes after the
+      // last pass hold base changes, and the next pass reviews the whole change (D22).
       head = await publish(`repair.${state.repairs.length}`)
+      if (merge) reviewedAt = null
       unreviewed = 'a repair after the last pass'
       ci = await waitCi(`ci.repair.${state.repairs.length}`, head)
     }
@@ -764,7 +780,10 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         if (thrown(point, error)) throw error
         return unmerged(point, criteria, `the push of the base merge failed: ${reasonOf(error)}`)
       }
-      if (merge.conflicts.length > 0 || merge.files.some((path) => merge.change.includes(path))) unreviewed = 'a base merge after the last pass'
+      if (merge.conflicts.length > 0) {
+        reviewedAt = null
+        unreviewed = 'a base merge with conflicts after the last pass'
+      } else afterCleanMerge()
       ci = await waitCi(`ci.base.${n}`, head)
       const ended = await repairLoop(point)
       if (ended) return ended
@@ -1124,7 +1143,7 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
           '',
           ...state.reviews.map(
             (review, index) =>
-              `- Pass ${index + 1}: ${review.pass ? 'PASS' : 'FAIL'}, ${triage(review.report)}, ${review.final === review.head ? 'no fixes' : `fixes merged from ${review.branch}`}`,
+              `- Pass ${index + 1}: ${review.pass ? 'PASS' : 'FAIL'}, ${triage(review.report)}, ${review.from ? `the changes after ${review.from.slice(0, 12)}, ` : ''}${review.final === review.head ? 'no fixes' : `fixes merged from ${review.branch}`}`,
           ),
           '',
         ]

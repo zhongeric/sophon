@@ -12,7 +12,7 @@ import type { Credentials, Provider } from '../providers.ts'
 import { asker, decisionLists, decisions, type Answer, type Channel } from '../questions.ts'
 import { reviewRoles, type ModelChoice } from '../roles.ts'
 import { signingLine, type SigningRecord } from '../signing.ts'
-import { askQuestions, intent, light, patch, review, splitReview, type LightLog, type PatchLog, type PatchOutcome, type Range, type RunContext, type Verdict } from '../steps.ts'
+import { askQuestions, intent, light, patch, review, reviewedFrom, splitReview, type LightLog, type PatchLog, type PatchOutcome, type Range, type RunContext, type Verdict } from '../steps.ts'
 import { StopError } from '../stop.ts'
 import { BudgetStop, budgetGate, checkPriced, resolveBudget, spendOf, usageOf, usageSection, type Prices, type RunUsage } from '../usage.ts'
 
@@ -202,8 +202,11 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   await deps.signing.apply(signing)
   const frozen = await step(ledger, 'freeze', () => repo.freeze())
   const stack = input.stack ?? input.config.stack
+  // A later pass of a development run reviews only the changes after an earlier pass (D22): triage, the reviewers and the
+  // host checks read them. The checks and the intent check read the whole change.
+  const start = reviewedFrom(frozen)
   // Triage also sees deleted files and the old path of each rename, so that a removal of code gets the full loop.
-  const touched = await repo.touchedFiles(frozen.base, frozen.head)
+  const touched = await repo.touchedFiles(start, frozen.head)
   const triageRecord = await step(ledger, 'triage', () => triage(touched, async (path) => (await repo.tree.stat(`/${path}`)) !== null, input.full === true))
   // A triage record from before D20 has no loop. That run started the strict loop, so its resume keeps it.
   const loop: Loop | null = triageRecord.path === 'full' ? (triageRecord.loop ?? 'strict') : null
@@ -273,7 +276,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
 
   // The light loop: host findings, then one agent that reviews the change, fixes it, and applies or rejects them.
   const lightLoop = async () => {
-    const found = await hostCheck('light.host', { from: frozen.base, to: frozen.head }, 'host')
+    const found = await hostCheck('light.host', { from: start, to: frozen.head }, 'host')
     const gated = await runGate('light.gate', familyHeader('Light', { light: input.models.light }), found)
     const outcome = await runPatch('light', gated, () =>
       light(context, 'light', input.models.light, {
@@ -288,7 +291,8 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
 
   // Step 1: read-only reviewers in parallel on the frozen change, then the gate and the patch.
   const runStep1 = async (roles: readonly Step1Role[]) => {
-    const step1Range = { from: frozen.base, to: frozen.head }
+    const step1Range = { from: start, to: frozen.head }
+    const note = frozen.from ? 'This pass reviews only the changes after an earlier review pass of this change. That pass reviewed the rest of the change.' : ''
     const asked = step(ledger, 'step1.questions', () => askQuestions(context, 'step1.questions', input.models.step1.questions, step1Range)).then((list) =>
       questions.post('ask', list),
     )
@@ -298,7 +302,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     // The bugs review is the slowest track: on a large diff, the host splits it across reviewers.
     const reviewed = settleAll(
       roles.map((id) =>
-        step(ledger, `step1.${id}`, () => (id === 'bugs' ? splitReview : review)(context, `step1.${id}`, reviewRoles[id], input.models.step1[id], step1Range, '')),
+        step(ledger, `step1.${id}`, () => (id === 'bugs' ? splitReview : review)(context, `step1.${id}`, reviewRoles[id], input.models.step1[id], step1Range, note)),
       ),
     )
     const checked = reviewed.then(() => hostCheck('step1.host', step1Range, 'host'))
@@ -568,7 +572,7 @@ function renderReport(run: ReportInput): string {
     '',
     `- Run: ${run.input.runId}`,
     `- Source: ${run.input.source}`,
-    `- Reviewed: ${short(run.frozen.base)}..${short(run.frozen.head)}`,
+    `- Reviewed: ${short(reviewedFrom(run.frozen))}..${short(run.frozen.head)}${run.frozen.from ? `, the changes after an earlier pass (the change starts at ${short(run.frozen.base)})` : ''}`,
     `- Fixes: branch ${run.frozen.branch} at ${short(run.current)} (${run.frozen.location})`,
     `- Triage: \`${triageLine(run.triage)}\``,
     `- ${signingLine(run.signing)}`,
