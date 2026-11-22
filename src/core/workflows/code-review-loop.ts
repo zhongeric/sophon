@@ -1,5 +1,5 @@
 import type { Contracts } from 'nanocode-ts'
-import type { CheckResult, RepoConfig } from '../checks.ts'
+import { failedChecks, type CheckResult, type FailedFinalCheck, type RepoConfig } from '../checks.ts'
 import { assignIds, type Finding } from '../findings.ts'
 import { acceptRejection, findingQuestion, gate, rejectionQuestion, settle, type GateResult } from '../gate.ts'
 import { step, type Ledger } from '../ledger.ts'
@@ -150,9 +150,20 @@ export type LoopDeps = {
 export type Criterion = { name: string; ok: boolean; detail: string }
 /**
  * `stopped` is true only when the user stopped the run at the cost budget. `pruned` is the prune of the fix branch. It is
- * absent in a result that a platform reads back from its ledger.
+ * absent in a result that a platform reads back from its ledger. `failedChecks` are the failed final checks (D15), for
+ * the fixer of a development run (D14).
  */
-export type LoopResult = { pass: boolean; criteria: Criterion[]; branch: string; final: string; report: string; usage: RunUsage; stopped: boolean; pruned?: PruneResult }
+export type LoopResult = {
+  pass: boolean
+  criteria: Criterion[]
+  branch: string
+  final: string
+  report: string
+  usage: RunUsage
+  stopped: boolean
+  pruned?: PruneResult
+  failedChecks: FailedFinalCheck[]
+}
 
 /**
  * The code review loop, with its order and hard rules in code. Triage picks the light
@@ -180,8 +191,8 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   const { budgetOverride, ...recorded } = input
   ledger.put('input', recorded)
   // A run that deleted its fix branch cannot go on: the worktree is gone, so the first git call of a resume fails.
-  const ended = ledger.get<LoopResult>('ended')
-  if (ended) return ended
+  const ended = ledger.get<Omit<LoopResult, 'failedChecks'> & { failedChecks?: FailedFinalCheck[] }>('ended')
+  if (ended) return { ...ended, failedChecks: ended.failedChecks ?? [] }
   // Freeze commits, so the check runs before it. A review with --base only pushes no branch.
   const headRef = input.headRef ?? input.ship?.headRef
   const signing = await step(ledger, 'signing', () => deps.signing.check(headRef === undefined ? [] : [headRef]))
@@ -420,7 +431,7 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
     const report = renderReport({ input, frozen, current, pass: false, criteria, triage: triaged, signing, steps, checks: null, verdict: null, decisions: decisions(ledger), usage: usageReport.lines, alarms: alarmLines(ledger), note, branches: lines })
     deps.files.write('report.md', report)
     ledger.put('result', { pass: false, criteria, final: current, usage: usageReport.run, stopped: true })
-    return end({ pass: false, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: true, pruned })
+    return end({ pass: false, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: true, pruned, failedChecks: [] })
   }
   const { current, secondPass, steps, checks, verdict } = outcome
 
@@ -436,8 +447,9 @@ export async function codeReviewLoop(input: LoopInput, deps: LoopDeps): Promise<
   const usageReport = usage()
   const report = renderReport({ input, frozen, current, pass, criteria, triage: triaged, signing, steps, checks, verdict, decisions: decisions(ledger), usage: usageReport.lines, alarms: alarmLines(ledger), note: null, branches: lines })
   deps.files.write('report.md', report)
-  ledger.put('result', { pass, criteria, final: current, usage: usageReport.run, stopped: false })
-  return end({ pass, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: false, pruned })
+  const failing = failedChecks(checks)
+  ledger.put('result', { pass, criteria, final: current, usage: usageReport.run, stopped: false, failedChecks: failing })
+  return end({ pass, criteria, branch: frozen.branch, final: current, report, usage: usageReport.run, stopped: false, pruned, failedChecks: failing })
 }
 
 function familyHeader(label: string, models: Record<string, ModelChoice>): string {

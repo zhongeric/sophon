@@ -311,6 +311,12 @@ export const runChecksTool = (files: string, more = ''): Contracts.HostTool => (
 export const checkTails = (results: CheckResult[]) =>
   results.map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-checkOutputTailChars) }))
 
+/** A failed check with the end of its output, cut as the refusal of a submit cuts it. */
+export type FailedFinalCheck = { name: string; command: string; output: string }
+
+export const failedChecks = (results: CheckResult[]): FailedFinalCheck[] =>
+  results.filter((result) => result.status === 'fail').map(({ name, command, output }) => ({ name, command, output: output.slice(-checkOutputTailChars) }))
+
 /** The failed checks or tests in the refusal of a submit: the name, the exit code and the end of the output of each. */
 export const failureText = (failed: CheckResult[]): string[] =>
   failed.map(({ name, exit_code, output }) => `--- ${name} (exit code ${exit_code ?? 'none'}) ---\n${output.slice(-checkOutputTailChars)}`)

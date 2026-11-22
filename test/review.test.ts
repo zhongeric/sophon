@@ -15,7 +15,7 @@ function memoryLedger(): Ledger {
 
 const options = { now: 1_000, pauseSeconds: undefined }
 const note = 'step1.patch.1 did not call submit_patch_log'
-const passed: LoopResult = { branch: 'factory/pr-9-1', criteria: [], final: 'abc', pass: true, report: 'PASS', stopped: false, usage: { tokens: zeroTokens(), unpriced: [], usd: 0 } }
+const passed: LoopResult = { branch: 'factory/pr-9-1', criteria: [], final: 'abc', pass: true, report: 'PASS', stopped: false, failedChecks: [], usage: { tokens: zeroTokens(), unpriced: [], usd: 0 } }
 const request = { by: 'maintainer', owner: 'acme', repo: 'app' }
 const review = { ask: 'Add sub', branch: 'factory/dev-1', full: false, head: 'abc', pr: 9, runId: 'dev-1-review-1' }
 
@@ -118,4 +118,17 @@ test('a refused resume of a review run in error counts as a D13 restart, keeps t
   assert.ok(resumed.error instanceof PausedError)
   assert.equal(fake.state, 'queued')
   assert.equal(fake.resumes, maxErrorRestarts + 1)
+})
+
+test('reviewPass returns the failed checks of the review run outcome', async () => {
+  const failedChecks = [{ name: 'ci test', command: 'npm test', output: 'the end of the output' }]
+  const failed: LoopResult = { ...passed, pass: false, failedChecks }
+  const runs: ReviewRuns = {
+    start: async () => ({ run: 'pr-9-1' }),
+    outcome: async () => failed,
+    resumeAfterError: async () => assert.fail('a finished review run gets no resume'),
+  }
+  const env = { PULL_REQUESTS: { idFromName: (name: string) => name, get: () => runs } }
+  const result = await reviewPass(env, request, progressLedger(memoryLedger()), review)
+  assert.deepEqual(result.failedChecks, failedChecks)
 })

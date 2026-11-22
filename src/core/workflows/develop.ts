@@ -1,6 +1,6 @@
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../ci.ts'
-import type { MergeMethod, RepoConfig } from '../checks.ts'
+import type { FailedFinalCheck, MergeMethod, RepoConfig } from '../checks.ts'
 import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { alarmLines, settleAll } from '../planned-stop.ts'
@@ -108,14 +108,15 @@ const clockSkewMs = 30_000
 const defaultParallel = 3
 
 type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failures: string }
-/** A review pass. Records of older runs have no usage, which counts as zero, and no failed criteria. */
-type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage; failed?: Criterion[] }
+/** A review pass. Records of older runs have no usage, which counts as zero, and no failed criteria or failed checks. */
+type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage; failed?: Criterion[]; failedChecks?: FailedFinalCheck[] }
 /**
  * The cause of a repair round. `from` is 'CI' or 'review pass N', `short` is one line for the prompt and the report,
  * `text` is /review/repair.txt, `logs` is /review/ci-failure.txt when CI failed, and `report` is
- * /review/review-report.md when a review pass failed. `conflicts` are the files that conflict in a base merge.
+ * /review/review-report.md when a review pass failed. `checks` is /review/check-failure.txt when final checks of a
+ * review pass failed. `conflicts` are the files that conflict in a base merge.
  */
-type Cause = { from: string; short: string; text: string; logs: string | null; report: string | null; conflicts?: string[] }
+type Cause = { from: string; short: string; text: string; logs: string | null; report: string | null; checks: string | null; conflicts?: string[] }
 type Repair = { round: number; cause: Cause; log: BuildLog }
 type BasePoint = 'ready' | 'merge'
 /** The result of a base merge, and `change`: the paths of the change before it, from the merge base to the head. */
@@ -381,7 +382,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         const remaining = limit === undefined ? {} : { budget: 2 * limit - budget.spent() + (state.stoppedReview?.usage?.usd ?? 0) }
         const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, base, branch: branchName, full: input.full === true, pr: state.pr!.number, ...remaining })
         const failed = loop.criteria.filter((criterion) => !criterion.ok)
-        const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage, failed }
+        const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage, failed, failedChecks: loop.failedChecks }
         if (!loop.stopped) return result
         ledger.put(stoppedKey, result)
         state.stoppedReview = result
@@ -436,6 +437,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
           '/plan.md': planText,
           '/repair.txt': cause.text,
           ...(cause.logs === null ? {} : { '/ci-failure.txt': cause.logs }),
+          ...(cause.checks === null ? {} : { '/check-failure.txt': cause.checks }),
           ...(cause.report === null ? {} : { '/review-report.md': cause.report }),
         },
         prompt: repairPrompt(round, cause),
@@ -698,6 +700,7 @@ function repairPrompt(round: number, cause: Cause): string {
     '- The causes: /review/repair.txt',
     ...(cause.conflicts ? [`- The files that conflict: ${cause.conflicts.join(', ')}. The merge of the base is in progress in /repo.`] : []),
     ...(cause.logs === null ? [] : ['- The CI logs: /review/ci-failure.txt']),
+    ...(cause.checks === null ? [] : ['- The output of the failed checks: /review/check-failure.txt']),
     ...(cause.report === null ? [] : ['- The report of the review pass, with the findings that the patch agents skipped: /review/review-report.md']),
     '- The plan: /review/plan.md',
     '- The ask: /review/ask.md',
@@ -717,6 +720,7 @@ function mergeCause(base: string, conflicts: string[]): Cause {
     text: [`# The merge of the base ${at} has conflicts`, '', ...conflicts.map((path) => `- ${path}`), '', 'The merge is in progress. Your checkpoint commits it.', ''].join('\n'),
     logs: null,
     report: null,
+    checks: null,
     conflicts,
   }
 }
@@ -733,15 +737,18 @@ function ciCause(ci: Ci): Cause {
     text: [`# CI failed on ${at}`, '', ...failed.map((job) => `- ${job.name}: ${job.url}`), '', 'The logs: /review/ci-failure.txt', ''].join('\n'),
     logs: ci.failures,
     report: null,
+    checks: null,
   }
 }
 
 /**
  * A failed review pass as a repair cause: its failed criteria, with the intent gaps and the refused rejections in their
- * details. The report of the pass gives the skipped findings with their reasons and the checks.
+ * details. The report of the pass gives the skipped findings with their reasons and the checks. Each failed final check
+ * goes to /review/check-failure.txt with its command and the end of its output.
  */
 function reviewCause(pass: number, review: Review): Cause {
   const failed = review.failed ?? []
+  const checks = review.failedChecks ?? []
   return {
     from: `review pass ${pass}`,
     short: failed.length > 0 ? `failed: ${failed.map((criterion) => criterion.name).join(', ')}` : 'FAIL',
@@ -750,9 +757,11 @@ function reviewCause(pass: number, review: Review): Cause {
       '',
       ...(failed.length > 0 ? failed.map((criterion) => `- ${criterion.name}: ${criterion.detail}`) : ['- The record of the pass has no failed criteria.']),
       '',
+      ...(checks.length > 0 ? ['The output of the failed checks: /review/check-failure.txt', ''] : []),
     ].join('\n'),
     logs: null,
     report: review.report,
+    checks: checks.length > 0 ? checks.map((check) => `--- ${check.name}: ${check.command} ---\n${check.output}\n`).join('\n') : null,
   }
 }
 

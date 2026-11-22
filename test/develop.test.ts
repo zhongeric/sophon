@@ -247,6 +247,9 @@ test('develop: CI red two times gets two repair rounds, then a review pass, and 
   assert.deepEqual(repairRounds(first), ['1'])
   assert.ok(!first.some((turn) => turn.role === 'intent'))
   assert.match(repairTexts(first)[0] ?? '', /# CI failed on [0-9a-f]{12}.*- CI \(pull_request\): https:\/\/ci\.example\//s)
+  // A CI cause has no failed checks of a review pass, so the fixer gets no /review/check-failure.txt.
+  assert.doesNotMatch(repairTexts(first)[0] ?? '', /check-failure/)
+  assert.ok(!first.some((turn) => turn.role === 'builder' && /The output of the failed checks: \/review\/check-failure\.txt/.test(turn.request)))
 
   const second: Turn[] = []
   const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), second), pulls: github.pulls, runId: 'red-ci' })
@@ -296,6 +299,32 @@ test('develop: a failed intent check gets a repair round and a second review pas
   assert.match(result.report, /^- \[x\] Review loop PASS on the head, at least 1 pass: pass 1: FAIL, pass 2: PASS$/m)
   assert.match(result.report, /^- Round 1, review pass 1: failed: Intent reviewer affirms the original ask\. repair 1: mul\(2, 3\) is 6$/m)
   assert.deepEqual(github.state.ready, [9])
+})
+
+test('develop: a ci command that fails in the final checks of a review pass gives the fixer the end of its output, and the run merges', { timeout: 240_000 }, async () => {
+  // The ci command fails while the flag exists and test/rounds.txt does not. The bugs reviewer creates the flag after the
+  // builders submit, so only the final checks of pass 1 fail.
+  const flag = join(mkdtempSync(join(tmpdir(), 'factory-flag-')), 'flag')
+  const output = `console.log('the start' + ' of the output'); console.log('filler line\\n'.repeat(500)); console.log('the cause: test/rounds.txt is missing')`
+  const command = `if [ -e '${flag}' ] && [ ! -e test/rounds.txt ]; then node -e "${output}"; exit 1; fi`
+  const config = { stack: 'TypeScript', checks: { smoke: 'node -e "process.exit(0)"' }, tests: { pattern: '\\.test\\.ts$', command: 'env -u NODE_TEST_CONTEXT node --test {tests}' }, ci: { test: command } }
+  const { repo } = developRepo(config, { merge: 'squash' })
+  const github = fakePulls([true])
+  const turns: Turn[] = []
+  const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript({ checkFlag: flag }), turns), pulls: github.pulls, runId: 'check-failure' })
+
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
+  assert.deepEqual(repairRounds(turns), ['1'])
+  const read = repairTexts(turns)[0] ?? ''
+  assert.match(read, /# Review pass 1 failed on [0-9a-f]{12}.*- Checks green: failed: ci test.*The output of the failed checks: \/review\/check-failure\.txt/s)
+  assert.ok(turns.some((turn) => turn.role === 'builder' && turn.request.includes('- The output of the failed checks: /review/check-failure.txt')))
+  // The fixer read the end of the output, cut as the submit gate cuts it, and not its start.
+  const checkFailure = turns.find((turn) => turn.role === 'builder' && turn.output?.includes('check-failure.txt: '))?.output ?? ''
+  assert.match(checkFailure, /--- ci test: if \[ -e .*the cause: test\/rounds\.txt is missing/s)
+  assert.doesNotMatch(checkFailure, /the start of the output/)
+  assert.match(result.report, /^- \[x\] Review loop PASS on the head, at least 1 pass: pass 1: FAIL, pass 2: PASS$/m)
+  assert.match(result.report, /^- Round 1, review pass 1: failed: Checks green\. repair 1: mul\(2, 3\) is 6$/m)
 })
 
 test('develop: a review that fails 6 times ends failed after 5 repair rounds, does not merge, and a resume starts no round 6', { timeout: 300_000 }, async () => {
@@ -933,7 +962,7 @@ async function runBudget(
     if (!pass) throw new Error('no scripted review pass left')
     const usage = { tokens: zeroTokens(), usd: pass.usd, unpriced: [] }
     const report = '- Triage: `TRIAGE path=full`'
-    return { pass: !pass.stopped, criteria: [], branch: 'factory/review', final: request.head, report, usage, stopped: pass.stopped }
+    return { pass: !pass.stopped, criteria: [], branch: 'factory/review', final: request.head, report, usage, stopped: pass.stopped, failedChecks: [] }
   }
   return { ...(await develop(input, { ...deps, review })), github }
 }
