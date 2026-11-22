@@ -2,13 +2,11 @@ import type { Contracts } from 'nanocode-ts'
 import { checkQuestions, decisionLists, questionsSchema, type Answer, type Question } from './questions.ts'
 import { StopError } from './stop.ts'
 
-/** What the intake agent understood of the ask, and how it routes the ask. */
+/** What the intake turn of the planner session understood of the ask, and the review passes that it recommends (D19). */
 export type Intake = {
   title: string
   summary: string
   slug: string
-  /** A larger change gets a spec before the plan. */
-  larger: boolean
   passes: 1 | 2
   reason: string
   questions: Question[]
@@ -17,19 +15,18 @@ export type Intake = {
 export const submitIntake: Contracts.HostTool = {
   name: 'submit_intake',
   description:
-    'Submit the intake one time: your summary of the ask, a PR title, a branch slug, the route (larger change, review passes) with the reason, and your open questions, each with a level by D11.',
+    'Submit the intake one time: your summary of the ask, a PR title, a branch slug, the route (review passes) with the reason, and your open questions, each with a level by D11.',
   parameters: {
     type: 'object',
     properties: {
       title: { type: 'string', description: 'A short PR title in the imperative, at most 72 characters' },
       summary: { type: 'string', description: 'The ask as you understand it, with the parts of the repository that it touches' },
       slug: { type: 'string', description: 'Lowercase words joined with hyphens, at most 40 characters, for example add-fee-switch' },
-      larger: { type: 'boolean', description: 'True when the ask needs a spec before the plan' },
       passes: { type: 'integer', enum: [1, 2], description: 'Review loop passes: 2 for a larger feature set in Solidity src/, else 1' },
-      reason: { type: 'string', description: 'Why you chose larger and passes, in one or two sentences' },
+      reason: { type: 'string', description: 'Why you chose passes, in one or two sentences' },
       questions: questionsSchema,
     },
-    required: ['title', 'summary', 'slug', 'larger', 'passes', 'reason', 'questions'],
+    required: ['title', 'summary', 'slug', 'passes', 'reason', 'questions'],
     additionalProperties: false,
   },
 }
@@ -40,7 +37,6 @@ export function checkIntake(input: unknown): Intake {
     ...(!intake?.title?.trim() || intake.title.length > 72 ? ['title must have 1 to 72 characters'] : []),
     ...(!intake?.summary?.trim() ? ['summary is required'] : []),
     ...(!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(intake?.slug ?? '') || intake.slug.length > 40 ? ['slug must be lowercase words joined with hyphens, at most 40 characters'] : []),
-    ...(typeof intake?.larger !== 'boolean' ? ['larger must be true or false'] : []),
     ...(intake?.passes !== 1 && intake?.passes !== 2 ? ['passes must be 1 or 2'] : []),
     ...(!intake?.reason?.trim() ? ['reason is required'] : []),
   ]
@@ -49,36 +45,46 @@ export function checkIntake(input: unknown): Intake {
 }
 
 export const confirmOptions = ['Yes, go on', 'No, stop the run']
-export const specOptions = ['Write a spec first', 'Plan now']
 export const passOptions = ['One pass', 'Two passes']
 
 /**
- * The host's questions after the intake agent's: confirm the ask, then the route. They are run questions (D11), so the host
- * takes the intake agent's recommendation. When the intake agent raises a user question, the batch goes to the user anyway,
- * so the confirmation goes too, with rule scope: the user sees the summary and can correct it or stop the run.
- * One batch, so a user question of the intake agent needs one round trip.
+ * The host's questions after the intake turn's: confirm the ask, then the review passes (P4). They are run questions (D11), so
+ * the host takes the recommendation of the intake turn. When the intake turn raises a user question, the batch goes to the user
+ * anyway, so the confirmation goes too, with rule scope: the user sees the summary and can correct it or stop the run.
+ * One batch, so a user question of the intake turn needs one round trip.
  */
 export function routeQuestions(intake: Intake): Question[] {
   const next = (offset: number) => `Q${intake.questions.length + offset}`
   const confirm: Pick<Question, 'level' | 'rule'> = intake.questions.some((question) => question.level === 'user') ? { level: 'user', rule: 'scope' } : { level: 'run' }
   return [
     { id: next(1), question: 'Is this the ask? Correct it in your own words if it is not.', why: intake.summary, options: confirmOptions, recommendation: confirmOptions[0]!, ...confirm },
-    { id: next(2), question: 'Write a spec before the plan?', why: intake.reason, options: specOptions, recommendation: specOptions[intake.larger ? 0 : 1]!, level: 'run' },
-    { id: next(3), question: 'How many review loop passes?', why: intake.reason, options: passOptions, recommendation: passOptions[intake.passes - 1]!, level: 'run' },
+    { id: next(2), question: 'How many review loop passes?', why: intake.reason, options: passOptions, recommendation: passOptions[intake.passes - 1]!, level: 'run' },
   ]
 }
 
 export type Route = { stop: boolean; spec: boolean; passes: 1 | 2 }
 
+/** The spec route question of a ledger from before D19, and its option for a spec. */
+const oldSpecQuestion = 'Write a spec before the plan?'
+const oldSpecOption = 'Write a spec first'
+
 /**
  * Reads the route from the answers to the host's questions. Free text that corrects the ask becomes a decision for the planner.
  * A correction can start with "No,". The stop option, "no", "stop", and "stop the run" stop the run.
+ * `spec` is the spec option of the run, false by default. Only the answers to the host questions count.
+ * For a batch from before D19, the host uses question text and the recorded spec answer (D19). That batch has the spec route
+ * question at the ID of the passes question. Research changes the text of the confirm question, so the ID is the fallback.
  */
-export function route(intake: Intake, answers: Answer[]): Route {
-  const [confirm, spec, passes] = routeQuestions(intake).map((question) => answers.find((answer) => answer.id === question.id)?.answer ?? question.recommendation)
+export function route(intake: Intake, answers: Answer[], spec = false): Route {
+  const own = new Set(intake.questions.map((question) => question.id))
+  const host = answers.filter((answer) => !own.has(answer.id))
+  const byText = (question: string) => host.find((answer) => answer.question === question)?.answer
+  const oldSpec = host.find((answer) => answer.id === `Q${intake.questions.length + 2}` && answer.question === oldSpecQuestion)?.answer
+  const byId = (id: string) => (oldSpec === undefined ? host.find((answer) => answer.id === id)?.answer : undefined)
+  const [confirm, passes] = routeQuestions(intake).map((question) => byText(question.question) ?? byId(question.id) ?? question.recommendation)
   return {
     stop: confirm === confirmOptions[1] || /^\s*(no([\s,]+stop(\s+the\s+run)?)?|stop(\s+the\s+run)?)[.!]?\s*$/i.test(confirm!),
-    spec: spec === specOptions[0] || /^\s*(yes|spec)\b/i.test(spec!),
+    spec: spec || (oldSpec !== undefined && (oldSpec === oldSpecOption || /^\s*(yes|spec)\b/i.test(oldSpec))),
     passes: passes === passOptions[1] || /\b(two|2)\b/i.test(passes!) ? 2 : 1,
   }
 }

@@ -7,7 +7,7 @@ import { commentChannel, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
-import { cutReport, defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
+import { cutReport, develop, developModels, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
 import { statusHeader } from './announcements.ts'
 import { boxMachine, syncWithSetup } from './box.ts'
 import { sqlBranches } from './branches.ts'
@@ -27,7 +27,7 @@ import { encodePath } from './trees.ts'
  * A development run on a GitHub issue: the issue's title and body are the ask, and its comments carry the questions.
  * `budget` is the cost budget in USD.
  */
-export type DevelopRequest = { owner: string; repo: string; issue: number; by: string; base?: string; hotfix?: boolean; full?: boolean; parallel?: number; budget?: number }
+export type DevelopRequest = { owner: string; repo: string; issue: number; by: string; base?: string; hotfix?: boolean; spec?: boolean; full?: boolean; parallel?: number; budget?: number }
 
 /**
  * The development runs of one issue. The brain stays here: the ledger, the branches as trees in SQL, every agent
@@ -102,7 +102,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
   private models(): DevelopInput['models'] {
     type Overrides = Partial<LoopModels> & { develop?: Partial<DevelopModels> }
     const overrides = this.env.MODELS ? (JSON.parse(this.env.MODELS) as Overrides) : {}
-    return { develop: { ...defaultDevelopModels, ...overrides.develop }, review: mergeModels(overrides) }
+    return { develop: developModels(overrides.develop), review: mergeModels(overrides) }
   }
 
   /** The run's input: the issue is the ask, verbatim. The checks and rails come from the base branch. */
@@ -124,6 +124,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       source: `${request.owner}/${request.repo}#${request.issue}`,
       issue: request.issue,
       ...(request.hotfix ? { hotfix: true } : {}),
+      ...(request.spec ? { spec: true } : {}),
       ...(request.full ? { full: true } : {}),
       ...(request.parallel ? { parallel: request.parallel } : {}),
       ...(request.budget !== undefined ? { budget: request.budget } : {}),

@@ -1170,7 +1170,7 @@ async function freeze(branch: Branch, prereg: Prereg, runId: string, baseTree: B
 }
 
 /** The research intake as a development intake, so that the confirm question and its stop rule (route) are the same. */
-const asDevelopIntake = (intake: ResearchIntake) => ({ ...intake, larger: false, passes: 1 as const, reason: '' })
+const asDevelopIntake = (intake: ResearchIntake) => ({ ...intake, passes: 1 as const, reason: '' })
 
 const capId = (intake: ResearchIntake) => `Q${intake.questions.length + 2}`
 

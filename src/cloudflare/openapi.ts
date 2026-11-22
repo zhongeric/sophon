@@ -164,6 +164,7 @@ export function openApi(origin: string) {
         post: start('startDevelopmentRun', 'Start a development run on an issue', 'The title and the body of the issue are the ask. The run ends in a PR that closes the issue.', {
           base,
           hotfix: { type: 'boolean', description: 'Take the recommendation of every question of the run, also to raise the budget, and ask nobody' },
+          spec: { type: 'boolean', description: 'Write a spec before the plan' },
           full,
           parallel: { type: 'integer', minimum: 1, description: 'At most this many builders at the same time. Default: 3' },
         }),

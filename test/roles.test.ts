@@ -52,9 +52,8 @@ test('the review and development roles keep their guides and rails, and get no e
     light: { guides: ['shared/factory.md', 'light.md', 'anti-slop.md', 'shared/ste.md'], stackGuides: true, findings: undefined, tests: true, egress: false },
   })
   assert.deepEqual(Object.fromEntries(Object.entries(developRoles).map(([id, role]) => [id, shape(role)])), {
-    intake: { guides: ['shared/factory.md', 'intake.md'], stackGuides: false, findings: undefined, tests: false, egress: false },
     spec: { guides: ['shared/factory.md', 'spec.md', 'shared/ste.md'], stackGuides: false, findings: undefined, tests: false, egress: false },
-    planner: { guides: ['shared/factory.md', 'planner.md', 'shared/ste.md'], stackGuides: true, findings: undefined, tests: false, egress: false },
+    planner: { guides: ['shared/factory.md', 'intake.md', 'planner.md', 'shared/ste.md'], stackGuides: true, findings: undefined, tests: false, egress: false },
     builder: { guides: ['shared/factory.md', 'builder.md', 'shared/ste.md'], stackGuides: true, findings: undefined, tests: true, egress: false },
   })
 })

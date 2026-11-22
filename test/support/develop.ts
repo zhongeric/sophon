@@ -73,7 +73,16 @@ export const sources = {
   subTest: "import assert from 'node:assert/strict'\nimport { test } from 'node:test'\nimport { sub } from '../src/sub.ts'\n\ntest('sub', () => {\n  assert.equal(sub(5, 3), 2)\n})\n",
 }
 
-const intake = { title: 'Add sub and mul', summary: 'Adds sub() and mul() next to add(), with tests.', slug: 'add-sub-mul', larger: false, passes: 1, reason: 'Two small functions.', questions: [] }
+const intake = { title: 'Add sub and mul', summary: 'Adds sub() and mul() next to add(), with tests.', slug: 'add-sub-mul', passes: 1, reason: 'Two small functions.', questions: [] }
+
+/** True when the current turn of the planner session is the plan turn: its prompt is the last prompt of the request (D19). */
+export const planTurn = (request: string) => request.lastIndexOf('Plan this confirmed ask.') > request.lastIndexOf('Read this new ask and the repository.')
+
+/** The spec that the scripted spec agent submits, with its one run decision. */
+export const spec = {
+  spec: '# Summary\n\nAdds sub and mul.\n\n# Surfaces\n\nsrc/sub.ts and src/mul.ts.\n\n# Edge cases\n\nNegative results.\n\n# Out of scope\n\nDivision.\n\n# Decisions\n\nsub may return a negative number.',
+  decisions: [{ question: 'May sub return a negative number?', why: 'sub(3, 5)', options: ['Yes', 'No, throw'], recommendation: 'Yes', level: 'run' }],
+}
 
 /** A question about the scope of the ask, which only the user can decide (D11). */
 export const scopeQuestion = {
@@ -114,7 +123,8 @@ const wrongProduct = {
  * fails, so the builder submits a test of sub only. The fixer of each repair round shows /review/repair.txt, adds mul to
  * the test, and writes its round to test/rounds.txt, so that each round makes a commit. Reviewers find nothing, unless
  * `reviewFix`: then the bugs reviewer finds the missing mul test and the patch agent adds it.
- * With `askScope`, the intake agent raises one user question about the scope. The fixer of a base merge conflict shows
+ * The planner submits the intake in its intake turn, and the plan in its plan turn, where it shows /review/spec.md when the
+ * prompt names it. With `askScope`, the intake turn raises one user question about the scope. The fixer of a base merge conflict shows
  * /review/repair.txt, writes the files of `resolved` without conflict markers, checkpoints and submits.
  * With `checkFlag`, the bugs reviewer creates that file. When the prompt names /review/check-failure.txt, the fixer shows it.
  * With `blockRepair`, the fixer of that repair round submits a blocked log and changes nothing.
@@ -133,10 +143,16 @@ export function developScript(options: { blockSub?: boolean; reviewFix?: boolean
             `await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'expect 6' }], skipped: [] })`,
           ].join('\n'),
         }
-      case 'intake':
-        return { cell: `await tools.submit_intake(${JSON.stringify(options.askScope ? { ...intake, questions: [scopeQuestion] } : intake)})` }
+      case 'spec':
+        return { cell: `await tools.submit_spec(${JSON.stringify(spec)})` }
       case 'planner':
-        return { cell: `await tools.submit_plan(${JSON.stringify(plan)})` }
+        if (!planTurn(request)) return { cell: `await tools.submit_intake(${JSON.stringify(options.askScope ? { ...intake, questions: [scopeQuestion] } : intake)})` }
+        return {
+          cell: [
+            ...(request.includes('- The spec: /review/spec.md') ? [`text('spec.md: ' + await tools.Read({ file_path: '/review/spec.md' }))`] : []),
+            `await tools.submit_plan(${JSON.stringify(plan)})`,
+          ].join('\n'),
+        }
       case 'builder': {
         // The session of the fixer keeps the prompts of the earlier rounds, so the last prompt gives the round.
         const round = [...request.matchAll(/Repair round (\d+) of/g)].at(-1)?.[1]
