@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { PausedError } from '../src/core/questions.ts'
 import { research, type ResearchDeps } from '../src/core/workflows/research.ts'
 import { worktreePath } from '../src/node/git.ts'
 import { nodeResearch } from '../src/node/platform.ts'
@@ -274,6 +275,112 @@ for (const change of ['remove', 'replace'] as const) {
     assert.equal(refs(origin), 'refs/heads/main\n')
   })
 }
+
+test('research: a calibration that pauses on inject keeps the known outputs of the earlier call', { timeout: 300_000 }, async () => {
+  const { repo, base } = notebook()
+  const input = researchInput(base, 'paused-inject')
+  const deps = await nodeResearch({
+    channel: memoryChannel({ pick: '/answer\nQ1: a' }).channel,
+    credentials,
+    dispatch: scriptedDispatch(researchScript(), []),
+    env: { ARCHIVE_TOKEN: 'token-1' },
+    fetch: archive().fetch,
+    input,
+    log: () => {},
+    module,
+    prices,
+    pulls: fakePulls().pulls,
+    repo,
+    reviewChannel: async () => memoryChannel().channel,
+    runsDir: runsDir(),
+  })
+  // As the job ledger on Cloudflare: a replay gets the recorded result of a command and does not run it again.
+  const jobs = new Map<string, { exit_code: number | null; output: string }>()
+  let paused = false
+  const cleanBox = deps.cleanBox.bind(deps)
+  deps.cleanBox = async (commit, key) => {
+    const box = await cleanBox(commit, key)
+    return {
+      ...box,
+      copyId: key,
+      async run(command, options) {
+        const recorded = jobs.get(`${key} ${command}`)
+        if (recorded) return recorded
+        if (key === 'calibrate.hyp-001.2' && command.includes(' inject ') && !paused) {
+          paused = true
+          // inject changes the known output, and the call ends before inject does.
+          await box.run('printf changed > out/hyp-001/known.txt', options)
+          throw new PausedError('waiting for the inject job')
+        }
+        const result = await box.run(command, options)
+        jobs.set(`${key} ${command}`, result)
+        return result
+      },
+    }
+  }
+  await assert.rejects(research(input, deps), PausedError)
+  const result = await research(input, deps)
+  assert.equal(result.status, 'ready', result.report)
+  assert.ok(paused)
+  assert.doesNotMatch(result.report, /does not match SHA-256|No such file/)
+  assert.match(result.report, /Calibration round 2 at [0-9a-f]{12}: PASS/)
+})
+
+test('research: a replacement checkout reruns known before inject consumes its output', { timeout: 300_000 }, async () => {
+  const { repo, base } = notebook({ config: {
+    research: { ...researchConfig, commands: {
+      ...researchConfig.commands,
+      inject: `test -f out/hyp-001/known.txt && ${researchConfig.commands.inject}`,
+    } },
+  } })
+  const input = researchInput(base, 'replaced-inject')
+  const deps = await nodeResearch({
+    channel: memoryChannel({ pick: '/answer\nQ1: a' }).channel,
+    credentials,
+    dispatch: scriptedDispatch(researchScript(), []),
+    env: { ARCHIVE_TOKEN: 'token-1' },
+    fetch: archive().fetch,
+    input,
+    log: () => {},
+    module,
+    prices,
+    pulls: fakePulls().pulls,
+    repo,
+    reviewChannel: async () => memoryChannel().channel,
+    runsDir: runsDir(),
+  })
+  const jobs = new Map<string, { exit_code: number | null; output: string }>()
+  let generation = 0
+  let knownRuns = 0
+  const cleanBox = deps.cleanBox.bind(deps)
+  deps.cleanBox = async (commit, key) => {
+    const box = await cleanBox(commit, key)
+    const copyId = `${key}@${generation}`
+    return {
+      ...box,
+      copyId,
+      async run(command, options) {
+        const jobKey = `${copyId} ${command}`
+        const recorded = jobs.get(jobKey)
+        if (recorded) return recorded
+        if (key === 'calibrate.hyp-001.2') {
+          if (command.includes(' known ')) knownRuns++
+          if (command.includes(' inject ') && generation === 0) throw new PausedError('waiting for the inject job')
+        }
+        const result = await box.run(command, options)
+        jobs.set(jobKey, result)
+        return result
+      },
+    }
+  }
+  await assert.rejects(research(input, deps), PausedError)
+  assert.equal(knownRuns, 1)
+  generation++
+  const result = await research(input, deps)
+  assert.equal(result.status, 'ready', result.report)
+  assert.equal(knownRuns, 2)
+  assert.match(result.report, /Calibration round 2 at [0-9a-f]{12}: PASS/)
+})
 
 test('research: a review fix outside analysis/ fails the run and the PR stays draft', { timeout: 300_000 }, async () => {
   const { result, pulls } = await dossierRun('d7', {}, {}, { 'research/run.mjs': 'process.exit(1)\n' })

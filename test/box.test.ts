@@ -394,11 +394,60 @@ test('a container job runs detached in its directory, and each poll renews the i
   mkdirSync(join(root, 'work/x'), { recursive: true })
   await box.startJob('job-1', ['bash', '-c', 'echo out; echo err >&2; pwd -P; exit 3'], { cwd: 'work/x', env: {}, timeoutMs: 60_000 })
   const renewals = container.renewals
-  assert.deepEqual(await jobResult(box, 'job-1'), { exit_code: 3, output: `out\nerr\n${realpathSync(join(root, 'work/x'))}\n` })
+  const result = { exit_code: 3, output: `out\nerr\n${realpathSync(join(root, 'work/x'))}\n` }
+  assert.deepEqual(await jobResult(box, 'job-1'), result)
   assert.ok(container.renewals > renewals)
-  // The output and the exit code are in the job directory, not in the work directory.
+  // A poll keeps the files until the caller stores the result and removes the job.
   assert.deepEqual(readdirSync(join(root, 'work/x')), [])
-  assert.deepEqual(readdirSync(join(root, 'jobs/job-1')).sort(), ['exit', 'limit', 'output', 'pgid', 'started'])
+  assert.equal(existsSync(join(root, 'jobs/job-1')), true)
+  assert.deepEqual(await box.pollJob('job-1'), { state: 'done', result })
+  await box.killJob('job-1')
+  await box.killJob('job-1')
+  assert.equal(existsSync(join(root, 'jobs/job-1')), false)
+  assert.deepEqual(await box.pollJob('job-1'), { state: 'missing' })
+})
+
+test('a lost poll response or ledger write keeps the container result for a new runner without a second command', async (t) => {
+  for (const fault of ['poll response', 'ledger write']) {
+    await t.test(fault, async () => {
+      const { box, root } = await containerJobs()
+      const stored = memoryLedger()
+      const failure = new Error(`lost ${fault}`)
+      let fail = true
+      const ledger: Ledger = {
+        ...stored,
+        put(key, value) {
+          if (fail && fault === 'ledger write' && key.startsWith('job:') && typeof value === 'object' && value !== null && 'state' in value && value.state === 'done') {
+            fail = false
+            throw failure
+          }
+          stored.put(key, value)
+        },
+      }
+      const interrupted: Box = {
+        ...box,
+        async pollJob(id) {
+          const state = await box.pollJob(id)
+          if (fail && fault === 'poll response' && state.state === 'done') {
+            fail = false
+            throw failure
+          }
+          return state
+        },
+      }
+      const argv = ['bash', '-c', 'echo started >> starts; echo result; exit 3']
+      const options = { cwd: '', deadline: Date.now() + 10_000, env: {}, timeoutMs: 60_000 }
+      await assert.rejects(jobRunner(interrupted, ledger, { pollMs: 20 }).pause('command', argv, options), failure)
+      const [id] = ledger.get<string[]>('jobs:open') ?? []
+      assert.equal(typeof id, 'string')
+      assert.equal(existsSync(join(root, `jobs/${id}/output`)), true)
+
+      assert.deepEqual(await jobRunner(box, ledger, { pollMs: 20 }).pause('command', argv, options), { exit_code: 3, output: 'result\n' })
+      assert.equal(readFileSync(join(root, 'starts'), 'utf8'), 'started\n')
+      assert.equal(existsSync(join(root, `jobs/${id}`)), false)
+      assert.deepEqual(ledger.get('jobs:open'), [])
+    })
+  }
 })
 
 test('a container job keeps the result rules of a command and the last 20,000 characters of its output', async () => {
@@ -433,6 +482,7 @@ test('a kill stops the process group of a container job with its child, and the 
   assert.ok(child > 0)
   assert.deepEqual(await box.pollJob('group'), { state: 'running' })
   await box.killJob('group')
+  assert.equal(existsSync(join(root, 'jobs/group')), false)
   // A killed process can stay a zombie until its parent reaps it.
   const gone = () => !existsSync(`/proc/${child}/stat`) || / Z /.test(readFileSync(`/proc/${child}/stat`, 'utf8').replace(/^.*\)/, ''))
   let state = await box.pollJob('group')
@@ -491,5 +541,29 @@ test('the test machine runs jobs over HTTP with the same result rules, and kills
     )
   } finally {
     await mock.close()
+  }
+})
+
+test('the test machine client refuses a response without a valid job state or result', async () => {
+  const realFetch = globalThis.fetch
+  let reply: unknown = null
+  globalThis.fetch = (async () => new Response(JSON.stringify(reply))) as typeof fetch
+  try {
+    const box = httpBox('http://machine.test')
+    const options = { cwd: '', env: {}, timeoutMs: 60_000 }
+    reply = { state: 'done', result: { exit_code: 0, output: 'ok' } }
+    assert.deepEqual(await box.pollJob('a'), { result: { exit_code: 0, output: 'ok' }, state: 'done' })
+    reply = { state: 'paused' }
+    await assert.rejects(box.pollJob('a'), /the machine at http:\/\/machine\.test\/jobs\/poll gave no valid job state/)
+    reply = { state: 'done', result: { exit_code: '0', output: 'ok' } }
+    await assert.rejects(box.pollJob('a'), /gave no valid result/)
+    reply = { state: 'done' }
+    await assert.rejects(box.pollJob('a'), /gave no valid result/)
+    reply = { exit_code: 1.5, output: '' }
+    await assert.rejects(box.exec(['true'], options), /gave no valid result/)
+    reply = { exit_code: null, output: 'killed' }
+    assert.deepEqual(await box.exec(['true'], options), { exit_code: null, output: 'killed' })
+  } finally {
+    globalThis.fetch = realFetch
   }
 })

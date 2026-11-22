@@ -26,9 +26,9 @@ export type Box = {
    * exit code outside the work directories, so that a later call can poll it. Each ID starts one job only.
    */
   startJob(id: string, argv: string[], options: JobOptions): Promise<void>
-  /** A job is `missing` when the machine has no such job, or when its processes died without an exit code. */
+  /** Keeps the result until killJob. A job is `missing` when it has no files, or its processes died without an exit code. */
   pollJob(id: string): Promise<JobState>
-  /** Kills the process group of a job. A job that is gone is not an error. */
+  /** Kills an unfinished job and removes its files. A job that is gone is not an error. */
   killJob(id: string): Promise<void>
 }
 
@@ -118,7 +118,8 @@ const jobPoll = [
   'echo state=missing',
 ].join('\n')
 
-const jobKill = [jobDir, 'if read -r leader group 2>/dev/null < "$job/pgid"; then kill -KILL -- "-$group" "-$leader" 2>/dev/null; fi', 'exit 0'].join('\n')
+/** Kills the process groups of a job, and removes its directory. */
+const jobKill = [jobDir, 'if test ! -e "$job/exit" && read -r leader group 2>/dev/null < "$job/pgid"; then kill -KILL -- "-$group" "-$leader" 2>/dev/null; fi', 'rm -rf -- "$job"', 'exit 0'].join('\n')
 
 const checkJobId = (id: string) => {
   if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error(`the job ID ${JSON.stringify(id)} is not a valid file name`)
@@ -169,7 +170,8 @@ export function containerBox(container: ContainerHandle, options: { inactivityMs
       if (!done) throw new Error(`the poll of job ${id} gave no state: ${JSON.stringify(output.slice(-300))}`)
       const [code, ended, started, limit] = done.slice(1).map(Number) as [number, number, number, number]
       // 80,000 bytes hold at least the last 20,000 characters, and the exec keeps only those.
-      const last = await script(`the output of job ${id}`, 'tail -c 80000 -- "${PWD%/}/jobs/$1/output"', [id])
+      // The runner removes the files after it stores the result in the ledger.
+      const last = await script(`the output of job ${id}`, `${jobDir}; tail -c 80000 -- "$job/output"`, [id])
       return { result: commandResult(code, last, ended - started, limit), state: 'done' }
     },
     async killJob(id) {
@@ -184,26 +186,44 @@ export function containerBox(container: ContainerHandle, options: { inactivityMs
  * routes are under the same URL.
  */
 export function httpBox(url: string): Box {
-  const post = async <T>(to: string, body: unknown): Promise<T> => {
+  const post = async (to: string, body: unknown): Promise<unknown> => {
     const response = await fetch(to, { body: JSON.stringify(body), headers: { 'content-type': 'application/json' }, method: 'POST' })
     if (!response.ok) throw new Error(`the machine at ${to} answered HTTP ${response.status}: ${await response.text()}`)
-    return (await response.json()) as T
+    return response.json()
   }
   return {
     async start() {},
     exec(argv, { cwd, env, stdin, timeoutMs }) {
       let binary = ''
       for (let offset = 0; stdin && offset < stdin.length; offset += 0x8000) binary += String.fromCharCode(...stdin.subarray(offset, offset + 0x8000))
-      return post<BoxResult>(url, { argv, cwd, env, stdin: stdin ? btoa(binary) : null, timeoutMs })
+      return post(url, { argv, cwd, env, stdin: stdin ? btoa(binary) : null, timeoutMs }).then((value) => boxResult(value, url))
     },
     async startJob(id, argv, { cwd, env, timeoutMs }) {
       await post(`${url}/jobs/start`, { argv, cwd, env, id, timeoutMs })
     },
-    pollJob: (id) => post<JobState>(`${url}/jobs/poll`, { id }),
+    pollJob: async (id) => jobState(await post(`${url}/jobs/poll`, { id }), `${url}/jobs/poll`),
     async killJob(id) {
       await post(`${url}/jobs/kill`, { id })
     },
   }
+}
+
+const field = (value: unknown, name: string): unknown => (typeof value === 'object' && value !== null ? (value as Record<string, unknown>)[name] : undefined)
+
+/** The result of a command in a response of the machine at `from`. */
+function boxResult(value: unknown, from: string): BoxResult {
+  const code = field(value, 'exit_code')
+  const output = field(value, 'output')
+  if ((code === null || (typeof code === 'number' && Number.isInteger(code))) && typeof output === 'string') return { exit_code: code, output }
+  throw new Error(`the machine at ${from} gave no valid result: ${JSON.stringify(value)?.slice(0, 300)}`)
+}
+
+/** The job state in a response of the machine at `from`. */
+function jobState(value: unknown, from: string): JobState {
+  const state = field(value, 'state')
+  if (state === 'running' || state === 'missing') return { state }
+  if (state === 'done') return { result: boxResult(field(value, 'result'), from), state }
+  throw new Error(`the machine at ${from} gave no valid job state: ${JSON.stringify(value)?.slice(0, 300)}`)
 }
 
 /** The files of a tree with their kind, size and change time, without .git, so that a sync sends only what changed. */
@@ -400,18 +420,13 @@ const resolveFile = 'root=$(realpath .) && file=$(realpath -- "$1" 2>/dev/null) 
  */
 export type CleanJobs = { runner: JobRunner; ledger: Ledger; key: string; deadline: number }
 
-/** What the ledger keeps for the step key of a clean box: its directory, and the copy ID in its marker. */
-type CleanCopy = { dir: string; sync: string }
-
 /**
  * Copies `tree`, which holds only the files of a commit, to the new directory `dir` of the machine. Commands of the
  * result run in `dir` without a sync. runDomainCommand runs the setup, so it does not run here. `read` gives the exact
  * bytes of a file in `dir`, also of a binary file, in base64 chunks.
  *
- * With `jobs`, each command is a pause-mode job, and the clean box keeps `dir` across calls: when the ledger has the
- * copy of `dir` for the step key and the marker `<dir>.sync` agrees, it does not copy again. Thus it never removes a
- * directory under a running job. The pause key holds the copy ID, so that a new copy, for example in a new machine,
- * runs each command again and makes its output files again.
+ * With `jobs`, each command is a pause-mode job. When the copy of the step key and the marker `<dir>.sync` agree,
+ * `dir` stays across calls. A new copy ID makes each command run again.
  */
 export async function cleanBox(
   box: Box,
@@ -419,26 +434,29 @@ export async function cleanBox(
   dir: string,
   log: (line: string) => void,
   jobs?: CleanJobs,
-): Promise<Machine & { read(path: string): Promise<Uint8Array> }> {
+): Promise<Machine & { copyId: string; read(path: string): Promise<Uint8Array> }> {
   await box.start()
   const started = Date.now()
   const marker = `${dir}.sync`
   const ledgerKey = `clean-box:${jobs?.key}`
-  let copy = jobs?.ledger.get<CleanCopy>(ledgerKey)
-  const agrees =
-    copy?.dir === dir &&
-    (await box.exec(['bash', '-c', 'test "$(cat -- "$1" 2>/dev/null)" = "$2"', 'bash', marker, copy.sync], { cwd: '', env: boxEnv, timeoutMs: 60_000 })).exit_code === 0
-  if (agrees) log(`sync ${dir}: kept, 0 files sent in ${Date.now() - started} ms`)
+  // The ledger keeps the copy ID of the step key. The caller gives the same directory for the same key.
+  let sync = jobs?.ledger.get<string>(ledgerKey)
+  if (
+    sync !== undefined &&
+    (await box.exec(['bash', '-c', 'test "$(cat -- "$1" 2>/dev/null)" = "$2"', 'bash', marker, sync], { cwd: '', env: boxEnv, timeoutMs: 60_000 })).exit_code === 0
+  )
+    log(`sync ${dir}: kept, 0 files sent in ${Date.now() - started} ms`)
   else {
     const files = await syncTree(box, tree, dir, null)
+    sync = crypto.randomUUID()
     if (jobs) {
-      copy = { dir, sync: crypto.randomUUID() }
-      const written = await box.exec(['bash', '-c', 'printf %s "$2" > "$1"', 'bash', marker, copy.sync], { cwd: '', env: boxEnv, timeoutMs: 60_000 })
+      const written = await box.exec(['bash', '-c', 'printf %s "$2" > "$1"', 'bash', marker, sync], { cwd: '', env: boxEnv, timeoutMs: 60_000 })
       if (written.exit_code !== 0) throw new Error(`writing the marker ${marker} failed: ${written.output.slice(-2000)}`)
-      jobs.ledger.put(ledgerKey, copy)
+      jobs.ledger.put(ledgerKey, sync)
     }
     log(`sync ${dir}: full, ${files.size} files sent in ${Date.now() - started} ms`)
   }
+  const copy = sync
   // Each command checks the path again, because a command of the run can replace a directory with a symlink.
   const readFile = async (path: string, script: string, args: string[]): Promise<string> => {
     const result = await box.exec(['bash', '-c', `${resolveFile}; ${script}`, 'bash', path, ...args], { cwd: dir, env: boxEnv, timeoutMs: 60_000 })
@@ -448,10 +466,11 @@ export async function cleanBox(
     return result.output
   }
   return {
+    copyId: copy,
     run(command, { timeoutMs }) {
       const options = { cwd: dir, env: boxEnv, timeoutMs }
-      if (!jobs || !copy) return box.exec(['bash', '-c', command], options)
-      return jobs.runner.pause(`${dir}@${copy.sync}:${command}`, ['bash', '-c', command], { ...options, deadline: jobs.deadline })
+      if (!jobs) return box.exec(['bash', '-c', command], options)
+      return jobs.runner.pause(`${dir}@${copy}:${command}`, ['bash', '-c', command], { ...options, deadline: jobs.deadline })
     },
     async read(path) {
       let depth = 0

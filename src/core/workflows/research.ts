@@ -135,7 +135,11 @@ export type ResearchDeps = {
 }
 
 /** A clean checkout with read access to the output files of its commands. */
-type ResearchBox = Machine & { read(path: string): Promise<Uint8Array> }
+type ResearchBox = Machine & {
+  /** Identifies a checkout that stays across calls. A replacement needs a new ID. */
+  copyId?: string
+  read(path: string): Promise<Uint8Array>
+}
 
 /** A frozen prereg as the ledger records it. */
 export type Freeze = { hypothesis: string; version: number; path: string; sha256: string; commit: string }
@@ -727,7 +731,10 @@ async function calibrate(stages: Stages, analysis: Analysis): Promise<Calibratio
     const threshold = preregThreshold(new TextDecoder().decode(await branch.tree.read(`/${path}`)))
     const head = await branch.head()
     const box = await deps.cleanBox(head, `calibrate.${hypothesis}.${round}`)
-    const known = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'known', path), hypothesis, round)
+    // Keep the snapshot on a replay, but run known again when the checkout changes.
+    const knownKey = `calibrate.${hypothesis}.${round}.known${box.copyId === undefined ? '' : `.${box.copyId}`}`
+    const known = await step(deps.ledger, knownKey, async () =>
+      keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'known', path), hypothesis, round))
     const inject = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'inject', path), hypothesis, round)
     const verdict = calibrationVerdict(known.run, inject.run, threshold)
     return {

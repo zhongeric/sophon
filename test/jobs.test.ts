@@ -9,6 +9,7 @@ import { cleanBox, type Box, type BoxResult, type JobState } from '../src/cloudf
 import { jobRunner, type JobRecord } from '../src/cloudflare/jobs.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import { PausedError } from '../src/core/questions.ts'
+import { StopError } from '../src/core/stop.ts'
 
 /** A ledger in memory. A value goes through JSON, as in Durable Object SQL. */
 function memoryLedger(): Ledger {
@@ -78,13 +79,13 @@ test('a pause job is in the ledger before it starts, and a later call gives its 
   }
   assert.deepEqual(await jobRunner(fake.box, ledger, options).pause('clean/1:make', make, pauseOptions(60_000)), done)
   const [record] = fake.recorded
-  assert.deepEqual(record && { ...record, call: '', id: '' }, { argv: make, call: '', cwd: 'clean/1', id: '', key: 'clean/1:make', mode: 'pause', started: 0, state: 'open' })
+  assert.deepEqual(record && { ...record, call: '', id: '' }, { argv: make, call: '', cwd: 'clean/1', id: '', mode: 'pause', state: 'open' })
   assert.deepEqual(ledger.get<JobRecord>(`job:${record?.id}`)?.result, done)
   assert.deepEqual(open(ledger), [])
 
   fake.states.clear()
   assert.deepEqual(await jobRunner(fake.box, ledger, clock().options).pause('clean/1:make', make, pauseOptions(60_000)), done)
-  assert.deepEqual(fake.events, ['start clean/1 bash -c make'])
+  assert.deepEqual(fake.events, ['start clean/1 bash -c make', `kill ${record?.id}`])
 })
 
 test('a pause job throws a PausedError at the deadline, and a replay with a new runner polls it and does not start it again', async () => {
@@ -101,8 +102,34 @@ test('a pause job throws a PausedError at the deadline, and a replay with a new 
   const replay = clock()
   replay.time.after = () => fake.states.set(open(ledger)![0]!, { result: done, state: 'done' })
   assert.deepEqual(await jobRunner(fake.box, ledger, replay.options).pause('clean/1:make', make, pauseOptions(60_000)), done)
-  assert.deepEqual(fake.events, ['start clean/1 bash -c make'])
+  assert.deepEqual(fake.events, ['start clean/1 bash -c make', `kill ${fake.recorded[0]?.id}`])
   assert.deepEqual(open(ledger), [])
+})
+
+test('a cleanup failure keeps the stored result and retries cleanup in a new call without a new command', async () => {
+  const ledger = memoryLedger()
+  const fake = fakeBox(ledger)
+  const { options, time } = clock()
+  time.after = () => fake.states.set(open(ledger)![0]!, { result: done, state: 'done' })
+  const failure = new Error('cleanup response lost')
+  const interrupted: Box = {
+    ...fake.box,
+    async killJob(id) {
+      assert.equal(ledger.get<JobRecord>(`job:${id}`)?.state, 'done')
+      assert.deepEqual(ledger.get<JobRecord>(`job:${id}`)?.result, done)
+      await fake.box.killJob(id)
+      throw failure
+    },
+  }
+  await assert.rejects(jobRunner(interrupted, ledger, options).pause('clean/1:make', make, pauseOptions(60_000)), failure)
+  const [id] = open(ledger) ?? []
+  assert.equal(typeof id, 'string')
+
+  const next = jobRunner(fake.box, ledger, clock().options)
+  await next.killStale()
+  assert.deepEqual(open(ledger), [])
+  assert.deepEqual(await next.pause('clean/1:make', make, pauseOptions(60_000)), done)
+  assert.deepEqual(fake.events, ['start clean/1 bash -c make', `kill ${id}`, `kill ${id}`])
 })
 
 test('a recorded pause job that the machine does not have starts again after a kill', async () => {
@@ -117,6 +144,20 @@ test('a recorded pause job that the machine does not have starts again after a k
   assert.notEqual(next, old)
   assert.deepEqual(fake.events, ['start clean/1 bash -c make', `kill ${old}`, 'start clean/1 bash -c make'])
   assert.equal(ledger.get<JobRecord>(`job:${old}`)?.state, 'killed')
+})
+
+test('a pause job that the machine loses again and again stops the run, also across copies of the clean box', async () => {
+  const ledger = memoryLedger()
+  const fake = fakeBox(ledger)
+  await assert.rejects(jobRunner(fake.box, ledger, clock().options).pause('clean/1@a:make', make, pauseOptions(0)), pauses)
+  // A new copy of the clean box gives a new pause key for the same command, and the machine loses each job.
+  const lost = clock()
+  lost.time.after = () => fake.states.clear()
+  const stops = (error: unknown) =>
+    error instanceof StopError &&
+    error.message === 'the machine lost the job `bash -c make` in clean/1 3 times, for example because the command used more memory than the container has'
+  await assert.rejects(jobRunner(fake.box, ledger, lost.options).pause('clean/1@b:make', make, pauseOptions(60_000)), stops)
+  assert.equal(fake.events.filter((event) => event.startsWith('start')).length, 3)
 })
 
 test('a wait job polls until its end, and the next call kills the wait jobs of earlier calls only', async () => {
@@ -170,28 +211,33 @@ test('a clean box keeps its directory when the ledger and the marker agree, and 
     }
     const runner = jobRunner(fake.box, ledger, options)
     const box = await cleanBox(fake.box, tree, 'clean/1', (line) => lines.push(line), { deadline: 60_000, key: 'calibrate.h1.1', ledger, runner })
-    return box.run('make', { env: [], timeoutMs: 60_000 })
+    return { copyId: box.copyId, result: await box.run('make', { env: [], timeoutMs: 60_000 }) }
   }
 
-  assert.deepEqual(await run(), done)
-  const copy = ledger.get<{ dir: string; sync: string }>('clean-box:calibrate.h1.1')
-  assert.deepEqual(copy?.dir, 'clean/1')
-  assert.equal(readFileSync(marker, 'utf8'), copy?.sync)
+  const first = await run()
+  assert.deepEqual(first.result, done)
+  const copy = ledger.get<string>('clean-box:calibrate.h1.1')
+  assert.equal(typeof copy, 'string')
+  assert.equal(first.copyId, copy)
+  assert.equal(readFileSync(marker, 'utf8'), copy)
   assert.match(lines.at(-1) ?? '', /^sync clean\/1: full, 1 files sent in \d+ ms$/)
   writeFileSync(join(dir, 'out.txt'), 'output of make')
 
   // A replay: the same directory, its output, and the stored result of the command.
   const before = fake.events.length
-  assert.deepEqual(await run(), done)
+  assert.deepEqual(await run(), first)
   assert.equal(readFileSync(join(dir, 'out.txt'), 'utf8'), 'output of make')
   assert.equal(fake.events.slice(before).some((event) => event.includes('rm -rf') || event.startsWith('start')), false)
   assert.match(lines.at(-1) ?? '', /^sync clean\/1: kept, 0 files sent in \d+ ms$/)
 
   // A new machine has no marker: a new copy, and the command runs again in it.
   rmSync(marker)
-  assert.deepEqual(await run(), done)
+  const replacement = await run()
+  assert.deepEqual(replacement.result, done)
+  assert.notEqual(replacement.copyId, first.copyId)
+  assert.equal(replacement.copyId, ledger.get<string>('clean-box:calibrate.h1.1'))
   assert.equal(existsSync(join(dir, 'out.txt')), false)
-  assert.notEqual(ledger.get<{ sync: string }>('clean-box:calibrate.h1.1')?.sync, copy?.sync)
+  assert.notEqual(ledger.get<string>('clean-box:calibrate.h1.1'), copy)
   assert.equal(fake.events.filter((event) => event === 'start clean/1 bash -c make').length, 2)
   assert.match(lines.at(-1) ?? '', /^sync clean\/1: full, 1 files sent in \d+ ms$/)
 })
