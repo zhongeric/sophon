@@ -43,7 +43,7 @@ The host runs steps 0 to 9. Steps 10 to 14 (dry run, the user's go, broadcast, l
 separate deploy workflow later (section 10).
 
 ```
-0 Intake ─▶ 1 Spec (larger changes) ─▶ 2 Plan ─▶ 3 Triage ─▶ Build ─▶ Split
+0 Intake ─▶ 1 Spec (--spec) ─▶ 2 Plan ─▶ 3 Triage ─▶ Build ─▶ Split
   ─▶ 4 Freeze ─▶ 5 Review loop (light or full, x1 or x2) ─▶ 6 Auditor (Solidity src/)
   ─▶ 7 PR hygiene ─▶ 8 CI green ─▶ 9 Ready for the user (the user merges)
 ```
@@ -52,32 +52,34 @@ Each stage below lists who does the work, what the host enforces, and where the 
 
 ### 0. Intake
 
-- **Who:** the host, with a read-only intake agent.
+- **Who:** the host, with the intake turn of the read-only planner session.
 - **Input:** the user's ask. Locally: `npm run develop -- --ask "<ask>"`. On Cloudflare: `npm run remote -- develop`,
   the `agent-develop` label on a GitHub issue, or a `/develop` comment.
-- **Work:** record the ask verbatim. A read-only intake agent reads the repo and the ask, and lists the open
-  questions and product calls, each with a recommendation. It explores the code first instead of asking what the
-  code answers.
-- **Rails:** no plan and no code until the ask is **confirmed**. The host adds three route questions to the intake
-  agent's batch: "Is this the ask?" with the agent's summary, a spec or not, and one or two review passes, each with
-  the agent's recommendation and reason (P4).
-  - The route questions are `run` level (D11), so the host uses the intake agent's recommendations at once.
-  - The confirmation of the ask becomes a question to the user only when the intake agent asks a `user` question.
+- **Work:** record the ask verbatim. In the intake turn, the planner session reads the repo and the ask. It submits
+  the open questions and product calls, each with a recommendation, the summary of the ask, the title, the slug, and
+  one or two review passes with the reason. It explores the code first instead of asking what the code answers.
+- **Rails:** no plan and no code until the ask is **confirmed**. The host adds two route questions to the batch of
+  the intake turn: "Is this the ask?" with the summary, and one or two review passes with the recommendation and
+  reason (P4).
+  - The route questions are `run` level (D11), so the host uses the recommendations of the intake turn at once.
+  - The confirmation of the ask becomes a question to the user only when the intake turn asks a `user` question.
     For example, the agent asks a question with rule `scope` when the scope of the ask is not clear. Then "Is this
     the ask?" is also `user` level, with rule `scope`, so the user sees the summary in the same batch. The user's
     `/answer` to that batch is then the confirmation.
-  - When the batch has no `user` question, the run continues without a pause. The report lists the recommendations
-    as decisions that the run made.
+  - When the batch has a `user` question, the run pauses between the intake turn and the plan turn, and the answers
+    go to the same planner session. Without a `user` question, the run continues without a pause. The report lists
+    the recommendations as decisions that the run made.
   - When the confirmation goes to the user, a free-text correction of the summary goes on, as a decision for the
     planner, and the stop option stops the run.
   - The host records which stack profiles apply (section 4).
 - **The user:** answers the `user` questions of the intake, when there are some. A small hotfix skips them when the
   user marks it so (`--hotfix`): the host uses every recommendation, as before D11.
 
-### 1. Spec, for larger changes
+### 1. Spec, with `--spec`
 
 - **Who:** a spec agent, in the role of a product manager. Read-only.
-- **When:** the intake marks the ask as a larger change, or the user says "start with a spec".
+- **When:** only with `--spec`: `npm run develop -- --spec`, `npm run remote -- develop --spec`, the `spec` option of
+  the admin route, or `/develop --spec`. It runs after the intake answers and before the plan turn.
 - **Output:** a short spec with edge cases, every product surface, out-of-scope items, and the product decisions
   that the user can overrule. Each decision is also a question with a level (D11). The host posts only the `user`
   decisions, and the run pauses for the user's answers to them. For the `run` decisions, the host uses the
@@ -85,7 +87,7 @@ Each stage below lists who does the work, what the host enforces, and where the 
 
 ### 2. Plan
 
-- **Who:** a planner agent on the strongest writer model. Read-only.
+- **Who:** the planner session on the strongest writer model, in a follow-up turn after the intake turn. Read-only.
 - **Output, through a checked submit tool:** smallest change, goals, non-goals, and done-looks-like.
   Done-looks-like is a list of acceptance checks. Each check is a command (a test, a typecheck, a CI job) or a
   statement that the intent reviewer verifies later.
@@ -303,9 +305,8 @@ Not built yet: `abi.encodePacked` with dynamic types and NatSpec, because they n
 
 | Role | Model | Access | Output (checked by the host) |
 | --- | --- | --- | --- |
-| Intake | strongest writer | read-only | questions with options and a recommendation |
 | Spec (product manager) | strongest writer | read-only | spec with edge cases, surfaces, out of scope, decisions that the user can overrule |
-| Planner | strongest writer | read-only | the four plan parts, done-looks-like with checkable items |
+| Planner | strongest writer | read-only | one session: the intake turn (questions with options and a recommendation, the summary, the review passes), then the plan turn (the four plan parts, done-looks-like with checkable items) |
 | Builder | an allowed model (D3) | write to the worktree, `run_tests`, `checkpoint` | commits, and a build log with what changed and why |
 | Review loop roles | as the loop defines them | as today | as today |
 | Auditor roles (phase 2) | different models for variance | read-only, PoC tests only | threads, PoCs, findings |
@@ -397,9 +398,9 @@ Each decision records a conflict between two rules, and the choice.
 | P1 | Entry point | `npm run develop` first. GitHub issues and `/develop` on Cloudflare come in phase 3. |
 | P2 | Platform | Phase 1 runs on the local platform. |
 | P3 | Branch and PR | The work goes to `factory/dev-<slug>` from the base. The host opens a draft PR through `gh`. |
-| P4 | Larger changes | The intake agent recommends a spec stage and one or two review passes, with a reason. These route questions are `run` level, so the run uses both recommendations (D11). |
+| P4 | Route | The intake turn recommends one or two review passes, with a reason. This route question is `run` level, so the run uses the recommendation (D11). The spec stage runs only with `--spec`. |
 | P5 | Repair budget | One budget of 5 repair rounds for all causes (CI failures and failed review passes), then the run ends failed (D14). |
-| P6 | Models | Intake, spec, planner and builders on Opus 5.5. |
+| P6 | Models | Spec, planner and builders on Opus 5.5. |
 | P7 | Static rules | They gate each builder checkpoint, and they are host findings in the review loop. |
 | P8 | Gaps | The defaults in section 9 apply. |
 

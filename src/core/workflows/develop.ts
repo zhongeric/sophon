@@ -16,12 +16,13 @@ import { StopError } from '../stop.ts'
 import { BudgetStop, belowBudget, budgetGate, checkPriced, resolveBudget, usageOf, usageSection, zeroTokens, type Prices, type RunUsage, type UsageRow } from '../usage.ts'
 import { checkAllowedModels, checkFamilySwap, decisionSections, defaultAllowedModels, loopModelIds, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
 
-export type DevelopModels = Record<'intake' | 'spec' | 'planner' | 'builder', ModelChoice>
+/** The models of the development roles. The planner model runs both turns of the planner session, the intake and the plan (D19). */
+export type DevelopModels = Record<'spec' | 'planner' | 'builder', ModelChoice>
 
 const opus: ModelChoice = { provider: 'claude', model: 'claude-opus-5-5' }
 
-/** Intake, spec, planner and builders run on Opus 5.5, the strongest writer of the allowed models. */
-export const defaultDevelopModels: DevelopModels = { intake: opus, spec: opus, planner: { ...opus, thinking: 'high' }, builder: { ...opus, thinking: 'high' } }
+/** Spec, planner and builders run on Opus 5.5, the strongest writer of the allowed models. */
+export const defaultDevelopModels: DevelopModels = { spec: opus, planner: { ...opus, thinking: 'high' }, builder: { ...opus, thinking: 'high' } }
 
 export type DevelopInput = {
   runId: string
@@ -38,6 +39,8 @@ export type DevelopInput = {
   allowedModels?: string[]
   /** A small hotfix: the host takes every recommendation without asking. */
   hotfix?: boolean
+  /** A spec stage before the plan (D19). */
+  spec?: boolean
   /** The full review loop, also for a docs or tests only change. */
   full?: boolean
   /** At most this many builders at the same time. */
@@ -143,7 +146,8 @@ export function checkDevelopModels(models: DevelopModels, allowed = defaultAllow
 
 /**
  * The development workflow, steps 0 to 9, with its order and hard rules in code:
- * intake and the confirmation of the ask, a spec for a larger change, one plan, builders for the plan's tasks (in
+ * the intake turn of the planner session and the confirmation of the ask, a spec with the spec option, the plan turn of the
+ * same session (D19), builders for the plan's tasks (in
  * parallel when their files do not overlap, each on its own branch), a draft PR, CI, the code review loop, CI again,
  * and a ready PR only when every criterion holds. A red CI or a failed review pass gets a repair round inside one
  * budget, and a new review pass reviews the fixes (D14). Before the ready step and the merge, the host merges a base
@@ -271,16 +275,19 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   }
   stop.finish = finish
 
-  // 0. Intake: no plan and no code before the ask is confirmed. The route questions are run questions (D11), so the run
-  // takes the recommendations of the intake agent. The run asks the user only when the intake agent raises a user question.
-  const intook = await step(ledger, 'intake', () => intake(context, 'intake', models.intake, view))
+  // 0. Intake: the first turn of the planner session (D19). No plan and no code before the ask is confirmed. The route
+  // questions are run questions (D11), so the run takes the recommendations of the intake turn. The run asks the user only
+  // when the intake turn raises a user question, and then pauses before the plan turn. A ledger from before D19 keeps the
+  // intake of its intake session.
+  const intook = await step(ledger, 'intake', () => intake(context, models.planner, view))
   state.intake = intook
   const intakeAnswers = await ask('intake', [...intook.questions, ...routeQuestions(intook)])
-  const routed = route(intook, intakeAnswers)
+  const routed = route(intook, intakeAnswers, input.spec === true)
   state.route = routed
   if (routed.stop) return finish('stopped', [], 'You stopped the run at intake.')
 
-  // 1. Spec, for a larger change. Its decisions are one batch of questions. Only its user questions go to the user (D11).
+  // 1. Spec, only with the spec option or the spec answer of a ledger from before D19. Its decisions are one batch of
+  // questions. Only its user questions go to the user (D11).
   let spec: string | null = null
   if (routed.spec) {
     const written = await step(ledger, 'spec', () => writeSpec(context, 'spec', models.spec, view))
@@ -289,8 +296,8 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     await ask('spec', written.decisions)
   }
 
-  // 2. Plan: one planner writes the four parts, the profile sections and the tasks (D7).
-  const planned = await step(ledger, 'plan', () => plan(context, 'plan', models.planner, view, [...new Set(active.flatMap((profile) => profile.planSections))], spec))
+  // 2. Plan: the second turn of the planner session writes the four parts, the profile sections and the tasks (D7, D19).
+  const planned = await step(ledger, 'plan', () => plan(context, models.planner, view, [...new Set(active.flatMap((profile) => profile.planSections))], spec))
   state.plan = planned
   const planText = `# Plan\n\n${renderPlan(planned, { tasks: true })}`
   deps.files.write('plan.md', planText)

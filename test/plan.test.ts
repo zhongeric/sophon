@@ -5,8 +5,9 @@ import { targetedTests, type RepoConfig } from '../src/core/checks.ts'
 import { baseTargetedTests } from '../src/core/develop-steps.ts'
 import { checkIntake, checkPlan, checkSpec, frozenAsk, parseIssue, parseParallel, route, routeQuestions, waves, type Plan, type PlanTask } from '../src/core/plan.ts'
 
-const intake = { title: 'Add sub', summary: 'Adds sub() to src/math.ts.', slug: 'add-sub', larger: false, passes: 1, reason: 'One small function.', questions: [] }
-const answer = (id: string, text: string) => ({ id, question: id, answer: text, recommended: false })
+const intake = { title: 'Add sub', summary: 'Adds sub() to src/math.ts.', slug: 'add-sub', passes: 1, reason: 'One small function.', questions: [] }
+const confirm = 'Is this the ask? Correct it in your own words if it is not.'
+const answer = (id: string, question: string, text: string) => ({ id, question, answer: text, recommended: false })
 
 test('the intake needs a title, a branch slug, and the route with its reason', () => {
   assert.throws(() => checkIntake({ ...intake, slug: 'Add Sub', passes: 3, reason: '' }), /slug must be .*\npasses must be 1 or 2\nreason is required/)
@@ -18,30 +19,45 @@ test('the route questions are run questions after the intake questions, and the 
     routeQuestions(checkIntake(intake)).map((entry) => [entry.id, entry.recommendation, entry.level]),
     [
       ['Q1', 'Yes, go on', 'run'],
-      ['Q2', 'Plan now', 'run'],
-      ['Q3', 'One pass', 'run'],
+      ['Q2', 'One pass', 'run'],
     ],
   )
   // A user question of the intake agent posts the batch, so the confirmation goes to the user with the summary.
   const question = { question: 'May sub return a negative number?', why: 'sub(3, 5)', options: ['Yes', 'No, throw'], recommendation: 'Yes', level: 'user', rule: 'scope' }
-  const asked = checkIntake({ ...intake, larger: true, questions: [question] })
+  const asked = checkIntake({ ...intake, questions: [question] })
   assert.equal(routeQuestions(asked)[0]!.rule, 'scope')
   assert.deepEqual(
     routeQuestions(asked).map((entry) => [entry.id, entry.recommendation, entry.level]),
     [
       ['Q2', 'Yes, go on', 'user'],
-      ['Q3', 'Write a spec first', 'run'],
-      ['Q4', 'One pass', 'run'],
+      ['Q3', 'One pass', 'run'],
     ],
   )
-  assert.deepEqual(route(asked, []), { stop: false, spec: true, passes: 1 })
-  assert.deepEqual(route(asked, [answer('Q2', 'Yes, and also handle zero'), answer('Q3', 'Plan now'), answer('Q4', 'Two passes')]), { stop: false, spec: false, passes: 2 })
-  assert.equal(route(asked, [answer('Q2', 'No, stop the run')]).stop, true)
+  // The spec route is the spec option of the run (D19).
+  assert.deepEqual(route(asked, [], false), { stop: false, spec: false, passes: 1 })
+  assert.deepEqual(route(asked, [], true), { stop: false, spec: true, passes: 1 })
+  assert.deepEqual(route(asked, [answer('Q2', confirm, 'Yes, and also handle zero'), answer('Q3', 'How many review loop passes?', 'Two passes')], false), { stop: false, spec: false, passes: 2 })
+  assert.equal(route(asked, [answer('Q2', confirm, 'No, stop the run')], false).stop, true)
   for (const text of ['no', 'Stop.', 'No, stop', 'no stop the run!', 'Stop the run', 'Stop the run!', ' STOP THE RUN. '])
-    assert.equal(route(asked, [answer('Q2', text)]).stop, true, text)
+    assert.equal(route(asked, [answer('Q2', confirm, text)], false).stop, true, text)
   // A correction that starts with "No" goes on, as a decision for the planner.
   for (const text of ['No, it must also handle zero', 'No — only the CLI, not the API', 'Nothing to add', 'stop at the first error'])
-    assert.equal(route(asked, [answer('Q2', text)]).stop, false, text)
+    assert.equal(route(asked, [answer('Q2', confirm, text)], false).stop, false, text)
+})
+
+test('a batch from before D19 gives its spec answer and its passes by question text, not by question ID', () => {
+  const old = [
+    answer('Q1', confirm, 'Yes, go on'),
+    answer('Q2', 'Write a spec before the plan?', 'Write a spec first'),
+    answer('Q3', 'How many review loop passes?', 'Two passes'),
+  ]
+  assert.deepEqual(route(checkIntake(intake), old, false), { stop: false, spec: true, passes: 2 })
+  assert.equal(route(checkIntake(intake), [answer('Q2', 'Write a spec before the plan?', 'Plan now')], false).spec, false)
+  assert.equal(route(checkIntake(intake), [answer('Q2', 'Write a spec before the plan?', 'Yes, a short one')], false).spec, true)
+})
+
+test('an answer to a route question with other text, as the confirm question of research, counts by its question ID', () => {
+  assert.equal(route(checkIntake(intake), [answer('Q1', 'Is this the program? Correct it in your own words if it is not.', 'Stop the run')]).stop, true)
 })
 
 test('the builder count is an integer of 1 or more', () => {

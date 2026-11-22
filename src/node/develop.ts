@@ -24,8 +24,8 @@ const pausedExitCode = 3
 
 const usage = `Usage: npm run develop -- --ask <text> [options]
 
-Develops an ask into a ready PR: intake and your confirmation, a spec for a larger change, a plan, builders
-for its tasks, a draft PR, CI, the code review loop, and up to 5 repair rounds for a red CI or a failed pass.
+Develops an ask into a ready PR: intake and your confirmation, a spec with --spec, a plan, builders for its
+tasks, a draft PR, CI, the code review loop, and up to 5 repair rounds for a red CI or a failed pass.
 The PR becomes ready only when every criterion holds. When ${repoConfigFile} has "merge", the host then merges
 the PR. Else you merge.
 
@@ -38,6 +38,7 @@ Options:
   --run <id>             Resume a run; the other options come from its ledger
   --runs-dir <path>      Where runs live (default: <agent-factory>/runs)
   --hotfix               A small hotfix: take every recommendation without asking
+  --spec                 Write a spec before the plan. The spec stage runs only with this option.
   --full                 The strict review loop, also when triage allows the light or the standard loop
   --parallel <n>         At most n builders at the same time (default 3)
   --issue <n>            The issue that the PR closes: the PR body says Closes #<n>. The report stays on the PR.
@@ -71,6 +72,7 @@ async function main(): Promise<number> {
       repo: { type: 'string' },
       run: { type: 'string' },
       'runs-dir': { type: 'string' },
+      spec: { type: 'boolean' },
       wait: { type: 'string' },
     },
   })
@@ -159,6 +161,7 @@ async function newInput(values: Values): Promise<{ input: DevelopInput; repo: st
     runId: `dev-${stamp}`,
     source: `${repo} on ${baseRef}`,
     ...(values.hotfix ? { hotfix: true } : {}),
+    ...(values.spec ? { spec: true } : {}),
     ...(values.full ? { full: true } : {}),
     ...(parallel !== undefined ? { parallel } : {}),
     ...(issue !== undefined ? { issue } : {}),
