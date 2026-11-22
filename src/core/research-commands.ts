@@ -41,6 +41,14 @@ export type FileOutputs = { outputs: DomainOutputs }
 
 export type FetchRun = CommandRun<'fetch', FileOutputs>
 
+/** The last line of a sweep unit: its data files, and the count of tests that it ran in addition to one for each target (RG5). */
+export type SweepUnitOutputs = FileOutputs & { tls_passes: number }
+
+/** The last line of sweep merge: the candidate table. */
+export type Candidates = { candidates: Record<string, unknown>[] }
+
+export type SweepMergeRun = CommandRun<'merge', Candidates>
+
 /**
  * The manifest of the units directory that merge reads in place of {units}:
  * - `<units>/<unit id>/<output path>`: each output file of each done unit.
@@ -196,6 +204,32 @@ const fileOutputs = (value: Record<string, unknown>, problems: string[]): FileOu
 /** Parses the last line of a unit on a scan box. The caller checks the exit code first. */
 export const parseUnitOutput = (output: string): Parsed<FileOutputs> => parseLastLine('unit', output, fileOutputs)
 
+/** Parses the last line of a sweep fetch on a scan box. The caller checks the exit code first. */
+export const parseSweepFetchOutput = (output: string): Parsed<FileOutputs> => parseLastLine('fetch', output, fileOutputs)
+
+/** Parses the last line of a sweep unit on a scan box. The caller checks the exit code first. */
+export const parseSweepUnitOutput = (output: string): Parsed<SweepUnitOutputs> =>
+  parseLastLine('unit', output, (value, problems) => {
+    const passes = value.tls_passes
+    if (typeof passes !== 'number' || !Number.isSafeInteger(passes) || passes < 0) problems.push('tls_passes must be an integer of 0 or more')
+    return { ...fileOutputs(value, problems), tls_passes: typeof passes === 'number' ? passes : 0 }
+  })
+
+/** The candidate table of the last line of sweep merge. Each problem goes into `problems`. */
+function candidatesJson(value: Record<string, unknown>, problems: string[]): Candidates {
+  const items = value.candidates
+  if (!Array.isArray(items)) {
+    problems.push('candidates must be a list of JSON objects')
+    return { candidates: [] }
+  }
+  const candidates: Record<string, unknown>[] = []
+  for (const [index, item] of items.entries()) {
+    if (isObject(item)) candidates.push(item)
+    else problems.push(`candidates[${index}] must be a JSON object`)
+  }
+  return { candidates }
+}
+
 /** The known part and the inject part of the last line of merge, each by the contract of that command. */
 function mergeParts(value: Record<string, unknown>, problems: string[]): Record<'known' | 'inject', DomainJson> {
   const part = (name: 'known' | 'inject'): DomainJson => {
@@ -252,10 +286,10 @@ async function runOnMachine(config: RepoConfig, machine: Machine, name: DomainCo
   return { exit_code, output, problem: exit_code === 0 ? null : exitProblem(name, exit_code) }
 }
 
-/** The command of a fan-out config, or an error when the config does not fan out. */
-function fanOutTemplate(config: RepoConfig, name: 'plan' | 'fetch' | 'unit' | 'merge'): string {
-  const template = config.research?.commands[name]
-  if (template === undefined) throw new Error(`the research config has no ${name} command`)
+/** The command of a stage 6 fan-out or of the stage 7 sweep, or an error when the config does not have it. */
+function fanOutTemplate(config: RepoConfig, name: 'plan' | 'fetch' | 'unit' | 'merge', source: 'commands' | 'sweep' = 'commands'): string {
+  const template = source === 'sweep' ? config.research?.sweep?.[name] : config.research?.commands[name]
+  if (template === undefined) throw new Error(`the research config has no ${source === 'sweep' ? 'sweep ' : ''}${name} command`)
   return template
 }
 
@@ -271,8 +305,30 @@ export async function runFetch(config: RepoConfig, machine: Machine, preregPath:
   return lastLineRun('fetch', command, await runOnMachine(config, machine, 'fetch', command), fileOutputs)
 }
 
+/** Runs the sweep plan for one frozen prereg on a machine, as runPlan. */
+export async function runSweepPlan(config: RepoConfig, machine: Machine, preregPath: string): Promise<PlanRun> {
+  const command = fillCommand(fanOutTemplate(config, 'plan', 'sweep'), { prereg: quote(preregPath) })
+  return lastLineRun('plan', command, await runOnMachine(config, machine, 'plan', command), planJson)
+}
+
+/** The shell command of the sweep fetch of one target on a scan box, as unitCommand. */
+export function sweepFetchCommand(config: RepoConfig, preregPath: string, target: string): string {
+  return fillCommand(fanOutTemplate(config, 'fetch', 'sweep'), { prereg: quote(preregPath), target: quote(target) })
+}
+
+/** The shell command of one sweep unit on a scan box, as unitCommand. */
+export function sweepUnitCommand(config: RepoConfig, preregPath: string, unit: string): string {
+  return fillCommand(fanOutTemplate(config, 'unit', 'sweep'), { prereg: quote(preregPath), unit: quote(unit) })
+}
+
+/** Runs the sweep merge on a machine, with {units} as the path of the units directory (UnitsManifest). */
+export async function runSweepMerge(config: RepoConfig, machine: Machine, preregPath: string, unitsDir: string): Promise<SweepMergeRun> {
+  const command = fillCommand(fanOutTemplate(config, 'merge', 'sweep'), { prereg: quote(preregPath), units: quote(unitsDir) })
+  return lastLineRun('merge', command, await runOnMachine(config, machine, 'merge', command), candidatesJson)
+}
+
 /** A CommandRun from a finished command and the parser of its last line. */
-function lastLineRun<Name extends 'plan' | 'fetch', Json>(
+function lastLineRun<Name extends 'plan' | 'fetch' | 'merge', Json>(
   name: Name,
   command: string,
   ran: { exit_code: number | null; output: string; problem: string | null },

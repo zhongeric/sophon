@@ -29,6 +29,8 @@ export type Env = {
   DEVELOPMENT_RUNS: DurableObjectNamespace<DevelopmentRuns>
   RESEARCH_RUNS: DurableObjectNamespace<ResearchRuns>
   SCAN_BOXES: DurableObjectNamespace<ScanBoxes>
+  /** The R2 bucket of the sweep data files (RG3). Without it, a research config with research.sweep stops at the start. */
+  SWEEP_DATA?: R2Bucket
   /** The token of the runs when the GitHub App secrets are not set. */
   GITHUB_TOKEN?: string
   /** With GITHUB_APP_PRIVATE_KEY, runs call GitHub as the App. */

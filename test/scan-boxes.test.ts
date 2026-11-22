@@ -182,3 +182,52 @@ for (const end of ['exit', 'SIGINT', 'SIGTERM'] as const) {
     }
   })
 }
+
+async function finish(boxes: ReturnType<typeof localScanBoxes>, slot: string) {
+  let state = await boxes.poll(slot)
+  while (state.state === 'running') {
+    await new Promise((done) => setTimeout(done, 10))
+    state = await boxes.poll(slot)
+  }
+  if (state.state !== 'done') throw new Error('the job is missing')
+  return state.result
+}
+
+test('local scan boxes: only an egress job gets AGENT_FACTORY_EGRESS, and its requests reach the handler', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scan-boxes-'))
+  const seen: string[] = []
+  const boxes = localScanBoxes(dir, { stack: 'python', checks: {} }, {
+    egress: async (request) => {
+      seen.push(new URL(request.url).pathname)
+      return new Response('archive row')
+    },
+  })
+  try {
+    assert.equal(boxes.egress, true)
+    const fetchJob = `node -e "fetch(process.env.AGENT_FACTORY_EGRESS + '/archive.example.org/T-1').then((r) => r.text()).then((t) => require('fs').writeFileSync('output', t))"`
+    await boxes.start('run/fetch', { command: fetchJob, inputs: [], timeoutMs: 10_000, egress: true })
+    const fetched = await finish(boxes, 'run/fetch')
+    assert.equal(fetched.exit_code, 0, fetched.output)
+    assert.equal(new TextDecoder().decode(await boxes.read('run/fetch', 'output')), 'archive row')
+    assert.deepEqual(seen, ['/archive.example.org/T-1'])
+    await boxes.start('run/unit', { command: 'test -z "$AGENT_FACTORY_EGRESS" && touch output', inputs: [], timeoutMs: 5_000 })
+    const unit = await finish(boxes, 'run/unit')
+    assert.equal(unit.exit_code, 0, unit.output)
+  } finally {
+    await boxes.kill('run/fetch')
+    await boxes.kill('run/unit')
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('local scan boxes: without an egress handler, egress is false and an egress job does not start', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scan-boxes-'))
+  const boxes = localScanBoxes(dir, { stack: 'python', checks: {} })
+  try {
+    assert.equal(boxes.egress, false)
+    await assert.rejects(boxes.start('run/fetch', { command: 'true', inputs: [], timeoutMs: 5_000, egress: true }), /have no egress/)
+    assert.equal(existsSync(join(dir, 'run', 'fetch')), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

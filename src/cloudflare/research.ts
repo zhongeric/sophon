@@ -22,6 +22,7 @@ import { bundledGuides } from './guides.ts'
 import { workLabels } from './labels.ts'
 import { loopChoices, type PreflightNeeds } from './preflight.ts'
 import { githubPulls } from './pulls.ts'
+import { r2DataStore } from './r2.ts'
 import { reviewPass } from './review.ts'
 import { answerersOf, credentialsFor, Runs, setupTimeoutMs, type Call } from './runs.ts'
 import { scanPool, standard4 } from './scan-pool.ts'
@@ -97,6 +98,7 @@ export class ResearchRuns extends Runs<ResearchRequest> {
       config,
       containerPrices: parseContainerPrices(this.env.CONTAINER_PRICES),
       credentials: credentialsFor(this.env, researchProviders(input.models)),
+      ...(this.env.SWEEP_DATA ? { data: r2DataStore(this.env.SWEEP_DATA) } : {}),
       domain,
       egress: {
         artifacts: sqlArtifacts(this.ctx.storage, run),

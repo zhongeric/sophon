@@ -3,6 +3,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Contracts } from 'nanocode-ts'
+import { artifactId, isArtifactId } from '../../src/core/artifacts.ts'
+import type { DataStore } from '../../src/core/platform.ts'
 import { coreSections } from '../../src/core/prereg.ts'
 import type { Channel } from '../../src/core/questions.ts'
 import type { ScanBoxes } from '../../src/core/fanout.ts'
@@ -46,6 +48,21 @@ export const fanOutConfig = {
   },
 }
 
+/** The research config with a sweep over `targets` fixture targets. `holdout` adds the holdout target to the plan. */
+export function sweepConfig(options: { targets?: number; holdout?: boolean; fetchRate?: number } = {}) {
+  const plan = `node research/run.mjs sweep-plan {prereg} ${options.targets ?? 3}${options.holdout ? ' holdout' : ''}`
+  return {
+    ...researchConfig,
+    sweep: {
+      plan,
+      fetch: 'node research/run.mjs sweep-fetch {prereg} {target}',
+      unit: 'node research/run.mjs sweep-unit {prereg} {unit}',
+      merge: 'node research/run.mjs sweep-merge {prereg} {units}',
+      fetch_rate: options.fetchRate ?? 1000,
+    },
+  }
+}
+
 /**
  * The domain commands of the notebook. It finds analysis/<id>/ from the prereg file name, writes the rows of
  * analysis/<id>/analyze.mjs to out/<id>/, and prints its working directory, then the last-line JSON with their SHA-256.
@@ -55,13 +72,18 @@ export const fanOutConfig = {
  * The fan-out commands give the same known and inject files: plan gives the units known, inject-1 and inject-2 on the
  * targets field-a and field-b, fetch writes data/<target>.txt, each unit checks its data file and that the holdout
  * file is absent, and writes a part of the rows. merge joins the parts into out/<id>/known.txt and inject.txt.
+ *
+ * The sweep commands: sweep-plan gives the targets field-000 to field-<N - 1>, and one unit u-<target> for each target.
+ * sweep-fetch gets the archive page of its target through AGENT_FACTORY_EGRESS and writes data/<target>.txt.
+ * sweep-unit checks its data file and that the holdout file is absent, writes candidate.txt and prints tls_passes 1.
+ * sweep-merge gives one candidate for each done unit, in the order of units.json.
  */
 export const runScript = `import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-const [command, prereg, arg] = process.argv.slice(2)
+const [command, prereg, arg, option] = process.argv.slice(2)
 const id = /(hyp-\\d+)-v\\d+\\.md$/.exec(prereg)[1]
 const analysis = await import(pathToFileURL(resolve('analysis', id, 'analyze.mjs')).href)
 const sha = (text) => createHash('sha256').update(text).digest('hex')
@@ -94,6 +116,27 @@ else if (command === 'unit') {
   const part = (unit) => readFileSync(arg + '/' + unit + '/part.txt', 'utf8')
   const known = { recall: analysis.recall, outputs: written('out/' + id + '/known.txt', part('known')) }
   console.log(JSON.stringify({ known, inject: { outputs: written('out/' + id + '/inject.txt', part('inject-1') + part('inject-2')) } }))
+} else if (command === 'sweep-plan') {
+  const targets = Array.from({ length: Number(arg) }, (_, index) => 'field-' + String(index).padStart(3, '0'))
+  if (option === 'holdout') targets.push('ngc-1234')
+  console.log(JSON.stringify({ targets, units: targets.map((target) => ({ id: 'u-' + target, targets: [target], expected_seconds: 10 })) }))
+} else if (command === 'sweep-fetch') {
+  const response = await fetch(process.env.AGENT_FACTORY_EGRESS + '/archive.example.org/fields/' + arg)
+  const text = await response.text()
+  if (!response.ok) {
+    console.log(text)
+    process.exit(1)
+  }
+  console.log(JSON.stringify({ outputs: written('data/' + arg + '.txt', text) }))
+} else if (command === 'sweep-unit') {
+  const target = arg.slice(2)
+  const data = existsSync('data/' + target + '.txt') ? readFileSync('data/' + target + '.txt', 'utf8') : ''
+  if (existsSync('research/holdout.json') || !data.includes('/fields/' + target + ':')) process.exit(1)
+  console.log(JSON.stringify({ outputs: written('candidate.txt', target + ' ' + data), tls_passes: 1 }))
+} else if (command === 'sweep-merge') {
+  const manifest = JSON.parse(readFileSync(arg + '/units.json', 'utf8'))
+  const done = manifest.units.filter((unit) => unit.status === 'done')
+  console.log(JSON.stringify({ candidates: done.map((unit) => ({ unit: unit.id, text: readFileSync(arg + '/' + unit.id + '/candidate.txt', 'utf8') })) }))
 } else if (command === 'known') console.log(JSON.stringify({ recall: analysis.recall, outputs: output('known'), ...reads }))
 else if (command === 'inject') console.log(JSON.stringify({ outputs: output('inject'), ...reads }))
 else if (command === 'analyze') console.log(JSON.stringify({ outputs: analysis.analyzes === false ? {} : output('analysis') }))
@@ -141,6 +184,23 @@ export function notebook(options: { config?: Record<string, unknown>; uncommitte
   run('push', '-q', 'origin', 'main')
   write({ 'research/holdout.json': JSON.stringify({ refuse: [], targets: ['changed-target'] }), ...options.uncommitted })
   return { repo, origin, base: run('rev-parse', 'HEAD').trim() }
+}
+
+/** A DataStore in memory. `objects` maps each ID to its bytes. */
+export function memoryData(): DataStore & { objects: Map<string, Uint8Array> } {
+  const objects = new Map<string, Uint8Array>()
+  return {
+    objects,
+    async put(bytes) {
+      const id = await artifactId(bytes)
+      if (!objects.has(id)) objects.set(id, new Uint8Array(bytes))
+      return id
+    },
+    get: async (id) => {
+      const bytes = isArtifactId(id) ? objects.get(id) : undefined
+      return bytes ? new Uint8Array(bytes) : null
+    },
+  }
 }
 
 export const pageText = (path: string) => `Archive page ${path}: dwarf galaxies stay quiet in the deep fields.`

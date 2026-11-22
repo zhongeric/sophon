@@ -12,14 +12,16 @@ import { profileDefaults, type RootFiles } from '../core/profiles.ts'
 import type { Credentials } from '../core/providers.ts'
 import type { SigningRecord } from '../core/signing.ts'
 import type { Channel } from '../core/questions.ts'
-import { analysisConfig } from '../core/research-steps.ts'
+import { analysisConfig, researchEgress } from '../core/research-steps.ts'
 import { loadResearchDomain, type ResearchConfig, type ResearchDomain, type ResearchFiles } from '../core/research.ts'
 import { StopError } from '../core/stop.ts'
+import { rateLimiter, sweepEgressHandler } from '../core/sweep-egress.ts'
 import type { ContainerPrices, Prices } from '../core/usage.ts'
 import { codeReviewLoop, type LoopDeps } from '../core/workflows/code-review-loop.ts'
 import type { DevelopDeps, DevelopInput } from '../core/workflows/develop.ts'
 import type { ResearchDeps, ResearchInput } from '../core/workflows/research.ts'
 import { nodeArtifacts } from './artifacts.ts'
+import { dirDataStore } from './data-dir.ts'
 import { diskFileSystem, guideFileSystem } from './disk.ts'
 import { git, gitBranches, gitRepo, gitTree, worktreePath, type GitCommits, type GitSource } from './git.ts'
 import { fileLedger } from './ledger.ts'
@@ -285,6 +287,18 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
   const env = options.env ?? process.env
   const host = { credentials: options.credentials, dispatch: options.dispatch, log: options.log, module: options.module, prices: options.prices }
   const machine = (branch: Branch) => localMachine(worktreePath(branchesDir, branch.name))
+  const data = dirDataStore(join(dir, 'data'))
+  const egress = {
+    artifacts: nodeArtifacts(dir),
+    lock: runLock(ledger, domain.holdout.refuse),
+    secret: (name: string) => env[name],
+    ...(options.fetch ? { fetch: options.fetch } : {}),
+  }
+  // The sweep fetch jobs reach the network only through this proxy, which keeps the response bodies in the data store.
+  const sweep = domain.config.sweep
+  const scanEgress = sweep
+    ? sweepEgressHandler({ egress: researchEgress(domain), host: { ...egress, bodies: data }, log: options.log, limit: rateLimiter(sweep.fetch_rate) })
+    : undefined
   return {
     ...host,
     dir,
@@ -331,14 +345,10 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
       return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr) })
     },
     domain,
-    scanBoxes: localScanBoxes(join(dir, 'scan'), config),
+    scanBoxes: localScanBoxes(join(dir, 'scan'), config, scanEgress ? { egress: scanEgress } : {}),
+    data,
     compute: { runBox: null },
     ...(options.containerPrices ? { containerPrices: options.containerPrices } : {}),
-    egress: {
-      artifacts: nodeArtifacts(dir),
-      lock: runLock(ledger, domain.holdout.refuse),
-      secret: (name) => env[name],
-      ...(options.fetch ? { fetch: options.fetch } : {}),
-    },
+    egress,
   }
 }
