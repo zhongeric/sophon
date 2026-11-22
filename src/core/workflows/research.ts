@@ -13,6 +13,7 @@ import {
   unitKey,
   unitsDir,
   unitsFiles,
+  unitsManifest,
   holdoutRefusal,
   type InputFile,
   type ScanBoxes,
@@ -26,7 +27,7 @@ import { pool } from '../pool.ts'
 import { freezePrereg, type Prereg } from '../prereg.ts'
 import { presentProfiles, profilesById, type Profile } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
-import { asker, decisionLists, decisions, type Answer, type Channel, type Question } from '../questions.ts'
+import { asker, decisionLists, decisions, PausedError, type Answer, type Channel, type Question } from '../questions.ts'
 import {
   analysisVerdict,
   calibrationVerdict,
@@ -41,6 +42,7 @@ import {
   type DomainRun,
   type HashMismatch,
   type PlanUnit,
+  type UnitsManifest,
 } from '../research-commands.ts'
 import {
   analyst,
@@ -72,7 +74,6 @@ import {
   BudgetStop,
   belowBudget,
   budgetGate,
-  checkContainerPriced,
   checkPriced,
   clearBudget,
   computeCost,
@@ -192,7 +193,8 @@ export type ResearchDeps = {
 }
 
 /** A clean checkout with read access to its output files. Its ID stays the same only when the checkout stays. */
-type ResearchBox = Machine & { id: string; read(path: string): Promise<Uint8Array> }
+/** `endedAt`: the end of the last command in ms since the epoch, when the box keeps it across a pause. */
+type ResearchBox = Machine & { id: string; read(path: string): Promise<Uint8Array>; endedAt?(): number | undefined }
 
 /** A frozen prereg as the ledger records it. */
 export type Freeze = { hypothesis: string; version: number; path: string; sha256: string; commit: string }
@@ -289,7 +291,7 @@ type ReportState = {
 type FanOutRound = {
   plan: string
   fetch: string[]
-  units: { id: string; status: 'done' | 'failed'; attempts: number; reason?: string }[]
+  units: UnitsManifest['units']
   failed: string[]
   retries: number
   conflicts: UnitConflict[]
@@ -314,10 +316,6 @@ type CalibrationRound = {
   tail: string
   fanout?: FanOutRound
 }
-
-/** The ledger record of the last plan, for the cost cap question of a later intake. */
-type PlanRecord = { commit: string; hypothesis: string; round: number; units: number; seconds: number }
-const planKey = 'plan'
 
 /** One analyze run on a clean checkout of `head`. `command` is the artifact ID of its output, `files` of each declared output file. */
 type AnalysisRun = { round: number; head: string; pass: boolean; outputs: DomainOutputs; command: string; files: string[]; reason: string; tail: string }
@@ -361,7 +359,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   const recordedBudget = capped ? (capped.usd ?? undefined) : input.budget
   const checkPrices = () => {
     checkPriced(researchModelIds(models), prices)
-    if (fanOut) checkContainerPriced(deps.containerPrices)
+    if (fanOut && deps.containerPrices === undefined) throw new StopError('the run has a budget and a fan-out config, but CONTAINER_PRICES is not set')
   }
   if (resolveBudget(ledger, recordedBudget, input.budgetOverride) !== undefined) checkPrices()
   const state: ReportState = {
@@ -458,11 +456,12 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   const intook = await step(ledger, 'intake', () => researchIntake(context, 'intake', models.intake))
   state.intake = intook
   // Without a price for each model, and for a fan-out config also CONTAINER_PRICES, a cap cannot work, so the question recommends no cap.
+  // The intake comes before stage 6 runs plan, so the compute cost is not known yet. Stage 6 posts the estimate as a budget notice.
   const modelsPriced = researchModelIds(models).every((model) => model in prices)
   const notes = [
     ...(modelsPriced ? [] : ['MODEL_PRICES has no price for some models of this run, and a cap needs a price for each model.']),
     ...(fanOut && !deps.containerPrices ? ['CONTAINER_PRICES is not set, and a cap with a fan-out config needs it.'] : []),
-    ...(fanOut ? [planNote(ledger.get<PlanRecord>(planKey), deps)] : []),
+    ...(fanOut ? ['The compute cost is unknown until stage 6 runs plan.'] : []),
   ]
   const priced = modelsPriced && (!fanOut || deps.containerPrices !== undefined)
   const [confirm, capAsk] = hostQuestions(intook, priced ? (budget.limit() ?? defaultCap) : undefined, notes)
@@ -874,33 +873,29 @@ async function keepOutputs(deps: ResearchDeps, box: ResearchBox, run: DomainRun,
 }
 
 /**
- * Runs a command on a run box under a compute entry `key`, when the platform meters run boxes. A planned stop keeps
- * the entry open, because the next call continues the same work.
+ * Runs a command on a run box under a compute entry `key`, when the platform meters run boxes. A planned stop or a pause
+ * keeps the entry open, because the next call continues the same job. The entry ends at the end of the job when the box
+ * keeps it, so that the time of a pause after the job does not count.
  */
-async function metered<T>(deps: ResearchDeps, key: string, run: () => Promise<T>): Promise<T> {
+async function metered<T>(deps: ResearchDeps, key: string, box: Pick<ResearchBox, 'endedAt'>, run: () => Promise<T>): Promise<T> {
   if (!deps.compute) return run()
   startCompute(deps.ledger, key, key, deps.compute.runBox)
-  let stopped = false
+  let result: T
   try {
-    return await run()
+    result = await run()
   } catch (error) {
-    stopped = error instanceof PlannedStop
+    if (!(error instanceof PlannedStop || error instanceof PausedError)) finishCompute(deps.ledger, key)
     throw error
-  } finally {
-    if (!stopped) finishCompute(deps.ledger, key)
   }
+  // The clock of the box is not the clock of the host, so the end is never after this call.
+  finishCompute(deps.ledger, key, Math.min(Date.now(), box.endedAt?.() ?? Date.now()))
+  return result
 }
 
 /** The expected compute cost of `seconds` of units on the scan boxes. */
-function computeEstimate(seconds: number, deps: ResearchDeps): string {
-  if (!deps.containerPrices || !deps.scanBoxes) return 'unknown, because CONTAINER_PRICES is not set'
-  return `about ${formatUsd(computeCost(seconds, deps.scanBoxes.instance, deps.containerPrices))}`
-}
-
-/** The note of the cost cap question about the compute cost of the units. */
-function planNote(plan: PlanRecord | undefined, deps: ResearchDeps): string {
-  if (!plan) return 'The compute cost is unknown until stage 6 runs plan.'
-  return `The last plan (${plan.hypothesis}, calibration round ${plan.round}) has ${plan.units} units of ${plan.seconds} expected seconds. The expected compute cost is ${computeEstimate(plan.seconds, deps)}.`
+function computeEstimate(seconds: number, boxes: ScanBoxes, deps: ResearchDeps): string {
+  if (!deps.containerPrices) return 'unknown, because CONTAINER_PRICES is not set'
+  return `about ${formatUsd(computeCost(seconds, boxes.instance, deps.containerPrices))}`
 }
 
 /**
@@ -918,10 +913,10 @@ async function calibrate(stages: Stages, analysis: Analysis): Promise<Calibratio
     if (fansOut(deps.domain.config)) return fanOutRound(stages, analysis, { key, round, head, threshold })
     const box = await deps.cleanBox(head, key)
     // A new copy runs known again. Reuse its snapshot only on that copy, because inject can change its files.
-    const knownRun = await metered(deps, `${key}.known`, () => runDomainCommand(deps.config, box, 'known', path))
+    const knownRun = await metered(deps, `${key}.known`, box, () => runDomainCommand(deps.config, box, 'known', path))
     const knownId = await artifactId(new TextEncoder().encode(JSON.stringify(knownRun)))
     const known = await step(deps.ledger, `${key}.known.${box.id}.${knownId}`, async () => keepOutputs(deps, box, knownRun, hypothesis, round))
-    const injectRun = await metered(deps, `${key}.inject`, () => runDomainCommand(deps.config, box, 'inject', path))
+    const injectRun = await metered(deps, `${key}.inject`, box, () => runDomainCommand(deps.config, box, 'inject', path))
     const inject = await keepOutputs(deps, box, injectRun, hypothesis, round)
     const verdict = calibrationVerdict(known.run, inject.run, threshold)
     return {
@@ -952,11 +947,11 @@ async function fanOutRound(stages: Stages, analysis: Analysis, at: { key: string
   const { ledger } = deps
   const { key, round, head, threshold } = at
   const { hypothesis, path, sha256 } = analysis.freeze
-  const boxes = deps.scanBoxes
-  if (!boxes) throw new StopError('the research config has plan, fetch, unit and merge, but this platform gives no scan boxes for the units')
+  // researchSteps stops at the start when a fan-out config has no scan boxes.
+  const boxes = deps.scanBoxes!
   const planned = await step(ledger, `${key}.plan`, async (): Promise<Planned> => {
     const box = await deps.cleanBox(head, `${key}.plan`)
-    const planRun = await metered(deps, `${key}.plan`, () => runPlan(deps.config, box, path))
+    const planRun = await metered(deps, `${key}.plan`, box, () => runPlan(deps.config, box, path))
     const plan = await keep(deps, planRun, hypothesis, round)
     if (planRun.problem !== null) return { plan, fetch: [], fetched: {}, units: [], reason: planRun.problem, tail: planRun.tail }
     const refused = holdoutRefusal(planRun.json.targets, deps.domain.holdout.targets)
@@ -964,7 +959,7 @@ async function fanOutRound(stages: Stages, analysis: Analysis, at: { key: string
     const fetch: string[] = []
     const fetched: Record<string, DomainOutputs> = {}
     for (const target of planRun.json.targets) {
-      const fetchRun = await metered(deps, `${key}.fetch.${target}`, () => runFetch(deps.config, box, path, target))
+      const fetchRun = await metered(deps, `${key}.fetch.${target}`, box, () => runFetch(deps.config, box, path, target))
       fetch.push(await keep(deps, fetchRun, hypothesis, round))
       if (fetchRun.problem !== null) return { plan, fetch, fetched, units: [], reason: `fetch ${target}: ${fetchRun.problem}`, tail: fetchRun.tail }
       const files = await keepFiles(deps, box, fetchRun, fetchRun.json.outputs, hypothesis, round)
@@ -974,7 +969,7 @@ async function fanOutRound(stages: Stages, analysis: Analysis, at: { key: string
     }
     const { units } = planRun.json
     const seconds = units.reduce((sum, unit) => sum + unit.expected_seconds, 0)
-    const notice = `The plan of ${hypothesis}, calibration round ${round}, has ${units.length} units of ${seconds} expected seconds. The expected compute cost is ${computeEstimate(seconds, deps)}.`
+    const notice = `The plan of ${hypothesis}, calibration round ${round}, has ${units.length} units of ${seconds} expected seconds. The expected compute cost is ${computeEstimate(seconds, boxes, deps)}.`
     deps.log(`budget notice: ${notice}`)
     // The notice only informs, and the run log has it, so a failed post does not stop the run.
     try {
@@ -982,7 +977,6 @@ async function fanOutRound(stages: Stages, analysis: Analysis, at: { key: string
     } catch (error) {
       deps.log(`budget notice failed: ${error instanceof Error ? error.message : String(error)}`)
     }
-    ledger.put(planKey, { commit: head, hypothesis, round, units: units.length, seconds } satisfies PlanRecord)
     return { plan, fetch, fetched, units, reason: '', tail: '' }
   })
   const fanout: FanOutRound = { plan: planned.plan, fetch: planned.fetch, units: [], failed: [], retries: 0, conflicts: [] }
@@ -1006,12 +1000,12 @@ async function fanOutRound(stages: Stages, analysis: Analysis, at: { key: string
     log: deps.log,
   })
   const keys = new Set(planned.units.map((unit) => unitKey({ commit: head, prereg }, unit.id)))
-  fanout.units = results.map((result) => ({ id: result.id, status: result.status, attempts: result.attempts, ...(result.reason !== undefined ? { reason: result.reason } : {}) }))
+  fanout.units = unitsManifest(results).units
   fanout.failed = results.filter((result) => result.status === 'failed').map((result) => result.id)
   fanout.retries = results.reduce((sum, result) => sum + Math.max(0, result.attempts - 1), 0)
   fanout.conflicts = unitConflicts(ledger).filter((conflict) => keys.has(conflict.key))
   const box = await deps.cleanBox(head, `${key}.merge`, await unitsFiles(results, deps.egress.artifacts))
-  const merged = await metered(deps, `${key}.merge`, () => runMerge(deps.config, box, path, unitsDir))
+  const merged = await metered(deps, `${key}.merge`, box, () => runMerge(deps.config, box, path, unitsDir))
   const known = await keepOutputs(deps, box, merged.known, hypothesis, round)
   const inject = await keepOutputs(deps, box, merged.inject, hypothesis, round)
   const verdict = calibrationVerdict(known.run, inject.run, threshold)
@@ -1041,7 +1035,7 @@ async function runAnalysis(stages: Stages, analysis: Analysis): Promise<Analysis
   const run = await step(deps.ledger, key, async (): Promise<AnalysisRun> => {
     const head = await branch.head()
     const box = await deps.cleanBox(head, key)
-    const analyzeRun = await metered(deps, `${key}.analyze`, () => runDomainCommand(deps.config, box, 'analyze', path, hypothesis))
+    const analyzeRun = await metered(deps, `${key}.analyze`, box, () => runDomainCommand(deps.config, box, 'analyze', path, hypothesis))
     const kept = await keepOutputs(deps, box, analyzeRun, hypothesis, round)
     const verdict = analysisVerdict(kept.run, finalCalibration(analysis).outputs)
     const [command = '', ...files] = kept.artifacts
@@ -1064,7 +1058,7 @@ async function runAnalysis(stages: Stages, analysis: Analysis): Promise<Analysis
  */
 async function reproduce(stages: Stages, analyses: Analysis[], head: string): Promise<boolean> {
   const { deps } = stages
-  let box: Promise<Machine> | undefined
+  let box: Promise<ResearchBox> | undefined
   for (const analysis of analyses) {
     const { hypothesis, path } = analysis.freeze
     const calibration = finalCalibration(analysis)
@@ -1072,7 +1066,7 @@ async function reproduce(stages: Stages, analyses: Analysis[], head: string): Pr
     const result = await step(deps.ledger, `reproduce.${hypothesis}.${head}`, async (): Promise<Reproduction> => {
       box ??= deps.cleanBox(head, `reproduce.${head}`)
       const machine = await box
-      const run = await metered(deps, `reproduce.${hypothesis}.${head.slice(0, 12)}`, () => runDomainCommand(deps.config, machine, 'reproduce', path))
+      const run = await metered(deps, `reproduce.${hypothesis}.${head.slice(0, 12)}`, machine, () => runDomainCommand(deps.config, machine, 'reproduce', path))
       const verdict = compareReproduction(expected, run)
       const artifact = await keep(deps, run, hypothesis, calibration.round)
       return { head, pass: verdict.pass, mismatches: verdict.mismatches, missing: verdict.missing, reason: verdict.pass ? '' : verdict.reason, artifact }

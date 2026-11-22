@@ -176,7 +176,10 @@ The host takes the command strings from the base branch. It replaces `{prereg}` 
 prereg. `{partition}` identifies the current data partition. `{target}` is the quoted name of a plan target, `{unit}`
 the quoted unit ID, and `{units}` the quoted path of the units directory. `feeds` are the sources of scout (section 3).
 `plan`, `fetch`, `unit` and `merge` are optional, but a config has all four or none of them. With all four, stage 6 fans out.
+`fetch`, `unit` and `merge` must use `{target}`, `{unit}` and `{units}`.
 `timeouts` gives the timeout in ms of each domain command. A missing key takes `timeout_ms`, else 30 minutes.
+The time limit of a unit is the smallest of 3 times its `expected_seconds`, `timeouts.unit` when set, and the 60-minute box limit.
+`timeout_ms` and the 30-minute default do not apply to a unit.
 `analyze` is optional. Without it, the host runs `python analysis/<id>/analyze.py {prereg}`, where `<id>` is the hypothesis.
 
 The last line of a command output that is not empty is a JSON object:
@@ -233,6 +236,10 @@ as profile guides do today.
 - **Scan boxes**: one small container with no network for each slot of a pool, in the Durable Object `ScanBoxes`.
   The units of a stage 6 fan-out run on them. The sweep does not use them yet. Local runs the units on the local
   machine, in the same pool.
+  - The first attempt of a unit runs in a lane of the pool, so that the next unit uses the same box. A retry runs on a
+    new box.
+  - The compute meter counts a unit from its start to the end of its job. After its last unit, a box stays on until its
+    inactivity timeout (the time limit of the unit plus 10 minutes). The meter does not count this time.
   - **TLS pass time on a scan box** (one pass of the droplet example): TO FILL IN AFTER DEPLOY.
 - **No mirrors.** Runs fetch queries, cutouts and per-target data. A program never copies a whole archive.
 

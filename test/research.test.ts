@@ -132,6 +132,12 @@ test('plan, fetch, unit and merge are optional together, each with its own place
   rejects(commands({ ...fanOut, known: 'run {target}' }), 'research.commands.known', /placeholder \{target\}, but only \{prereg\} are permitted/)
 })
 
+test('fetch, unit and merge must use {target}, {unit} and {units}, because else each call runs the same command', () => {
+  for (const [name, required] of [['fetch', 'target'], ['unit', 'unit'], ['merge', 'units']] as const)
+    rejects(commands({ ...fanOut, [name]: 'run {prereg}' }), `research.commands.${name}`, new RegExp(`must use the placeholder \\{${required}\\}`))
+  assert.equal(parse(commands({ ...fanOut, plan: 'run' }))?.commands.plan, 'run')
+})
+
 test('one to three of plan, fetch, unit and merge is an error that names the present and the missing commands', () => {
   rejects(commands({ plan: fanOut.plan }), 'research.commands', /has plan but not fetch, unit, merge: give all of plan, fetch, unit and merge, or none of them/)
   rejects(commands({ fetch: fanOut.fetch, merge: fanOut.merge }), 'research.commands', /has fetch, merge but not plan, unit/)

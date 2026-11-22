@@ -72,7 +72,7 @@ const output = (name) => {
   return { [path]: sha(analysis.rows(name)) }
 }
 const reads = process.env.READS ? { reads: process.env.READS.split(',') } : {}
-const units = [{ id: 'known', targets: ['field-a'], expected_seconds: 1 }, { id: 'inject-1', targets: ['field-a'], expected_seconds: 1 }, { id: 'inject-2', targets: ['field-b'], expected_seconds: 1 }]
+const units = [{ id: 'known', targets: ['field-a'], expected_seconds: 60 }, { id: 'inject-1', targets: ['field-a'], expected_seconds: 60 }, { id: 'inject-2', targets: ['field-b'], expected_seconds: 60 }]
 const half = (text, index) => (index === 0 ? text.slice(0, Math.floor(text.length / 2)) : text.slice(Math.floor(text.length / 2)))
 const written = (path, text) => {
   mkdirSync(dirname(path), { recursive: true })

@@ -56,9 +56,9 @@ function memoryLedger(): Ledger & { entries: Map<string, unknown> } {
 
 /**
  * What each attempt of a unit does, in order: done after one running poll (ok), a bad last line, a wrong hash, exit 2,
- * exit null, the box loses the job, it runs until the kill, or the start is full.
+ * exit null, the box loses the job, it runs until the kill, the start is full, the start throws, or the first poll throws.
  */
-type Kind = 'ok' | 'bad-line' | 'bad-hash' | 'exit' | 'timeout' | 'missing' | 'hang' | 'full'
+type Kind = 'ok' | 'bad-line' | 'bad-hash' | 'exit' | 'timeout' | 'missing' | 'hang' | 'full' | 'start-error' | 'poll-error'
 
 function fakeBoxes(kinds: Record<string, Kind[]>) {
   const started: { slot: string; command: string; timeoutMs: number; inputs: string[] }[] = []
@@ -72,9 +72,10 @@ function fakeBoxes(kinds: Record<string, Kind[]>) {
     maxUnitMs: 60_000,
     pollMs: 1000,
     async start(slot, job) {
-      const id = /\/(.+)-\d+$/.exec(slot)?.[1] ?? ''
+      const id = /'([^']*)'$/.exec(job.command)?.[1] ?? ''
       const kind = kinds[id]?.shift() ?? 'ok'
       if (kind === 'full') return { full: true }
+      if (kind === 'start-error') throw new Error('the start RPC failed')
       started.push({ slot, command: job.command, timeoutMs: job.timeoutMs, inputs: job.inputs.map((file) => file.path) })
       slots.set(slot, { kind, polls: 0 })
       return { job: `job-${started.length}` }
@@ -84,6 +85,7 @@ function fakeBoxes(kinds: Record<string, Kind[]>) {
       const state = slots.get(slot)
       if (!state || state.kind === 'missing') return { state: 'missing' }
       state.polls += 1
+      if (state.kind === 'poll-error') throw new Error('the poll RPC failed')
       if (state.kind === 'hang' || state.polls === 1) return { state: 'running' }
       if (state.kind === 'exit') return done(2, 'boom')
       if (state.kind === 'timeout') return done(null, '[host] killed')
@@ -133,8 +135,8 @@ test('fanout: over-time, a lost box and a non-zero exit each count as an attempt
   const [result] = await runUnits([unit('u1')], options)
   assert.equal(result?.status, 'done')
   assert.equal(result?.attempts, 4)
-  assert.deepEqual(started.map((entry) => entry.slot), ['run-1/u1-1', 'run-1/u1-2', 'run-1/u1-3', 'run-1/u1-4'])
-  assert.deepEqual(killed, ['run-1/u1-1'])
+  assert.deepEqual(started.map((entry) => entry.slot), ['run-1/lane_0', 'run-1/u1-2', 'run-1/u1-3', 'run-1/u1-4'])
+  assert.deepEqual(killed, ['run-1/lane_0'])
   // The limit is 3 times the expected second, and the command is the unit command of the config.
   assert.equal(started[0]?.timeoutMs, 3000)
   assert.equal(started[0]?.command, "nb unit 'prereg/hyp-001-v1.md' 'u1'")
@@ -171,7 +173,7 @@ test('fanout: a full pool waits one poll interval and tries again without counti
   const [result] = await runUnits([unit('u1')], options)
   assert.equal(result?.status, 'done')
   assert.equal(result?.attempts, 1)
-  assert.deepEqual(started.map((entry) => entry.slot), ['run-1/u1-1'])
+  assert.deepEqual(started.map((entry) => entry.slot), ['run-1/lane_0'])
   // Two waits for the full pool and one for the running poll.
   assert.equal(clock.now - before, 3000)
 })
@@ -196,9 +198,123 @@ test('fanout: a resume polls the recorded job and does not run a finished unit a
   const [result] = await runUnits(units, fanOut(boxes, ledger).options)
   assert.equal(result?.status, 'done')
   assert.equal(started.length, 1)
-  assert.deepEqual(polls, ['run-1/u1-1', 'run-1/u1-1'])
+  assert.deepEqual(polls, ['run-1/lane_0', 'run-1/lane_0'])
   const failing: ScanBoxes = { ...boxes, start: async () => assert.fail('a finished unit must not start again') }
   assert.deepEqual(await runUnits(units, fanOut(failing, ledger).options), [result])
+})
+
+test('fanout: a failed start or poll kills the slot before the next attempt', async () => {
+  const { boxes, started, killed } = fakeBoxes({ u1: ['start-error', 'poll-error', 'ok'] })
+  const ledger = memoryLedger()
+  const [result] = await runUnits([unit('u1')], fanOut(boxes, ledger).options)
+  assert.equal(result?.status, 'done')
+  assert.equal(result?.attempts, 3)
+  assert.deepEqual(killed, ['run-1/lane_0', 'run-1/u1-2'])
+  assert.deepEqual(started.map((entry) => entry.slot), ['run-1/u1-2', 'run-1/u1-3'])
+  const reasons = ledger.get<{ reason?: string }[]>(`attempts.unit.c0ffee.${'a'.repeat(64)}.u1`)?.map((attempt) => attempt.reason)
+  assert.match(reasons?.[0] ?? '', /the start failed: the start RPC failed/)
+  assert.match(reasons?.[1] ?? '', /the poll failed: the poll RPC failed/)
+})
+
+test('fanout: a first attempt runs in a free lane, and a retry runs on a new slot', async () => {
+  const { boxes, started } = fakeBoxes({ u2: ['exit'] })
+  const results = await runUnits([unit('u1'), unit('u2'), unit('u3')], fanOut(boxes, memoryLedger(), { parallel: 2 }).options)
+  assert.deepEqual(results.map((result) => result.status), ['done', 'done', 'done'])
+  assert.equal(started.length, 4)
+  // u3 reuses the lane of a unit that ended, so the pool has only two lanes.
+  assert.deepEqual([...new Set(started.map((entry) => entry.slot))].sort(), ['run-1/lane_0', 'run-1/lane_1', 'run-1/u2-2'])
+})
+
+test('fanout: after a resume, the lane of a running attempt stays busy', async () => {
+  const { boxes, started } = fakeBoxes({})
+  const ledger = memoryLedger()
+  let stopped = false
+  const pausing: Ledger = {
+    get: ledger.get,
+    put: ledger.put,
+    safePoint(nextMs) {
+      if (nextMs !== undefined && !stopped) {
+        stopped = true
+        throw new PlannedStop('the call has no time left')
+      }
+    },
+  }
+  await assert.rejects(runUnits([unit('u1')], fanOut(boxes, pausing).options), PlannedStop)
+  await runUnits([unit('u1'), unit('u2')], fanOut(boxes, ledger).options)
+  assert.deepEqual(started.map((entry) => entry.slot), ['run-1/lane_0', 'run-1/lane_1'])
+})
+
+test('fanout: a lane whose kill failed is not used again', async () => {
+  const { boxes, started } = fakeBoxes({ u1: ['hang'] })
+  const failing: ScanBoxes = {
+    ...boxes,
+    async kill() {
+      throw new Error('the kill RPC failed')
+    },
+  }
+  await runUnits([unit('u1'), unit('u2')], fanOut(failing, memoryLedger(), { parallel: 1 }).options)
+  assert.deepEqual(started.map((entry) => entry.slot), ['run-1/lane_0', 'run-1/u1-2', 'run-1/lane_1'])
+})
+
+test('fanout: a resume keeps a lane busy after an earlier attempt could not be killed', async () => {
+  for (const kind of ['hang', 'start-error', 'poll-error'] as const) {
+    for (const retryDone of [false, true]) {
+      const { boxes, started, killed } = fakeBoxes({ u1: [kind] })
+      const failing: ScanBoxes = {
+        ...boxes,
+        async kill(slot) {
+          await boxes.kill(slot)
+          throw new Error('the kill RPC failed')
+        },
+      }
+      const ledger = memoryLedger()
+      const pausing: Ledger = {
+        get: ledger.get,
+        put: ledger.put,
+        safePoint(nextMs) {
+          if (started.at(-1)?.slot === 'run-1/u1-2' && (retryDone ? nextMs === undefined : nextMs !== undefined))
+            throw new PlannedStop('the call has no time left')
+        },
+      }
+      const units = [unit('u1'), unit('u2')]
+      await assert.rejects(runUnits(units, fanOut(failing, pausing, { parallel: 1 }).options), PlannedStop)
+      const results = await runUnits(units, fanOut(failing, ledger).options)
+      assert.deepEqual(results.map((result) => result.status), ['done', 'done'])
+      assert.deepEqual(results.map((result) => result.attempts), [2, 1])
+      assert.equal(started.at(-1)?.slot, 'run-1/lane_1')
+      assert.deepEqual(killed, ['run-1/lane_0'])
+    }
+  }
+})
+
+test('fanout: a resume ends the compute entry at the end time of the job, not at the late poll', async () => {
+  const { boxes } = fakeBoxes({})
+  const ledger = memoryLedger()
+  let stopped = false
+  const pausing: Ledger = {
+    get: ledger.get,
+    put: ledger.put,
+    safePoint(nextMs) {
+      if (nextMs !== undefined && !stopped) {
+        stopped = true
+        throw new PlannedStop('the call has no time left')
+      }
+    },
+  }
+  await assert.rejects(runUnits([unit('u1')], fanOut(boxes, pausing).options), PlannedStop)
+  // The job ends 2 s after its start, and the host polls it again one hour later.
+  const ending: ScanBoxes = {
+    ...boxes,
+    async poll(slot) {
+      const polled = await boxes.poll(slot)
+      return polled.state === 'done' ? { state: 'done', result: { ...polled.result, ended_at: 1_002_000 } } : polled
+    },
+  }
+  const { options, clock } = fanOut(ending, ledger)
+  clock.now += 3_600_000
+  const [result] = await runUnits([unit('u1')], options)
+  assert.equal(result?.status, 'done')
+  assert.deepEqual(computeOf(ledger).map((row) => row.seconds), [2])
 })
 
 test('fanout: a planned stop keeps the compute entry of the attempt open', async () => {
@@ -260,9 +376,9 @@ test('fanout: research.timeouts.unit limits the box timeout', async () => {
 
 test('fanout: slot names keep the part pattern for each run ID and unit ID', () => {
   assert.equal(slotName('run-1', 'u1', 2), 'run-1/u1-2')
-  const long = slotName('research.20261122 run', `${'x'.repeat(70)}.y`, 3)
+  const long = slotName('research.20261122 run', `${'x'.repeat(63)}y`, 3)
   assert.match(long, /^[A-Za-z0-9_-]{1,64}\/[A-Za-z0-9_-]{1,64}$/)
-  assert.notEqual(long, slotName('research.20261122 run', `${'x'.repeat(70)}.z`, 3))
+  assert.notEqual(long, slotName('research.20261122 run', `${'x'.repeat(63)}z`, 3))
 })
 
 test('fanout: unit inputs put the fetched data over the commit files, and the units directory has a manifest', async () => {

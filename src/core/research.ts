@@ -32,11 +32,8 @@ export type FanOutCommand = 'plan' | 'fetch' | 'unit' | 'merge'
 
 export const fanOutCommands: readonly FanOutCommand[] = ['plan', 'fetch', 'unit', 'merge']
 
-/** A research config whose stage 6 fans out: it has all of plan, fetch, unit and merge. */
-export type FanOutConfig = ResearchConfig & { commands: Record<FanOutCommand, string> }
-
 /** Tells if stage 6 of the config fans out over scan boxes. parseResearchConfig permits only all four commands or none. */
-export const fansOut = (research: ResearchConfig): research is FanOutConfig => fanOutCommands.every((name) => research.commands[name] !== undefined)
+export const fansOut = (research: ResearchConfig): boolean => fanOutCommands.every((name) => research.commands[name] !== undefined)
 
 export type ResearchTimeouts = Partial<Record<'known' | 'inject' | 'evaluate' | 'reproduce' | 'analyze' | FanOutCommand, number>>
 
@@ -120,10 +117,12 @@ function feedList(value: unknown, key: string, fail: Fail): string[] {
 /** A placeholder is {name} that does not follow a $, so that a shell ${VAR} stays permitted. */
 const placeholder = /(?<!\$)\{([A-Za-z_][A-Za-z0-9_]*)\}/g
 
-function command(value: unknown, key: string, permitted: string[], fail: Fail): string {
+/** `required` is a placeholder that the command must use, because without it each call runs the same command. */
+function command(value: unknown, key: string, permitted: string[], fail: Fail, required?: string): string {
   const text = nonEmptyString(value, key, fail)
-  for (const [found] of text.matchAll(placeholder))
-    if (!permitted.includes(found.slice(1, -1))) fail(key, `uses the placeholder ${found}, but only ${permitted.map((item) => `{${item}}`).join(' and ')} are permitted`)
+  const used = [...text.matchAll(placeholder)].map(([found]) => found.slice(1, -1))
+  for (const name of used) if (!permitted.includes(name)) fail(key, `uses the placeholder {${name}}, but only ${permitted.map((item) => `{${item}}`).join(' and ')} are permitted`)
+  if (required !== undefined && !used.includes(required)) fail(key, `must use the placeholder {${required}}`)
   return text
 }
 
@@ -213,7 +212,8 @@ export function parseResearchConfig(value: unknown, source: string): ResearchCon
     fail('research.commands', `has ${present.join(', ')} but not ${missing.join(', ')}: give all of plan, fetch, unit and merge, or none of them`)
   }
   const fanOutPlaceholders: Record<FanOutCommand, string[]> = { plan: prereg, fetch: [...prereg, 'target'], unit: [...prereg, 'unit'], merge: [...prereg, 'units'] }
-  for (const name of present) config.commands[name] = command(commands[name], `research.commands.${name}`, fanOutPlaceholders[name], fail)
+  const fanOutRequired: Partial<Record<FanOutCommand, string>> = { fetch: 'target', unit: 'unit', merge: 'units' }
+  for (const name of present) config.commands[name] = command(commands[name], `research.commands.${name}`, fanOutPlaceholders[name], fail, fanOutRequired[name])
   if (research.credentials !== undefined) config.credentials = credentials(research.credentials, 'research.credentials', egress, fail)
   if (research.timeouts !== undefined) config.timeouts = timeouts(research.timeouts, 'research.timeouts', fail)
   if (research.feeds !== undefined) config.feeds = feedList(research.feeds, 'research.feeds', fail)

@@ -8,14 +8,44 @@ const outputTailChars = 20_000
 const slotPattern = /^[A-Za-z0-9_-]{1,64}\/[A-Za-z0-9_-]{1,64}$/
 
 /** A job of a slot. `result` is set when the process closed. */
-type Job = { id: string; child: ChildProcess; closed: Promise<void>; result?: { exit_code: number | null; output: string } }
+type Job = { id: string; child: ChildProcess; closed: Promise<void>; result?: { exit_code: number | null; output: string; ended_at: number } }
 
 /** The path of `path` in `root`. A path outside `root` is an error. */
-export function inside(root: string, path: string): string {
+function inside(root: string, path: string): string {
   const full = resolve(root, path)
   const rel = relative(root, full)
   if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || resolve(rel) === rel) throw new Error(`the path ${path} is outside its directory`)
   return full
+}
+
+// A unit runs detached in its own process group, so neither the signal of the terminal nor the end of the host ends it.
+const groups = new Set<number>()
+
+/** Kills each process group of a unit that has not closed. */
+function killGroups(): void {
+  for (const pid of groups) {
+    try {
+      process.kill(-pid, 'SIGKILL')
+    } catch {
+      // The process group already ended.
+    }
+  }
+  groups.clear()
+}
+
+let hooked = false
+
+/** Kills the units when the host exits, or when SIGINT or SIGTERM ends it. Then the signal ends the host as before. */
+function hookExit(): void {
+  if (hooked) return
+  hooked = true
+  process.on('exit', killGroups)
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.once(signal, () => {
+      killGroups()
+      process.kill(process.pid, signal)
+    })
+  }
 }
 
 /** Writes each file under `root`, with its directories. */
@@ -61,7 +91,11 @@ export function localScanBoxes(dir: string, config: RepoConfig, options: { pollM
       mkdirSync(root, { recursive: true })
       writeInputs(root, unit.inputs)
       const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => names.has(name)))
-      const child = spawn('bash', ['-c', unit.command], { cwd: root, detached: true, env, stdio: ['ignore', 'pipe', 'pipe'] })
+      hookExit()
+      const command = config.setup ? `{\n${config.setup}\n} && {\n${unit.command}\n}` : unit.command
+      const child = spawn('bash', ['-c', command], { cwd: root, detached: true, env, stdio: ['ignore', 'pipe', 'pipe'] })
+      const pid = child.pid
+      if (pid !== undefined) groups.add(pid)
       const job: Job = { id: crypto.randomUUID(), child, closed: Promise.resolve() }
       let output = ''
       const collect = (chunk: Buffer) => {
@@ -74,12 +108,17 @@ export function localScanBoxes(dir: string, config: RepoConfig, options: { pollM
         const timer = setTimeout(() => {
           timedOut = true
           output += `\n[host] killed after ${unit.timeoutMs} ms`
-          if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL')
+          try {
+            if (pid !== undefined) process.kill(-pid, 'SIGKILL')
+          } catch {
+            // The process group already ended.
+          }
         }, unit.timeoutMs)
         const end = (code: number | null) => {
           if (job.result !== undefined) return
           clearTimeout(timer)
-          job.result = { exit_code: timedOut ? null : code, output }
+          if (pid !== undefined) groups.delete(pid)
+          job.result = { exit_code: timedOut ? null : code, output, ended_at: Date.now() }
           done()
         }
         child.on('error', (error) => {

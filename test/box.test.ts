@@ -397,7 +397,10 @@ test('a clean box reads the exact bytes of a file, and refuses a path outside it
 async function jobResult(box: Box, id: string): Promise<BoxResult> {
   for (let polls = 0; polls < 100; polls++) {
     const polled = await box.pollJob(id)
-    if (polled.state === 'done') return polled.result
+    if (polled.state === 'done') {
+      // The end time comes from the clock of the machine, so the callers compare the other fields.
+      return { exit_code: polled.result.exit_code, output: polled.result.output }
+    }
     assert.equal(polled.state, 'running')
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
@@ -443,7 +446,7 @@ test('a container job keeps the result rules of a command and the last 20,000 ch
   const late = join(root, 'jobs/late')
   mkdirSync(late)
   for (const [name, value] of Object.entries({ limit: '1000\n', started: '5000\n', exit: '137 6000\n', output: 'partial' })) writeFileSync(join(late, name), value)
-  assert.deepEqual(await box.pollJob('late'), { result: { exit_code: null, output: 'partial\n[host] killed after 1000 ms' }, state: 'done' })
+  assert.deepEqual(await box.pollJob('late'), { result: { exit_code: null, output: 'partial\n[host] killed after 1000 ms', ended_at: 6000 }, state: 'done' })
 })
 
 test('a kill stops the process group of a container job with its child, and the job is then missing', async () => {

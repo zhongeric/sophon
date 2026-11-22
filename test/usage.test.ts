@@ -10,7 +10,6 @@ import { StopError } from '../src/core/stop.ts'
 import {
   budgetGate,
   BudgetStop,
-  checkContainerPriced,
   checkPriced,
   clearBudget,
   computeCost,
@@ -507,11 +506,6 @@ test('CONTAINER_PRICES needs both non-negative prices, and an instance entry nee
   stops(JSON.stringify({ ...containerPrices, instances: { big: 1 } }), /instances\.big must be an object/)
   stops(JSON.stringify({ ...containerPrices, instances: { big: { vcpu_second: 1, gib_second: 1, disk: 1 } } }), /instances\.big\.disk is not a known key/)
   stops(JSON.stringify({ ...containerPrices, instances: { big: { vcpu_second: 1 } } }), /instances\.big\.gib_second must be a non-negative number/)
-})
-
-test('checkContainerPriced stops a run without CONTAINER_PRICES', () => {
-  checkContainerPriced(containerPrices)
-  assert.throws(() => checkContainerPriced(undefined), (error) => error instanceof StopError && /budget and a fan-out config, but CONTAINER_PRICES is not set/.test(error.message))
 })
 
 test('computeCost bills vCPU and GiB seconds, with the price of the instance type when it has one, and nothing for the local machine', () => {

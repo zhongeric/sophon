@@ -276,12 +276,11 @@ function lastLineRun<Name extends 'plan' | 'fetch', Json>(
 }
 
 /**
- * The shell command of one unit on a scan box. A scan box is a new machine, thus the setup of the config runs first in
- * the same command. The caller gives the timeout of the unit.
+ * The shell command of one unit on a scan box. The setup of the config does not run: a scan box has no network, and
+ * the scan image holds the packages. The caller gives the timeout of the unit.
  */
 export function unitCommand(config: RepoConfig, preregPath: string, unit: string): string {
-  const command = fillCommand(fanOutTemplate(config, 'unit'), { prereg: quote(preregPath), unit: quote(unit) })
-  return config.setup ? `(${config.setup}\n) && ${command}` : command
+  return fillCommand(fanOutTemplate(config, 'unit'), { prereg: quote(preregPath), unit: quote(unit) })
 }
 
 /**

@@ -313,9 +313,9 @@ test('fetch gets the quoted target and gives its data files, each at a relative 
   }
 })
 
-test('the unit command has the quoted prereg and unit ID after the setup, and its last line gives the unit files', () => {
+test('the unit command has the quoted prereg and unit ID without the setup, and its last line gives the unit files', () => {
   assert.equal(unitCommand(fanOutConfig, prereg, 'inj_01'), `nb unit '${prereg}' 'inj_01'`)
-  assert.equal(unitCommand({ ...fanOutConfig, setup: 'make setup # deps' }, prereg, 'inj_01'), `(make setup # deps\n) && nb unit '${prereg}' 'inj_01'`)
+  assert.equal(unitCommand({ ...fanOutConfig, setup: 'make setup # deps' }, prereg, 'inj_01'), `nb unit '${prereg}' 'inj_01'`)
   assert.throws(() => unitCommand(config, prereg, 'inj_01'), /has no unit command/)
 
   assert.deepEqual(parseUnitOutput(`injected 3\n${JSON.stringify({ outputs: { 'out/units/inj_01.csv': hash('C') } })}\n`), { json: { outputs: { 'out/units/inj_01.csv': hash('c') } }, problem: null })

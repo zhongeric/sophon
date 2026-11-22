@@ -30,7 +30,7 @@ export type ContainerPrices = { vcpu_second: number; gib_second: number; instanc
 type ContainerPrice = { vcpu_second: number; gib_second: number }
 
 /** One metered command. A null instance is the local machine, which costs nothing. Times are epoch milliseconds. */
-export type ComputeEntry = { step: string; instance: InstanceSpec | null; startedAt: number; endedAt?: number }
+type ComputeEntry = { step: string; instance: InstanceSpec | null; startedAt: number; endedAt?: number }
 
 /** One compute row of the Usage section. */
 export type ComputeRow = { step: string; instance: InstanceSpec | null; seconds: number }
@@ -119,11 +119,6 @@ export function parseBudget(value: unknown): number {
 export function checkPriced(models: string[], prices: Prices): void {
   const missing = [...new Set(models)].filter((model) => !(model in prices))
   if (missing.length > 0) throw new StopError(`the run has a budget, but MODEL_PRICES has no price for: ${missing.join(', ')}`)
-}
-
-/** A budget with a fan-out config needs CONTAINER_PRICES. The caller decides when this applies. */
-export function checkContainerPriced(prices: ContainerPrices | undefined): void {
-  if (prices === undefined) throw new StopError('the run has a budget and a fan-out config, but CONTAINER_PRICES is not set')
 }
 
 /** The USD of `seconds` of wall time on `instance`. The local machine (null) costs nothing. */
