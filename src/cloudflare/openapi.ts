@@ -28,7 +28,7 @@ export function openApi(origin: string) {
       version: '1',
       description:
         'Starts and follows agent-factory runs. A development or a research run works on a GitHub issue, and a review run on a PR. ' +
-        'The run posts its questions and its report on that issue or PR. The answer to a question is an /answer comment there. Then resumeRun wakes the run.',
+        'The run keeps one status comment on that issue or PR, and posts its questions there. The answer to a question is an /answer comment there. Then resumeRun wakes the run.',
     },
     servers: [{ url: origin }],
     security: [{ admin: [] }],
@@ -84,11 +84,51 @@ export function openApi(origin: string) {
           type: 'number',
           exclusiveMinimum: 0,
           description:
-            'The cost budget of the run in USD. At the budget, the run posts a notice. At two times the budget, it asks to raise the budget or to stop. Needs MODEL_PRICES on the Worker.',
+            'The cost budget of the run in USD. At the budget, the run puts a notice into its status comment. At two times the budget, it asks to raise the budget or to stop. Needs MODEL_PRICES on the Worker.',
+        },
+        InboxItem: {
+          type: 'object',
+          properties: {
+            kind: {
+              type: 'string',
+              enum: ['question', 'failed', 'blocked', 'error', 'ready'],
+              description: 'question: questions wait for an /answer. error: the run stopped, and resumeRun starts it again. ready: a PR waits for your merge.',
+            },
+            repository: { type: 'string', description: 'owner/repo' },
+            number: { type: 'integer', description: 'The number of the issue or the PR' },
+            cause: { type: 'string', description: 'Why the item waits for you' },
+            link: { type: 'string', description: 'The comment or the PR to read' },
+          },
+          required: ['kind', 'repository', 'number', 'cause', 'link'],
+        },
+        Inbox: {
+          type: 'object',
+          properties: {
+            items: { type: 'array', items: ref('InboxItem') },
+            skipped: {
+              type: 'array',
+              description: 'The installations, repositories and items that the inbox cannot read',
+              items: { type: 'object', properties: { what: { type: 'string' }, reason: { type: 'string' } }, required: ['what', 'reason'] },
+            },
+          },
+          required: ['items', 'skipped'],
         },
       },
     },
     paths: {
+      '/inbox': {
+        get: {
+          operationId: 'getInbox',
+          summary: 'List the items that wait for you on all repositories of the GitHub App',
+          description:
+            'Open questions, runs that failed, are blocked or stopped on an error, and ready PRs without merge permission. It finds the runs through the work labels.',
+          responses: {
+            200: { description: 'The inbox', content: json(ref('Inbox')) },
+            401: unauthorized,
+            503: { description: 'The Worker has no GitHub App secrets, and the inbox needs the App', content: { 'text/plain': { schema: { type: 'string' } } } },
+          },
+        },
+      },
       '/runs/{owner}/{repo}/{number}': {
         parameters: target,
         get: {

@@ -120,10 +120,10 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 - **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
   fixes stay on `factory/<run>`. The run deletes it at its end after `--ship` or a closed PR.
 - **Models:** `--models file.json` sets the model of each role.
-- **Budget:** `--budget <usd>` sets a soft limit on the spend of a run. At the budget, the run posts a notice and
-  continues. At two times the budget, it asks you to raise the budget or stop, and `/answer recommended` raises it to
-  two times the spend. Prices come from `MODEL_PRICES`, JSON with the USD per million tokens of each model ID (`input`,
-  `cached_input`, `cache_write`, `output`). Each report shows the usage of each step.
+- **Budget:** `--budget <usd>` sets a soft limit on the spend of a run. At the budget, the run gives a notice (on
+  Cloudflare, in its status comment) and continues. At two times the budget, it asks you to raise the budget or stop, and
+  `/answer recommended` raises it to two times the spend. Prices come from `MODEL_PRICES`, JSON with the USD per million
+  tokens of each model ID (`input`, `cached_input`, `cache_write`, `output`). Each report shows the usage of each step.
 - **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
 - **Commits:** the host commits unsigned, unless a GitHub rule requires signed commits on a branch that the run pushes.
   Then signing must work without a prompt.
@@ -159,6 +159,7 @@ npm run remote -- research acme/app#45   # a research run on a program issue (--
 npm run remote -- resume acme/app#45     # wake a paused run, or start a run that stopped on an error
 npm run remote -- status acme/app#45     # or report
 npm run remote -- prune acme/app         # delete the merged, applied and stranded factory/* branches
+npm run remote -- inbox                  # the questions, stops, failures and PRs to merge that wait for you (needs the App)
 npm run metrics                          # CPU, memory and network of each build container
 ```
 
@@ -176,7 +177,7 @@ resume it after a crash. Development and research runs run their commands, and r
 tests, in a Cloudflare Container that has no secrets. Commits and pushes go through the GitHub API.
 The object keeps the sync state of each container directory in SQL, so after a restart the next sync sends only the
 changed files and does not run the setup again.
-A development PR says `Closes #<issue>`.
+A development PR says `Closes #<issue>`. A run edits one status comment. It posts a new comment only when you must act.
 
 ## Layout
 
