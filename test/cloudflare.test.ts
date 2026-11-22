@@ -515,6 +515,39 @@ test('on Cloudflare, GET /inbox needs the token, and without the GitHub App secr
   }
 })
 
+test('on Cloudflare, with the GitHub App, GET /inbox lists the open question batch of a labeled PR, and nothing after the answer', { timeout: 180_000 }, async () => {
+  const repo = fixtureRepo()
+  const mock = await mockServices(repo, { app: { installed: true, slug: 'sophon-factory' }, botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } })
+  const worker = await startFor(mock, { ...withMachine(mock), GITHUB_APP_ID: '12345', GITHUB_APP_PRIVATE_KEY: privateKey })
+  const admin = { authorization: 'Bearer admin' }
+  const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => c.body.slice(0, 120)))}\nworker:\n${worker.output().slice(-3000)}`
+  const inbox = async () => {
+    const response = await fetch(`${worker.url}/inbox`, { headers: admin })
+    assert.equal(response.status, 200, describe())
+    return (await response.json()) as { items: { kind: string; repository: string; number: number; cause: string; link: string }[]; skipped: unknown[] }
+  }
+  try {
+    assert.deepEqual(await inbox(), { items: [], skipped: [] })
+    await fetch(`${worker.url}/runs/acme/app/7`, { body: '{}', headers: { ...admin, 'content-type': 'application/json' }, method: 'POST' })
+    const asked = await until(() => mock.state.comments.find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
+    assert.deepEqual(mock.state.labels.get(7), ['agent-review'])
+    // The Worker found the PR through its label, and Runs.inbox() read the posted batch from the ledger of the run.
+    const waiting = await inbox()
+    assert.deepEqual(waiting.skipped, [], describe())
+    assert.deepEqual(waiting.items.map(({ kind, repository, number, link }) => ({ kind, link, number, repository })), [{ kind: 'question', link: asked.html_url, number: 7, repository: 'acme/app' }], describe())
+    assert.match(waiting.items[0]!.cause, /^the questions \S+ wait for your \/answer$/)
+
+    mock.comment('maintainer', '/answer recommended')
+    const done = await until(() => mock.state.comments.find((entry) => entry.body.includes('### agent-factory:')), 120_000, describe)
+    assert.match(done.body, /agent-factory: PASS/)
+    assert.deepEqual(await inbox(), { items: [], skipped: [] })
+  } finally {
+    await worker.stop()
+    await mock.close()
+  }
+})
+
 test('on Cloudflare, a docs and tests only change takes the light loop, with host findings from the virtual git diff', { timeout: 180_000 }, async () => {
   const repo = fixtureRepo({ light: true })
   const mock = await mockServices(repo, { botLogin: 'factory-bot', name: 'app', owner: 'acme', pr: 7, script: scriptFor({ tests: false }) })

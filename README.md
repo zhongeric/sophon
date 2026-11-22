@@ -149,9 +149,8 @@ as a secret to use budgets. The `secret` of a research credential is the name of
 `npx wrangler secret put <NAME>`. It cannot be a host secret or a Worker setting.
 
 `npm run remote` starts and follows runs. It reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from
-`.secrets/cloudflare.env`. For other tools, `https://<worker>/openapi.json` describes the same routes. Each run keeps
-one status comment on its issue or PR, and edits it at each change. It posts a new comment only when you must act. A
-run that stops on an error that can pass starts again by itself after 30 minutes, at most three times.
+`.secrets/cloudflare.env`. For other tools, `https://<worker>/openapi.json` describes the same routes. A run that stops on
+an error that can pass starts again by itself after 30 minutes, at most three times.
 
 ```bash
 npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full, --budget)
@@ -177,7 +176,8 @@ A Durable Object holds the ledger, the repository tree and the agent sessions of
 resume it after a crash. Development and research runs run their commands, and review runs with tests run their
 tests, in a Cloudflare Container that has no secrets. Commits and pushes go through the GitHub API.
 The object keeps the sync state of each container directory in SQL, so after a restart the next sync sends only the
-changed files and does not run the setup again. A development PR says `Closes #<issue>`.
+changed files and does not run the setup again.
+A development PR says `Closes #<issue>`. A run edits one status comment. It posts a new comment only when you must act.
 
 ## Layout
 

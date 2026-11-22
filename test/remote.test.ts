@@ -109,6 +109,7 @@ test('inbox sends GET /inbox with no target, and refuses a target and --budget',
   assert.deepEqual(remoteRequest('inbox', undefined, {}), { method: 'GET', path: '/inbox' })
   assert.throws(() => remoteRequest('inbox', 'acme/app#7', {}), { message: /inbox takes no target/, name: 'StopError' })
   assert.throws(() => remoteRequest('inbox', undefined, { budget: '5' }), /only start, develop and research take --budget/)
+  assert.throws(() => remoteRequest('status', undefined, {}), { message: /^status needs a target/, name: 'StopError' })
   assert.throws(() => remoteRequest('status', undefined, {}), { message: /status needs a target/, name: 'StopError' })
 })
 

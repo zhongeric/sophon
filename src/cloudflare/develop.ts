@@ -8,7 +8,7 @@ import { StopError } from '../core/stop.ts'
 import { parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
 import { cutReport, defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
-import { developAnnouncement } from './announcements.ts'
+import { statusHeader } from './announcements.ts'
 import { boxMachine, syncWithSetup } from './box.ts'
 import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
@@ -47,7 +47,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
   }
 
   protected announcement(run: string, request: DevelopRequest) {
-    return developAnnouncement(run, request.by)
+    return statusHeader('development', run, request.by)
   }
 
   protected async execute(run: string, request: DevelopRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call) {

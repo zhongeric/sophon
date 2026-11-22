@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { developAnnouncement, reviewAnnouncement } from '../src/cloudflare/announcements.ts'
+import { statusHeader } from '../src/cloudflare/announcements.ts'
 import { renderStatus } from '../src/cloudflare/status.ts'
 import { renderPlan } from '../src/core/plan.ts'
 import { commentLimit, render, type Answer, type Question } from '../src/core/questions.ts'
@@ -104,7 +104,7 @@ test('the question comment has the marker, one line about how to answer, then ev
 })
 
 test('each status comment has a one-line header after its state that says where questions come', () => {
-  for (const text of [developAnnouncement('dev-5-1', 'maintainer'), reviewAnnouncement('pr-7-1', 'maintainer')]) {
+  for (const text of [statusHeader('development', 'dev-5-1', 'maintainer'), statusHeader('review', 'pr-7-1', 'maintainer')]) {
     assert.doesNotMatch(text, /\n/)
     assert.doesNotMatch(text, /@/)
     assert.match(text, /^agent-factory (development|review) run `(dev-5-1|pr-7-1)` for `maintainer`\. Questions come here\. .*`\/answer`/)

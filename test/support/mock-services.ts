@@ -314,6 +314,19 @@ export async function mockServices(
         const expires_at = new Date(Date.now() + (options.app.expiresInSeconds ?? 3_600) * 1_000).toISOString()
         return json(response, 201, { expires_at, token: `ghs_installation${++installationTokens}` })
       }
+      // The installed App has one installation, 42, with this repository only.
+      if (options.app?.installed && route === 'GET /app/installations') return json(response, 200, page(url, [{ id: 42 }]))
+      if (options.app?.installed && route === 'GET /installation/repositories') {
+        return json(response, 200, { repositories: page(url, [{ name: options.name, owner: { login: options.owner } }]), total_count: 1 })
+      }
+      if (route === `GET ${api}/issues`) {
+        // The open issues and PRs with the label: the mock has no closed ones.
+        const label = url.searchParams.get('labels') ?? ''
+        const labeled = [...state.labels].filter(([, names]) => names.includes(label)).map(([number]) => number).sort((a, b) => a - b)
+        const kind = (number: number) => (pulls.has(number) ? 'pull' : 'issues')
+        const items = labeled.map((number) => ({ html_url: `https://github.com/${options.owner}/${options.name}/${kind(number)}/${number}`, number, ...(pulls.has(number) ? { pull_request: {} } : {}) }))
+        return json(response, 200, page(url, items))
+      }
       if (route === `GET ${api}/pulls`) {
         const head = url.searchParams.get('head')?.split(':')[1]
         const wanted = url.searchParams.get('state') ?? 'open'

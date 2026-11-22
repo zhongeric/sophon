@@ -8,8 +8,11 @@ import { statusKeys } from '../src/cloudflare/status.ts'
 
 type Item = { number: number; labels: string[]; pr?: boolean }
 
-/** A GitHub stub with the installations, the repositories and the open items, and the path prefixes that fail with HTTP 500. */
-function stub(installations: Record<number, string[]>, items: Record<string, Item[]>, broken: string[] = []) {
+/**
+ * A GitHub stub with the installations, the repositories and the open items, and the path prefixes that fail with HTTP 500.
+ * Each PR is open, except the PRs in `closed` (owner/repo#n).
+ */
+function stub(installations: Record<number, string[]>, items: Record<string, Item[]>, broken: string[] = [], closed: string[] = []) {
   const gh = (installation: number | null): GitHub => ({
     async json<T>(method: string, path: string): Promise<T> {
       const url = new URL(path, 'https://api.github.test')
@@ -28,6 +31,8 @@ function stub(installations: Record<number, string[]>, items: Record<string, Ite
           .filter((item) => item.labels.includes(label))
           .map((item) => ({ html_url: `https://github.test/${issues[1]}/${item.pr ? 'pull' : 'issues'}/${item.number}`, number: item.number, ...(item.pr ? { pull_request: {} } : {}) })) as T
       }
+      const pull = /^\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)$/.exec(url.pathname)
+      if (pull) return { number: Number(pull[2]), state: closed.includes(`${pull[1]}#${pull[2]}`) ? 'closed' : 'open' } as T
       throw new Error(`stub has no route ${method} ${path}`)
     },
     raw: () => Promise.reject(new Error('no raw calls')),
@@ -73,7 +78,7 @@ test('the inbox lists one item of each kind, with the link of the issue or PR wh
   const { asked, result } = await inbox(github, {
     'develop acme/app#5': [{ cause: 'the questions intake wait for your /answer', kind: 'question', link: 'https://q' }],
     'develop acme/app#8': [{ cause: 'the run ended with failed', kind: 'failed', link: null }],
-    'develop acme/app#9': [{ cause: 'PR #10 is ready and waits for your merge', kind: 'ready', link: 'https://pr/10' }],
+    'develop acme/app#9': [{ cause: 'PR #10 is ready and waits for your merge', kind: 'ready', link: 'https://pr/10', pr: 10 }],
     'research acme/app#6': [{ cause: 'the run ended with blocked', kind: 'blocked', link: 'https://b' }],
     'review acme/app#7': [{ cause: 'HTTP 403', kind: 'error', link: 'https://e' }],
   })
@@ -88,6 +93,12 @@ test('the inbox lists one item of each kind, with the link of the issue or PR wh
   ])
   // Only a PR takes a review, and only an issue takes a development or a research run.
   assert.ok(!asked.includes('review acme/app#9'), asked.join('\n'))
+})
+
+test('the inbox drops a ready item when its PR is merged or closed', async () => {
+  const github = stub({ 1: ['acme/app'] }, { 'acme/app': [{ labels: ['agent-research'], number: 6 }] }, [], ['acme/app#10'])
+  const { result } = await inbox(github, { 'research acme/app#6': [{ cause: 'PR #10 is ready and waits for your merge', kind: 'ready', link: 'https://pr/10', pr: 10 }] })
+  assert.deepEqual(result, { items: [], skipped: [] })
 })
 
 test('a failed installation, repository or item goes to skipped, and the other items stay in the list', async () => {
@@ -151,7 +162,7 @@ test('a failed run gives blocked for a blocked result, else failed, with the lin
 
 test('a passed run gives ready for a ready PR without a merge, and nothing for a merged PR or a review', () => {
   const pr = { number: 10, url: 'https://pr/10' }
-  const ready = [{ cause: 'PR #10 is ready and waits for your merge', kind: 'ready', link: 'https://pr/10' }]
+  const ready = [{ cause: 'PR #10 is ready and waits for your merge', kind: 'ready', link: 'https://pr/10', pr: 10 }]
   assert.deepEqual(runEntries({ note: '', state: 'passed' }, ledgerOf({ result: { merge: null, pr, status: 'ready' } }), []), ready)
   // A research result has no merge field.
   assert.deepEqual(runEntries({ note: '', state: 'passed' }, ledgerOf({ result: { pr, status: 'ready' } }), []), ready)

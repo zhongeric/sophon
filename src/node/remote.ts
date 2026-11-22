@@ -211,7 +211,7 @@ async function main(): Promise<number> {
     },
   })
   const [command, target] = positionals
-  if (values.help || !command || (!target && command !== 'inbox')) {
+  if (values.help || !command) {
     console.log(usage)
     return values.help ? 0 : 2
   }

@@ -11,7 +11,7 @@ import { parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
 import { cutReport } from '../core/workflows/develop.ts'
 import { defaultResearchModels, research, researchProviders, type ResearchInput, type ResearchModels } from '../core/workflows/research.ts'
-import { researchAnnouncement } from './announcements.ts'
+import { statusHeader } from './announcements.ts'
 import { sqlArtifacts } from './artifacts.ts'
 import { boxEnv, boxMachine, cleanBox, syncWithSetup } from './box.ts'
 import { commitTree, sqlBranches } from './branches.ts'
@@ -53,7 +53,7 @@ export class ResearchRuns extends Runs<ResearchRequest> {
   }
 
   protected announcement(run: string, request: ResearchRequest) {
-    return researchAnnouncement(run, request.by)
+    return statusHeader('research', run, request.by)
   }
 
   protected async execute(run: string, request: ResearchRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call) {

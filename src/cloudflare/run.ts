@@ -7,7 +7,7 @@ import { commentChannel, commentLimit, type Comments } from '../core/questions.t
 import { StopError } from '../core/stop.ts'
 import { parsePrices, zeroTokens, type RunUsage } from '../core/usage.ts'
 import { allowedModelsFrom, codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
-import { reviewAnnouncement } from './announcements.ts'
+import { statusHeader } from './announcements.ts'
 import { boxMachine, syncWithSetup } from './box.ts'
 import { ciChecker, reviewChecker } from './checker.ts'
 import { baseConfig } from './config.ts'
@@ -43,7 +43,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
   }
 
   protected announcement(run: string, request: StartRequest) {
-    return reviewAnnouncement(run, request.by)
+    return statusHeader('review', run, request.by)
   }
 
   /** A review that a development or research run started has the ask of its parent, and the parent reports to the user. */

@@ -7,7 +7,7 @@ import { PausedError, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { afterError, alarmBudgetMs, countRestart, initCounters, preflightKey, progressLedger, restartAtKey } from './alarm.ts'
 import { containerBox, httpBox, type Box, type SyncStore } from './box.ts'
-import { githubComments } from './comments.ts'
+import { githubComments, type StatusComments } from './comments.ts'
 import type { WorkerSetting } from './egress.ts'
 import type { DevelopmentRuns } from './develop.ts'
 import { GitHubError, type GitHub } from './github.ts'
@@ -265,17 +265,28 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     const budgetMs = alarmBudgetMs(this.env.ALARM_BUDGET_SECONDS)
     const stored = sqlLedger(this.ctx.storage.sql, row.run)
     // Without a client, the run cannot post: a failed GitHub setup goes only to the state note.
-    const shown: { status?: RunStatus } = {}
+    // One client carries the status comment and the other posts of the run, because they go to the same thread.
+    const shown: { status?: RunStatus; comments?: StatusComments } = {}
+    const comments = (gh: GitHub): StatusComments => (shown.comments ??= githubComments(gh, request.owner, request.repo, this.number(request)))
     const track = (gh: GitHub): RunStatus =>
       (shown.status ??= runStatus({
-        comments: githubComments(gh, request.owner, request.repo, this.number(request)),
+        comments: comments(gh),
         header: this.announcement(row.run, request),
         ledger: stored,
         log: (line, error) => console.error(`[${row.run}] ${line}`, error),
         quiet: this.reportsToParent(request),
       }))
     // Each finished step edits the status comment with its stage (D21).
-    const ledger = callBudget(stageLedger(progressLedger(stored), (stage) => shown.status?.stage(stage)), { budgetMs, startedAt })
+    const staged = stageLedger(progressLedger(stored), (stage) => shown.status?.stage(stage))
+    // Recorded answers continue a paused run, so the status comment shows it as running before the next step ends.
+    const answered: Ledger = {
+      get: (key) => staged.get(key),
+      put(key, value) {
+        staged.put(key, value)
+        if (key.startsWith('answers:')) void shown.status?.update({ state: 'running' })
+      },
+    }
+    const ledger = callBudget(answered, { budgetMs, startedAt })
     const notice = async (text: string) => shown.status?.update({ notice: text })
     const call = this.call(row.run, ledger, startedAt + budgetMs, notice)
     const target = `${request.owner}/${request.repo}#${this.number(request)}`
@@ -301,7 +312,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
         : await githubAccess(this.env, request.owner, request.repo, this.tokens)
       if (due) ledger.put(preflightKey, true)
       app = access.app
-      const posts = githubComments(access.gh, request.owner, request.repo, this.number(request))
+      const posts = comments(access.gh)
       const status = track(access.gh)
       initCounters(ledger)
       if (row.state === 'running') countRestart(ledger)

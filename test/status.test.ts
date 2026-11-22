@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { developAnnouncement } from '../src/cloudflare/announcements.ts'
+import { statusHeader } from '../src/cloudflare/announcements.ts'
 import type { StatusComments } from '../src/cloudflare/comments.ts'
 import { renderStatus, runStatus, stageLedger, statusKeys } from '../src/cloudflare/status.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import { commentLimit } from '../src/core/questions.ts'
 
-const header = developAnnouncement('dev-5-1', 'maintainer')
+const header = statusHeader('development', 'dev-5-1', 'maintainer')
 
 const memoryLedger = (entries: Record<string, unknown> = {}) => {
   const map = new Map(Object.entries(entries))
