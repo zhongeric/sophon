@@ -18,9 +18,6 @@ test('a long log keeps a not ok block far from its end, and the end', () => {
   const excerpt = failureExcerpt(log, budget)
   const block = firstLines(log.slice(log.indexOf(failure)))
   assert.ok(block.startsWith(failure))
-  assert.equal(head(excerpt), block)
-  assert.ok(excerpt.endsWith(`ok 1193 - a test passes\n${summary}`))
-  assert.ok(excerpt.length <= budget)
   assert.equal(excerpt, `${block}${endMark}${log.slice(-(budget - block.length - endMark.length))}`)
 })
 
@@ -68,4 +65,30 @@ test('blocks that do not fit give the first blocks and the count of the cut bloc
   assert.equal(head(excerpt), `${blocks.slice(0, kept).join('')}${note}`)
   assert.ok(excerpt.endsWith(summary))
   assert.ok(excerpt.length <= budget + note.length)
+})
+
+test('a first block longer than the block space keeps its first whole lines, and only the later blocks count as cut', () => {
+  const prefix = 'test\tRun npm test\t2026-11-22T05:10:50.0000000Z '
+  const line = (text: string) => `${prefix}${text}`.padEnd(120, '.') + '\n'
+  const first = [line('not ok 793 - the runs keep their invariants'), ...Array.from({ length: 39 }, (_, index) => line(`    at frame ${index} (file:///repo/src/core/develop.ts)`))].join('')
+  assert.ok(first.length > budget - 2_000)
+  const later = ['FAIL test/a.test.ts\n', 'FAIL test/b.test.ts\n']
+  const log = `${first}${later.join('')}${passes(500)}${summary}`
+  const excerpt = failureExcerpt(log, budget)
+  const note = '[2 more failure blocks cut]\n'
+  assert.ok(excerpt.startsWith(line('not ok 793 - the runs keep their invariants')))
+  const kept = head(excerpt) ?? ''
+  assert.ok(kept.endsWith(note))
+  const lines = kept.slice(0, -note.length)
+  assert.ok(lines.endsWith('\n') && first.startsWith(lines))
+  assert.ok(excerpt.endsWith(summary))
+  assert.ok(excerpt.length <= budget + note.length)
+})
+
+test('the end of the log keeps 2,000 characters when the blocks fill the block space', () => {
+  const block = `Error: ${'x'.repeat(182)}\n${`${'d'.repeat(99)}\n`.repeat(38)}`
+  assert.equal(block.length, 3_990)
+  const excerpt = failureExcerpt(`${block}FAIL test/a.test.ts\n${passes(500)}${summary}`, budget)
+  assert.ok((excerpt.split(endMark)[1] ?? '').length >= 2_000)
+  assert.ok(excerpt.endsWith(summary))
 })

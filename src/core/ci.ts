@@ -79,18 +79,25 @@ export function failureExcerpt(log: string, budget: number): string {
   const kept: string[] = []
   let used = 0
   let cut = 0
+  const endStart = () => log.length - (budget - used - endMark.length)
   for (const [index, block] of blocks.entries()) {
     // A block in the end of the log is in the excerpt already, and so are the blocks after it.
-    if (block.start >= log.length - (budget - used - endMark.length)) break
-    if (used + block.text.length > budget - endReserve) {
-      const endStart = log.length - (budget - used - endMark.length)
-      cut = blocks.slice(index).filter((later) => later.start < endStart).length
+    if (block.start >= endStart()) break
+    const room = budget - endReserve - endMark.length - used
+    if (block.text.length > room) {
+      // When the first block is longer than the block space, keep its first lines, so that the excerpt names the failure.
+      const head = kept.length === 0 && room > 1 ? block.text.slice(0, room) : ''
+      const text = head.includes('\n') ? head.slice(0, head.lastIndexOf('\n') + 1) : head && `${head.slice(0, -1)}\n`
+      kept.push(text)
+      used += text.length
+      const end = endStart()
+      cut = blocks.slice(text ? index + 1 : index).filter((later) => later.start < end).length
       break
     }
     kept.push(block.text)
     used += block.text.length
   }
-  if (kept.length === 0 && cut === 0) return log.slice(-budget)
+  if (used === 0 && cut === 0) return log.slice(-budget)
   const note = cut === 0 ? '' : `[${cut} more failure ${cut === 1 ? 'block' : 'blocks'} cut]\n`
-  return `${kept.join('')}${note}${endMark}${log.slice(-(budget - used - endMark.length))}`
+  return `${kept.join('')}${note}${endMark}${log.slice(endStart())}`
 }
