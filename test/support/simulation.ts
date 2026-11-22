@@ -10,6 +10,7 @@ import { DatabaseSync, type SQLInputValue, type StatementSync } from 'node:sqlit
 import { fileURLToPath } from 'node:url'
 import type { Box, BoxResult, JobState } from '../../src/cloudflare/box.ts'
 import type { Clock } from '../../src/core/clock.ts'
+import { planTurn } from './develop.ts'
 import { mockServices } from './mock-services.ts'
 import type { Script } from './scripted-model.ts'
 
@@ -801,13 +802,12 @@ const plan = {
 const buildLog = { summary: 'sub works', changes: [{ path: 'src/sub.ts', why: 'sub works' }], tests: [], blocked: '' }
 
 /** The scripted agents, short so that a seed is fast. The reviewers find nothing, so that the review passes without a patch. */
-const script: Script = ({ role, output }) => {
+const script: Script = ({ role, output, request }) => {
   if (output !== null) return { text: 'done' }
   switch (role) {
-    case 'intake':
-      return { cell: `await tools.submit_intake(${JSON.stringify(intake)})` }
+    // One planner session: the intake turn, then the plan turn (D19).
     case 'planner':
-      return { cell: `await tools.submit_plan(${JSON.stringify(plan)})` }
+      return { cell: planTurn(request) ? `await tools.submit_plan(${JSON.stringify(plan)})` : `await tools.submit_intake(${JSON.stringify(intake)})` }
     case 'builder':
       return {
         cell: [
