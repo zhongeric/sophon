@@ -180,6 +180,16 @@ export type Artifacts = {
   list(): Promise<{ id: string; meta: ArtifactMeta }[]>
 }
 
+/**
+ * A content-addressed store of bulk data, without meta: the sweep data files and their egress bodies. The ID is the
+ * SHA-256 lowercase hex of the bytes, so the same bytes give one object.
+ */
+export type DataStore = {
+  put(bytes: Uint8Array): Promise<string>
+  /** Null for an unknown or malformed ID. */
+  get(id: string): Promise<Uint8Array | null>
+}
+
 /** Where agent sessions keep their journals and events. */
 export type AgentStore = {
   sql: Contracts.SqlHost

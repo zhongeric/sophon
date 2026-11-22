@@ -15,8 +15,13 @@ export type ResearchConfig = {
   guides: string
   checklist: string
   prereg_sections: string[]
-  /** analyze is optional: without it, the host runs the fixed entry point of analyzeCommand in research-commands.ts. */
-  commands: { known: string; inject: string; evaluate: string; reproduce: string; analyze?: string; sweep?: string }
+  /**
+   * analyze is optional: without it, the host runs the fixed entry point of analyzeCommand in research-commands.ts.
+   * plan, fetch, unit and merge are all present or all absent. With them, stage 6 fans out (fansOut).
+   */
+  commands: { known: string; inject: string; evaluate: string; reproduce: string; analyze?: string } & Partial<Record<FanOutCommand, string>>
+  /** The commands of stage 7. With them, the host runs the sweep over scan boxes for each prereg. */
+  sweep?: SweepConfig
   credentials?: Record<string, ResearchCredential>
   /** The timeout in ms of each domain command. A missing key takes the timeout of the checks. */
   timeouts?: ResearchTimeouts
@@ -24,7 +29,21 @@ export type ResearchConfig = {
   feeds?: string[]
 }
 
-export type ResearchTimeouts = Partial<Record<'known' | 'inject' | 'evaluate' | 'reproduce' | 'analyze', number>>
+/** The notebook commands of a stage 6 fan-out (section 6.3 of docs/specs/research-workflow.md). */
+export type FanOutCommand = 'plan' | 'fetch' | 'unit' | 'merge'
+
+export const fanOutCommands: readonly FanOutCommand[] = ['plan', 'fetch', 'unit', 'merge']
+
+/** Tells if stage 6 of the config fans out over scan boxes. parseResearchConfig permits only all four commands or none. */
+export const fansOut = (research: ResearchConfig): boolean => fanOutCommands.every((name) => research.commands[name] !== undefined)
+
+/** The stage 7 sweep. fetch_rate is the limit of egress requests in each second. fetch_parallel is the size of the fetch pool. */
+export type SweepConfig = Record<FanOutCommand, string> & { fetch_rate: number; fetch_parallel: number }
+
+export const defaultSweepFetchRate = 5
+export const defaultSweepFetchParallel = 16
+
+export type ResearchTimeouts = Partial<Record<'known' | 'inject' | 'evaluate' | 'reproduce' | 'analyze' | FanOutCommand, number>>
 
 /**
  * The holdout file. `refuse` is the list of URL prefixes that the egress refuses to agents. Each prefix has the
@@ -106,12 +125,18 @@ function feedList(value: unknown, key: string, fail: Fail): string[] {
 /** A placeholder is {name} that does not follow a $, so that a shell ${VAR} stays permitted. */
 const placeholder = /(?<!\$)\{([A-Za-z_][A-Za-z0-9_]*)\}/g
 
-function command(value: unknown, key: string, permitted: string[], fail: Fail): string {
+/** `required` is a placeholder that the command must use, because without it each call runs the same command. */
+function command(value: unknown, key: string, permitted: string[], fail: Fail, required?: string): string {
   const text = nonEmptyString(value, key, fail)
-  for (const [found] of text.matchAll(placeholder))
-    if (!permitted.includes(found.slice(1, -1))) fail(key, `uses the placeholder ${found}, but only ${permitted.map((item) => `{${item}}`).join(' and ')} are permitted`)
+  const used = [...text.matchAll(placeholder)].map(([found]) => found.slice(1, -1))
+  for (const name of used) if (!permitted.includes(name)) fail(key, `uses the placeholder {${name}}, but only ${permitted.map((item) => `{${item}}`).join(' and ')} are permitted`)
+  if (required !== undefined && !used.includes(required)) fail(key, `must use the placeholder {${required}}`)
   return text
 }
+
+/** Replaces each placeholder of a command that `values` names with its value. A value is not searched for placeholders again. */
+export const fillCommand = (template: string, values: Record<string, string>): string =>
+  template.replace(placeholder, (found, name: string) => values[name] ?? found)
 
 /** Normalizes . and .. segments and extra slashes. The path must stay in the repository. */
 function relativePath(value: unknown, key: string, fail: Fail): string {
@@ -150,7 +175,7 @@ function credentials(value: unknown, key: string, egress: string[], fail: Fail):
   return parsed
 }
 
-const timeoutKeys: readonly (keyof ResearchTimeouts)[] = ['known', 'inject', 'evaluate', 'reproduce', 'analyze']
+const timeoutKeys: readonly (keyof ResearchTimeouts)[] = ['known', 'inject', 'evaluate', 'reproduce', 'analyze', ...fanOutCommands]
 
 function timeouts(value: unknown, key: string, fail: Fail): ResearchTimeouts {
   const entries = object(value, key, [...timeoutKeys], fail)
@@ -163,7 +188,26 @@ function timeouts(value: unknown, key: string, fail: Fail): ResearchTimeouts {
   return parsed
 }
 
-const researchKeys = ['egress', 'holdout', 'lenses', 'guides', 'checklist', 'prereg_sections', 'commands', 'credentials', 'timeouts', 'feeds']
+const researchKeys = ['egress', 'holdout', 'lenses', 'guides', 'checklist', 'prereg_sections', 'commands', 'sweep', 'credentials', 'timeouts', 'feeds']
+
+const fanOutPlaceholders: Record<FanOutCommand, string[]> = { plan: ['prereg'], fetch: ['prereg', 'target'], unit: ['prereg', 'unit'], merge: ['prereg', 'units'] }
+const fanOutRequired: Partial<Record<FanOutCommand, string>> = { fetch: 'target', unit: 'unit', merge: 'units' }
+
+function sweep(value: unknown, key: string, fail: Fail): SweepConfig {
+  const entries = object(value, key, [...fanOutCommands, 'fetch_rate', 'fetch_parallel'], fail)
+  const at = (name: FanOutCommand) => command(entries[name], `${key}.${name}`, fanOutPlaceholders[name], fail, fanOutRequired[name])
+  const rate = entries.fetch_rate === undefined ? defaultSweepFetchRate : entries.fetch_rate
+  const parallel = entries.fetch_parallel === undefined ? defaultSweepFetchParallel : entries.fetch_parallel
+  return {
+    plan: at('plan'),
+    fetch: at('fetch'),
+    unit: at('unit'),
+    merge: at('merge'),
+    fetch_rate:
+      typeof rate === 'number' && Number.isFinite(rate) && rate > 0 ? rate : fail(`${key}.fetch_rate`, 'must be a finite number of requests per second, more than 0'),
+    fetch_parallel: typeof parallel === 'number' && Number.isSafeInteger(parallel) && parallel > 0 ? parallel : fail(`${key}.fetch_parallel`, 'must be a positive integer'),
+  }
+}
 
 /** Parses the research field of .agent-factory.json. Each error names `source` and the bad key. */
 export function parseResearchConfig(value: unknown, source: string): ResearchConfig {
@@ -171,7 +215,9 @@ export function parseResearchConfig(value: unknown, source: string): ResearchCon
   const research = object(value, 'research', researchKeys, fail)
   const egress = egressList(research.egress, 'research.egress', fail)
   const lenses = object(research.lenses, 'research.lenses', ['survey', 'skeptic'], fail)
-  const commands = object(research.commands, 'research.commands', ['known', 'inject', 'evaluate', 'reproduce', 'analyze', 'sweep'], fail)
+  if (isObject(research.commands) && research.commands.sweep !== undefined)
+    fail('research.commands.sweep', 'is removed: give the stage 7 commands in research.sweep ({ plan, fetch, unit, merge })')
+  const commands = object(research.commands, 'research.commands', ['known', 'inject', 'evaluate', 'reproduce', 'analyze', ...fanOutCommands], fail)
   const prereg = ['prereg']
   const config: ResearchConfig = {
     egress,
@@ -188,7 +234,13 @@ export function parseResearchConfig(value: unknown, source: string): ResearchCon
     },
   }
   if (commands.analyze !== undefined) config.commands.analyze = command(commands.analyze, 'research.commands.analyze', prereg, fail)
-  if (commands.sweep !== undefined) config.commands.sweep = command(commands.sweep, 'research.commands.sweep', [...prereg, 'partition'], fail)
+  const present = fanOutCommands.filter((name) => commands[name] !== undefined)
+  if (present.length > 0 && present.length < fanOutCommands.length) {
+    const missing = fanOutCommands.filter((name) => !present.includes(name))
+    fail('research.commands', `has ${present.join(', ')} but not ${missing.join(', ')}: give all of plan, fetch, unit and merge, or none of them`)
+  }
+  for (const name of present) config.commands[name] = command(commands[name], `research.commands.${name}`, fanOutPlaceholders[name], fail, fanOutRequired[name])
+  if (research.sweep !== undefined) config.sweep = sweep(research.sweep, 'research.sweep', fail)
   if (research.credentials !== undefined) config.credentials = credentials(research.credentials, 'research.credentials', egress, fail)
   if (research.timeouts !== undefined) config.timeouts = timeouts(research.timeouts, 'research.timeouts', fail)
   if (research.feeds !== undefined) config.feeds = feedList(research.feeds, 'research.feeds', fail)

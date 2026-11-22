@@ -140,6 +140,18 @@ test('build: submit refuses a reverted base file even when the tree matches HEAD
   assert.equal(result.blocked, '')
 })
 
+test('build: in a base merge, the submit runs no targeted test of the files that the base brings unchanged', { timeout: 60_000 }, async () => {
+  const { machine } = fakeMachine(() => pass)
+  const own = `await tools.Write({ file_path: '/repo/src/extra.ts', content: 'export const extra = 1\\n' })`
+  const submit = `await tools.submit_build_log(${JSON.stringify({ summary: 'merge', changes: [{ path: 'src/extra.ts', why: 'resolve' }], tests: [], blocked: '' })}); text('LOG ACCEPTED')`
+  const { calls, output, result } = await buildWith({ cell: [own, checkpoint, submit].join('\n'), machine, baseFiles: { 'src/math.ts': changedMath } })
+
+  assert.match(output, /LOG ACCEPTED/)
+  // test/add.test.ts imports only src/math.ts, which the base brings: the CI of the base tested it.
+  assert.deepEqual(calls.tests, [])
+  assert.equal(result.blocked, '')
+})
+
 test('build: run_checks runs only the configured checks, and submit runs the targeted tests and accepts the log when they pass', { timeout: 60_000 }, async () => {
   const { commands, machine } = fakeMachine(() => pass)
   const cell = [write, checkpoint, `text('checks: ' + JSON.stringify(await tools.run_checks({})))`, trySubmit].join('\n')

@@ -223,6 +223,24 @@ test('a clean box keeps its directory when the ledger and the marker agree, and 
   assert.match(lines.at(-1) ?? '', /^sync clean\/1: full, 1 files sent in \d+ ms$/)
 })
 
+test('a clean box gives the end time of its last job, also after a pause', async () => {
+  const ledger = memoryLedger()
+  const fake = fakeBox(ledger)
+  const tree = MemoryFileSystem.create({ files: { '/a.txt': 'a' } })
+  const open = (deadline: number) => {
+    const runner = jobRunner(fake.box, ledger, clock().options)
+    return cleanBox(fake.box, tree, 'clean/1', () => {}, { deadline, key: 'calibrate.h1.1', ledger, runner })
+  }
+  const first = await open(0)
+  await assert.rejects(first.run('make', { env: [], timeoutMs: 60_000 }), PausedError)
+  assert.equal(first.endedAt(), undefined)
+  // The job ends during the pause, and the next call polls it later.
+  for (const id of fake.states.keys()) fake.states.set(id, { result: { ...done, ended_at: 5_000 }, state: 'done' })
+  const second = await open(60_000)
+  assert.deepEqual(await second.run('make', { env: [], timeoutMs: 60_000 }), { ...done, ended_at: 5_000 })
+  assert.equal(second.endedAt(), 5_000)
+})
+
 test('a wait job ends by the deadline of the runner, and no job starts with less than a second left', async () => {
   const ledger = memoryLedger()
   const fake = fakeBox(ledger)

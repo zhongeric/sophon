@@ -311,7 +311,8 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       const setupFailed = (failed: CheckResult[]) => failed.some(({ name }) => name === 'setup')
       // A command with no exit code, when the call has no time left, is a stop at the end of the call (D12).
       const cut = (failed: CheckResult[]) => shortTime() !== null && failed.some((result) => result.exit_code === null)
-      const taskChanges = await branch.changedFiles(task.base, head)
+      // The CI of the base tested the files that a base merge brings unchanged, so the gate skips them (D16).
+      const taskChanges = (await branch.changedFiles(task.base, head)).filter((path) => !baseFiles.has(path))
       const runTests = checker.tests
       const tests = runTests ? await targetedTests(branch, context.config, taskChanges) : []
       if (runTests && tests.length > 0) {

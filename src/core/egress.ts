@@ -1,6 +1,6 @@
 import { artifactId, artifactSizeLimit } from './artifacts.ts'
 import type { Ledger } from './ledger.ts'
-import type { Artifacts } from './platform.ts'
+import type { Artifacts, DataStore } from './platform.ts'
 import { hostSecrets } from './secrets.ts'
 
 /** A header that the host adds for one host. `secret` is the name of a host secret, never its value. */
@@ -27,8 +27,11 @@ const defaultRequestLimit = 8 * 1024
 /** URL prefixes that the egress refuses until the host unlocks them. Only the host can unlock. */
 export type RunLock = { locked(url: string): boolean; pending(): string[]; unlock(pattern: string): void }
 
-/** What the egress gets from the host. `fetch` replaces the global fetch, for tests. */
-export type EgressHost = { artifacts: Artifacts; lock?: RunLock; secret(name: string): string | undefined; fetch?: typeof fetch }
+/**
+ * What the egress gets from the host. `fetch` replaces the global fetch, for tests. With `bodies`, the response bodies
+ * go there and not into `artifacts`, for the bulk data of a sweep. The provenance records stay in `artifacts`.
+ */
+export type EgressHost = { artifacts: Artifacts; bodies?: DataStore; lock?: RunLock; secret(name: string): string | undefined; fetch?: typeof fetch }
 
 const unlockedKey = 'egress:unlocked'
 const maxRedirects = 5
@@ -323,7 +326,8 @@ export function egressFetch(agent: string, egress: Egress, host: EgressHost, log
       const bytes = await readCapped(response, cap)
       const source = { url: url.href, method }
       const labels = { body_sha256: await artifactId(body ?? new Uint8Array()), status: String(response.status) }
-      const id = await host.artifacts.put(bytes, { source, media_type: response.headers.get('content-type') ?? 'application/octet-stream', labels })
+      const media_type = response.headers.get('content-type') ?? 'application/octet-stream'
+      const id = host.bodies ? await host.bodies.put(bytes) : await host.artifacts.put(bytes, { source, media_type, labels })
       const record = { body: id, url: url.href, method, ...labels, nonce: crypto.randomUUID() }
       const provenance = await host.artifacts.put(new TextEncoder().encode(JSON.stringify(record)), {
         source: { command: 'egress provenance' },

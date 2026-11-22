@@ -2,7 +2,26 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { Machine, RepoConfig } from '../src/core/checks.ts'
 import { freezePrereg } from '../src/core/prereg.ts'
-import { analysisVerdict, analyzeCommand, calibrationVerdict, compareReproduction, needsRecalibration, preregThreshold, runDomainCommand } from '../src/core/research-commands.ts'
+import {
+  analysisVerdict,
+  analyzeCommand,
+  calibrationVerdict,
+  compareReproduction,
+  needsRecalibration,
+  parseSweepFetchOutput,
+  parseSweepUnitOutput,
+  parseUnitOutput,
+  preregThreshold,
+  runDomainCommand,
+  runFetch,
+  runMerge,
+  runPlan,
+  runSweepMerge,
+  runSweepPlan,
+  sweepFetchCommand,
+  sweepUnitCommand,
+  unitCommand,
+} from '../src/core/research-commands.ts'
 import type { ResearchConfig } from '../src/core/research.ts'
 
 const hash = (char: string) => char.repeat(64)
@@ -226,4 +245,209 @@ test('the threshold comes from the frozen prereg markdown', async () => {
   assert.equal(preregThreshold(frozen.markdown), 0.85)
   assert.throws(() => preregThreshold('# Prereg hyp-001 v1\n'), /no line "Known recall: <n>"/)
   assert.throws(() => preregThreshold('Known recall: high\n'), /no line "Known recall: <n>"/)
+})
+
+const fanOutResearch: ResearchConfig = {
+  ...research,
+  commands: { ...research.commands, plan: 'nb plan {prereg}', fetch: 'nb fetch {prereg} {target}', unit: 'nb unit {prereg} {unit}', merge: 'nb merge {prereg} {units}' },
+}
+const fanOutConfig: RepoConfig = { ...config, research: fanOutResearch }
+const prereg = 'prereg/hyp-001-v1.md'
+const plan = (reply: Reply) => runPlan(fanOutConfig, fakeMachine({ 'nb plan': reply }).machine, prereg)
+const fetch = (reply: Reply) => runFetch(fanOutConfig, fakeMachine({ 'nb fetch': reply }).machine, prereg, 'T-1')
+const merge = (reply: Reply) => runMerge(fanOutConfig, fakeMachine({ 'nb merge': reply }).machine, prereg, '.agent-factory/units')
+
+test('plan gets the quoted prereg and gives its targets and units, and zero units is a valid plan', async () => {
+  const { machine, calls } = fakeMachine({ 'nb plan': ok({ targets: ['T-1', "T'2"], units: [{ id: 'inj_01', targets: ['T-1'], expected_seconds: 300 }, { id: 'inj-02', targets: [], expected_seconds: 0.5 }] }) })
+  const result = await runPlan(fanOutConfig, machine, "prereg/it's.md")
+  assert.equal(result.command, `nb plan 'prereg/it'\\''s.md'`)
+  assert.deepEqual(calls.map(({ command, timeoutMs }) => [command, timeoutMs]), [[result.command, 5_000]])
+  assert.deepEqual(result.json, { targets: ['T-1', "T'2"], units: [{ id: 'inj_01', targets: ['T-1'], expected_seconds: 300 }, { id: 'inj-02', targets: [], expected_seconds: 0.5 }] })
+  assert.equal(result.problem, null)
+  assert.deepEqual((await plan(ok({ targets: [], units: [] }))).json, { targets: [], units: [] })
+})
+
+test('a bad plan fails with the problem and the tail', async () => {
+  const unit = (patch: Record<string, unknown>) => ({ id: 'u1', targets: ['T-1'], expected_seconds: 60, ...patch })
+  const cases: [Reply, RegExp][] = [
+    [{ exit_code: 0, output: 'planning\n' }, /the last line of plan is not JSON/],
+    [{ exit_code: 2, output: 'Traceback: plan broke' }, /plan exited with code 2/],
+    [ok({ targets: 'T-1', units: [] }), /targets must be a list of non-empty strings/],
+    [ok({ targets: ['T-1', 'T-2', 'T-1'], units: [] }), /targets repeats T-1/],
+    [ok({ targets: ['T-1'] }), /units must be a list/],
+    [ok({ targets: ['T-1'], units: [unit({}), 'u2'] }), /units\[1\] must be an object/],
+    [ok({ targets: ['T-1'], units: [unit({}), unit({ expected_seconds: 5 })] }), /units\[1\]\.id repeats the unit ID u1/],
+    [ok({ targets: ['T-1'], units: [unit({ targets: ['T-1', 'T-9'] })] }), /units\[0\]\.targets has T-9, which is not in targets/],
+    [ok({ targets: ['T-1'], units: [unit({ targets: 'T-1' })] }), /units\[0\]\.targets must be a list of non-empty strings/],
+    [ok({ targets: ['T-1 ', ' T-2'], units: [] }), /targets has names with spaces at the start or the end: "T-1 ", " T-2"/],
+    [ok({ targets: ['T-1'], units: [unit({ targets: ['T-1 '] })] }), /units\[0\]\.targets has names with spaces/],
+  ]
+  for (const id of ['', 'a/b', '../x', 'a.b', 'a b', 'x'.repeat(65), 7]) cases.push([ok({ targets: ['T-1'], units: [unit({ id })] }), /units\[0\]\.id must match/])
+  for (const seconds of [0, -1, '60', null]) cases.push([ok({ targets: ['T-1'], units: [unit({ expected_seconds: seconds })] }), /units\[0\]\.expected_seconds must be a finite positive number/])
+  cases.push([{ exit_code: 0, output: '{"targets": ["T-1"], "units": [{"id": "u1", "targets": [], "expected_seconds": 1e400}]}' }, /expected_seconds must be a finite positive number/])
+  for (const [reply, reason] of cases) {
+    const result = await plan(reply)
+    assert.equal(result.json, null, reason.source)
+    if (result.problem === null) continue
+    assert.match(result.problem, reason)
+    assert.ok(result.tail.startsWith(`--- plan: nb plan '${prereg}' (exit code ${reply.exit_code})\n`), result.tail)
+    assert.ok(result.tail.includes(reply.output.trim()), result.tail)
+  }
+})
+
+test('fetch gets the quoted target and gives its data files, each at a relative path', async () => {
+  const { machine, calls } = fakeMachine({ 'nb fetch': ok({ outputs: { 'data/T-1/light.fits': hash('A') } }) })
+  const result = await runFetch(fanOutConfig, machine, prereg, "T'1 && rm -rf /")
+  assert.equal(result.command, `nb fetch '${prereg}' 'T'\\''1 && rm -rf /'`)
+  assert.equal(calls[0]?.command, result.command)
+  assert.deepEqual(result.json, { outputs: { 'data/T-1/light.fits': hash('a') } })
+  assert.deepEqual((await fetch(ok({ outputs: {} }))).json, { outputs: {} })
+
+  const cases: [Reply, RegExp][] = [
+    [{ exit_code: 1, output: 'HTTP 503' }, /fetch exited with code 1/],
+    [{ exit_code: null, output: 'slow archive' }, /fetch did not finish/],
+    [ok([]), /the last line of fetch is not a JSON object/],
+    [ok({}), /outputs must be an object of path to SHA-256 hex/],
+    [ok({ outputs: { 'data/a.fits': 'abc' } }), /the hash of data\/a.fits is not SHA-256 hex/],
+  ]
+  for (const path of ['/data/a.fits', '../a.fits', 'data/../../a.fits', 'data//a.fits', './a.fits', 'data\\a.fits'])
+    cases.push([ok({ outputs: { [path]: hash('a') } }), /must be relative, with \/ and without empty, \. or \.\. segments/])
+  for (const [reply, reason] of cases) {
+    const result = await fetch(reply)
+    assert.equal(result.json, null, reason.source)
+    if (result.problem === null) continue
+    assert.match(result.problem, reason)
+    assert.ok(result.tail.includes(reply.output.trim()), result.tail)
+  }
+})
+
+test('the unit command has the quoted prereg and unit ID without the setup, and its last line gives the unit files', () => {
+  assert.equal(unitCommand(fanOutConfig, prereg, 'inj_01'), `nb unit '${prereg}' 'inj_01'`)
+  assert.equal(unitCommand({ ...fanOutConfig, setup: 'make setup # deps' }, prereg, 'inj_01'), `nb unit '${prereg}' 'inj_01'`)
+  assert.throws(() => unitCommand(config, prereg, 'inj_01'), /has no unit command/)
+
+  assert.deepEqual(parseUnitOutput(`injected 3\n${JSON.stringify({ outputs: { 'out/units/inj_01.csv': hash('C') } })}\n`), { json: { outputs: { 'out/units/inj_01.csv': hash('c') } }, problem: null })
+  assert.deepEqual(parseUnitOutput(''), { json: null, problem: 'unit printed nothing, but its last line must be a JSON object' })
+  assert.deepEqual(parseUnitOutput('done'), { json: null, problem: 'the last line of unit is not JSON' })
+  assert.match(parseUnitOutput(JSON.stringify({ outputs: { '../x.csv': hash('c') } })).problem ?? '', /the last line of unit: the output path \.\.\/x\.csv must be relative/)
+})
+
+const merged = {
+  known: { recall: 0.9, outputs: { 'out/known.csv': hash('a') }, reads: ['search/'] },
+  inject: { outputs: { 'out/inject.csv': hash('b') }, reads: ['search/', 'data/'] },
+}
+
+test('merge gets the quoted units directory, and its last line splits into a known run and an inject run for calibrationVerdict', async () => {
+  const { machine, calls } = fakeMachine({ 'nb merge': ok(merged, 'merged 45 units\n') })
+  const { known, inject } = await runMerge(fanOutConfig, machine, prereg, "units/it's")
+  const command = `nb merge '${prereg}' 'units/it'\\''s'`
+  assert.equal(calls[0]?.command, command)
+  assert.deepEqual(known, { name: 'known', command, exit_code: 0, output: `merged 45 units\n${JSON.stringify(merged)}\n\n`, json: merged.known, problem: null })
+  assert.deepEqual(inject, { ...known, name: 'inject', json: { recall: null, ...merged.inject } })
+  assert.deepEqual(calibrationVerdict(known, inject, 0.8), { pass: true, recall: 0.9, threshold: 0.8, outputs: { 'out/known.csv': hash('a'), 'out/inject.csv': hash('b') } })
+  assert.equal(needsRecalibration(known.json?.reads ?? null, inject.json?.reads ?? null, ['analysis/hyp-001/']), false)
+
+  const withoutReads = await merge(ok({ known: { recall: 1, outputs: {} }, inject: { outputs: {} } }))
+  assert.equal(withoutReads.known.json?.reads, null)
+  assert.equal(withoutReads.inject.json?.reads, null)
+})
+
+test('a failed merge or a bad merge line fails both runs with the merge problem', async () => {
+  const cases: [Reply, RegExp][] = [
+    [{ exit_code: 1, output: 'Traceback: merge broke' }, /^merge exited with code 1$/],
+    [{ exit_code: null, output: 'slow merge' }, /^merge did not finish/],
+    [{ exit_code: 0, output: 'merged\n' }, /^the last line of merge is not JSON$/],
+    [ok({ known: merged.known }), /^the last line of merge: inject must be an object$/],
+    [ok({ ...merged, known: { ...merged.known, recall: 2 } }), /^the last line of merge: in known, recall must be a number from 0 to 1$/],
+    [ok({ ...merged, inject: { outputs: { 'out/a.csv': 'abc' } } }), /^the last line of merge: in inject, the hash of out\/a.csv is not SHA-256 hex$/],
+  ]
+  for (const [reply, reason] of cases) {
+    const { known, inject } = await merge(reply)
+    for (const run of [known, inject]) {
+      assert.equal(run.json, null)
+      assert.match(run.problem ?? '', reason)
+      assert.equal(run.output, reply.output)
+      assert.equal(run.exit_code, reply.exit_code)
+    }
+    const verdict = calibrationVerdict(known, inject, 0.5)
+    assert.equal(verdict.pass, false)
+    if (!verdict.pass) assert.ok(verdict.tail.includes(reply.output.trim()), verdict.tail)
+  }
+})
+
+test('plan, fetch and merge take their own timeouts from research.timeouts, and the setup runs one time for each machine', async () => {
+  const replies = { 'make setup': { exit_code: 0, output: '' }, 'nb plan': ok({ targets: [], units: [] }), 'nb fetch': ok({ outputs: {} }), 'nb merge': ok(merged), 'search known': ok({ recall: 1, outputs: {} }) }
+  const { machine, calls } = fakeMachine(replies)
+  const timed = { ...fanOutConfig, setup: 'make setup', research: { ...fanOutResearch, timeouts: { plan: 60_000, fetch: 600_000, merge: 900_000, unit: 1_000 } } }
+  await runPlan(timed, machine, prereg)
+  await runFetch(timed, machine, prereg, 'T-1')
+  await runMerge(timed, machine, prereg, 'units')
+  await runDomainCommand(timed, machine, 'known', prereg)
+  assert.deepEqual(calls.map(({ command, timeoutMs }) => [command.split(' ').slice(0, 2).join(' '), timeoutMs]), [
+    ['make setup', 5_000],
+    ['nb plan', 60_000],
+    ['nb fetch', 600_000],
+    ['nb merge', 900_000],
+    ['search known', 5_000],
+  ])
+
+  const other = fakeMachine(replies)
+  await runFetch({ ...fanOutConfig, research: { ...fanOutResearch, timeouts: { plan: 60_000 } } }, other.machine, prereg, 'T-1')
+  assert.equal(other.calls[0]?.timeoutMs, 5_000)
+  const failed = await runPlan({ ...fanOutConfig, setup: 'make setup' }, fakeMachine({ 'make setup': { exit_code: 2, output: 'no compiler' } }).machine, prereg)
+  assert.match(failed.problem ?? '', /the setup make setup exited with code 2/)
+  await assert.rejects(runPlan(config, other.machine, prereg), /has no plan command/)
+})
+
+const sweepResearch: ResearchConfig = {
+  ...fanOutResearch,
+  sweep: { plan: 'sw plan {prereg}', fetch: 'sw fetch {prereg} {target}', unit: 'sw unit {prereg} {unit}', merge: 'sw merge {prereg} {units}', fetch_rate: 5, fetch_parallel: 16 },
+  timeouts: { plan: 60_000, merge: 900_000 },
+}
+const sweepConfig: RepoConfig = { ...config, research: sweepResearch }
+
+test('the sweep commands come from research.sweep, quoted as in stage 6, with the plan and merge timeouts', async () => {
+  const { machine, calls } = fakeMachine({ 'sw plan': ok({ targets: ['T-1'], units: [{ id: 'u1', targets: ['T-1'], expected_seconds: 5 }] }), 'sw merge': ok({ candidates: [{ id: 'T-1', score: 3 }] }) })
+  const planned = await runSweepPlan(sweepConfig, machine, "prereg/it's.md")
+  assert.equal(planned.command, `sw plan 'prereg/it'\\''s.md'`)
+  assert.deepEqual(planned.json, { targets: ['T-1'], units: [{ id: 'u1', targets: ['T-1'], expected_seconds: 5 }] })
+  assert.equal(sweepFetchCommand(sweepConfig, prereg, "T'1"), `sw fetch '${prereg}' 'T'\\''1'`)
+  assert.equal(sweepUnitCommand(sweepConfig, prereg, 'u1'), `sw unit '${prereg}' 'u1'`)
+  const merged = await runSweepMerge(sweepConfig, machine, prereg, '.agent-factory/units')
+  assert.equal(merged.command, `sw merge '${prereg}' '.agent-factory/units'`)
+  assert.deepEqual(merged.json, { candidates: [{ id: 'T-1', score: 3 }] })
+  assert.deepEqual(calls.map(({ timeoutMs }) => timeoutMs), [60_000, 900_000])
+  assert.equal(unitCommand(sweepConfig, prereg, 'u1'), `nb unit '${prereg}' 'u1'`)
+  assert.throws(() => sweepUnitCommand(fanOutConfig, prereg, 'u1'), /has no sweep unit command/)
+  await assert.rejects(runSweepPlan(fanOutConfig, machine, prereg), /has no sweep plan command/)
+})
+
+test('a sweep fetch gives file outputs, and a sweep unit gives file outputs and tls_passes', () => {
+  assert.deepEqual(parseSweepFetchOutput(JSON.stringify({ outputs: { 'data/T-1.txt': hash('A') } })), { json: { outputs: { 'data/T-1.txt': hash('a') } }, problem: null })
+  assert.match(parseSweepFetchOutput(JSON.stringify({ outputs: { '../x': hash('a') } })).problem ?? '', /the last line of fetch: the output path \.\.\/x must be relative/)
+  const unit = (json: unknown) => parseSweepUnitOutput(`scanned\n${JSON.stringify(json)}\n`)
+  assert.deepEqual(unit({ outputs: { 'out/u1.csv': hash('c') }, tls_passes: 4 }), { json: { outputs: { 'out/u1.csv': hash('c') }, tls_passes: 4 }, problem: null })
+  assert.deepEqual(unit({ outputs: {}, tls_passes: 0 }), { json: { outputs: {}, tls_passes: 0 }, problem: null })
+  for (const passes of [undefined, -1, 1.5, '3', null])
+    assert.equal(unit({ outputs: {}, tls_passes: passes }).problem, 'the last line of unit: tls_passes must be an integer of 0 or more', String(passes))
+  assert.equal(parseSweepUnitOutput('').problem, 'unit printed nothing, but its last line must be a JSON object')
+})
+
+test('a sweep merge gives a list of JSON objects, else a problem with the tail', async () => {
+  const merge = (reply: Reply) => runSweepMerge(sweepConfig, fakeMachine({ 'sw merge': reply }).machine, prereg, 'units')
+  assert.deepEqual((await merge(ok({ candidates: [] }))).json, { candidates: [] })
+  const cases: [Reply, RegExp][] = [
+    [ok({}), /^the last line of merge: candidates must be a list of JSON objects$/],
+    [ok({ candidates: { id: 'T-1' } }), /^the last line of merge: candidates must be a list of JSON objects$/],
+    [ok({ candidates: [{ id: 'T-1' }, 'T-2', [1]] }), /^the last line of merge: candidates\[1\] must be a JSON object, candidates\[2\] must be a JSON object$/],
+    [{ exit_code: 3, output: 'Traceback: merge broke' }, /^merge exited with code 3$/],
+  ]
+  for (const [reply, reason] of cases) {
+    const result = await merge(reply)
+    assert.equal(result.json, null, reason.source)
+    if (result.problem === null) continue
+    assert.match(result.problem, reason)
+    assert.ok(result.tail.startsWith(`--- merge: sw merge '${prereg}' 'units' (exit code ${reply.exit_code})\n`), result.tail)
+    assert.ok(result.tail.includes(reply.output.trim()), result.tail)
+  }
 })

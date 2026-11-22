@@ -12,18 +12,21 @@ import { profileDefaults, type RootFiles } from '../core/profiles.ts'
 import type { Credentials } from '../core/providers.ts'
 import type { SigningRecord } from '../core/signing.ts'
 import type { Channel } from '../core/questions.ts'
-import { analysisConfig } from '../core/research-steps.ts'
+import { analysisConfig, researchEgress } from '../core/research-steps.ts'
 import { loadResearchDomain, type ResearchConfig, type ResearchDomain, type ResearchFiles } from '../core/research.ts'
 import { StopError } from '../core/stop.ts'
-import type { Prices } from '../core/usage.ts'
+import { rateLimiter, sweepEgressHandler } from '../core/sweep-egress.ts'
+import type { ContainerPrices, Prices } from '../core/usage.ts'
 import { codeReviewLoop, type LoopDeps } from '../core/workflows/code-review-loop.ts'
 import type { DevelopDeps, DevelopInput } from '../core/workflows/develop.ts'
 import type { ResearchDeps, ResearchInput } from '../core/workflows/research.ts'
 import { nodeArtifacts } from './artifacts.ts'
+import { dirDataStore } from './data-dir.ts'
 import { diskFileSystem, guideFileSystem } from './disk.ts'
 import { git, gitBranches, gitRepo, gitTree, worktreePath, type GitCommits, type GitSource } from './git.ts'
 import { fileLedger } from './ledger.ts'
 import { localMachine } from './machine.ts'
+import { localScanBoxes, writeInputs } from './scan-boxes.ts'
 import { nodeSigning } from './signing.ts'
 
 export const agentsDir = fileURLToPath(new URL('../../agents/', import.meta.url))
@@ -253,6 +256,8 @@ export type NodeResearchOptions = {
   module: WebAssembly.Module
   dispatch?: Contracts.RuntimeOptions['dispatch']
   prices?: Prices
+  /** USD per vCPU second and GiB second, from CONTAINER_PRICES. The local machine costs nothing. */
+  containerPrices?: ContainerPrices
   /** Where the egress finds the secrets of the research config. Default: process.env. */
   env?: Record<string, string | undefined>
   /** Replaces the global fetch of the egress, for tests. */
@@ -262,7 +267,7 @@ export type NodeResearchOptions = {
 
 /**
  * The platform of one research run on this machine: runs/<id>/ holds the ledger, the journals, the artifacts, the
- * report, the branch worktrees and one clean checkout. The config, the holdout, the checklist and
+ * report, the branch worktrees, one clean checkout and the scan slots of the units. The config, the holdout, the checklist and
  * the guides come from the base commit, never from the working copy, so an uncommitted change cannot move the holdout.
  * The review loop pass is a run of its own, runs/<id>-review-1/.
  */
@@ -282,6 +287,18 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
   const env = options.env ?? process.env
   const host = { credentials: options.credentials, dispatch: options.dispatch, log: options.log, module: options.module, prices: options.prices }
   const machine = (branch: Branch) => localMachine(worktreePath(branchesDir, branch.name))
+  const data = dirDataStore(join(dir, 'data'))
+  const egress = {
+    artifacts: nodeArtifacts(dir),
+    lock: runLock(ledger, domain.holdout.refuse),
+    secret: (name: string) => env[name],
+    ...(options.fetch ? { fetch: options.fetch } : {}),
+  }
+  // The sweep fetch jobs reach the network only through this proxy, which keeps the response bodies in the data store.
+  const sweep = domain.config.sweep
+  const scanEgress = sweep
+    ? sweepEgressHandler({ egress: researchEgress(domain), host: { ...egress, bodies: data }, log: options.log, limit: rateLimiter(sweep.fetch_rate) })
+    : undefined
   return {
     ...host,
     dir,
@@ -297,13 +314,14 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
     // A new checkout each time, at a new path, so that no file of an earlier command or of the branch worktree is in it,
     // and an output that depends on the path does not reproduce. Only the last checkout stays on disk. A local run does
     // not pause, so it ignores the step key.
-    async cleanBox(commit) {
+    async cleanBox(commit, _key, files = []) {
       const previous = join(dir, `clean-${cleanCheckouts}`)
       if (existsSync(previous)) await git(options.repo, 'worktree', 'remove', '--force', previous)
       cleanCheckouts += 1
       const tree = join(dir, `clean-${cleanCheckouts}`)
       if (existsSync(tree)) await git(options.repo, 'worktree', 'remove', '--force', tree)
       await git(options.repo, 'worktree', 'add', '--detach', tree, commit)
+      writeInputs(tree, files)
       return { ...localMachine(tree), id: crypto.randomUUID(), read: diskFileSystem(tree).read }
     },
     async review({ runId, ask, head, full, pr, budget }) {
@@ -327,11 +345,10 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
       return codeReviewLoop(loopInput, { ...run, ...host, channel: await options.reviewChannel(pr) })
     },
     domain,
-    egress: {
-      artifacts: nodeArtifacts(dir),
-      lock: runLock(ledger, domain.holdout.refuse),
-      secret: (name) => env[name],
-      ...(options.fetch ? { fetch: options.fetch } : {}),
-    },
+    scanBoxes: localScanBoxes(join(dir, 'scan'), config, scanEgress ? { egress: scanEgress } : {}),
+    data,
+    compute: { runBox: null },
+    ...(options.containerPrices ? { containerPrices: options.containerPrices } : {}),
+    egress,
   }
 }
