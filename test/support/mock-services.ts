@@ -5,12 +5,27 @@ import type { AddressInfo } from 'node:net'
 import { constants, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { commandResult, type BoxResult, type JobState } from '../../src/cloudflare/box.ts'
+import { probeOutputTokens } from '../../src/core/preflight.ts'
+import type { Provider } from '../../src/core/providers.ts'
 import { scriptedDispatch, type Script, type Turn } from './scripted-model.ts'
 
 export type MockComment = { id: number; issue: number; user: { login: string }; body: string; created_at: string; updated_at: string; html_url: string }
 type TreeEntry = { path: string; mode: string; type: string; sha: string | null }
 /** `merged` is the merge commit, after the host merged the PR. `closed` is a PR closed without a merge. */
 type Pull = { head: string; title: string; body: string; draft: boolean; headRepo?: string; merged?: string; closed?: boolean }
+
+/** The provider probe of the preflight in a request, or null: a request without a stream, with the probe output limit (D17). */
+function probeOf(route: string, body: Buffer): { provider: Provider; model: string } | null {
+  if (route !== 'POST /v1/messages' && route !== 'POST /v1/responses') return null
+  let fields: { model?: unknown; max_tokens?: unknown; max_output_tokens?: unknown; stream?: unknown }
+  try {
+    fields = JSON.parse(body.toString()) as typeof fields
+  } catch {
+    return null
+  }
+  const [provider, limit] = route === 'POST /v1/messages' ? (['claude', fields.max_tokens] as const) : (['codex', fields.max_output_tokens] as const)
+  return limit === probeOutputTokens[provider] && !fields.stream ? { model: String(fields.model), provider } : null
+}
 
 /**
  * GitHub, Anthropic, OpenAI and a build machine on one local port, for the Cloudflare host under wrangler dev.
@@ -63,6 +78,8 @@ export async function mockServices(
     commands: [] as { argv: string[]; cwd: string }[],
     /** The jobs that the machine started, so that a test can count the starts of a command. */
     jobs: [] as { id: string; argv: string[]; cwd: string }[],
+    /** True for a command whose job the machine loses at start. */
+    loseJob: (_argv: string[]) => false,
     /** The HTTP status of the workflow-runs endpoint, so that a test can withhold the Actions permission. */
     ciStatus: 200,
     /** The PR merges that the host made, with the squash commit on main of each. */
@@ -71,6 +88,19 @@ export async function mockServices(
     deleted: [] as string[],
     /** The requests that reached the egress route: the URL that the run fetched, and its x-api-key header. */
     egress: [] as { url: string; key: string | null }[],
+    /** The labels of the repository. It has none at the start, so a run makes the label of its kind. */
+    repoLabels: new Set<string>(),
+    /** The labels of each issue or PR, by number. */
+    labels: new Map<number, string[]>(),
+    /** The provider probes of the preflight. They are not in requests or turns, so that the counts of model calls stay. */
+    probes: [] as { provider: Provider; model: string }[],
+    /** The answer to the probes of each provider, so that a test can make a provider refuse its key. */
+    probeReply: {
+      claude: { status: 200, body: { content: [], id: 'msg_probe', model: 'probe', role: 'assistant', type: 'message' } },
+      codex: { status: 200, body: { id: 'resp_probe', object: 'response', output: [], status: 'completed' } },
+    } as Record<Provider, { status: number; body: unknown }>,
+    /** False makes the listing of .github/workflows 404. True lists ci.yml when the repository has no such directory. */
+    workflows: true,
   }
   let next = Math.max(100, ...pulls.keys(), ...issues.keys())
   let ids = 0
@@ -174,6 +204,7 @@ export async function mockServices(
     if (jobs.has(body.id)) throw new Error(`the job ${body.id} started before`)
     state.jobs.push({ argv: body.argv, cwd: body.cwd, id: body.id })
     state.commands.push({ argv: body.argv, cwd: body.cwd })
+    if (state.loseJob(body.argv)) return
     const cwd = join(machineRoot, body.cwd)
     mkdirSync(cwd, { recursive: true })
     const started = Date.now()
@@ -217,6 +248,12 @@ export async function mockServices(
     const strings = (value: unknown, name: string): string[] => {
       if (!Array.isArray(value)) throw new Error(`${route}: ${name} must be an array`)
       return value.map((item, index) => string(item, `${name}[${index}]`))
+    }
+    const probe = probeOf(route, body)
+    if (probe) {
+      state.probes.push(probe)
+      const reply = state.probeReply[probe.provider]
+      return json(response, reply.status, reply.body)
     }
     state.requests.push(route)
     state.authorizations.push({ authorization: request.headers.authorization ?? '', route })
@@ -342,6 +379,9 @@ export async function mockServices(
         const path = decodeURIComponent(url.pathname.slice(`${api}/contents/`.length))
         const ref = url.searchParams.get('ref')!
         const listing = text(['ls-tree', ref, '--', path])
+        // The fixture repositories have no workflow files, and the Node tests share them, so the mock lists one.
+        if (path === '.github/workflows' && !state.workflows) return json(response, 404, { message: 'Not Found' })
+        if (path === '.github/workflows' && !listing) return json(response, 200, [{ name: 'ci.yml', path: '.github/workflows/ci.yml', type: 'file' }])
         if (!listing) return json(response, 404, { message: 'Not Found' })
         // A directory gives the array of its entries, as on GitHub.
         if (request.headers.accept !== 'application/vnd.github.raw' && listing.split(/\s/)[1] === 'tree') return json(response, 200, entriesAt(ref, path))
@@ -352,6 +392,26 @@ export async function mockServices(
           return
         }
         return json(response, 200, listing.startsWith('120000') ? { target: content.toString(), type: 'symlink' } : { type: 'file' })
+      }
+      if (route.startsWith(`GET ${api}/labels/`)) {
+        const name = decodeURIComponent(url.pathname.slice(`${api}/labels/`.length))
+        return state.repoLabels.has(name) ? json(response, 200, { name }) : json(response, 404, { message: 'Not Found' })
+      }
+      if (route === `POST ${api}/labels`) {
+        const fields = input()
+        const name = string(fields.name, 'name')
+        string(fields.color, 'color')
+        if (state.repoLabels.has(name)) return json(response, 422, { errors: [{ code: 'already_exists', field: 'name', resource: 'Label' }], message: 'Validation Failed' })
+        state.repoLabels.add(name)
+        return json(response, 201, { name })
+      }
+      const issueLabels = new RegExp(`^POST ${api}/issues/(\\d+)/labels$`).exec(route)
+      if (issueLabels) {
+        const number = Number(issueLabels[1])
+        const added = strings(input().labels, 'labels')
+        const labels = [...new Set([...(state.labels.get(number) ?? []), ...added])]
+        state.labels.set(number, labels)
+        return json(response, 200, labels.map((name) => ({ name })))
       }
       const comments = new RegExp(`^(GET|POST) ${api}/issues/(\\d+)/comments$`).exec(route)
       if (comments?.[1] === 'GET') return json(response, 200, page(url, state.comments.filter((entry) => entry.issue === Number(comments[2]))))
@@ -398,6 +458,29 @@ export async function mockServices(
         const [message, parents, tree] = [string(fields.message, 'message'), strings(fields.parents, 'parents'), string(fields.tree, 'tree')]
         const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
         return json(response, 201, { sha: text(['commit-tree', tree, ...parents.flatMap((parent) => ['-p', parent]), '-m', message], undefined, identity) })
+      }
+      if (route === `POST ${api}/merges`) {
+        // A merge commit of head into the branch base, from a real 3-way merge: 204 when the branch has head, 409 for a conflict.
+        const fields = input()
+        const [base, head, message] = [string(fields.base, 'base'), string(fields.head, 'head'), string(fields.commit_message, 'commit_message')]
+        const [into, from] = [shaOf(`refs/heads/${base}`), shaOf(head)]
+        if (!into || !from) return json(response, 404, { message: 'Not Found' })
+        if (text(['merge-base', into, from]) === from) {
+          response.writeHead(204)
+          response.end()
+          return
+        }
+        let tree: string
+        try {
+          tree = text(['merge-tree', '--write-tree', into, from]).split('\n')[0]!
+        } catch {
+          return json(response, 409, { message: 'Merge conflict' })
+        }
+        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
+        const commit = text(['commit-tree', tree, '-p', into, '-p', from, '-m', message], undefined, identity)
+        git(['update-ref', `refs/heads/${base}`, commit])
+        state.refs.set(`refs/heads/${base}`, commit)
+        return json(response, 201, { parents: [{ sha: into }, { sha: from }], sha: commit })
       }
       if (route === `POST ${api}/git/refs`) {
         const fields = input()

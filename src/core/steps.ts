@@ -1,7 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { runTurn, submitOnce, type AgentHost, type AgentSpec, type HostTools } from './agent.ts'
-import { callRunTests, checkTails, failureText, isProtected, runChecksTool, runTestsTool, targetedTests, type RepoConfig } from './checks.ts'
+import { callRunTests, checkTails, failureText, isProtected, runChecksTool, runTestsTool, targetedTests, type CheckResult, type RepoConfig } from './checks.ts'
 import { assignIds, checkFindings, parseLocation, submitFindings, type Finding } from './findings.ts'
 import { step } from './ledger.ts'
 import { settleAll } from './planned-stop.ts'
@@ -25,6 +25,8 @@ export type RunContext = {
   tests: Checker['tests']
   /** The run_checks of the editing agents, where the platform has a machine for agents. */
   agentChecks?: Checker['agentChecks']
+  /** The ci commands of the submit gates, where the config has them and the platform has a machine (D15). */
+  ci?: Checker['ci']
 }
 
 export type Range = { from: string; to: string }
@@ -48,6 +50,7 @@ function spec(context: RunContext, id: string, role: Role, model: ModelChoice, w
     instructions: role.tests && !tests.run_tests ? `${base}\n\n${noTestRunner}` : base,
     tools: { ...tools, ...tests },
     workspace,
+    turnMs: role.turnMs,
   }
 }
 
@@ -191,35 +194,45 @@ function checkTools(context: RunContext, id: string): HostTools {
   }
 }
 
-const gated = (context: RunContext) => context.tests !== null && Boolean(context.config.tests)
-const gateText = 'When you submit, the host runs the targeted tests of the files that you changed, and refuses the log while one fails.'
+/** The gate text of the prompt of an editing agent, when its submit runs the targeted tests or the ci commands. */
+function gateText(context: RunContext): string[] {
+  const tests = context.tests !== null && Boolean(context.config.tests)
+  if (!tests && !context.ci) return []
+  const runs = [...(tests ? ['the targeted tests of the files that you changed'] : []), ...(context.ci ? ['the ci commands of the repository'] : [])]
+  return [`When you submit, the host runs ${runs.join(', then ')}, and refuses the log while one fails.`]
+}
+
+const gateFix = 'Fix the cause and submit again. When you cannot fix it, revert your edit and list the finding in skipped with the reason.'
 
 /**
  * The gate at the submit of an editing agent: the targeted tests of only the files that this agent changed, also its
- * new test files. A reverted edit does not count. A failure refuses the log. A failed setup runs no test, so the host
- * accepts the log and records the note.
+ * new test files, then the ci commands on these files (D15). A reverted edit does not count. A failure refuses the log.
+ * A failed setup runs no command, so the host accepts the log and records the note.
  */
 async function testGate(context: RunContext, id: string): Promise<void> {
-  const { tests, config } = context
+  const { tests, config, ci } = context
   const edits = await netEdits(context, id)
-  if (!tests || !config.tests || edits.length === 0) return
-  const pattern = new RegExp(config.tests.pattern)
-  const added: string[] = []
-  for (const path of edits) if (pattern.test(path) && (await context.repo.tree.stat(`/${path}`)) !== null) added.push(path)
-  const targeted = [...new Set([...(await targetedTests(context.repo, config, edits)), ...added])]
-  if (targeted.length === 0) return
-  const failed = (await tests(targeted)).filter((result) => result.status !== 'pass')
-  if (failed.length === 0) return
-  if (failed.some((result) => result.name === 'setup')) {
+  if (edits.length === 0) return
+  const existing: string[] = []
+  for (const path of edits) if ((await context.repo.tree.stat(`/${path}`)) !== null) existing.push(path)
+  const recordUntested = (failed: CheckResult[]) => {
+    if (!failed.some((result) => result.name === 'setup')) return false
     context.host.ledger.put(untestedKey(id), true)
-    return
+    return true
   }
-  throw new Error(
-    [
-      `the targeted tests of your edits failed (${targeted.join(', ')}). Fix the cause and submit again. When you cannot fix it, revert your edit and list the finding in skipped with the reason.`,
-      ...failureText(failed),
-    ].join('\n'),
-  )
+  if (tests && config.tests) {
+    const pattern = new RegExp(config.tests.pattern)
+    const added = existing.filter((path) => pattern.test(path))
+    const targeted = [...new Set([...(await targetedTests(context.repo, config, edits)), ...added])]
+    const failed = targeted.length === 0 ? [] : (await tests(targeted)).filter((result) => result.status !== 'pass')
+    if (recordUntested(failed)) return
+    if (failed.length > 0) throw new Error([`the targeted tests of your edits failed (${targeted.join(', ')}). ${gateFix}`, ...failureText(failed)].join('\n'))
+  }
+  if (!ci) return
+  // A skipped {files} command is not a failure.
+  const failed = (await ci(existing)).filter((result) => result.status === 'fail')
+  if (failed.length === 0 || recordUntested(failed)) return
+  throw new Error([`the ci commands failed (${failed.map((result) => result.name).join(', ')}). ${gateFix}`, ...failureText(failed)].join('\n'))
 }
 
 /** The report note of a step when the gate of one of its agents did not run its tests. */
@@ -385,11 +398,11 @@ async function patchTurn<Log extends PatchLog = PatchLog>(
       ? [
           '',
           'When a fix needs a file that the host refuses, do not put the change in another place. List the finding in deferred, with the file and the work that is left. One more patch agent applies the deferred findings after the others finish.',
-          'A test can fail because another patch agent is in the middle of an edit. Fix only the failures in your files.',
+          'A test or a ci command can fail because another patch agent is in the middle of an edit. Fix only the failures in your files.',
         ]
       : []),
     '',
-    ...(gated(context) ? [gateText] : []),
+    ...gateText(context),
     'Edit the files in /repo. Then call submit_patch_log one time.',
   ].join('\n')
   return runTurn<Log>(context.host, spec(context, id, reviewRoles.patch, model, workspace, tools), prompt, 'submit_patch_log')
@@ -488,7 +501,7 @@ export async function light(
     '',
     'Triage: docs or tests only. The host refuses your writes outside docs and tests.',
     '',
-    ...(gated(context) ? [gateText] : []),
+    ...gateText(context),
     'Edit the files in /repo. Then call submit_light_log one time.',
   ].join('\n')
   const log = await runTurn<LightLog>(context.host, spec(context, id, reviewRoles.light, model, workspace, tools), prompt, 'submit_light_log')

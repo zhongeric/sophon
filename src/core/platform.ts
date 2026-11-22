@@ -38,6 +38,8 @@ export type Branch = {
   readonly tree: FileSystem.FileSystem
   head(): Promise<string>
   changedFiles(from: string, to: string): Promise<string[]>
+  /** Every path that the change touches, including deleted files and the old path of each rename. */
+  touchedFiles(from: string, to: string): Promise<string[]>
   committedFiles(): Promise<string[]>
   /** The uncommitted changes against the last commit, new files included: their diff, the paths that exist after them, and the deleted paths. */
   pending(): Promise<{ diff: string; changed: string[]; removed: string[] }>
@@ -45,6 +47,24 @@ export type Branch = {
   commit(message: string): Promise<void>
   /** Brings the changes of a branch or commit into this branch, in one or more commits. */
   merge(ref: string, message: string): Promise<void>
+  /**
+   * The merge base of the branch head and `commit`. `changedFiles` and `touchedFiles` accept it as `from`. The base
+   * did not move when the result is `commit`.
+   */
+  mergeBaseWith(commit: string): Promise<string>
+  /**
+   * Merges `commit` with a merge commit, never with a fast-forward, a rebase or a force (D16). `files` are the paths
+   * that the merge brings: the paths touched from the old merge base to `commit`. Without a conflict, the merge is
+   * committed. With a conflict, nothing is committed: the merge stays in progress with conflict markers in the tree,
+   * and `conflicts` lists the files that conflict. Any other failure stops the merge and throws.
+   */
+  mergeCommit(commit: string, message: string): Promise<{ files: string[]; conflicts: string[] }>
+  /**
+   * Gives the files of `files` that still have conflict markers, and then commits nothing. Else it commits the merge in
+   * progress as a merge commit, also when the tree is the same as the head. After a checkpoint committed the merge,
+   * it only checks.
+   */
+  finishMerge(files: string[], message: string): Promise<string[]>
 }
 
 /** The local branches of the repository that the development workflow changes. */
@@ -54,6 +74,8 @@ export type Branches = {
   /** Creates a branch from a commit in a worktree of its own, or reopens it. */
   branch(name: string, from: string): Promise<Branch>
   exists(name: string): Promise<boolean>
+  /** The commit ID of the head of branch `ref` on origin now. */
+  remoteHead(ref: string): Promise<string>
   /** Pushes the branch to origin, never with force, and returns the commit ID that GitHub has for its head. */
   push(branch: Branch): Promise<string>
   /**
@@ -68,7 +90,13 @@ export type Branches = {
 }
 
 /** The result of a merge. GitHub can refuse a merge, for example for a conflict, a changed head or a check that is not green. */
-export type MergeResult = { merged: true; sha: string } | { merged: false; reason: string }
+export type MergeResult = { merged: true; sha: string } | { merged: false; reason: string; kind: MergeRefusal }
+
+/**
+ * The kind of a merge refusal. 'stale': GitHub refused because the branch is not current with the base or its head
+ * moved. 'other': any other refusal, for example a PR that is not mergeable, a draft or a merge queue.
+ */
+export type MergeRefusal = 'stale' | 'other'
 
 /** The pull requests and the CI of the repository on GitHub. */
 export type PullRequests = {
@@ -105,6 +133,8 @@ export type Checker = {
    * platform has no machine for agents. An agent tool never calls `checks`, because on Cloudflare it is the CI.
    */
   agentChecks?: (changed: string[]) => Promise<CheckResult[]>
+  /** The `ci` commands of the config on a real machine, for the submit gates (D15). Absent without `ci` entries or without a machine. */
+  ci?: (changed: string[]) => Promise<CheckResult[]>
 }
 
 /** The output files of the run, such as report.md and gate-log.txt. */

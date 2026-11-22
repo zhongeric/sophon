@@ -80,7 +80,7 @@ test('research: build, calibration with a fix round, vet, dossier, reproduction,
 
   // Each domain command output is in the run store with its command line as the source. The store keeps equal outputs one time.
   const commands = (await deps.egress.artifacts.list()).filter(({ meta }) => meta.labels?.hypothesis === 'hyp-001')
-  assert.deepEqual(new Set(commands.map(({ meta }) => meta.labels?.command)), new Set(['known', 'inject', 'reproduce']))
+  assert.deepEqual(new Set(commands.map(({ meta }) => meta.labels?.command)), new Set(['known', 'inject', 'analyze', 'reproduce']))
   for (const { meta } of commands) assert.deepEqual(meta.source, { command: `node research/run.mjs ${meta.labels?.command} 'prereg/hyp-001-v2.md'` })
   // The reproduction ran on a clean checkout, not in the worktree of the run branch, and matched the calibration.
   const reproduce = commands.find(({ meta }) => meta.labels?.command === 'reproduce')
@@ -89,6 +89,14 @@ test('research: build, calibration with a fix round, vet, dossier, reproduction,
   assert.ok(cwd)
   assert.notEqual(cwd, worktreePath(join(deps.dir, 'branches'), branch))
   assert.match(result.report, /Reproduction at [0-9a-f]{12} \(output artifact [0-9a-f]{64}\): PASS/)
+  // The analysis ran on a clean checkout too. Without reads, the analyst change ran the calibration again, then the analysis.
+  const analyzed = commands.find(({ meta }) => meta.labels?.command === 'analyze' && meta.labels.path === undefined)
+  const analyzeCwd = /analyze of hyp-001 in (.+)/.exec(new TextDecoder().decode((await deps.egress.artifacts.get(analyzed?.id ?? '')) ?? new Uint8Array()))?.[1]
+  assert.ok(analyzeCwd)
+  assert.notEqual(analyzeCwd, worktreePath(join(deps.dir, 'branches'), branch))
+  assert.ok(deps.ledger.get('step:calibrate.hyp-001.3'))
+  assert.ok(deps.ledger.get('step:analysis.hyp-001.2'))
+  assert.match(result.report, /Analysis round 2 at [0-9a-f]{12}: PASS, analyze output [0-9a-f]{64}, output files [0-9a-f]{64}/)
 
   // The pushed branch has the analysis, the analyst note and the dossier.
   const show = (path: string) => execFileSync('git', ['--git-dir', origin, 'show', `${branch}:${path}`]).toString()
@@ -101,6 +109,16 @@ test('research: build, calibration with a fix round, vet, dossier, reproduction,
   assert.match(show('dossier/hyp-001.md'), new RegExp(`artifact:${measurement.id}: "inject rows"`))
   assert.match(outputs(turns, 'skeptic'), /inject rows/)
   assert.match(outputs(turns, 'writer'), /inject rows/)
+  // The skeptic, the writer and the dossier cite the analysis output.
+  const analysisFile = commands.find(({ meta }) => meta.labels?.path === 'out/hyp-001/analysis.txt')
+  assert.ok(analysisFile)
+  assert.equal(analysisFile.meta.labels?.command, 'analyze')
+  assert.equal(new TextDecoder().decode(await deps.egress.artifacts.get(analysisFile.id) ?? new Uint8Array()), 'analysis rows')
+  assert.match(outputs(turns, 'skeptic'), /analysis rows/)
+  assert.match(outputs(turns, 'writer'), /analysis rows/)
+  assert.match(result.report, new RegExp(`output files ${analysisFile.id}`))
+  assert.match(show('dossier/hyp-001.md'), new RegExp(`## Analysis outputs\n\n- out/hyp-001/analysis\\.txt: artifact:${analysisFile.id}`))
+  assert.match(show('dossier/hyp-001.md'), new RegExp(`artifact:${analysisFile.id}: "analysis rows"`))
   // The output files of the domain commands stay out of the run branch.
   assert.doesNotMatch(execFileSync('git', ['--git-dir', origin, 'ls-tree', '-r', '--name-only', branch]).toString(), /^out\//m)
 
@@ -276,11 +294,16 @@ for (const change of ['remove', 'replace'] as const) {
   })
 }
 
-test('research: a calibration that pauses on inject keeps the known outputs of the earlier call', { timeout: 300_000 }, async () => {
-  const { repo, base } = notebook()
-  const input = researchInput(base, 'paused-inject')
+test('research: a calibration replay after a pause on inject keeps the known outputs of the first pass', { timeout: 300_000 }, async () => {
+  const { repo, base } = notebook({ config: {
+    checks: { smoke: 'true' },
+    research: { ...researchConfig, commands: { ...researchConfig.commands, inject: `${researchConfig.commands.inject}; printf changed > out/hyp-001/known.txt` } },
+  } })
+  const input = researchInput(base, 'inject-pause')
+  const { channel } = memoryChannel({ pick: '/answer\nQ1: a' })
+  const pulls = fakePulls()
   const deps = await nodeResearch({
-    channel: memoryChannel({ pick: '/answer\nQ1: a' }).channel,
+    channel,
     credentials,
     dispatch: scriptedDispatch(researchScript(), []),
     env: { ARCHIVE_TOKEN: 'token-1' },
@@ -289,53 +312,60 @@ test('research: a calibration that pauses on inject keeps the known outputs of t
     log: () => {},
     module,
     prices,
-    pulls: fakePulls().pulls,
+    pulls: pulls.pulls,
     repo,
     reviewChannel: async () => memoryChannel().channel,
     runsDir: runsDir(),
   })
-  // As the job ledger on Cloudflare: a replay gets the recorded result of a command and does not run it again.
-  const jobs = new Map<string, { exit_code: number | null; output: string }>()
+  // Like the Worker: the same step key gives the same checkout, and a replay gives the result of a finished command.
+  type Box = Awaited<ReturnType<ResearchDeps['cleanBox']>>
+  const boxes = new Map<string, Promise<Box>>()
+  const finished = new Map<string, Awaited<ReturnType<Box['run']>>>()
   let paused = false
-  const cleanBox = deps.cleanBox.bind(deps)
-  deps.cleanBox = async (commit, key) => {
-    const box = await cleanBox(commit, key)
+  const cleanBox: ResearchDeps['cleanBox'] = async (commit, key) => {
+    const kept = boxes.get(key) ?? deps.cleanBox(commit, key)
+    boxes.set(key, kept)
+    const box = await kept
     return {
       ...box,
-      copyId: key,
       async run(command, options) {
-        const recorded = jobs.get(`${key} ${command}`)
-        if (recorded) return recorded
-        if (key === 'calibrate.hyp-001.2' && command.includes(' inject ') && !paused) {
-          paused = true
-          // inject changes the known output, and the call ends before inject does.
-          await box.run('printf changed > out/hyp-001/known.txt', options)
-          throw new PausedError('waiting for the inject job')
-        }
+        const done = finished.get(`${key}:${command}`)
+        if (done) return done
         const result = await box.run(command, options)
-        jobs.set(`${key} ${command}`, result)
+        finished.set(`${key}:${command}`, result)
+        if (!paused && command.includes(' inject ')) {
+          paused = true
+          throw new PausedError('inject runs past the call deadline')
+        }
         return result
       },
     }
   }
-  await assert.rejects(research(input, deps), PausedError)
-  const result = await research(input, deps)
+  await assert.rejects(research(input, { ...deps, cleanBox }), PausedError)
+  assert.equal(deps.ledger.get('step:calibrate.hyp-001.1'), undefined)
+
+  const result = await research(input, { ...deps, cleanBox })
   assert.equal(result.status, 'ready', result.report)
-  assert.ok(paused)
-  assert.doesNotMatch(result.report, /does not match SHA-256|No such file/)
-  assert.match(result.report, /Calibration round 2 at [0-9a-f]{12}: PASS/)
+  const round = deps.ledger.get<{ result: { known: string[]; reason: string } }>('step:calibrate.hyp-001.1')?.result
+  assert.equal(round?.known.length, 2)
+  assert.match(round?.reason ?? '', /^the known recall 0\.5 is below the threshold 0\.9$/)
 })
 
-test('research: a replacement checkout reruns known before inject consumes its output', { timeout: 300_000 }, async () => {
+for (const change of ['stdout', 'remove', 'replace', 'restore'] as const) {
+  test(`research: a replacement checkout verifies known outputs again (${change})`, { timeout: 300_000 }, async () => {
+    await replacementCalibration(change)
+  })
+}
+
+async function replacementCalibration(change: 'stdout' | 'remove' | 'replace' | 'restore') {
   const { repo, base } = notebook({ config: {
-    research: { ...researchConfig, commands: {
-      ...researchConfig.commands,
-      inject: `test -f out/hyp-001/known.txt && ${researchConfig.commands.inject}`,
-    } },
+    checks: { smoke: 'true' },
+    research: { ...researchConfig, commands: { ...researchConfig.commands, inject: `cat out/hyp-001/known.txt > /dev/null && ${researchConfig.commands.inject}` } },
   } })
-  const input = researchInput(base, 'replaced-inject')
+  const input = researchInput(base, `inject-lost-box-${change}`)
+  const { channel } = memoryChannel({ pick: '/answer\nQ1: a' })
   const deps = await nodeResearch({
-    channel: memoryChannel({ pick: '/answer\nQ1: a' }).channel,
+    channel,
     credentials,
     dispatch: scriptedDispatch(researchScript(), []),
     env: { ARCHIVE_TOKEN: 'token-1' },
@@ -349,38 +379,50 @@ test('research: a replacement checkout reruns known before inject consumes its o
     reviewChannel: async () => memoryChannel().channel,
     runsDir: runsDir(),
   })
-  const jobs = new Map<string, { exit_code: number | null; output: string }>()
-  let generation = 0
-  let knownRuns = 0
-  const cleanBox = deps.cleanBox.bind(deps)
-  deps.cleanBox = async (commit, key) => {
-    const box = await cleanBox(commit, key)
-    const copyId = `${key}@${generation}`
+  let paused = false
+  const knownOutputs: string[] = []
+  const cleanBox: ResearchDeps['cleanBox'] = async (commit, key) => {
+    const box = await deps.cleanBox(commit, key)
     return {
       ...box,
-      copyId,
       async run(command, options) {
-        const jobKey = `${copyId} ${command}`
-        const recorded = jobs.get(jobKey)
-        if (recorded) return recorded
-        if (key === 'calibrate.hyp-001.2') {
-          if (command.includes(' known ')) knownRuns++
-          if (command.includes(' inject ') && generation === 0) throw new PausedError('waiting for the inject job')
+        if (!paused && command.includes(' inject ')) {
+          paused = true
+          throw new PausedError('the machine stopped before inject finished')
         }
         const result = await box.run(command, options)
-        jobs.set(jobKey, result)
+        if (key === 'calibrate.hyp-001.1' && command.includes(' known ')) {
+          // Remove the checkout path so that replacement runs give identical stdout.
+          if (change !== 'stdout') result.output = result.output.split('\n').slice(1).join('\n')
+          knownOutputs.push(result.output)
+          if ((paused && (change === 'remove' || change === 'replace')) || (!paused && change === 'restore')) {
+            const alter = change === 'replace' ? 'printf changed > out/hyp-001/known.txt' : 'rm out/hyp-001/known.txt'
+            assert.equal((await box.run(alter, options)).exit_code, 0)
+          }
+        }
         return result
       },
     }
   }
-  await assert.rejects(research(input, deps), PausedError)
-  assert.equal(knownRuns, 1)
-  generation++
-  const result = await research(input, deps)
+  await assert.rejects(research(input, { ...deps, cleanBox }), PausedError)
+  assert.equal(knownOutputs.length, 1)
+  assert.equal(deps.ledger.get('step:calibrate.hyp-001.1'), undefined)
+
+  const result = await research(input, { ...deps, cleanBox })
   assert.equal(result.status, 'ready', result.report)
-  assert.equal(knownRuns, 2)
-  assert.match(result.report, /Calibration round 2 at [0-9a-f]{12}: PASS/)
-})
+  assert.equal(knownOutputs.length, 2)
+  if (change === 'stdout') assert.notEqual(knownOutputs[0], knownOutputs[1])
+  else assert.equal(knownOutputs[0], knownOutputs[1])
+  const round = deps.ledger.get<{ result: { known: string[]; reason: string } }>('step:calibrate.hyp-001.1')?.result
+  assert.ok(round)
+  if (change === 'remove' || change === 'replace') {
+    assert.match(round.reason, /known output out\/hyp-001\/known\.txt:/)
+    assert.match(round.reason, change === 'remove' ? /No such file or directory/ : /the file does not match SHA-256/)
+  } else assert.match(round.reason, /^the known recall 0\.5 is below the threshold 0\.9$/)
+  const kept = await deps.egress.artifacts.get(round.known[0] ?? '')
+  assert.ok(kept)
+  assert.equal(new TextDecoder().decode(kept), knownOutputs[1])
+}
 
 test('research: a review fix outside analysis/ fails the run and the PR stays draft', { timeout: 300_000 }, async () => {
   const { result, pulls } = await dossierRun('d7', {}, {}, { 'research/run.mjs': 'process.exit(1)\n' })

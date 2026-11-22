@@ -13,6 +13,8 @@ import { boxMachine, syncWithSetup } from './box.ts'
 import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
+import { workLabels } from './labels.ts'
+import { loopChoices, type PreflightNeeds } from './preflight.ts'
 import { githubPulls } from './pulls.ts'
 import { githubSigning } from './signing.ts'
 import { baseConfig } from './config.ts'
@@ -34,6 +36,8 @@ export type DevelopRequest = { owner: string; repo: string; issue: number; by: s
  * container directory got from its last sync, for each run. Thus a restart of this object does not cause a full copy.
  */
 export class DevelopmentRuns extends Runs<DevelopRequest> {
+  protected readonly label = workLabels.develop
+
   protected number(request: DevelopRequest) {
     return request.issue
   }
@@ -78,9 +82,23 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       signing: githubSigning(gh, owner, repo),
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
-    // A run that waits for the user, for example for CI, stops on an error, so that the admin resume starts it again from its ledger.
-    if (result.resume) throw new StopError(result.resume)
+    // A run that waits for the user, for example for CI, stops on an error, so that a restart starts it again from its ledger (D13).
+    if (result.resume) throw new StopError(result.resume, { transient: true })
     return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
+  }
+
+  protected async preflightNeeds(request: DevelopRequest, ledger: Ledger, gh: GitHub | undefined): Promise<PreflightNeeds> {
+    const recorded = ledger.get<DevelopInput>('input')
+    const { develop, review } = recorded?.models ?? this.models()
+    const ciBase = recorded?.baseRef ?? request.base ?? (gh ? (await gh.json<{ default_branch: string }>('GET', `/repos/${request.owner}/${request.repo}`)).default_branch : null)
+    return { ciBase, container: true, models: [...Object.values(develop), ...loopChoices(review)] }
+  }
+
+  /** The models of a new run: the defaults with the MODELS overrides. */
+  private models(): DevelopInput['models'] {
+    type Overrides = Partial<LoopModels> & { develop?: Partial<DevelopModels> }
+    const overrides = this.env.MODELS ? (JSON.parse(this.env.MODELS) as Overrides) : {}
+    return { develop: { ...defaultDevelopModels, ...overrides.develop }, review: mergeModels(overrides) }
   }
 
   /** The run's input: the issue is the ask, verbatim. The checks and rails come from the base branch. */
@@ -90,8 +108,6 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     if (issue.pull_request) throw new StopError(`#${request.issue} is a PR. Start a development run on an issue, and a review run on a PR.`)
     const baseRef = request.base ?? (await gh.json<{ default_branch: string }>('GET', api)).default_branch
     const base = (await gh.json<{ object: { sha: string } }>('GET', `${api}/git/ref/heads/${encodePath(baseRef)}`)).object.sha
-    type Overrides = Partial<LoopModels> & { develop?: Partial<DevelopModels> }
-    const overrides = this.env.MODELS ? (JSON.parse(this.env.MODELS) as Overrides) : {}
     return {
       allowedModels: allowedModelsFrom(this.env.ALLOWED_MODELS),
       ask: `${issue.title}\n\n${issue.body ?? ''}`.trim(),
@@ -99,7 +115,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       baseRef,
       // The build container runs the checks, so a development run needs at least one.
       config: requireChecks(await baseConfig(gh, request.owner, request.repo, baseRef), `${request.owner}/${request.repo}`),
-      models: { develop: { ...defaultDevelopModels, ...overrides.develop }, review: mergeModels(overrides) },
+      models: this.models(),
       runId: run,
       source: `${request.owner}/${request.repo}#${request.issue}`,
       issue: request.issue,

@@ -362,7 +362,7 @@ test('a hotfix run raises the budget to twice the spend at twice the budget, wit
   assert.equal(gate().limit(), 20)
   assert.equal(posted.length, 0)
   assert.deepEqual(notices, [
-    'The run spent about $10.00 of its budget of $5.00. This is a hotfix run, so the host raised the budget to $20.00, and the run continues. The most expensive steps: a $10.00.',
+    'The run spent about $10.00 of its budget of $5.00. The run takes every recommendation, so the host raised the budget to $20.00, and the run continues. The most expensive steps: a $10.00.',
   ])
   assert.ok(logs.includes('budget raised to $20.00'))
   assert.ok(logs.includes(`budget notice: ${notices[0]}`))

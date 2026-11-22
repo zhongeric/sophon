@@ -225,8 +225,9 @@ export async function nodeDevelop(options: NodeDevelopOptions): Promise<DevelopD
     },
     pulls: options.pulls,
     checker: (branch) => commandChecker(branch, input.config, localMachine(worktreePath(branchesDir, branch.name))),
-    async review({ runId, ask, head, branch, full, pr, budget }) {
-      const source = { repo: options.repo, base: input.base, head }
+    async review({ runId, ask, head, branch, full, pr, budget, base }) {
+      // A base merge moves the merge base of the change, so the review gets the current one (D16).
+      const source = { repo: options.repo, base: base ?? input.base, head }
       const run = await nodeRun({ config: input.config, runId, runsDir: options.runsDir, source })
       run.ledger.put('git', source)
       const loopInput = { allowedModels: input.allowedModels, ask, config: input.config, headRef: branch, models: input.models.review, pr, runId, source: `${options.repo} ${input.baseRef}..${head.slice(0, 12)}`, ...(full ? { full } : {}), ...(budget !== undefined ? { budgetOverride: budget } : {}), stopAtBudget: true }
@@ -303,7 +304,7 @@ export async function nodeResearch(options: NodeResearchOptions): Promise<Resear
       const tree = join(dir, `clean-${cleanCheckouts}`)
       if (existsSync(tree)) await git(options.repo, 'worktree', 'remove', '--force', tree)
       await git(options.repo, 'worktree', 'add', '--detach', tree, commit)
-      return { ...localMachine(tree), read: diskFileSystem(tree).read }
+      return { ...localMachine(tree), id: crypto.randomUUID(), read: diskFileSystem(tree).read }
     },
     async review({ runId, ask, head, full, pr, budget }) {
       const reviewSource = { repo: options.repo, base: input.base, head }

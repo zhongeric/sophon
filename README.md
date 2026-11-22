@@ -16,23 +16,30 @@ designs and their decisions are in [docs/specs](docs/specs).
 ## The review loop
 
 ```
-freeze ─▶ triage: light or full
+freeze ─▶ triage: light, standard or strict
 
-full:  step 1: minimize │ rules │ bugs ×1-4 │ anti-slop     read-only, at the same time
-       ─▶ gate ─▶ patch ×1-4 by file ─▶ commit
-       ─▶ step 2: late-minimize │ late-rules on the new diff   each on the other model family
-       ─▶ gate ─▶ patch ─▶ commit ─▶ late bugs on every fix ─▶ gate ─▶ patch ─▶ commit
-       ─▶ checks ─▶ intent ─▶ PASS or FAIL
+strict:   step 1: minimize │ rules │ bugs ×1-4 │ anti-slop     read-only, at the same time
+          ─▶ gate ─▶ patch ×1-4 by file ─▶ commit
+          ─▶ step 2: late-minimize │ late-rules on the new diff   each on the other model family
+          ─▶ gate ─▶ patch ─▶ commit ─▶ late bugs on every fix ─▶ gate ─▶ patch ─▶ commit
+          ─▶ checks ─▶ intent ─▶ PASS or FAIL
 
-light: one reviewer that also fixes ─▶ commit ─▶ checks ─▶ PASS or FAIL
+standard: step 1: rules │ bugs ×1-4 │ cleanup                   read-only, at the same time
+          ─▶ gate ─▶ patch ×1-4 by file ─▶ commit
+          ─▶ late bugs on every fix, on the other model family ─▶ gate ─▶ patch ─▶ commit
+          ─▶ checks ─▶ intent ─▶ PASS or FAIL
+
+light:    one reviewer that also fixes ─▶ commit ─▶ checks ─▶ PASS or FAIL
 ```
 
 - **Triage.** A change to docs and tests only takes the light loop. Solidity `src/` and `script/`, agent prompts and
-  rule files (`agents/`, `AGENTS.md`, `CLAUDE.md`) always take the full loop. `--full` forces the full loop.
+  rule files (`agents/`, `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING*`) take the strict loop. `--full` forces the strict
+  loop. All other changes take the standard loop.
 - **Scale.** A diff over 600 lines splits across up to 4 bugs reviewers. Patch agents split the findings by file.
 - **Static rules.** Each profile has mechanical rules, for example a fixed Solidity pragma, or no `.env` file in the
   change. The host checks the added lines and gives each break to the patch agent.
-- **Models.** Step 1 runs on Opus 5.5, with the rules track on Sol. Step 2 swaps the family of each role.
+- **Models.** Step 1 runs on Opus 5.5, with the rules track on Sol. Each step 2 and late bugs role swaps the family
+  of its step 1 role.
 - **Resume.** Each step's result goes to the run's ledger, so a stopped run continues where it stopped.
 
 ## Rules the host enforces
@@ -83,14 +90,18 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
   runs one command for each test file.
 - `protect` lists paths that agents cannot write. A `*` matches inside one path segment.
 - `env` lists extra environment variables for the checks. `guides` mounts reference material at `/guides/<name>`.
-- `answerers` limits who can answer questions. `research` configures a research notebook. Its `known`, `inject` and
-  `reproduce` commands print a JSON last line, and `research.timeouts` gives each command a timeout in ms
+- `answerers` limits who can answer questions. `research` configures a research notebook. Its `known`, `inject`,
+  `analyze` and `reproduce` commands print a JSON last line, and `research.timeouts` gives each command a timeout in ms
   ([spec, section 6.3](docs/specs/research-workflow.md#63-the-domain-in-the-notebook)).
 - Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
   file that no test imports gets the test files that have its base name as a word. The `run_checks` of builders,
   patch agents and light agents runs only the checks. Their targeted tests run one time, when they submit their log.
+- `ci` has the form of `checks`. Its commands run at each submit of an editing agent, after the targeted tests, and
+  as the final checks of a review run. On Cloudflare, they replace GitHub CI for a review run.
 - `merge` (`"squash"`, `"merge"` or `"rebase"`) is the standing permission for the host to merge a ready development
   PR with that method. Without it, the host does not merge.
+- `questions: "recommended"` is the standing answer to every question of a run: the host takes the recommendation, also
+  to raise the budget, and asks nobody. The report lists the answers. `--hotfix` does the same for one run.
 
 The STE dictionary is optional: see [agents/guides/ste/README.md](agents/guides/ste/README.md).
 
@@ -138,24 +149,27 @@ as a secret to use budgets. The `secret` of a research credential is the name of
 `npx wrangler secret put <NAME>`. It cannot be a host secret or a Worker setting.
 
 `npm run remote` starts and follows runs. It reads `FACTORY_URL` and `ADMIN_TOKEN` from the environment or from
-`.secrets/cloudflare.env`.
+`.secrets/cloudflare.env`. For other tools, `https://<worker>/openapi.json` describes the same routes. A run that stops on
+an error that can pass starts again by itself after 30 minutes, at most three times.
 
 ```bash
 npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full, --budget)
 npm run remote -- develop acme/app#45    # a development run on an issue (--base, --hotfix, --full, --parallel, --budget)
 npm run remote -- research acme/app#45   # a research run on a program issue (--base, --parallel, --budget)
-npm run remote -- resume acme/app#45     # wake a paused run after you answer
+npm run remote -- resume acme/app#45     # wake a paused run, or start a run that stopped on an error
 npm run remote -- status acme/app#45     # or report
 npm run remote -- prune acme/app         # delete the merged, applied and stranded factory/* branches
 npm run metrics                          # CPU, memory and network of each build container
 ```
 
-The webhook is optional. With it, a `/review`, `/develop` or `/research` comment, or the `agent-review`,
-`agent-develop` or `agent-research` label, starts a run, and answers take effect at once. Without it, runs poll for
-answers and CI. One App webhook replaces the webhook of each repository: point it at
-`https://<worker>/github/webhook` and set its secret as `GITHUB_APP_WEBHOOK_SECRET`. Without that secret, the Worker
-checks the webhook of each repository with `GITHUB_WEBHOOK_SECRET`. Use the events Issue comments, Issues, Pull
-requests, Workflow runs and Statuses. The Worker ignores the comment, issue and PR events of its own bot.
+Every 5 minutes, a sweep finds the open issues with the `agent-develop` or `agent-research` label and the open PRs with
+the `agent-review` label. It starts a run for each one that has no run, when a login in `ALLOWED_USERS` added the
+label. The sweep also prunes the factory/* branches of each repository, and it needs the App. The webhook is optional:
+it makes labels, comments and answers take effect at once. Without it, runs poll for answers and CI. One App webhook
+replaces the webhook of each repository: point it at `https://<worker>/github/webhook` and set its secret as
+`GITHUB_APP_WEBHOOK_SECRET`. Without that secret, the Worker checks the webhook of each repository with
+`GITHUB_WEBHOOK_SECRET`. Use the events Issue comments, Issues, Pull requests, Workflow runs and Statuses. The Worker
+ignores the comment, issue and PR events of its own bot.
 
 A Durable Object holds the ledger, the repository tree and the agent sessions of each run. Alarms drive the run and
 resume it after a crash. Development and research runs run their commands, and review runs with tests run their

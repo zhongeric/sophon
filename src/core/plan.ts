@@ -129,7 +129,8 @@ export const submitPlan: Contracts.HostTool = {
   description:
     'Submit the plan one time: the four parts (smallest change, goals, non-goals, done checks), the sections that /review/plan-sections.txt names, and the tasks for the builders. ' +
     'The host refuses a plan with an empty part, with no done check that has a command, or with tasks that depend on unknown tasks or on each other in a cycle. ' +
-    'It also refuses a task whose files include a protected path, because the host refuses each write to it. The prompt lists the protected paths.',
+    'It also refuses a task whose files include a protected path, because the host refuses each write to it. The prompt lists the protected paths. ' +
+    'It also refuses a task when a targeted test of its files is only in the files of another task, because the task cannot change that test.',
   parameters: {
     type: 'object',
     properties: {
@@ -176,8 +177,10 @@ export const submitPlan: Contracts.HostTool = {
 /**
  * Refuses a plan without its four parts, its required sections, or tasks that the host can schedule.
  * `isProtected` tells which task files the host refuses to write, so a task with one of them can never finish.
+ * `targeted` gives the targeted tests of the files of a task on the base tree. A task whose targeted test is only in
+ * the files of another task cannot fix that test, so its builder blocks.
  */
-export function checkPlan(input: unknown, sections: string[], isProtected: (path: string) => boolean): Plan {
+export async function checkPlan(input: unknown, sections: string[], isProtected: (path: string) => boolean, targeted: (files: string[]) => Promise<string[]>): Promise<Plan> {
   const plan = input as Plan
   const filled = (list: unknown) => Array.isArray(list) && list.length > 0 && list.every((item) => typeof item === 'string' && item.trim() !== '')
   const problems: string[] = []
@@ -203,6 +206,12 @@ export function checkPlan(input: unknown, sections: string[], isProtected: (path
     else for (const id of task.depends_on) if (!ids.includes(id)) problems.push(`task "${task.id}": depends on the unknown task "${id}"`)
   }
   if (problems.length === 0 && waves(tasks, maxTasks).flat().length < tasks.length) problems.push('the tasks depend on each other in a cycle')
+  if (problems.length === 0)
+    for (const task of tasks)
+      for (const test of await targeted(task.files))
+        if (!inScope(test, task.files))
+          for (const other of tasks)
+            if (other !== task && inScope(test, other.files)) problems.push(`task "${task.id}": its targeted test ${test} is in task "${other.id}". Put them in one task.`)
   if (problems.length > 0) throw new Error(problems.join('\n'))
   return plan
 }

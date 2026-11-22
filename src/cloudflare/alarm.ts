@@ -3,14 +3,27 @@ import { crashRestartsKey, PlannedStop, plannedStopsKey } from '../core/planned-
 import { PausedError } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { refusedCredential } from './github.ts'
+import { resetJobStarts } from './jobs.ts'
 
 const maxAttempts = 3
 /** Restarts of a run whose isolate died with no finished step in between, before the run stops. */
 export const maxRestarts = 5
 const retryMs = 60_000
 const defaultPauseSeconds = 60
-/** The wall time of one alarm call before its planned stop, when ALARM_BUDGET_SECONDS does not say (D12). */
-const defaultBudgetSeconds = 480
+/** Restarts of a run after an error, before the run waits for the administrator (D13). */
+export const maxErrorRestarts = 3
+const errorRestartMs = 30 * 60_000
+/** The count of restarts after an error. A finished step resets it. */
+const errorRestartsKey = 'error-restarts'
+/** The time of the next restart after an error, so that the admin resume can start the waiting run at once. */
+export const restartAtKey = 'restart-at'
+/** True when the preflight passed after the last start, admin resume or D13 restart of the run (D17). */
+export const preflightKey = 'preflight-passed'
+/**
+ * The wall time that one alarm call plans for, when ALARM_BUDGET_SECONDS does not say (D12). Cloudflare stops the call
+ * at 900 s. The rest is for the model request and the submit that are in flight at the end of the budget.
+ */
+export const defaultBudgetSeconds = 780
 
 /** ALARM_BUDGET_SECONDS in ms. A value that is not a number above 0 gives the default. */
 export function alarmBudgetMs(value: string | undefined): number {
@@ -27,6 +40,7 @@ export function progressLedger(ledger: Ledger): Ledger {
       if (key.startsWith('step:')) {
         ledger.put('attempts', 0)
         ledger.put('restarts', 0)
+        ledger.put(errorRestartsKey, 0)
       }
     },
   }
@@ -42,30 +56,47 @@ export function countRestart(ledger: Ledger): void {
   const restarts = (ledger.get<number>('restarts') ?? 0) + 1
   ledger.put('restarts', restarts)
   ledger.put(crashRestartsKey, (ledger.get<number>(crashRestartsKey) ?? 0) + 1)
-  if (restarts > maxRestarts) throw new StopError(`the run died ${maxRestarts} times without finishing a step, for example on the memory or CPU limit`)
+  if (restarts > maxRestarts) throw new StopError(`the run died ${maxRestarts} times without finishing a step, for example on the memory or CPU limit`, { transient: true })
 }
 
 /**
  * What the alarm call does after execute() threw: the state and note of the run, and the time of the next alarm
- * (null: no alarm). `attempts` is the count of failed attempts when the error counted as one, else null.
+ * (null: no alarm). `attempts` is the count of failed attempts when the error counted as one, else null. `restart` is
+ * the number of the restart after an error that the next alarm starts, else null.
  */
-export type Outcome = { state: 'queued' | 'paused' | 'error'; note: string; next: number | null; attempts: number | null }
+export type Outcome = { state: 'queued' | 'paused' | 'error'; note: string; next: number | null; attempts: number | null; restart: number | null }
 
 export function afterError(ledger: Ledger, error: unknown, options: { now: number; pauseSeconds: string | undefined }): Outcome {
   const message = error instanceof Error ? error.message : String(error)
   if (error instanceof PlannedStop) {
     // A planned stop is not a failure: attempts and restarts stay, and the next call starts at once.
     ledger.put(plannedStopsKey, (ledger.get<number>(plannedStopsKey) ?? 0) + 1)
-    return { state: 'queued', note: `${message}. The run continues in the next alarm call.`, next: options.now, attempts: null }
+    return { state: 'queued', note: `${message}. The run continues in the next alarm call.`, next: options.now, attempts: null, restart: null }
   }
   if (error instanceof PausedError) {
     ledger.put('attempts', 0)
-    return { state: 'paused', note: message, next: options.now + Number(options.pauseSeconds ?? defaultPauseSeconds) * 1_000, attempts: null }
+    return { state: 'paused', note: message, next: options.now + Number(options.pauseSeconds ?? defaultPauseSeconds) * 1_000, attempts: null, restart: null }
   }
   const attempts = (ledger.get<number>('attempts') ?? 0) + 1
   ledger.put('attempts', attempts)
-  // A refused credential or permission does not fix itself: stop at once instead of retrying.
-  const permanent = error instanceof StopError || refusedCredential(error)
-  if (permanent || attempts >= maxAttempts) return { state: 'error', note: message, next: null, attempts }
-  return { state: 'queued', note: `attempt ${attempts} failed: ${message}`, next: options.now + retryMs, attempts }
+  // A refused credential or permission, or a stop rule of the workflow, does not fix itself: stop at once.
+  if ((error instanceof StopError && !error.transient) || refusedCredential(error)) return { state: 'error', note: message, next: null, attempts, restart: null }
+  if (!(error instanceof StopError) && attempts < maxAttempts) return { state: 'queued', note: `attempt ${attempts} failed: ${message}`, next: options.now + retryMs, attempts, restart: null }
+  // Other errors can pass by themselves, so the run starts again later, as after an admin resume (D13).
+  const restart = (ledger.get<number>(errorRestartsKey) ?? 0) + 1
+  if (restart > maxErrorRestarts) return { state: 'error', note: `${message}. The run stopped again after ${maxErrorRestarts} restarts`, next: null, attempts, restart: null }
+  const next = options.now + errorRestartMs
+  ledger.put(errorRestartsKey, restart)
+  ledger.put(restartAtKey, next)
+  ledger.put(preflightKey, false)
+  ledger.put('attempts', 0)
+  ledger.put('restarts', 0)
+  resetJobStarts(ledger)
+  return {
+    state: 'queued',
+    note: `${message}. The host starts the run again from its ledger at ${new Date(next).toISOString()} (restart ${restart} of ${maxErrorRestarts})`,
+    next,
+    attempts,
+    restart,
+  }
 }

@@ -49,6 +49,7 @@ test('research: each clean box is a new checkout at a new path, and only the las
     writeFileSync(join(tree, 'untracked'), 'output\n')
     // The local platform ignores the key: the same key two times also gives a new checkout.
     const box = await deps.cleanBox(commit, `reproduce.${commit}`)
+    assert.notEqual(box.id, first.id)
     const next = await box.run('pwd', { env: [], timeoutMs: 10_000 })
     assert.equal(next.exit_code, 0)
     // A new path, so that an output that depends on the path does not reproduce. The earlier checkout is gone.
@@ -177,6 +178,19 @@ test('research: a Drop answer at the approval removes the hypothesis without a f
   )
   assert.equal(turns.filter((turn) => turn.role === 'preregistrar' && turn.output === null).length, 2)
   assert.match(result.report, /Dropped at the approval: hyp-003/)
+})
+
+test('research: with the standing answers of the notebook, the run confirms, picks and approves the recommendations and posts no question', { timeout: 120_000 }, async () => {
+  const { repo, base } = notebook({ config: { checks: { smoke: 'true' }, questions: 'recommended', research: researchConfig } })
+  const { channel, posted } = memoryChannel({ intake: null, pick: null, 'approve.1': null })
+  const { result } = await runResearch(repo, runsDir(), researchInput(base, 'standing'), { channel, dispatch: scriptedDispatch(blocked, []) })
+
+  assert.equal(result.status, 'blocked', result.report)
+  assert.deepEqual(posted, [])
+  assert.deepEqual(
+    result.frozen.map((entry) => entry.path),
+    ['prereg/hyp-001-v2.md'],
+  )
 })
 
 test('research: a fresh run creates the next version when the base has an identical prereg', { timeout: 120_000 }, async () => {

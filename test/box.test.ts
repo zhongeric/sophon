@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -15,6 +17,7 @@ import { createSyncTables, sqlSyncs, type SyncSql } from '../src/cloudflare/sync
 import { commandChecker } from '../src/core/checks.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import type { Checker } from '../src/core/platform.ts'
+import { localContainer } from './support/container.ts'
 import { mockServices } from './support/mock-services.ts'
 
 /** Durable Object SQL over node:sqlite. A new store over the same database is a new object after a restart. */
@@ -104,34 +107,6 @@ test('a sync copies the whole tree without .git, then only what changed or went 
     ['changed', false, 'new', 'installed'],
   )
 })
-
-/**
- * A container whose root is a local directory. It comes back empty when it starts, as a stopped Cloudflare Container
- * does. `renewals` counts the calls that renew its inactivity timeout.
- */
-function localContainer(root: string, exitCode?: number) {
-  const container = {
-    running: false,
-    renewals: 0,
-    start() {
-      rmSync(root, { force: true, recursive: true })
-      mkdirSync(root, { recursive: true })
-      container.running = true
-    },
-    async setInactivityTimeout() {
-      container.renewals += 1
-    },
-    async exec(argv: string[], options: { cwd: string; stdin?: ReadableStream }) {
-      // The box wraps each command in timeout -k 10 <seconds>.
-      const command = argv.slice(4)
-      const cwd = join(root, options.cwd)
-      const input = options.stdin ? Buffer.from(await new Response(options.stdin).arrayBuffer()) : undefined
-      const result = existsSync(cwd) ? spawnSync(command[0]!, command.slice(1), { cwd, input }) : { status: 1, stdout: '', stderr: `no directory ${options.cwd}` }
-      return { stdout: new Blob([`${result.stdout}${result.stderr}`]).stream(), exitCode: Promise.resolve(exitCode ?? result.status ?? 1) }
-    },
-  }
-  return container
-}
 
 test('a sync after the container stopped copies all of the tree and runs the setup again', async () => {
   const root = mkdtempSync(join(tmpdir(), 'factory-container-'))
@@ -278,8 +253,13 @@ test('the checker of a review run keeps CI as its checks, and gives a failed set
   writeFileSync(join(fixture.root, 'fail'), '')
   const config = { stack: 'TypeScript', checks: { smoke: 'true' }, tests: { pattern: '\\.test\\.ts$', command: 'node --test {tests}' } }
   const ci: Checker = { checks: async () => [], tests: null }
-  const checker = reviewChecker(ci, commandChecker({ committedFiles: async () => [], tree: fixture.tree }, config, boxMachine(fixture.box, 'work/x', fixture.sync)))
+  const checker = reviewChecker(
+    ci,
+    commandChecker({ committedFiles: async () => [], tree: fixture.tree }, config, boxMachine(fixture.box, 'work/x', fixture.sync)),
+    async () => assert.fail('a review run without ci publishes in its CI checks'),
+  )
   assert.equal(checker.checks, ci.checks)
+  assert.equal(checker.ci, undefined)
   const failed = { command: 'test ! -f ../../fail && echo run >> setup.log', exit_code: 1, name: 'setup', output: '', status: 'fail' }
   assert.deepEqual(await checker.tests!(['test/a.test.ts']), [failed])
   assert.deepEqual(await checker.agentChecks!([]), [failed])
@@ -288,6 +268,35 @@ test('the checker of a review run keeps CI as its checks, and gives a failed set
   rmSync(join(fixture.root, 'fail'))
   fixture.failTar = true
   await assert.rejects(checker.tests!(['test/a.test.ts']), /syncing work\/x failed/)
+})
+
+test('the checker of a review run with ci publishes the fixes, then runs ci on the machine as its final checks, not GitHub CI (D15)', async () => {
+  const fixture = syncFixture()
+  const config = { stack: 'TypeScript', checks: { smoke: 'true' }, ci: { build: 'cat a.txt' } }
+  const ci: Checker = { checks: async () => assert.fail('a review run with ci reads no GitHub CI'), tests: null }
+  const published: number[] = []
+  const machine = commandChecker({ committedFiles: async () => [], tree: fixture.tree }, config, boxMachine(fixture.box, 'work/x', fixture.sync))
+  const checker = reviewChecker(ci, machine, async () => {
+    // The count of commands on the machine at the publish shows that the publish comes before ci.
+    published.push(fixture.commands.filter((command) => command.includes('cat a.txt')).length)
+    return 'sha'
+  })
+  assert.equal(checker.tests, null)
+  const passed = { command: 'cat a.txt', exit_code: 0, name: 'ci build', output: 'a', status: 'pass' }
+  assert.deepEqual(await checker.checks(['a.txt']), [passed])
+  assert.deepEqual(published, [0])
+  // The submit gates run the same ci on the machine, with no publish.
+  assert.deepEqual(await checker.ci!(['a.txt']), [passed])
+  assert.deepEqual(published, [0])
+
+  // A failed setup on the machine gives a failed result named setup.
+  const broken = syncFixture()
+  writeFileSync(join(broken.root, 'fail'), '')
+  const brokenMachine = commandChecker({ committedFiles: async () => [], tree: broken.tree }, config, boxMachine(broken.box, 'work/x', broken.sync))
+  const brokenChecker = reviewChecker(ci, brokenMachine, async () => 'sha')
+  const failed = { command: 'test ! -f ../../fail && echo run >> setup.log', exit_code: 1, name: 'setup', output: '', status: 'fail' }
+  assert.deepEqual(await brokenChecker.checks(['a.txt']), [failed])
+  assert.deepEqual(await brokenChecker.ci!(['a.txt']), [failed])
 })
 
 test('a sync with changes removes the marker before its first write, so a failed copy leaves no valid state', async () => {
@@ -393,13 +402,14 @@ test('a container job runs detached in its directory, and each poll renews the i
   const { box, container, root } = await containerJobs()
   mkdirSync(join(root, 'work/x'), { recursive: true })
   await box.startJob('job-1', ['bash', '-c', 'echo out; echo err >&2; pwd -P; exit 3'], { cwd: 'work/x', env: {}, timeoutMs: 60_000 })
-  const renewals = container.renewals
+  const renewals = container.timeouts.length
   const result = { exit_code: 3, output: `out\nerr\n${realpathSync(join(root, 'work/x'))}\n` }
   assert.deepEqual(await jobResult(box, 'job-1'), result)
-  assert.ok(container.renewals > renewals)
-  // A poll keeps the files until the caller stores the result and removes the job.
+  assert.ok(container.timeouts.length > renewals)
+  // The output and the exit code are in the job directory, not in the work directory.
   assert.deepEqual(readdirSync(join(root, 'work/x')), [])
-  assert.equal(existsSync(join(root, 'jobs/job-1')), true)
+  assert.deepEqual(readdirSync(join(root, 'jobs/job-1')).sort(), ['exit', 'limit', 'output', 'pgid', 'started'])
+  // A poll keeps the files until the caller stores the result and removes the job.
   assert.deepEqual(await box.pollJob('job-1'), { state: 'done', result })
   await box.killJob('job-1')
   await box.killJob('job-1')
@@ -454,11 +464,14 @@ test('a container job keeps the result rules of a command and the last 20,000 ch
   const { box, root } = await containerJobs()
   await box.startJob('slow', ['sleep', '5'], { cwd: '', env: {}, timeoutMs: 1_000 })
   await box.startJob('killed', ['bash', '-c', 'kill -9 $$'], { cwd: '', env: {}, timeoutMs: 60_000 })
-  await box.startJob('long', ['bash', '-c', 'head -c 30000 /dev/zero | tr "\\0" a; printf end'], { cwd: '', env: {}, timeoutMs: 60_000 })
+  await box.startJob('long', ['bash', '-c', 'head -c 100000 /dev/zero | tr "\\0" a; printf end'], { cwd: '', env: {}, timeoutMs: 60_000 })
   assert.deepEqual(await jobResult(box, 'slow'), { exit_code: null, output: '\n[host] killed after 1000 ms' })
   const killed = await jobResult(box, 'killed')
   assert.equal(killed.exit_code, 137)
   assert.match(killed.output, /killed before its time limit/)
+  assert.deepEqual(await jobResult(box, 'long'), { exit_code: 0, output: `${'a'.repeat(19_997)}end` })
+  // The poll keeps only the bytes that it reads, and a poll again gives the same result.
+  assert.equal(statSync(join(root, 'jobs/long/output')).size, 80_000)
   assert.deepEqual(await jobResult(box, 'long'), { exit_code: 0, output: `${'a'.repeat(19_997)}end` })
 
   // timeout sends its SIGKILL 10 s after the limit, so the test writes the files of a 137 at the limit.
@@ -482,7 +495,6 @@ test('a kill stops the process group of a container job with its child, and the 
   assert.ok(child > 0)
   assert.deepEqual(await box.pollJob('group'), { state: 'running' })
   await box.killJob('group')
-  assert.equal(existsSync(join(root, 'jobs/group')), false)
   // A killed process can stay a zombie until its parent reaps it.
   const gone = () => !existsSync(`/proc/${child}/stat`) || / Z /.test(readFileSync(`/proc/${child}/stat`, 'utf8').replace(/^.*\)/, ''))
   let state = await box.pollJob('group')
@@ -492,6 +504,9 @@ test('a kill stops the process group of a container job with its child, and the 
   }
   assert.equal(gone(), true)
   assert.deepEqual(state, { state: 'missing' })
+  assert.equal(existsSync(join(root, 'jobs/group')), false)
+  // A kill removes the job directory, so an ID can never name /jobs or its parent.
+  await assert.rejects(box.killJob('..'), /the job ID "\.\." is not a valid file name/)
 })
 
 test('a branch machine and its setup run their commands as wait-mode jobs', async () => {
@@ -544,26 +559,24 @@ test('the test machine runs jobs over HTTP with the same result rules, and kills
   }
 })
 
-test('the test machine client refuses a response without a valid job state or result', async () => {
-  const realFetch = globalThis.fetch
-  let reply: unknown = null
-  globalThis.fetch = (async () => new Response(JSON.stringify(reply))) as typeof fetch
+test('the test machine refuses a poll or a command result that is not valid', async () => {
+  let answer: unknown = {}
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify(answer))
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   try {
-    const box = httpBox('http://machine.test')
-    const options = { cwd: '', env: {}, timeoutMs: 60_000 }
-    reply = { state: 'done', result: { exit_code: 0, output: 'ok' } }
-    assert.deepEqual(await box.pollJob('a'), { result: { exit_code: 0, output: 'ok' }, state: 'done' })
-    reply = { state: 'paused' }
-    await assert.rejects(box.pollJob('a'), /the machine at http:\/\/machine\.test\/jobs\/poll gave no valid job state/)
-    reply = { state: 'done', result: { exit_code: '0', output: 'ok' } }
-    await assert.rejects(box.pollJob('a'), /gave no valid result/)
-    reply = { state: 'done' }
-    await assert.rejects(box.pollJob('a'), /gave no valid result/)
-    reply = { exit_code: 1.5, output: '' }
-    await assert.rejects(box.exec(['true'], options), /gave no valid result/)
-    reply = { exit_code: null, output: 'killed' }
-    assert.deepEqual(await box.exec(['true'], options), { exit_code: null, output: 'killed' })
+    const box = httpBox(`http://127.0.0.1:${(server.address() as AddressInfo).port}/machine`)
+    for (const invalid of [{}, null, { state: 'done' }, { result: { exit_code: '0', output: '' }, state: 'done' }, { result: { exit_code: 0 }, state: 'done' }]) {
+      answer = invalid
+      await assert.rejects(box.pollJob('job-1'), /answered without a job state/)
+    }
+    answer = { result: { exit_code: null, output: 'out' }, state: 'done' }
+    assert.deepEqual(await box.pollJob('job-1'), { result: { exit_code: null, output: 'out' }, state: 'done' })
+    answer = { exit_code: 1.5, output: '' }
+    await assert.rejects(box.exec(['true'], { cwd: '', env: {}, timeoutMs: 1_000 }), /answered without a command result/)
   } finally {
-    globalThis.fetch = realFetch
+    await new Promise((resolve) => server.close(resolve))
   }
 })

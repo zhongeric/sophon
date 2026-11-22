@@ -19,6 +19,8 @@ import { baseConfig, baseResearch } from './config.ts'
 import { checkWorkerCredentials, egressUrlFetch, workerSecret } from './egress.ts'
 import type { GitHub } from './github.ts'
 import { bundledGuides } from './guides.ts'
+import { workLabels } from './labels.ts'
+import { loopChoices, type PreflightNeeds } from './preflight.ts'
 import { githubPulls } from './pulls.ts'
 import { reviewPass } from './review.ts'
 import { answerersOf, credentialsFor, Runs, setupTimeoutMs, type Call } from './runs.ts'
@@ -40,6 +42,8 @@ type Notebook = { input: ResearchInput; config: RepoConfig; domain: ResearchDoma
  * commands of the notebook, on copies of the branches and on clean checkouts of commits.
  */
 export class ResearchRuns extends Runs<ResearchRequest> {
+  protected readonly label = workLabels.research
+
   protected number(request: ResearchRequest) {
     return request.issue
   }
@@ -110,6 +114,18 @@ export class ResearchRuns extends Runs<ResearchRequest> {
     return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
   }
 
+  protected async preflightNeeds(_request: ResearchRequest, ledger: Ledger): Promise<PreflightNeeds> {
+    const { generators, review, ...roles } = ledger.get<Notebook>('notebook')?.input.models ?? this.models()
+    return { ciBase: null, container: true, models: [...Object.values(roles), ...generators, ...loopChoices(review)] }
+  }
+
+  /** The models of a new run: the defaults with the MODELS overrides. */
+  private models(): ResearchModels {
+    type Overrides = Partial<LoopModels> & { research?: Partial<Omit<ResearchModels, 'review'>> }
+    const overrides = this.env.MODELS ? (JSON.parse(this.env.MODELS) as Overrides) : {}
+    return { ...defaultResearchModels, ...overrides.research, review: mergeModels(overrides) }
+  }
+
   /** The run's input: the issue is the program, verbatim. The config and the domain come from the base commit. */
   private async notebook(run: string, request: ResearchRequest, gh: GitHub, ledger: Ledger): Promise<Notebook> {
     const { owner, repo } = request
@@ -121,13 +137,11 @@ export class ResearchRuns extends Runs<ResearchRequest> {
     const config = await baseConfig(gh, owner, repo, base)
     if (!config.research) throw new StopError(`${repoConfigFile} on ${baseRef} has no research field`)
     const domain = await baseResearch(gh, owner, repo, base, config.research)
-    type Overrides = Partial<LoopModels> & { research?: Partial<Omit<ResearchModels, 'review'>> }
-    const overrides = this.env.MODELS ? (JSON.parse(this.env.MODELS) as Overrides) : {}
     const input: ResearchInput = {
       allowedModels: allowedModelsFrom(this.env.ALLOWED_MODELS),
       base,
       baseRef,
-      models: { ...defaultResearchModels, ...overrides.research, review: mergeModels(overrides) },
+      models: this.models(),
       program: `${issue.title}\n\n${issue.body ?? ''}`.trim(),
       runId: run,
       source: `${owner}/${repo}#${request.issue}`,

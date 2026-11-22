@@ -236,7 +236,7 @@ export function budgetGate(options: {
   log(line: string): void
   /** Precomputed rows that the ledger does not record, for example finished review passes. Their USD counts as spend. */
   extraRows?: () => UsageRow[]
-  /** At twice the budget, raise the budget to twice the spend without a question, as in a hotfix run. */
+  /** At twice the budget, raise the budget to twice the spend without a question, as in a hotfix run or with standing answers. */
   recommend?: boolean
   /** Stop at the budget without a notice or a question, as in a nested review pass. */
   stopAtBudget?: boolean
@@ -283,9 +283,9 @@ export function budgetGate(options: {
       const pause = !belowBudget(now, 2 * state.limit)
       const target = doubled(now)
       if (pause && options.recommend) {
-        // A hotfix run takes the recommendation, and the recommendation is to raise the budget.
+        // A run that takes every recommendation raises the budget, because that is the recommendation.
         raise(state, target)
-        await notify(`The run spent about ${formatUsd(now)} of its budget of ${formatUsd(state.limit)}. This is a hotfix run, so the host raised the budget to ${formatUsd(target)}, and the run continues.`)
+        await notify(`The run spent about ${formatUsd(now)} of its budget of ${formatUsd(state.limit)}. The run takes every recommendation, so the host raised the budget to ${formatUsd(target)}, and the run continues.`)
         return
       }
       if (!ledger.get(noticeKey(state.round))) {

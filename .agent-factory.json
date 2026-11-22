@@ -3,7 +3,12 @@
   "checks": {
     "typecheck": "npm run check"
   },
+  "ci": {
+    "check": "npm run check"
+  },
   "setup": "npm ci --prefer-offline --no-audit --no-fund",
+  "questions": "recommended",
+  "merge": "squash",
   "tests": {
     "pattern": "^test/[^/]+\\.test\\.ts$",
     "command": "node --disable-warning=ExperimentalWarning --test {tests}"

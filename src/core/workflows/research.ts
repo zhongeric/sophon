@@ -12,7 +12,17 @@ import { freezePrereg, type Prereg } from '../prereg.ts'
 import { presentProfiles, profilesById, type Profile } from '../profiles.ts'
 import type { Credentials, Provider } from '../providers.ts'
 import { asker, decisionLists, decisions, type Answer, type Channel, type Question } from '../questions.ts'
-import { calibrationVerdict, compareReproduction, preregThreshold, runDomainCommand, type DomainOutputs, type DomainRun, type HashMismatch } from '../research-commands.ts'
+import {
+  analysisVerdict,
+  calibrationVerdict,
+  compareReproduction,
+  needsRecalibration,
+  preregThreshold,
+  runDomainCommand,
+  type DomainOutputs,
+  type DomainRun,
+  type HashMismatch,
+} from '../research-commands.ts'
 import {
   analyst,
   buildAnalysis,
@@ -28,7 +38,7 @@ import {
   skeptic,
   survey,
   writeDossier,
-  type CalibrationFailure,
+  type BuildFailure,
   type CalibrationSummary,
   type HeldAnswer,
   type LensSurvey,
@@ -134,12 +144,8 @@ export type ResearchDeps = {
   log(line: string): void
 }
 
-/** A clean checkout with read access to the output files of its commands. */
-type ResearchBox = Machine & {
-  /** Identifies a checkout that stays across calls. A replacement needs a new ID. */
-  copyId?: string
-  read(path: string): Promise<Uint8Array>
-}
+/** A clean checkout with read access to its output files. Its ID stays the same only when the checkout stays. */
+type ResearchBox = Machine & { id: string; read(path: string): Promise<Uint8Array> }
 
 /** A frozen prereg as the ledger records it. */
 export type Freeze = { hypothesis: string; version: number; path: string; sha256: string; commit: string }
@@ -229,7 +235,10 @@ type ReportState = {
   stoppedReview: Review | null
 }
 
-/** One calibration round on a clean checkout. `known` and `inject` hold artifact IDs for command output and declared files. */
+/**
+ * One calibration round on a clean checkout. `known` and `inject` hold artifact IDs for command output and declared files.
+ * `reads` holds the reads lists of known and inject, each null when the command did not give one.
+ */
 type CalibrationRound = {
   round: number
   head: string
@@ -238,10 +247,14 @@ type CalibrationRound = {
   known: string[]
   inject: string[]
   outputs: DomainOutputs
+  reads: { known: string[] | null; inject: string[] | null }
   pass: boolean
   reason: string
   tail: string
 }
+
+/** One analyze run on a clean checkout of `head`. `command` is the artifact ID of its output, `files` of each declared output file. */
+type AnalysisRun = { round: number; head: string; pass: boolean; outputs: DomainOutputs; command: string; files: string[]; reason: string; tail: string }
 
 /** One reproduce run of one prereg on a clean checkout of `head`. `artifact` is the artifact ID of its output. */
 type Reproduction = { head: string; pass: boolean; mismatches: HashMismatch[]; missing: string[]; reason: string; artifact: string }
@@ -251,6 +264,7 @@ type Analysis = {
   freeze: Freeze
   builds: BuildLog[]
   calibrations: CalibrationRound[]
+  runs: AnalysisRun[]
   rounds: VetRound[]
   answers: HeldAnswer[]
   dossier: Dossier | null
@@ -294,6 +308,8 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     stoppedReview: null,
   }
   const spentPasses = () => [...state.reviews, ...(state.stoppedReview ? [state.stoppedReview] : [])]
+  // The standing answers of the notebook take every recommendation (D11).
+  const recommend = deps.config.questions === 'recommended'
   // The review pass keeps its usage in its own ledger, so its rows count here as extra rows.
   const budget = budgetGate({
     channel: deps.channel,
@@ -301,6 +317,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     ledger,
     log: deps.log,
     prices,
+    recommend,
     runId: input.runId,
   })
   // A resume without --budget must not apply the override again, so the recorded input does not keep it.
@@ -322,7 +339,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     program: input.program,
     tree: await deps.branches.view(input.base),
   }
-  const questions = asker(ledger, deps.channel, input.runId, deps.log)
+  const questions = asker(ledger, deps.channel, input.runId, deps.log, { recommend })
   const ask = async (batch: string, list: Question[]): Promise<Answer[]> => {
     await questions.post(batch, list)
     return questions.wait(batch)
@@ -332,6 +349,8 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
     for (let round = 2; ; round++) {
       const parsed = parse(answer)
       if ('value' in parsed) return parsed.value
+      // Asking again would give the same recommendation.
+      if (recommend) throw new StopError(`the recommendation of ${batch} is not a valid answer: ${parsed.error}`)
       deps.log(`the answer ${JSON.stringify(answer)} (${batch}): ${parsed.error}, asking again`)
       const [again] = await ask(`${batch}.${round}`, [{ ...question, id: 'Q1', why: `${parsed.error}.\n${question.why}` }])
       answer = again?.answer ?? ''
@@ -434,7 +453,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   const active = profilesById(await step(ledger, 'profiles', async () => (await presentProfiles(async (path) => (await context.tree.stat(`/${path}`)) !== null)).map((profile) => profile.id)))
   const stages: Stages = { input, deps, context, branch, active, parallel, ask, askUntil }
   for (const freeze of state.frozen) {
-    const analysis: Analysis = { freeze, builds: [], calibrations: [], rounds: [], answers: [], dossier: null, reproductions: [] }
+    const analysis: Analysis = { freeze, builds: [], calibrations: [], runs: [], rounds: [], answers: [], dossier: null, reproductions: [] }
     state.analyses.push(analysis)
     const end = await analyze(stages, analysis)
     if (end) return finish(end.status, end.note)
@@ -444,7 +463,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   await checkFrozen(branch, state.frozen)
   for (const analysis of state.analyses) {
     const { hypothesis } = analysis.freeze
-    const task = { branch, prereg: analysis.freeze, calibration: summary(finalCalibration(analysis)), rounds: analysis.rounds, answers: analysis.answers }
+    const task = { ...vetTask(branch, analysis), rounds: analysis.rounds, answers: analysis.answers }
     const dossier = await step(ledger, `writer.${hypothesis}`, () => writeDossier(context, models.writer, task))
     analysis.dossier = dossier
     try {
@@ -452,7 +471,7 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
         const outside = await outsidePaths(branch, (path) => path === `dossier/${hypothesis}.md`)
         if (outside.length > 0) throw new AnalysisScopeError(`Before the dossier of ${hypothesis}, the run branch has uncommitted changes: ${outside.join(', ')}. ${notPushed}`)
         await branch.tree.mkdir('/dossier')
-        await branch.tree.write(`/dossier/${hypothesis}.md`, new TextEncoder().encode(renderDossier(hypothesis, dossier, analysis.rounds, analysis.answers)))
+        await branch.tree.write(`/dossier/${hypothesis}.md`, new TextEncoder().encode(renderDossier(hypothesis, dossier, analysis.rounds, analysis.answers, finalAnalysis(analysis).outputs)))
         await branch.commit(`agent-factory: dossier ${hypothesis} (${input.runId})`)
         return branch.head()
       })
@@ -513,6 +532,11 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
       // The dossier cites the calibration before the review, and the host does not write the dossier again.
       if (calibration.recall !== cited.recall || !sameOutputs(calibration.outputs, cited.outputs))
         return finish('failed', `After the review fixes, the calibration of ${hypothesis} gives another known recall or other output hashes than dossier/${hypothesis}.md cites. The PR stays draft.`)
+      const citedRun = finalAnalysis(analysis)
+      const analyzed = await runAnalysis(stages, analysis)
+      if (!analyzed.pass) return finish('failed', `${analysisLine(hypothesis, analyzed)} after the review fixes. The PR stays draft.`)
+      if (!sameOutputs(analyzed.outputs, citedRun.outputs))
+        return finish('failed', `After the review fixes, the analysis of ${hypothesis} gives other output hashes than dossier/${hypothesis}.md cites. The PR stays draft.`)
     }
     if (!(await reproduce(stages, state.analyses, final))) return finish('failed', `The reproduction on a clean checkout of ${final.slice(0, 12)} failed after the review fixes. The PR stays draft.`)
   }
@@ -539,13 +563,13 @@ type End = { status: ResearchStatus; note: string } | null
 
 class AnalysisScopeError extends Error {}
 
-/** Stages 5 to 9 of one frozen prereg: the build, the calibration with one fix round, and two vet rounds. */
+/** Stages 5 to 9 of one frozen prereg: the build, the calibration with one fix round, the analysis with one fix round, and two vet rounds. */
 async function analyze(stages: Stages, analysis: Analysis): Promise<End> {
   const { input, deps, context, branch } = stages
   const { ledger } = deps
   const { hypothesis } = analysis.freeze
   const start = await step(ledger, `start.${hypothesis}`, () => branch.head())
-  const build = async (key: string, failure?: CalibrationFailure): Promise<End> => {
+  const build = async (key: string, failure?: BuildFailure): Promise<End> => {
     const log = await step(ledger, key, () =>
       buildAnalysis(context, {
         model: input.models.builder,
@@ -566,10 +590,28 @@ async function analyze(stages: Stages, analysis: Analysis): Promise<End> {
   if (built) return built
   let calibration = await calibrate(stages, analysis)
   if (!calibration.pass) {
-    const fixed = await build(`build.${hypothesis}.fix-1`, { round: calibration.round, reason: calibration.reason, tail: calibration.tail })
+    const fixed = await build(`build.${hypothesis}.fix-1`, { step: 'calibration', round: calibration.round, reason: calibration.reason, tail: calibration.tail })
     if (fixed) return fixed
     calibration = await calibrate(stages, analysis)
     if (!calibration.pass) return { status: 'blocked', note: `${calibrationLine(hypothesis, calibration)}. ${notPushed}` }
+  }
+  // The analysis on a new clean checkout. A failed first analysis goes back to the builder one time, apart from the
+  // calibration rounds. The calibration runs again when reads are missing or match the fix paths.
+  let analyzed = await runAnalysis(stages, analysis)
+  if (!analyzed.pass) {
+    const { reads } = finalCalibration(analysis)
+    const fixed = await build(`build.${hypothesis}.analysis-fix-1`, { step: 'analysis', round: analyzed.round, reason: analyzed.reason, tail: analyzed.tail })
+    if (fixed) return fixed
+    // A step, so that a resume takes the same decision after the branch moved on.
+    const again = await step(ledger, `recalibrate.${hypothesis}.analysis-fix-1`, async () =>
+      needsRecalibration(reads.known, reads.inject, await branch.touchedFiles(analyzed.head, await branch.head())),
+    )
+    if (again) {
+      calibration = await calibrate(stages, analysis)
+      if (!calibration.pass) return { status: 'blocked', note: `${calibrationLine(hypothesis, calibration)} after the analysis fix. ${notPushed}` }
+    }
+    analyzed = await runAnalysis(stages, analysis)
+    if (!analyzed.pass) return { status: 'blocked', note: `${analysisLine(hypothesis, analyzed)}. ${notPushed}` }
   }
 
   // 9. The skeptics, then the late skeptics. The analyst answers each round that has objections.
@@ -588,8 +630,14 @@ async function analyze(stages: Stages, analysis: Analysis): Promise<End> {
         if (error instanceof AnalysisScopeError) return { status: 'blocked', note: error.message }
         throw error
       }
-      calibration = await calibrate(stages, analysis)
-      if (!calibration.pass) return { status: 'blocked', note: `${calibrationLine(hypothesis, calibration)} after the analyst changes. ${notPushed}` }
+      // Only the analysis runs again when known and inject declare reads outside analysis/<id>/.
+      const { reads } = finalCalibration(analysis)
+      if (needsRecalibration(reads.known, reads.inject, [`analysis/${hypothesis}/`])) {
+        calibration = await calibrate(stages, analysis)
+        if (!calibration.pass) return { status: 'blocked', note: `${calibrationLine(hypothesis, calibration)} after the analyst changes. ${notPushed}` }
+      }
+      analyzed = await runAnalysis(stages, analysis)
+      if (!analyzed.pass) return { status: 'blocked', note: `${analysisLine(hypothesis, analyzed)} after the analyst changes. ${notPushed}` }
     }
     const held = await hold(stages, analysis, round)
     if (held) return held
@@ -601,7 +649,7 @@ async function analyze(stages: Stages, analysis: Analysis): Promise<End> {
 async function vet(stages: Stages, analysis: Analysis, round: 1 | 2): Promise<{ round: VetRound; changed: boolean }> {
   const { input, deps, context, branch } = stages
   const { hypothesis } = analysis.freeze
-  const task = { branch, prereg: analysis.freeze, calibration: summary(finalCalibration(analysis)) }
+  const task = vetTask(branch, analysis)
   const lists = await pool(deps.domain.config.lenses.skeptic, stages.parallel, (lens, index) => {
     const id = `${round === 1 ? 'skeptic' : 'late-skeptic'}.${hypothesis}.${index + 1}`
     return step(deps.ledger, id, async () => {
@@ -679,6 +727,15 @@ const summary = (calibration: CalibrationRound): CalibrationSummary => ({
 /** The last calibration round. The stages give it to an agent only after it passed. */
 const finalCalibration = (analysis: Analysis): CalibrationRound => analysis.calibrations.at(-1)!
 
+/** The last analysis run. As with the calibration, the stages give it to an agent only after it passed. */
+const finalAnalysis = (analysis: Analysis): AnalysisRun => analysis.runs.at(-1)!
+
+/** What each vet agent and the writer read of one hypothesis. */
+const vetTask = (branch: Branch, analysis: Analysis) => {
+  const { round, command, outputs } = finalAnalysis(analysis)
+  return { branch, prereg: analysis.freeze, calibration: summary(finalCalibration(analysis)), analysis: { round, command, outputs } }
+}
+
 const oneLine = (text: string) => text.trim().replace(/\s*\n\s*/g, '; ')
 
 const notPushed = 'The run did not push the branch and opened no PR.'
@@ -693,6 +750,8 @@ async function outsidePaths(branch: Branch, allowed: (path: string) => boolean):
 
 const calibrationLine = (hypothesis: string, calibration: CalibrationRound) =>
   `Calibration round ${calibration.round} of ${hypothesis} failed (known recall ${calibration.recall ?? 'none'}, threshold ${calibration.threshold}): ${oneLine(calibration.reason)}`
+
+const analysisLine = (hypothesis: string, run: AnalysisRun) => `Analysis round ${run.round} of ${hypothesis} failed: ${oneLine(run.reason)}`
 
 /** Keeps the output of a domain command in the run store. */
 function keep(deps: ResearchDeps, run: DomainRun, hypothesis: string, round: number): Promise<string> {
@@ -727,14 +786,15 @@ async function calibrate(stages: Stages, analysis: Analysis): Promise<Calibratio
   const { deps, branch } = stages
   const { hypothesis, path } = analysis.freeze
   const round = analysis.calibrations.length + 1
-  const calibration = await step(deps.ledger, `calibrate.${hypothesis}.${round}`, async (): Promise<CalibrationRound> => {
+  const key = `calibrate.${hypothesis}.${round}`
+  const calibration = await step(deps.ledger, key, async (): Promise<CalibrationRound> => {
     const threshold = preregThreshold(new TextDecoder().decode(await branch.tree.read(`/${path}`)))
     const head = await branch.head()
-    const box = await deps.cleanBox(head, `calibrate.${hypothesis}.${round}`)
-    // Keep the snapshot on a replay, but run known again when the checkout changes.
-    const knownKey = `calibrate.${hypothesis}.${round}.known${box.copyId === undefined ? '' : `.${box.copyId}`}`
-    const known = await step(deps.ledger, knownKey, async () =>
-      keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'known', path), hypothesis, round))
+    const box = await deps.cleanBox(head, key)
+    // A new copy runs known again. Reuse its snapshot only on that copy, because inject can change its files.
+    const knownRun = await runDomainCommand(deps.config, box, 'known', path)
+    const knownId = await artifactId(new TextEncoder().encode(JSON.stringify(knownRun)))
+    const known = await step(deps.ledger, `${key}.known.${box.id}.${knownId}`, async () => keepOutputs(deps, box, knownRun, hypothesis, round))
     const inject = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'inject', path), hypothesis, round)
     const verdict = calibrationVerdict(known.run, inject.run, threshold)
     return {
@@ -745,6 +805,7 @@ async function calibrate(stages: Stages, analysis: Analysis): Promise<Calibratio
       known: known.artifacts,
       inject: inject.artifacts,
       outputs: verdict.outputs,
+      reads: { known: known.run.json?.reads ?? null, inject: inject.run.json?.reads ?? null },
       ...(verdict.pass ? { pass: true, reason: '', tail: '' } : { pass: false, reason: verdict.reason, tail: verdict.tail }),
     }
   })
@@ -753,8 +814,36 @@ async function calibrate(stages: Stages, analysis: Analysis): Promise<Calibratio
 }
 
 /**
- * Stage 11: reproduce of each prereg on one clean checkout of `head`, against the outputs of its last calibration.
- * True when each output hash matches.
+ * Stage 6: analyze on a new clean checkout of the run branch head, after a calibration passed. Its outputs must not
+ * give another hash for a path of the final calibration. As with the calibration, no output file goes on the run branch.
+ */
+async function runAnalysis(stages: Stages, analysis: Analysis): Promise<AnalysisRun> {
+  const { deps, branch } = stages
+  const { hypothesis, path } = analysis.freeze
+  const round = analysis.runs.length + 1
+  const key = `analysis.${hypothesis}.${round}`
+  const run = await step(deps.ledger, key, async (): Promise<AnalysisRun> => {
+    const head = await branch.head()
+    const box = await deps.cleanBox(head, key)
+    const kept = await keepOutputs(deps, box, await runDomainCommand(deps.config, box, 'analyze', path, hypothesis), hypothesis, round)
+    const verdict = analysisVerdict(kept.run, finalCalibration(analysis).outputs)
+    const [command = '', ...files] = kept.artifacts
+    return {
+      round,
+      head,
+      outputs: verdict.outputs,
+      command,
+      files,
+      ...(verdict.pass ? { pass: true, reason: '', tail: '' } : { pass: false, reason: verdict.reason, tail: verdict.tail }),
+    }
+  })
+  analysis.runs.push(run)
+  return run
+}
+
+/**
+ * Stage 11: reproduce of each prereg on one clean checkout of `head`, against the outputs of its last calibration and
+ * its last analysis. True when each output hash matches.
  */
 async function reproduce(stages: Stages, analyses: Analysis[], head: string): Promise<boolean> {
   const { deps } = stages
@@ -762,10 +851,11 @@ async function reproduce(stages: Stages, analyses: Analysis[], head: string): Pr
   for (const analysis of analyses) {
     const { hypothesis, path } = analysis.freeze
     const calibration = finalCalibration(analysis)
+    const expected = { ...calibration.outputs, ...finalAnalysis(analysis).outputs }
     const result = await step(deps.ledger, `reproduce.${hypothesis}.${head}`, async (): Promise<Reproduction> => {
       box ??= deps.cleanBox(head, `reproduce.${head}`)
       const run = await runDomainCommand(deps.config, await box, 'reproduce', path)
-      const verdict = compareReproduction(calibration.outputs, run)
+      const verdict = compareReproduction(expected, run)
       const artifact = await keep(deps, run, hypothesis, calibration.round)
       return { head, pass: verdict.pass, mismatches: verdict.mismatches, missing: verdict.missing, reason: verdict.pass ? '' : verdict.reason, artifact }
     })
@@ -987,6 +1077,10 @@ function analysisLines(analysis: Analysis): string[] {
     ...analysis.calibrations.map(
       (calibration) =>
         `- Calibration round ${calibration.round} at ${calibration.head.slice(0, 12)}: ${calibration.pass ? 'PASS' : 'FAIL'}, known recall ${calibration.recall ?? 'none'}, threshold ${calibration.threshold}, known output ${calibration.known.join(', ')}, inject output ${calibration.inject.join(', ')}${calibration.pass ? '' : `. ${oneLine(calibration.reason)}`}`,
+    ),
+    ...analysis.runs.map(
+      (run) =>
+        `- Analysis round ${run.round} at ${run.head.slice(0, 12)}: ${run.pass ? 'PASS' : 'FAIL'}, analyze output ${run.command}, output files ${run.files.join(', ') || 'none'}${run.pass ? '' : `. ${oneLine(run.reason)}`}`,
     ),
     ...objectionLines(analysis.rounds, analysis.answers),
     ...(analysis.dossier ? [`- Dossier: dossier/${hypothesis}.md, outcome ${analysis.dossier.outcome}`] : []),

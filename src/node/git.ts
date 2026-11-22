@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process'
 import { existsSync, realpathSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
+import { markedFiles } from '../core/merge.ts'
 import type { Branch, Branches, Frozen, Repo } from '../core/platform.ts'
 import type { RootFiles } from '../core/profiles.ts'
 import type { ResearchFiles } from '../core/research.ts'
@@ -63,11 +64,24 @@ export async function trackedFiles(tree: string): Promise<string[]> {
   return names.split('\n').filter(Boolean)
 }
 
-/** Commits every change in the worktree. Does nothing when nothing changed. */
+/**
+ * Commits every change in the worktree. Does nothing when nothing changed. A merge in progress always commits, so that
+ * its merge commit gets the second parent, also when the resolved tree is the same as the head.
+ */
 export async function commitAll(tree: string, message: string, commits: GitCommits): Promise<void> {
   await git(tree, 'add', '-A')
   const staged = await git(tree, 'diff', '--cached', '--name-only')
-  if (staged.trim() !== '') await git(tree, ...signature(commits), 'commit', '--no-verify', '-m', message)
+  if (staged.trim() !== '' || (await mergeInProgress(tree))) await git(tree, ...signature(commits), 'commit', '--no-verify', '-m', message)
+}
+
+/** True while the worktree has a merge in progress, that is, a MERGE_HEAD. */
+async function mergeInProgress(tree: string): Promise<boolean> {
+  try {
+    await git(tree, 'rev-parse', '-q', '--verify', 'MERGE_HEAD')
+    return true
+  } catch {
+    return false
+  }
 }
 
 export async function currentCommit(tree: string): Promise<string> {
@@ -183,9 +197,12 @@ function gitBranch(tree: string, name: string, commits: GitCommits): Branch {
     tree: diskFileSystem(tree),
     head: () => currentCommit(tree),
     changedFiles: (from, to) => changedFiles(tree, from, to),
+    touchedFiles: (from, to) => touchedFiles(tree, from, to),
     committedFiles: () => trackedFiles(tree),
     async pending() {
       // Staging shows new files in the diff. The reset after it keeps the index as it was, so run_tests still sees only committed files.
+      // A plain reset removes MERGE_HEAD, so during a merge only the index goes back to the head, and the merge stays.
+      const merging = await mergeInProgress(tree)
       await git(tree, 'add', '-A')
       try {
         const patch = await git(tree, 'diff', '--cached', '--no-color', '--no-ext-diff')
@@ -193,7 +210,7 @@ function gitBranch(tree: string, name: string, commits: GitCommits): Branch {
         const removed = await git(tree, 'diff', '--cached', '--name-only', '--no-renames', '--diff-filter=D')
         return { diff: patch, changed: names.split('\n').filter(Boolean), removed: removed.split('\n').filter(Boolean) }
       } finally {
-        await git(tree, 'reset', '-q')
+        await (merging ? git(tree, 'read-tree', 'HEAD') : git(tree, 'reset', '-q'))
       }
     },
     commit: (message) => commitAll(tree, message, commits),
@@ -205,6 +222,25 @@ function gitBranch(tree: string, name: string, commits: GitCommits): Branch {
         await git(tree, 'merge', '--abort').catch(() => undefined)
         throw error
       }
+    },
+    mergeBaseWith: async (commit) => (await git(tree, 'merge-base', 'HEAD', commit)).trim(),
+    async mergeCommit(commit, message) {
+      const files = await touchedFiles(tree, (await git(tree, 'merge-base', 'HEAD', commit)).trim(), commit)
+      try {
+        await git(tree, ...signature(commits), 'merge', '--no-ff', '--no-edit', '-m', message, commit)
+        return { files, conflicts: [] }
+      } catch (error) {
+        // A conflict keeps the merge in progress for the fixer. Any other failure leaves a clean worktree.
+        const conflicts = (await git(tree, 'diff', '--name-only', '--diff-filter=U')).split('\n').filter(Boolean)
+        if (conflicts.length > 0) return { files, conflicts }
+        await git(tree, 'merge', '--abort').catch(() => undefined)
+        throw error
+      }
+    },
+    async finishMerge(files, message) {
+      const marked = await markedFiles(diskFileSystem(tree), files)
+      if (marked.length === 0 && (await mergeInProgress(tree))) await commitAll(tree, message, commits)
+      return marked
     },
   }
 }
@@ -226,6 +262,10 @@ export function gitBranches(repo: string, dir: string, commits: GitCommits = { u
       return gitBranch(tree, name, commits)
     },
     exists: async (name) => (await branchExists(repo, name)) || (await remoteBranchExists(repo, name)),
+    async remoteHead(ref) {
+      await git(repo, 'fetch', '-q', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`)
+      return (await git(repo, 'rev-parse', '--verify', `refs/remotes/origin/${ref}^{commit}`)).trim()
+    },
     async push(branch) {
       await git(worktreePath(dir, branch.name), 'push', 'origin', `HEAD:refs/heads/${branch.name}`)
       return branch.head()

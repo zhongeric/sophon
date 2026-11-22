@@ -203,6 +203,22 @@ test('with --hotfix, every question takes its recommendation, and run questions 
   ])
 })
 
+test('an asker that recommends posts nothing and answers each batch with its recommendations, also a batch posted before', async () => {
+  const { channel, posted } = recordingChannel()
+  const ledger = memoryLedger({ 'questions:old': [ask('Q1', 'user')], 'posted:old': { batch: 'old', ref: 'memory', at: 'now' } })
+  const questions = asker(ledger, channel, 'run-1', () => {}, { recommend: true })
+  await questions.post('intake', [ask('Q1', 'user'), ask('Q2', 'run')])
+  assert.deepEqual(posted, [])
+  assert.deepEqual(await questions.wait('intake'), [
+    { id: 'Q1', question: 'Q1?', answer: 'a', recommended: true },
+    { id: 'Q2', question: 'Q2?', answer: 'a', recommended: true, decidedBy: 'run' },
+  ])
+  // A batch that waited for the user before the standing answers takes the recommendation on the next post.
+  await questions.post('old', [ask('Q1', 'user')])
+  assert.deepEqual(await questions.wait('old'), [{ id: 'Q1', question: 'Q1?', answer: 'a', recommended: true }])
+  assert.deepEqual(posted, [])
+})
+
 test("decisions.md lists the user's decisions, then the decisions that the run made", () => {
   assert.deepEqual(decisionsFile(memoryLedger()), {})
   const user = { id: 'Q1', question: 'Cut the CLI?', answer: 'No', recommended: false }

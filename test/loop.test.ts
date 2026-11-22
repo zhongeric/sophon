@@ -37,8 +37,8 @@ function testCalls(options: { setupFails?: boolean } = {}) {
 
 const patchOutput = (turns: Turn[]) => turns.filter((turn) => turn.role === 'patch' && turn.output).map((turn) => turn.output).join('\n')
 
-test('the loop reviews, gates, patches, swaps families, checks and passes', async () => {
-  const repo = fixtureRepo()
+test('a change to an agent prompt takes the strict loop: it reviews, gates, patches, swaps families, checks and passes', async () => {
+  const repo = fixtureRepo({ strict: true })
   const turns: Turn[] = []
   const result = await runLoop(repo, 'e2e', runsDir(), { dispatch: scriptedDispatch(probeNetwork(script, 'minimize'), turns) })
 
@@ -61,13 +61,19 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   const providers = (role: string) => new Set(turns.filter((turn) => turn.role === role).map((turn) => turn.provider))
   for (const role of ['minimize', 'bugs', 'anti-slop', 'patch', 'questions', 'late-rules', 'intent']) assert.deepEqual(providers(role), new Set(['claude']))
   for (const role of ['rules', 'late-minimize', 'late-bugs']) assert.deepEqual(providers(role), new Set(['codex']))
+  assert.ok(!turns.some((turn) => turn.role === 'cleanup'))
 
   const gateLog = readFileSync(join(result.dir, 'gate-log.txt'), 'utf8')
-  assert.match(gateLog, /# Step 1 \| model_family=claude\+codex \| minimize=claude-opus-5-5 rules=gpt-6.1-sol bugs=claude-opus-5-5/)
+  assert.match(gateLog, /^TRIAGE path=full reason=not-docs-or-tests loop=strict files=agents\/math\.md,/)
+  assert.match(result.report, /^- Triage: `TRIAGE path=full reason=not-docs-or-tests loop=strict /m)
+  assert.match(gateLog, /# Step 1 \| model_family=claude\+codex \| minimize=claude-opus-5-5 rules=gpt-6.1-sol bugs=claude-opus-5-5 anti-slop=claude-opus-5-5 patch=claude-opus-5-5 questions=claude-opus-5-5\n/)
   assert.match(gateLog, /# Step 2 \| model_family=codex\+claude \| late-minimize=gpt-6.1-sol late-rules=claude-opus-5-5/)
   assert.match(gateLog, /FINDING bugs-001 \| track=bugs \| severity=critical \| ACTION=keep/)
   assert.match(gateLog, /FINDING min-001 \| track=minimize \| severity=low \| ACTION=keep/)
   assert.match(result.report, /skipped: min-001 \(inlining adds nothing\)/)
+  assert.match(result.report, /^- Step 1 findings: host=0, minimize=1, rules=0, bugs=1, anti-slop=0$/m)
+  assert.match(result.report, /^- Step 2 gate: kept 0 of 0$/m)
+  assert.match(result.report, /^- \[x\] Step 1 and Step 2 ran with context-free reviewers: each reviewer ran in a new session$/m)
   // The fixture has no origin and no usable key, so the host commits unsigned.
   assert.match(result.report, /^- Commits: unsigned \(no GitHub origin\)$/m)
   assert.equal(readFileSync(join(result.dir, 'report.md'), 'utf8'), result.report)
@@ -87,6 +93,77 @@ test('the loop reviews, gates, patches, swaps families, checks and passes', asyn
   assert.equal(branchLine(result, repo), `Fixes are on factory/e2e. Apply them with: git -C ${repo} merge --ff-only factory/e2e`)
 })
 
+test('a TypeScript change takes the standard loop: bugs, rules and cleanup, the gate, patch, late bugs on the other family, checks and intent', async () => {
+  const repo = fixtureRepo()
+  const turns: Turn[] = []
+  const result = await runLoop(repo, 'standard', runsDir(), { dispatch: scriptedDispatch(probeNetwork(script, 'cleanup'), turns) })
+
+  assert.equal(result.pass, true, result.report)
+  assert.equal(execFileSync('git', ['show', `${result.branch}:src/math.ts`], { cwd: repo }).toString(), fixed)
+  assert.deepEqual(new Set(turns.map((turn) => turn.role)), new Set(['rules', 'bugs', 'cleanup', 'questions', 'patch', 'late-bugs', 'intent']))
+  const outputs = (role: string) => turns.filter((turn) => turn.role === role && turn.output).map((turn) => turn.output!).join('\n')
+  assert.match(outputs('cleanup'), /write refused: .*Read-only file system/)
+  assert.match(outputs('cleanup'), /cell fetch: .*network access is off/)
+  const providers = (role: string) => new Set(turns.filter((turn) => turn.role === role).map((turn) => turn.provider))
+  for (const role of ['bugs', 'cleanup', 'patch', 'questions', 'intent']) assert.deepEqual(providers(role), new Set(['claude']))
+  for (const role of ['rules', 'late-bugs']) assert.deepEqual(providers(role), new Set(['codex']))
+  assert.match(turns.find((turn) => turn.role === 'cleanup')!.request, /Agent role: cleanup/)
+
+  const gateLog = readFileSync(join(result.dir, 'gate-log.txt'), 'utf8')
+  assert.match(gateLog, /^TRIAGE path=full reason=not-docs-or-tests loop=standard files=src\/math\.ts,test\/sub\.test\.ts profiles=docs\n/)
+  assert.match(gateLog, /# Step 1 \| model_family=codex\+claude \| rules=gpt-6.1-sol bugs=claude-opus-5-5 cleanup=claude-opus-5-5 patch=claude-opus-5-5 questions=claude-opus-5-5\n/)
+  assert.match(gateLog, /FINDING clean-001 \| track=cleanup \| severity=low \| ACTION=keep/)
+  assert.match(gateLog, /# Late bugs \| model_family=codex \| late-bugs=gpt-6.1-sol\n/)
+  assert.doesNotMatch(gateLog, /# Step 2/)
+
+  assert.match(result.report, /^- Triage: `TRIAGE path=full reason=not-docs-or-tests loop=standard files=src\/math\.ts,test\/sub\.test\.ts profiles=docs`$/m)
+  assert.match(result.report, /^- Step 1 findings: host=0, rules=0, bugs=1, cleanup=1$/m)
+  assert.match(result.report, /^- Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 \(sub returns a - b\); skipped: clean-001 \(inlining adds nothing\)$/m)
+  assert.match(result.report, /^- Late bugs gate: kept 0 of 0\n- Late bugs patch: nothing to apply$/m)
+  assert.doesNotMatch(result.report, /Step 2/)
+  assert.match(result.report, /^- \[x\] Step 1 and the late bugs pass ran with context-free reviewers: each reviewer ran in a new session$/m)
+  assert.match(result.report, /^- \[x\] The late bugs pass used another model family: /m)
+  assert.match(result.report, /^\| step1\.cleanup \| claude-opus-5-5 \| [1-9]\d* \|/m)
+  assert.match(result.report, /^## Intent$/m)
+})
+
+test('--full sends a TypeScript change to the strict loop', async () => {
+  const repo = fixtureRepo()
+  const input = { ...(await loopInput(repo, 'full')), full: true }
+  const turns: Turn[] = []
+  const result = await runLoop(repo, 'full', runsDir(), { dispatch: scriptedDispatch(script, turns), input })
+
+  assert.equal(result.pass, true, result.report)
+  for (const role of ['minimize', 'rules', 'bugs', 'anti-slop', 'late-minimize', 'late-rules', 'late-bugs']) assert.ok(turns.some((turn) => turn.role === role), `${role} did not run`)
+  assert.ok(!turns.some((turn) => turn.role === 'cleanup'))
+  assert.match(result.report, /^- Triage: `TRIAGE path=full reason=full-asked loop=strict profiles=/m)
+  assert.match(result.report, /^- Step 2 gate: kept 0 of 0$/m)
+})
+
+test('a resumed run whose triage record has no loop, from before D20, runs the strict loop', async () => {
+  const repo = fixtureRepo()
+  const dir = runsDir()
+  const { channel, replies } = memoryChannel({ ask: null })
+  await assert.rejects(runLoop(repo, 'old-triage', dir, { channel, dispatch: scriptedDispatch(script, []) }), PausedError)
+  const ledger = fileLedger(join(dir, 'old-triage', 'state.json'))
+  const recorded = ledger.get<{ result: Record<string, unknown> }>('step:triage')
+  assert.ok(recorded)
+  assert.equal(recorded.result.loop, 'standard')
+  const { loop: _loop, ...old } = recorded.result
+  ledger.put('step:triage', { result: old })
+
+  replies.ask = '/answer recommended'
+  const turns: Turn[] = []
+  const result = await runLoop(repo, 'old-triage', dir, { channel, dispatch: scriptedDispatch(script, turns) })
+  assert.equal(result.pass, true, result.report)
+  for (const role of ['minimize', 'anti-slop', 'late-minimize', 'late-rules', 'late-bugs']) assert.ok(turns.some((turn) => turn.role === role), `${role} did not run`)
+  // The resume reuses the rules and bugs reviews of the first call, and runs no cleanup reviewer.
+  for (const role of ['rules', 'bugs', 'cleanup']) assert.ok(!turns.some((turn) => turn.role === role), `${role} ran again`)
+  assert.match(result.report, /^- Triage: `TRIAGE path=full reason=not-docs-or-tests loop=strict /m)
+  assert.match(result.report, /^- Step 1 findings: host=0, minimize=1, rules=0, bugs=1, anti-slop=0$/m)
+  assert.match(result.report, /^- Step 2 gate: kept 0 of 0$/m)
+})
+
 test('the host refuses a patch log while a targeted test fails, and accepts it after the fix', async () => {
   const repo = fixtureRepo()
   const turns: Turn[] = []
@@ -101,7 +178,7 @@ test('the host refuses a patch log while a targeted test fails, and accepts it a
   assert.doesNotMatch(output, /FAILING PATCH ACCEPTED/)
   assert.match(output, /checks: syntax=skipped smoke=pass/)
   assert.ok(turns.some((turn) => turn.role === 'patch' && turn.request.includes('the host runs the targeted tests of the files that you changed')))
-  assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 \(sub returns a - b\); skipped: min-001 \(inlining adds nothing\)$/m)
+  assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 \(sub returns a - b\); skipped: clean-001 \(inlining adds nothing\)$/m)
 })
 
 test('a failed setup at the patch gate accepts the log, and the report says that the targeted tests did not run', async () => {
@@ -121,7 +198,73 @@ test('a patch agent that changed no files submits without a gate run', async () 
 
   // Only the run_tests call of the bugs reviewer reaches the test runner.
   assert.deepEqual(calls, [['test/sub.test.ts']])
-  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(callers depend on the sum\); min-001 \(inlining adds nothing\)$/m)
+  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(callers depend on the sum\); clean-001 \(inlining adds nothing\)$/m)
+})
+
+/** The loop input of the fixture with tests off and with the ci commands of `ci`. */
+async function ciInput(repo: string, runId: string, ci: Record<string, string>): Promise<LoopInput> {
+  const input = await loopInput(repo, runId)
+  return { ...input, config: { ...input.config, tests: null, ci } }
+}
+
+const subCi = { sub: 'env -u NODE_TEST_CONTEXT node --test test/sub.test.ts' }
+
+/** Records the files of each ci call of the checker. With `setupFails`, each call gives a failed setup and runs nothing. */
+function ciCalls(options: { setupFails?: boolean } = {}) {
+  const calls: string[][] = []
+  const checker = (real: Checker): Checker => ({
+    ...real,
+    ci: async (changed) => {
+      calls.push(changed)
+      if (options.setupFails) return [{ name: 'setup', command: 'npm ci', status: 'fail', exit_code: 1, output: 'npm ERR! setup failed' }]
+      if (!real.ci) throw new Error('the checker of the ci input has no ci')
+      return real.ci(changed)
+    },
+  })
+  return { calls, checker }
+}
+
+test('with ci and no tests, the host refuses a patch log while a ci command fails, and accepts it after the fix', async () => {
+  const repo = fixtureRepo()
+  const turns: Turn[] = []
+  const { calls, checker } = ciCalls()
+  const input = await ciInput(repo, 'ci-break-first', subCi)
+  const result = await runLoop(repo, 'ci-break-first', runsDir(), { input, checker, dispatch: scriptedDispatch(scriptFor({ tests: false, breakFirst: true }), turns) })
+
+  assert.equal(result.pass, true, result.report)
+  assert.equal(execFileSync('git', ['show', `${result.branch}:src/math.ts`], { cwd: repo }).toString(), fixed)
+  const output = patchOutput(turns)
+  assert.match(output, /refused: .*the ci commands failed \(ci sub\)\. Fix the cause and submit again\./)
+  assert.match(output, /--- ci sub \(exit code 1\) ---/)
+  assert.match(output, /3 !== 2/)
+  assert.doesNotMatch(output, /FAILING PATCH ACCEPTED/)
+  assert.deepEqual(calls, [['src/math.ts'], ['src/math.ts']])
+  assert.ok(turns.some((turn) => turn.role === 'patch' && turn.request.includes('When you submit, the host runs the ci commands of the repository, and refuses the log while one fails.')))
+  assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 \(sub returns a - b\); skipped: clean-001 \(inlining adds nothing\)$/m)
+  // On Node, the final checks also run ci.
+  assert.match(result.report, /ci sub/)
+})
+
+test('a patch agent that changed no files runs no ci', async () => {
+  const repo = fixtureRepo()
+  const { calls, checker } = ciCalls()
+  const input = await ciInput(repo, 'ci-no-edits', subCi)
+  const result = await runLoop(repo, 'ci-no-edits', runsDir(), { input, checker, dispatch: scriptedDispatch(scriptFor({ rejectBug: true, tests: false }), []) })
+
+  assert.deepEqual(calls, [])
+  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(callers depend on the sum\); clean-001 \(inlining adds nothing\)$/m)
+})
+
+test('a failed setup at the ci gate accepts the log, and the report says that the tests did not run', async () => {
+  const repo = fixtureRepo()
+  const { calls, checker } = ciCalls({ setupFails: true })
+  const input = await ciInput(repo, 'ci-setup', subCi)
+  const result = await runLoop(repo, 'ci-setup', runsDir(), { input, checker, dispatch: scriptedDispatch(scriptFor({ tests: false }), []) })
+
+  assert.equal(result.pass, true, result.report)
+  assert.equal(execFileSync('git', ['show', `${result.branch}:src/math.ts`], { cwd: repo }).toString(), fixed)
+  assert.deepEqual(calls, [['src/math.ts']])
+  assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 .*; targeted tests did not run: the setup failed$/m)
 })
 
 test('a patch agent that reverts its edit after a refusal, because the targeted test fails at the base, can skip the finding', async () => {
@@ -132,9 +275,9 @@ test('a patch agent that reverts its edit after a refusal, because the targeted 
       ? {
           cell: [
             `await tools.Write({ file_path: '/repo/src/math.ts', content: ${JSON.stringify(`// sub\n${base}`)} })`,
-            `try { await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'commented sub' }], skipped: [{ id: 'min-001', reason: 'inlining adds nothing' }] }); text('FAILING PATCH ACCEPTED') } catch (error) { text('refused: ' + error) }`,
+            `try { await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'commented sub' }], skipped: [{ id: 'clean-001', reason: 'inlining adds nothing' }] }); text('FAILING PATCH ACCEPTED') } catch (error) { text('refused: ' + error) }`,
             `await tools.Write({ file_path: '/repo/src/math.ts', content: ${JSON.stringify(base)} })`,
-            `await tools.submit_patch_log({ applied: [], skipped: [{ id: 'bugs-001', reason: 'test/sub.test.ts fails at the base' }, { id: 'min-001', reason: 'inlining adds nothing' }] })`,
+            `await tools.submit_patch_log({ applied: [], skipped: [{ id: 'bugs-001', reason: 'test/sub.test.ts fails at the base' }, { id: 'clean-001', reason: 'inlining adds nothing' }] })`,
           ].join('\n'),
         }
       : script(turn)
@@ -145,7 +288,7 @@ test('a patch agent that reverts its edit after a refusal, because the targeted 
   assert.doesNotMatch(patchOutput(turns), /FAILING PATCH ACCEPTED/)
   // The bugs reviewer and the first submit reach the test runner. The reverted edit does not count at the second submit.
   assert.deepEqual(calls, [['test/sub.test.ts'], ['test/add.test.ts', 'test/sub.test.ts']])
-  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(test\/sub\.test\.ts fails at the base\); min-001 \(inlining adds nothing\)$/m)
+  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(test\/sub\.test\.ts fails at the base\); clean-001 \(inlining adds nothing\)$/m)
 })
 
 test('a patch agent that reverses a directory rename after a failed test can skip without another gate run', async () => {
@@ -155,9 +298,9 @@ test('a patch agent that reverses a directory rename after a failed test can ski
       ? {
           cell: [
             `text(JSON.stringify(await tools.Bash({ command: 'mv src moved' })))`,
-            `try { await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'moved src' }], skipped: [{ id: 'min-001', reason: 'inlining adds nothing' }] }); text('FAILING PATCH ACCEPTED') } catch (error) { text('refused: ' + error) }`,
+            `try { await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'moved src' }], skipped: [{ id: 'clean-001', reason: 'inlining adds nothing' }] }); text('FAILING PATCH ACCEPTED') } catch (error) { text('refused: ' + error) }`,
             `text(JSON.stringify(await tools.Bash({ command: 'mv moved src' })))`,
-            `await tools.submit_patch_log({ applied: [], skipped: [{ id: 'bugs-001', reason: 'test/sub.test.ts fails at the base' }, { id: 'min-001', reason: 'inlining adds nothing' }] })`,
+            `await tools.submit_patch_log({ applied: [], skipped: [{ id: 'bugs-001', reason: 'test/sub.test.ts fails at the base' }, { id: 'clean-001', reason: 'inlining adds nothing' }] })`,
           ].join('\n'),
         }
       : script(turn)
@@ -167,7 +310,7 @@ test('a patch agent that reverses a directory rename after a failed test can ski
   assert.match(patchOutput(turns), /refused: .*the targeted tests of your edits failed \(test\/add\.test\.ts, test\/sub\.test\.ts\)/)
   assert.doesNotMatch(patchOutput(turns), /FAILING PATCH ACCEPTED/)
   assert.deepEqual(calls, [['test/sub.test.ts'], ['test/add.test.ts', 'test/sub.test.ts']])
-  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(test\/sub\.test\.ts fails at the base\); min-001 \(inlining adds nothing\)$/m)
+  assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(test\/sub\.test\.ts fails at the base\); clean-001 \(inlining adds nothing\)$/m)
 })
 
 const hasBranch = (repo: string, name: string) => {
@@ -285,7 +428,7 @@ test('at the cost budget, the run posts a notice; at twice the budget, it asks, 
   assert.match(asked.questions[0]!.recommendation, /^Raise the budget to \$0\.\d{2}$/)
   // The step 1 reviewers spent more than twice the budget, so no patch agent opened. The bugs reviewer starts last, after
   // the diff split, so the budget can stop it before its first turn.
-  assert.ok(turns.some((turn) => ['minimize', 'rules', 'anti-slop', 'bugs'].includes(turn.role)))
+  assert.ok(turns.some((turn) => ['rules', 'cleanup', 'bugs'].includes(turn.role)))
   assert.ok(!turns.some((turn) => turn.role === 'patch'))
   assert.deepEqual([result.pass, result.stopped], [false, true])
   assert.ok(result.usage.usd >= 0.05)
@@ -356,7 +499,7 @@ test('a resumed run does not repeat finished steps', async () => {
   const second: Turn[] = []
   const result = await runLoop(repo, 'resume', dir, { dispatch: scriptedDispatch(script, second) })
   assert.equal(result.pass, true)
-  for (const role of ['minimize', 'rules', 'bugs', 'anti-slop']) assert.ok(!second.some((turn) => turn.role === role), `${role} ran again`)
+  for (const role of ['rules', 'bugs', 'cleanup']) assert.ok(!second.some((turn) => turn.role === role), `${role} ran again`)
   assert.ok(second.some((turn) => turn.role === 'patch'))
 })
 
@@ -364,9 +507,10 @@ test('a planned stop in step 1 ends the call only after the questions agent sett
   const repo = fixtureRepo()
   const input = await loopInput(repo, 'stop')
   const run = await nodeRun({ config: input.config, runId: 'stop', runsDir: runsDir(), source: gitSource(repo) })
-  const reviewed = () => ['minimize', 'rules', 'bugs', 'anti-slop'].every((id) => run.ledger.get(`step:step1.${id}`) !== undefined)
-  // The budget is spent when the step 1 reviewers finished, so the step 1 host check stops the run.
-  const ledger = callBudget(run.ledger, { budgetMs: 1000, startedAt: 0, now: () => (reviewed() ? 5000 : 0) })
+  const reviewed = () => ['rules', 'bugs', 'cleanup'].every((id) => run.ledger.get(`step:step1.${id}`) !== undefined)
+  // Each turn of step 1 fits in the budget until the step 1 reviewers finished. Then the budget is spent, so the step 1
+  // host check stops the run.
+  const ledger = callBudget(run.ledger, { budgetMs: 600_000, startedAt: 0, now: () => (reviewed() ? 700_000 : 0) })
   const scripted = scriptedDispatch(scriptFor({ tests: false }), [])
   // The questions agent answers only after the reviewers finished.
   const dispatch: Contracts.RuntimeOptions['dispatch'] = async (request, signal, timing) => {
@@ -498,6 +642,20 @@ test('the user answers the open questions before the gate, and decides the findi
   assert.match(result.report, /## Your decisions\n\n- May sub return a negative number\? \*\*No, throw an error\*\*/)
 })
 
+test('with the standing answers of the repository, the open questions and the held findings take the recommendation, and nothing is posted', async () => {
+  const repo = fixtureRepo()
+  const turns: Turn[] = []
+  const { channel, posted } = memoryChannel({ ask: null, 'step1.gate': null })
+  const base = await loopInput(repo, 'standing')
+  const input = { ...base, config: { ...base.config, questions: 'recommended' as const } }
+  const result = await runLoop(repo, 'standing', runsDir(), { channel, input, dispatch: scriptedDispatch(scriptFor({ holdBug: true, tests: true }), turns) })
+
+  assert.equal(result.pass, true, result.report)
+  assert.deepEqual(posted, [])
+  assert.match(result.report, /## Your decisions\n\n- May sub return a negative number\? \*\*.+\*\* \(recommended\)/)
+  assert.match(result.report, /bugs-001 at src\/math\.ts:6: Subtract b in sub\. Fix it\? \*\*.+\*\* \(recommended\)/)
+})
+
 test('a run without answers pauses, and resumes without asking again or repeating the reviewers', async () => {
   const repo = fixtureRepo()
   const dir = runsDir()
@@ -514,13 +672,13 @@ test('a run without answers pauses, and resumes without asking again or repeatin
   const result = await runLoop(repo, 'pause', dir, { channel, dispatch: scriptedDispatch(script, second) })
   assert.equal(result.pass, true)
   assert.equal(posted.length, 1)
-  for (const role of ['questions', 'minimize', 'rules', 'bugs', 'anti-slop']) assert.ok(!second.some((turn) => turn.role === role), `${role} ran again`)
+  for (const role of ['questions', 'rules', 'bugs', 'cleanup']) assert.ok(!second.some((turn) => turn.role === role), `${role} ran again`)
 })
 
 test('the loop stops before any work when a model is outside the allowed list', async () => {
   const repo = fixtureRepo()
   const input = await loopInput(repo, 'not-allowed')
-  input.models = { ...defaultModels, step1: { ...defaultModels.step1, 'anti-slop': { provider: 'claude', model: 'claude-sonnet-5-5' } } }
+  input.models = { ...defaultModels, step1: { ...defaultModels.step1, cleanup: { provider: 'claude', model: 'claude-sonnet-5-5' } } }
   const turns: Turn[] = []
   await assert.rejects(runLoop(repo, 'not-allowed', runsDir(), { dispatch: scriptedDispatch(script, turns), input }), /outside the allowed list .*claude-sonnet-5-5/)
   assert.equal(turns.length, 0)
@@ -531,7 +689,7 @@ test('ALLOWED_MODELS replaces the allowed list', async () => {
   assert.deepEqual(allowedModelsFrom(' , '), defaultAllowedModels)
   const repo = fixtureRepo()
   const input = await loopInput(repo, 'allowed-setting')
-  input.models = { ...defaultModels, step1: { ...defaultModels.step1, 'anti-slop': { provider: 'claude', model: 'claude-sonnet-5-5' } } }
+  input.models = { ...defaultModels, step1: { ...defaultModels.step1, cleanup: { provider: 'claude', model: 'claude-sonnet-5-5' } } }
   input.allowedModels = allowedModelsFrom('claude-sonnet-5-5, claude-opus-5-5')
   const turns: Turn[] = []
   await assert.rejects(
@@ -653,7 +811,7 @@ const largeScript: Script = ({ role, output, request }) => {
     case 'bugs':
       if (request.includes('src/alpha/a.ts')) return { cell: findings([at('src/alpha/a.ts:3', 'export const a2 = 2', 'high')]) }
       return { cell: findings([at('src/beta/b.ts:3', 'export const b2 = 2', 'medium')]) }
-    case 'anti-slop':
+    case 'cleanup':
       return { cell: findings([at('src/beta/b.ts:5', 'export const b4 = 4', 'info'), at('src/util.ts:1', 'export const util = 2', 'info')]) }
     case 'questions':
       return { cell: 'await tools.submit_questions({ questions: [] })' }
@@ -668,10 +826,10 @@ const largeScript: Script = ({ role, output, request }) => {
           cell: [
             write('src/beta/b.ts', largeFixed.beta),
             `try { ${write('src/alpha/a.ts', 'x')}; text('OTHER AGENT FILE WRITTEN') } catch (error) { text('refused: ' + error) }`,
-            log(['anti-001'], [{ id: 'bugs-002', reason: 'b2 also needs a3 in src/alpha/a.ts' }]),
+            log(['clean-001'], [{ id: 'bugs-002', reason: 'b2 also needs a3 in src/alpha/a.ts' }]),
           ].join('\n'),
         }
-      return { cell: [write('src/util.ts', largeFixed.util), log(['anti-002'])].join('\n') }
+      return { cell: [write('src/util.ts', largeFixed.util), log(['clean-002'])].join('\n') }
     default:
       return { cell: findings([]) }
   }
@@ -690,7 +848,7 @@ test('a large change splits the bugs review across reviewers, and patch agents w
   assert.equal(bugs.length, 2)
   assert.ok(bugs.some((turn) => /Your files, 2 of the 3 files of the change: src\/alpha\/a\.ts, src\/util\.ts\./.test(turn.request)))
   assert.ok(bugs.some((turn) => /Your files, 1 of the 3 files of the change: src\/beta\/b\.ts\./.test(turn.request)))
-  assert.match(result.report, /Step 1 findings: host=0, minimize=0, rules=0, bugs=2, anti-slop=2/)
+  assert.match(result.report, /Step 1 findings: host=0, rules=0, bugs=2, cleanup=2$/m)
   const gateLog = readFileSync(join(result.dir, 'gate-log.txt'), 'utf8')
   assert.match(gateLog, /FINDING bugs-001 \| track=bugs \| severity=high/)
   assert.match(gateLog, /FINDING bugs-002 \| track=bugs \| severity=medium/)
@@ -698,14 +856,14 @@ test('a large change splits the bugs review across reviewers, and patch agents w
   // Three patch agents at the same time: alpha, beta with its info finding, and the other info finding. Then one for the deferred finding.
   assert.equal(first('patch').length, 4)
   assert.match(turns.filter((turn) => turn.role === 'patch' && turn.output).map((turn) => turn.output).join('\n'), /refused: .*EACCES/)
-  assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12} \(3 patch agents at the same time, then one for bugs-002\); applied: bugs-001 \(fixed\); anti-001 \(fixed\); anti-002 \(fixed\); bugs-002 \(fixed a3\)/)
+  assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12} \(3 patch agents at the same time, then one for bugs-002\); applied: bugs-001 \(fixed\); clean-001 \(fixed\); clean-002 \(fixed\); bugs-002 \(fixed a3\)/)
   const show = (path: string) => execFileSync('git', ['show', `${result.branch}:${path}`], { cwd: repo }).toString()
   assert.deepEqual([show('src/alpha/a.ts'), show('src/beta/b.ts'), show('src/util.ts')], [largeFixed.alphaFinal, largeFixed.beta, largeFixed.util])
   // Each patch agent gates only the tests of its own files: alpha, beta, nothing for util, and alpha for the deferred finding.
   assert.deepEqual(calls.map((tests) => tests.join(' ')).sort(), ['test/alpha.test.ts', 'test/alpha.test.ts', 'test/beta.test.ts'])
   assert.deepEqual(fileLedger(join(result.dir, 'state.json')).get('groups:step1.patch'), [
     { ids: ['bugs-001'], files: ['src/alpha/a.ts'] },
-    { ids: ['bugs-002', 'anti-001'], files: ['src/beta/b.ts'] },
-    { ids: ['anti-002'], files: ['src/util.ts'] },
+    { ids: ['bugs-002', 'clean-001'], files: ['src/beta/b.ts'] },
+    { ids: ['clean-002'], files: ['src/util.ts'] },
   ])
 })

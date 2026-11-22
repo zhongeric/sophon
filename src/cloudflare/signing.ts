@@ -3,6 +3,14 @@ import { commitMode, readSignatureRules, type GitHubAnswer } from '../core/signi
 import { StopError } from '../core/stop.ts'
 import { GitHubError, type GitHub } from './github.ts'
 
+const jsonOrNull = (text: string): unknown => {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
 /** The signing check of the Cloudflare host. Its commits go through the Git Data API and are unsigned, so a rule that requires signatures stops the run. */
 export function githubSigning(gh: GitHub, owner: string, repo: string): Signing {
   const get = async (path: string): Promise<GitHubAnswer> => {
@@ -10,7 +18,7 @@ export function githubSigning(gh: GitHub, owner: string, repo: string): Signing 
       return { body: await gh.json<unknown>('GET', path), status: 200 }
     } catch (error) {
       // A rate limit rejects the request, so the run loop tries again.
-      if (error instanceof GitHubError && !error.rateLimited) return { body: null, status: error.status }
+      if (error instanceof GitHubError && !error.rateLimited) return { body: jsonOrNull(error.body), status: error.status }
       throw error
     }
   }

@@ -1,6 +1,5 @@
 import type { Ledger } from '../core/ledger.ts'
 import { PausedError } from '../core/questions.ts'
-import { StopError } from '../core/stop.ts'
 import type { Box, BoxResult, JobOptions } from './box.ts'
 
 /**
@@ -27,7 +26,10 @@ export type JobRunner = {
    * job again when the machine does not have it. Throws a PausedError at `deadline`, so that a later call polls the job.
    */
   pause(key: string, argv: string[], options: JobOptions & { deadline: number }): Promise<BoxResult>
-  /** Starts a new job and waits for its end in this call, with no deadline. */
+  /**
+   * Starts a new job and waits for its end in this call. With the deadline of the runner, the job ends by then, and no job
+   * starts when less than a second is left.
+   */
   wait(argv: string[], options: JobOptions): Promise<BoxResult>
   /** Kills the open wait-mode jobs of earlier calls. Call it before an agent turn can run again. */
   killStale(): Promise<void>
@@ -39,41 +41,49 @@ export type JobRunner = {
 const openKey = 'jobs:open'
 const recordKey = (id: string) => `job:${id}`
 const pauseKey = (key: string) => `job-key:${key}`
-// The cwd and the command, not the pause key: a new copy of a clean box gives a new pause key in the same directory.
-const startsKey = (cwd: string, argv: string[]) => `job-starts:${cwd}:${argv.join(' ')}`
-/** The most starts of one pause-mode command. A command that kills the machine otherwise starts again with no end. */
-const maxStarts = 3
+// A new copy keeps the start count. Only an explicit error resume gives each command a new retry budget.
+const retryBudgetKey = 'jobs:retry-budget'
+const startsKey = (ledger: Ledger, cwd: string, argv: string[]) => {
+  const budget = ledger.get<number>(retryBudgetKey)
+  return `${budget === undefined ? 'job-starts' : `job-starts@${budget}`}:${cwd}:${argv.join(' ')}`
+}
+const maxPauseStarts = 3
 const firstPollMs = 250
+/** The shortest timeout of a wait-mode job. With less time left in the call, the job does not start. */
+const minWaitMs = 1_000
+
+/** Resets lost-job retries for a restart after an error, by the administrator or by the host (D13), not for the retries of one attempt. */
+export function resetJobStarts(ledger: Ledger): void {
+  ledger.put(retryBudgetKey, (ledger.get<number>(retryBudgetKey) ?? 0) + 1)
+}
 
 /** True when a job needs a kill or file cleanup, so that the end of a run needs the machine only then. */
 export const hasOpenJobs = (ledger: Ledger): boolean => (ledger.get<string[]>(openKey) ?? []).length > 0
 
-/** The jobs of one alarm call on `box`, in the ledger of the run. `now` and `sleep` are for tests. */
+/**
+ * The jobs of one alarm call on `box`, in the ledger of the run. `deadline` is the end of the call budget: the command
+ * of a turn ends by then, so that the agent has time to submit before Cloudflare stops the call (D12). `now` and
+ * `sleep` are for tests.
+ */
 export function jobRunner(
   box: Box,
   ledger: Ledger,
-  options: { now?: () => number; sleep?: (ms: number) => Promise<void>; pollMs?: number } = {},
+  options: { deadline?: number; now?: () => number; sleep?: (ms: number) => Promise<void>; pollMs?: number } = {},
 ): JobRunner {
+  const deadline = options.deadline
   const now = options.now ?? Date.now
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   const pollMs = options.pollMs ?? 5_000
   const call = crypto.randomUUID()
-  const describe = (record: Pick<JobRecord, 'argv' | 'cwd'>) => `\`${record.argv.join(' ')}\` in ${record.cwd || '/'}`
+  const describe = (record: JobRecord) => `\`${record.argv.join(' ')}\` in ${record.cwd || '/'}`
   const save = (record: JobRecord) => {
     ledger.put(recordKey(record.id), record)
     const open = (ledger.get<string[]>(openKey) ?? []).filter((id) => id !== record.id)
     ledger.put(openKey, record.state === 'open' ? [...open, record.id] : open)
   }
-  /** Starts a pause-mode job when `key` is given, else a wait-mode job. */
-  const start = async (argv: string[], { cwd, env, timeoutMs }: JobOptions, key?: string) => {
-    if (key !== undefined) {
-      const starts = ledger.get<number>(startsKey(cwd, argv)) ?? 0
-      if (starts >= maxStarts) {
-        throw new StopError(`the machine lost the job ${describe({ argv, cwd })} ${maxStarts} times, for example because the command used more memory than the container has`)
-      }
-      ledger.put(startsKey(cwd, argv), starts + 1)
-    }
-    const record: JobRecord = { argv, call, cwd, id: `job-${crypto.randomUUID()}`, mode: key === undefined ? 'wait' : 'pause', state: 'open' }
+  /** Starts a job. `key` is the pause key of a pause-mode job. */
+  const start = async (argv: string[], mode: JobRecord['mode'], { cwd, env, timeoutMs }: JobOptions, key?: string) => {
+    const record: JobRecord = { argv, call, cwd, id: `job-${crypto.randomUUID()}`, mode, state: 'open' }
     save(record)
     if (key !== undefined) ledger.put(pauseKey(key), record.id)
     await box.startJob(record.id, argv, { cwd, env, timeoutMs })
@@ -88,6 +98,7 @@ export function jobRunner(
     const done: JobRecord = { ...record, state: 'done', ...(record.mode === 'pause' ? { result } : {}) }
     // Keep the ID in jobs:open until cleanup ends, so a later call can retry cleanup without a new command.
     ledger.put(recordKey(record.id), done)
+    if (record.mode === 'pause') ledger.put(startsKey(ledger, record.cwd, record.argv), 0)
     await cleanup(done)
     return result
   }
@@ -131,14 +142,22 @@ export function jobRunner(
             continue
           }
           current = record
-        } else current = await start(argv, options, key)
+        } else {
+          // A PausedError does not count as a failed attempt, so this limit stops a job that the machine loses each time.
+          const starts = ledger.get<number>(startsKey(ledger, options.cwd, argv)) ?? 0
+          if (starts >= maxPauseStarts) throw new Error(`the machine lost the job \`${argv.join(' ')}\` in ${options.cwd || '/'} ${starts} times, for example on the memory limit of the container`)
+          ledger.put(startsKey(ledger, options.cwd, argv), starts + 1)
+          current = await start(argv, 'pause', options, key)
+        }
         const left = options.deadline - now()
         if (left <= 0) throw new PausedError(`waiting for the job ${describe(current)}`)
         await sleep(Math.min(interval(), left))
       }
     },
     async wait(argv, options) {
-      const record = await start(argv, options)
+      const left = deadline === undefined ? Infinity : deadline - now()
+      if (left < minWaitMs) return { exit_code: null, output: '[host] not started: the alarm call has no time left for this command' }
+      const record = await start(argv, 'wait', { ...options, timeoutMs: Math.min(options.timeoutMs, left) })
       const interval = backoff()
       for (;;) {
         await sleep(interval())

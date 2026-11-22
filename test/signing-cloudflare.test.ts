@@ -78,6 +78,14 @@ test('a 403 from the rules endpoint stops in check', async () => {
   await assert.rejects(signing.check([branch]), (error) => error instanceof StopError && /403/.test(error.message) && error.message.includes(rules))
 })
 
+test('the 403 of a private repository whose plan has no rulesets or branch protection gives unsigned commits', async () => {
+  const upgrade = answer(403, { message: 'Upgrade to GitHub Pro or make this repository public to enable this feature.', status: '403' })
+  const { signing } = scripted({ [rules]: upgrade, [classic]: upgrade })
+  const record = await signing.check([branch])
+  assert.deepEqual(record, { branches: [{ branch, classic: 'none', rulesets: [] }], mode: 'unsigned', origin: true })
+  await signing.apply(record)
+})
+
 // Not a StopError: the run loop tries the run again.
 test('a 500 that stays after the retries rejects in check without a StopError', async () => {
   const { calls, signing } = scripted({ [rules]: answer(500, { message: 'Server Error' }) })

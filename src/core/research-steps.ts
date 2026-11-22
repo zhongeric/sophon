@@ -28,6 +28,7 @@ import type { Branch, Checker, Guides } from './platform.ts'
 import { checkPrereg, coreSections, submitPrereg, type Prereg } from './prereg.ts'
 import type { Profile } from './profiles.ts'
 import { checkQuestions, decisionsFile, decisionsLine, questionsSchema, type Question } from './questions.ts'
+import { analyzeCommand } from './research-commands.ts'
 import type { ResearchDomain } from './research.ts'
 import { instructions, researchRoles, type ModelChoice, type Role } from './roles.ts'
 import { StopError } from './stop.ts'
@@ -124,7 +125,7 @@ async function agent(
   const domainGuides = Object.keys(context.domain.guides)
     .sort()
     .map((name) => context.domain.guides[name]!.trim())
-  return { id, ...model, instructions: [roleText, ...domainGuides].join('\n\n'), tools, workspace, ...(egress ? { egress } : {}) }
+  return { id, ...model, instructions: [roleText, ...domainGuides].join('\n\n'), tools, workspace, turnMs: role.turnMs, ...(egress ? { egress } : {}) }
 }
 
 /** The input lines that every prompt starts with. */
@@ -276,6 +277,7 @@ export async function preregister(
     '- The hypothesis: /review/hypothesis.md',
     '- The surveys: /review/surveys.md',
     '- The required sections: /review/prereg-sections.txt',
+    `- The builder of the analysis can write only ${analysisDir(hypothesis.id)}. Thus a changed search goes there, not in the domain package.`,
     '',
     'Call submit_prereg one time.',
   ].join('\n')
@@ -288,8 +290,11 @@ export type FrozenRef = { hypothesis: string; path: string }
 /** The calibration that the host gives the vet agents: the gate numbers and the artifact IDs of the command outputs. */
 export type CalibrationSummary = { round: number; recall: number; threshold: number; known: string[]; inject: string[]; outputs: Record<string, string> }
 
-/** A failed calibration round, for the fix turn of the builder. `tail` is the end of the command output. */
-export type CalibrationFailure = { round: number; reason: string; tail: string }
+/** The analysis that the host gives the vet agents and the writer. `command` is the artifact ID of the analyze output. `outputs` maps each output path to its artifact ID. */
+export type AnalysisSummary = { round: number; command: string; outputs: Record<string, string> }
+
+/** A failed calibration or analysis round, for the fix turn of the builder. `tail` is the end of the command output. */
+export type BuildFailure = { step: 'calibration' | 'analysis'; round: number; reason: string; tail: string }
 
 /** An objection as a skeptic submits it, before the host gives it an ID. */
 export type SkepticObjection = Omit<Objection, 'id'>
@@ -310,7 +315,7 @@ export function analysisConfig(config: RepoConfig): RepoConfig {
 
 const preregText = async (branch: Branch, prereg: FrozenRef) => new TextDecoder().decode(await branch.tree.read(`/${prereg.path}`))
 
-function renderCalibration(hypothesis: string, calibration: CalibrationSummary): string {
+function renderCalibration(hypothesis: string, calibration: CalibrationSummary, analysis: AnalysisSummary): string {
   return [
     `# Calibration of ${hypothesis}`,
     '',
@@ -319,6 +324,12 @@ function renderCalibration(hypothesis: string, calibration: CalibrationSummary):
     `- Known output artifacts: ${calibration.known.join(', ') || 'none'}`,
     `- Inject output artifacts: ${calibration.inject.join(', ') || 'none'}`,
     ...Object.entries(calibration.outputs).map(([path, id]) => `- Output file ${path}: artifact:${id}`),
+    '',
+    '## Analysis',
+    '',
+    `- Round: ${analysis.round}`,
+    `- Analyze output artifact: ${analysis.command}`,
+    ...Object.entries(analysis.outputs).map(([path, id]) => `- Analysis output file ${path}: artifact:${id}`),
     '',
   ].join('\n')
 }
@@ -379,34 +390,41 @@ export type AnalysisTask = {
   checker: Checker
   /** The commit that the analysis started from, for run_checks and the targeted tests. */
   base: string
-  /** The failed calibration round that this fix turn answers. Without it, the turn is the first build. */
-  failure?: CalibrationFailure
+  /** The failed calibration or analysis round that this fix turn answers. Without it, the turn is the first build. */
+  failure?: BuildFailure
 }
 
-/** Stage 5: the builder writes only analysis/<id>/ of one prereg. Each calibration fix round is a new turn of the same agent. */
+/** Stage 5: the builder writes only analysis/<id>/ of one prereg. Each fix round is a new turn of the same agent. */
 export async function buildAnalysis(context: ResearchContext, task: AnalysisTask): Promise<BuildLog> {
   const { hypothesis, path } = task.prereg
   const id = `build.${hypothesis}`
   const failure = task.failure
-  const turn = failure ? { request: `fix-${failure.round}`, key: `output:${id}:fix-${failure.round}` } : { request: 'task', key: `output:${id}` }
+  const request = failure ? `${failure.step === 'analysis' ? 'analysis-' : ''}fix-${failure.round}` : 'task'
+  const turn = { request, key: failure ? `output:${id}:${request}` : `output:${id}` }
   const develop: DevelopContext = { host: context.host, config: analysisConfig(task.config), guides: context.guides, stackGuides: [], ask: context.program }
   const { known, inject } = context.domain.config.commands
+  const failureFile = failure ? `/${failure.step}-failure.txt` : ''
   const review = {
     '/program.md': context.program,
     '/prereg.md': await preregText(task.branch, task.prereg),
-    ...(failure ? { '/calibration-failure.txt': `${failure.reason}\n\n--- end of the output ---\n${failure.tail}` } : {}),
+    ...(failure ? { [failureFile]: `${failure.reason}\n\n--- end of the output ---\n${failure.tail}` } : {}),
   }
+  const ask = !failure
+    ? `Build the analysis of ${hypothesis} from its frozen prereg.`
+    : failure.step === 'analysis'
+      ? `Analysis round ${failure.round} of ${hypothesis} failed. Fix the analysis so that analyze gives its outputs.`
+      : `Calibration round ${failure.round} of ${hypothesis} failed. Fix the analysis so that the known recall gets to the threshold of the prereg.`
   const prompt = [
-    failure
-      ? `Calibration round ${failure.round} of ${hypothesis} failed. Fix the analysis so that the known recall gets to the threshold of the prereg.`
-      : `Build the analysis of ${hypothesis} from its frozen prereg.`,
+    ask,
     '',
     '- The program: /review/program.md',
     `- The frozen prereg: /review/prereg.md (${path} in /repo)`,
-    ...(failure ? ['- The calibration failure: /review/calibration-failure.txt, with the reason and the end of the output'] : []),
-    `- The notebook: /repo, ${branchNotebook}. You can write only in ${analysisDir(hypothesis)}. prereg/ and dossier/ are protected.`,
+    ...(failure ? [`- The ${failure.step} failure: /review${failureFile}, with the reason and the end of the output`] : []),
+    `- The notebook: /repo, ${branchNotebook}. You can write only in ${analysisDir(hypothesis)}, so a changed search goes there and not in the domain package. prereg/ and dossier/ are protected.`,
     `- After your build, the host runs these domain commands with {prereg} as ${path}: known (${known}) and inject (${inject}).`,
     '  The last line of each output is JSON. known gives {"recall": <0 to 1>, "outputs": {"<path>": "<sha256>"}}, inject gives {"outputs": {...}}.',
+    `- After the calibration passes, the host runs analyze (${analyzeCommand(context.domain.config, hypothesis)}) on a new clean checkout.`,
+    '  Its last line gives {"outputs": {"<path>": "<sha256>"}} with at least one output file.',
     '',
     'Checkpoint your work, then call submit_build_log one time.',
   ].join('\n')
@@ -417,7 +435,8 @@ export async function buildAnalysis(context: ResearchContext, task: AnalysisTask
     branch: task.branch,
     scope: [analysisDir(hypothesis)],
     active: task.active,
-    checker: task.checker,
+    // The analysis build has no ci gate: its builder can write only analysis/<id>/.
+    checker: { ...task.checker, ci: undefined },
     base: task.base,
     review,
     prompt,
@@ -426,18 +445,18 @@ export async function buildAnalysis(context: ResearchContext, task: AnalysisTask
 }
 
 /** What each vet agent reads of one hypothesis. */
-export type VetTask = { branch: Branch; prereg: FrozenRef; calibration: CalibrationSummary }
+export type VetTask = { branch: Branch; prereg: FrozenRef; calibration: CalibrationSummary; analysis: AnalysisSummary }
 
 /** The review files that each vet agent gets. The program and the decisions come from agent(). */
 const vetReview = async (task: VetTask) => ({
   '/prereg.md': await preregText(task.branch, task.prereg),
-  '/calibration.md': renderCalibration(task.prereg.hypothesis, task.calibration),
+  '/calibration.md': renderCalibration(task.prereg.hypothesis, task.calibration, task.analysis),
 })
 
 const vetInputs = (context: ResearchContext) => [
   ...inputs(context, branchNotebook),
   '- The frozen prereg: /review/prereg.md',
-  '- The calibration: /review/calibration.md',
+  '- The calibration and the analysis outputs: /review/calibration.md',
   '- The run store: /artifacts',
 ]
 
@@ -487,7 +506,7 @@ export type AnalystTask = VetTask & {
 
 /**
  * Stage 9: the analyst answers the objections of one round. It can write only analysis/<id>/, and the host commits.
- * `changed` tells the host that the analysis changed, so that the host commits it and runs the calibration again.
+ * `changed` tells the host that the analysis changed, so that the host commits it and runs the analysis again.
  */
 export async function analyst(context: ResearchContext, model: ModelChoice, task: AnalystTask): Promise<{ responses: Responses; changed: boolean }> {
   const { hypothesis } = task.prereg
@@ -505,7 +524,8 @@ export async function analyst(context: ResearchContext, model: ModelChoice, task
     ...vetInputs(context),
     '- The objections: /review/objections.md',
     '',
-    `You can write only in ${analysisDir(hypothesis)}. prereg/ is protected. The host commits your changes and runs the calibration again.`,
+    `You can write only in ${analysisDir(hypothesis)}. prereg/ is protected. The host commits your changes and runs the analysis again.`,
+    `When known or inject read ${analysisDir(hypothesis)}, the host also runs the calibration again.`,
     'The host asks the user about each conceded critical or high objection. Call submit_responses one time.',
   ].join('\n')
   const spec = await agent(context, id, researchRoles.analyst, model, review, tools, repo)
@@ -539,6 +559,7 @@ export async function writeDossier(context: ResearchContext, model: ModelChoice,
     '- The objections, the analyst responses and the user answers: /review/objections.md',
     '',
     `Cite at least one inject output artifact (${inject.join(', ') || 'none'}) in completeness and in false_positives. Call submit_dossier one time.`,
+    `You can also cite the analysis output artifacts (${Object.values(task.analysis.outputs).join(', ')}) in claims, completeness and false_positives.`,
   ].join('\n')
   const spec = await agent(context, id, researchRoles.writer, model, review, tools, readOnly(guard(task.branch.tree)))
   return runTurn(context.host, spec, prompt, 'submit_dossier')
@@ -554,8 +575,8 @@ export function conceded(rounds: VetRound[]): { objection: Objection; reason: st
   )
 }
 
-/** dossier/<id>.md, from the dossier and the vet record. The same input always gives the same text. */
-export function renderDossier(hypothesis: string, dossier: Dossier, rounds: VetRound[], answers: HeldAnswer[] = []): string {
+/** dossier/<id>.md, from the dossier, the vet record and the analysis outputs (path to artifact ID). The same input always gives the same text. */
+export function renderDossier(hypothesis: string, dossier: Dossier, rounds: VetRound[], answers: HeldAnswer[], analysis: Record<string, string>): string {
   const kept = conceded(rounds)
   const artifacts = (ids: string[]) => ids.map((id) => `- artifact:${id}`)
   return [
@@ -575,6 +596,10 @@ export function renderDossier(hypothesis: string, dossier: Dossier, rounds: VetR
     '## Checklist',
     '',
     ...dossier.checklist.map((entry) => `- ${entry.item}: ${entry.status}${entry.location ? ` (${entry.location}: "${(entry.evidence ?? '').trim()}")` : ''}`),
+    '',
+    '## Analysis outputs',
+    '',
+    ...Object.entries(analysis).map(([path, id]) => `- ${path}: artifact:${id}`),
     '',
     '## Completeness',
     '',

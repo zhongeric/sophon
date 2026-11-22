@@ -11,6 +11,7 @@ export const workerSettings = [
   'PULL_REQUESTS',
   'DEVELOPMENT_RUNS',
   'RESEARCH_RUNS',
+  'SCAN_BOXES',
   'GITHUB_TOKEN',
   'GITHUB_APP_ID',
   'GITHUB_APP_PRIVATE_KEY',

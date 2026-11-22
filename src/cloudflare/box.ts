@@ -26,7 +26,7 @@ export type Box = {
    * exit code outside the work directories, so that a later call can poll it. Each ID starts one job only.
    */
   startJob(id: string, argv: string[], options: JobOptions): Promise<void>
-  /** Keeps the result until killJob. A job is `missing` when it has no files, or its processes died without an exit code. */
+  /** Keeps the result until killJob. A job is `missing` when the machine has no such job, or when its processes died without an exit code. */
   pollJob(id: string): Promise<JobState>
   /** Kills an unfinished job and removes its files. A job that is gone is not an error. */
   killJob(id: string): Promise<void>
@@ -118,21 +118,25 @@ const jobPoll = [
   'echo state=missing',
 ].join('\n')
 
-/** Kills the process groups of a job, and removes its directory. */
+/** Kills the groups of an unfinished job, and removes the job directory with the full output. */
 const jobKill = [jobDir, 'if test ! -e "$job/exit" && read -r leader group 2>/dev/null < "$job/pgid"; then kill -KILL -- "-$group" "-$leader" 2>/dev/null; fi', 'rm -rf -- "$job"', 'exit 0'].join('\n')
 
+// No ID starts with a dot, so that the job directory is never /jobs or its parent: a kill removes it.
 const checkJobId = (id: string) => {
-  if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error(`the job ID ${JSON.stringify(id)} is not a valid file name`)
+  if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(id)) throw new Error(`the job ID ${JSON.stringify(id)} is not a valid file name`)
 }
 
-/** The run's Cloudflare Container. It starts on the first command and stops after `inactivityMs` without one. */
-export function containerBox(container: ContainerHandle, options: { inactivityMs: number; onStart(): void }): Box {
+/**
+ * The run's Cloudflare Container. It starts on the first command and stops after `inactivityMs` without one. A function
+ * gives the timeout again at each call, for a caller whose timeout depends on its running job.
+ */
+export function containerBox(container: ContainerHandle, options: { inactivityMs: number | (() => number); onStart(): void; enableInternet?: boolean }): Box {
   const ready = async () => {
     if (!container.running) {
       options.onStart()
-      container.start({ enableInternet: true, entrypoint: ['sleep', 'infinity'], env: boxEnv })
+      container.start({ enableInternet: options.enableInternet ?? true, entrypoint: ['sleep', 'infinity'], env: boxEnv })
     }
-    await container.setInactivityTimeout(options.inactivityMs)
+    await container.setInactivityTimeout(typeof options.inactivityMs === 'number' ? options.inactivityMs : options.inactivityMs())
   }
   const exec: Box['exec'] = async (argv, { cwd, env, stdin, timeoutMs }) => {
     await ready()
@@ -169,9 +173,10 @@ export function containerBox(container: ContainerHandle, options: { inactivityMs
       const done = /^state=done exit=(\d+) (\d+) started=(\d+) limit=(\d+)$/m.exec(output)
       if (!done) throw new Error(`the poll of job ${id} gave no state: ${JSON.stringify(output.slice(-300))}`)
       const [code, ended, started, limit] = done.slice(1).map(Number) as [number, number, number, number]
-      // 80,000 bytes hold at least the last 20,000 characters, and the exec keeps only those.
-      // The runner removes the files after it stores the result in the ledger.
-      const last = await script(`the output of job ${id}`, `${jobDir}; tail -c 80000 -- "$job/output"`, [id])
+      // 80,000 bytes hold at least the last 20,000 characters, and the exec keeps only those. The job keeps only
+      // these bytes on the disk, and a poll again reads the same bytes. The runner removes the files after it stores the
+      // result in the ledger.
+      const last = await script(`the output of job ${id}`, `${jobDir}; tail -c 80000 -- "$job/output" > "$job/output.tmp" && mv -f -- "$job/output.tmp" "$job/output" && cat -- "$job/output"`, [id])
       return { result: commandResult(code, last, ended - started, limit), state: 'done' }
     },
     async killJob(id) {
@@ -179,6 +184,24 @@ export function containerBox(container: ContainerHandle, options: { inactivityMs
       await script(`the kill of job ${id}`, jobKill, [id])
     },
   }
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null
+
+/** The result in a response of a test machine, or null when the response is not a result. */
+function parseResult(value: unknown): BoxResult | null {
+  if (!isRecord(value) || typeof value.output !== 'string') return null
+  const code = value.exit_code
+  if (code === null || (typeof code === 'number' && Number.isInteger(code))) return { exit_code: code, output: value.output }
+  return null
+}
+
+/** The job state in a response of a test machine, or null when the response is not a job state. */
+function parseJobState(value: unknown): JobState | null {
+  if (!isRecord(value)) return null
+  if (value.state === 'running' || value.state === 'missing') return { state: value.state }
+  const result = value.state === 'done' ? parseResult(value.result) : null
+  return result && { result, state: 'done' }
 }
 
 /**
@@ -191,39 +214,28 @@ export function httpBox(url: string): Box {
     if (!response.ok) throw new Error(`the machine at ${to} answered HTTP ${response.status}: ${await response.text()}`)
     return response.json()
   }
+  /** Posts `body`, and throws when `parse` refuses the response. */
+  const ask = async <T>(to: string, body: unknown, parse: (value: unknown) => T | null, what: string): Promise<T> => {
+    const value = await post(to, body)
+    const parsed = parse(value)
+    if (parsed === null) throw new Error(`the machine at ${to} answered without ${what}: ${JSON.stringify(value).slice(0, 300)}`)
+    return parsed
+  }
   return {
     async start() {},
     exec(argv, { cwd, env, stdin, timeoutMs }) {
       let binary = ''
       for (let offset = 0; stdin && offset < stdin.length; offset += 0x8000) binary += String.fromCharCode(...stdin.subarray(offset, offset + 0x8000))
-      return post(url, { argv, cwd, env, stdin: stdin ? btoa(binary) : null, timeoutMs }).then((value) => boxResult(value, url))
+      return ask(url, { argv, cwd, env, stdin: stdin ? btoa(binary) : null, timeoutMs }, parseResult, 'a command result')
     },
     async startJob(id, argv, { cwd, env, timeoutMs }) {
       await post(`${url}/jobs/start`, { argv, cwd, env, id, timeoutMs })
     },
-    pollJob: async (id) => jobState(await post(`${url}/jobs/poll`, { id }), `${url}/jobs/poll`),
+    pollJob: (id) => ask(`${url}/jobs/poll`, { id }, parseJobState, 'a job state'),
     async killJob(id) {
       await post(`${url}/jobs/kill`, { id })
     },
   }
-}
-
-const field = (value: unknown, name: string): unknown => (typeof value === 'object' && value !== null ? (value as Record<string, unknown>)[name] : undefined)
-
-/** The result of a command in a response of the machine at `from`. */
-function boxResult(value: unknown, from: string): BoxResult {
-  const code = field(value, 'exit_code')
-  const output = field(value, 'output')
-  if ((code === null || (typeof code === 'number' && Number.isInteger(code))) && typeof output === 'string') return { exit_code: code, output }
-  throw new Error(`the machine at ${from} gave no valid result: ${JSON.stringify(value)?.slice(0, 300)}`)
-}
-
-/** The job state in a response of the machine at `from`. */
-function jobState(value: unknown, from: string): JobState {
-  const state = field(value, 'state')
-  if (state === 'running' || state === 'missing') return { state }
-  if (state === 'done') return { result: boxResult(field(value, 'result'), from), state }
-  throw new Error(`the machine at ${from} gave no valid job state: ${JSON.stringify(value)?.slice(0, 300)}`)
 }
 
 /** The files of a tree with their kind, size and change time, without .git, so that a sync sends only what changed. */
@@ -415,6 +427,43 @@ const readChunkBytes = 14_400
 const resolveFile = 'root=$(realpath .) && file=$(realpath -- "$1" 2>/dev/null) || exit 3; case "$file" in "$root"/*) ;; *) exit 4 ;; esac; test -f "$file" || exit 3'
 
 /**
+ * The exact bytes of a file in the directory `dir` of the machine, also of a binary file, in base64 chunks. Refuses a
+ * path outside `dir`, also through a symlink, a missing file, and a file over artifactSizeLimit.
+ */
+export async function readBoxFile(box: Box, dir: string, path: string): Promise<Uint8Array> {
+  let depth = 0
+  for (const part of path.split('/')) {
+    if (part === '..') depth -= 1
+    else if (part !== '' && part !== '.') depth += 1
+    if (depth < 0) break
+  }
+  if (path.startsWith('/') || depth < 0) throw new Error(`read ${path}: the path is not relative to ${dir}`)
+  // Each command checks the path again, because a command of the run can replace a directory with a symlink.
+  const readFile = async (script: string, args: string[]): Promise<string> => {
+    const result = await box.exec(['bash', '-c', `${resolveFile}; ${script}`, 'bash', path, ...args], { cwd: dir, env: boxEnv, timeoutMs: 60_000 })
+    if (result.exit_code === 3) throw new Error(`read ${path}: no such file in ${dir}`)
+    if (result.exit_code === 4) throw new Error(`read ${path}: the path resolves outside ${dir}`)
+    if (result.exit_code !== 0) throw new Error(`read ${path} failed: ${result.output.slice(-2000)}`)
+    return result.output
+  }
+  // The output can hold other lines, for example warnings on stderr, so each value comes after a marker.
+  const sized = await readFile('printf "size=%s\\n" "$(wc -c < "$file")"', [])
+  const size = Number(/^size=\s*(\d+)\s*$/m.exec(sized)?.[1])
+  if (!Number.isSafeInteger(size)) throw new Error(`read ${path}: no size for the file in the output ${JSON.stringify(sized.slice(-300))}`)
+  if (size > artifactSizeLimit) throw new Error(`read ${path}: the file has ${size} bytes, over the limit of ${artifactSizeLimit} bytes`)
+  const bytes = new Uint8Array(size)
+  for (let offset = 0; offset < size; offset += readChunkBytes) {
+    const output = await readFile('printf "base64=%s\\n" "$(tail -c "+$2" -- "$file" | head -c "$3" | base64 | tr -d "\\n")"', [String(offset + 1), String(readChunkBytes)])
+    const text = /^base64=([A-Za-z0-9+/=]*)$/m.exec(output)?.[1]
+    if (text === undefined) throw new Error(`read ${path}: no bytes in the output ${JSON.stringify(output.slice(-300))}`)
+    const chunk = Uint8Array.from(atob(text), (char) => char.charCodeAt(0))
+    if (chunk.length !== Math.min(readChunkBytes, size - offset)) throw new Error(`read ${path}: the file changed while the host read it`)
+    bytes.set(chunk, offset)
+  }
+  return bytes
+}
+
+/**
  * The jobs of a clean box across alarm calls: the runner and the ledger of the run, the step key of the caller, and
  * the end of the call for the pause.
  */
@@ -425,8 +474,10 @@ export type CleanJobs = { runner: JobRunner; ledger: Ledger; key: string; deadli
  * result run in `dir` without a sync. runDomainCommand runs the setup, so it does not run here. `read` gives the exact
  * bytes of a file in `dir`, also of a binary file, in base64 chunks.
  *
- * With `jobs`, each command is a pause-mode job. When the copy of the step key and the marker `<dir>.sync` agree,
- * `dir` stays across calls. A new copy ID makes each command run again.
+ * With `jobs`, each command is a pause-mode job, and the clean box keeps `dir` across calls: when the ledger has the
+ * copy of `dir` for the step key and the marker `<dir>.sync` agrees, it does not copy again. Thus it never removes a
+ * directory under a running job. The pause key holds the copy ID, so that a new copy, for example in a new machine,
+ * runs each command again and makes its output files again.
  */
 export async function cleanBox(
   box: Box,
@@ -434,67 +485,33 @@ export async function cleanBox(
   dir: string,
   log: (line: string) => void,
   jobs?: CleanJobs,
-): Promise<Machine & { copyId: string; read(path: string): Promise<Uint8Array> }> {
+): Promise<Machine & { id: string; read(path: string): Promise<Uint8Array> }> {
   await box.start()
   const started = Date.now()
   const marker = `${dir}.sync`
   const ledgerKey = `clean-box:${jobs?.key}`
-  // The ledger keeps the copy ID of the step key. The caller gives the same directory for the same key.
-  let sync = jobs?.ledger.get<string>(ledgerKey)
-  if (
-    sync !== undefined &&
-    (await box.exec(['bash', '-c', 'test "$(cat -- "$1" 2>/dev/null)" = "$2"', 'bash', marker, sync], { cwd: '', env: boxEnv, timeoutMs: 60_000 })).exit_code === 0
-  )
+  // The caller keeps one directory for each step key, so the ledger keeps only the copy ID in its marker.
+  let sync = jobs?.ledger.get<string>(ledgerKey) ?? ''
+  const agrees = sync && (await box.exec(['bash', '-c', 'test "$(cat -- "$1" 2>/dev/null)" = "$2"', 'bash', marker, sync], { cwd: '', env: boxEnv, timeoutMs: 60_000 })).exit_code === 0
+  if (agrees) {
     log(`sync ${dir}: kept, 0 files sent in ${Date.now() - started} ms`)
-  else {
+  } else {
     const files = await syncTree(box, tree, dir, null)
-    sync = crypto.randomUUID()
+    log(`sync ${dir}: full, ${files.size} files sent in ${Date.now() - started} ms`)
     if (jobs) {
+      sync = crypto.randomUUID()
       const written = await box.exec(['bash', '-c', 'printf %s "$2" > "$1"', 'bash', marker, sync], { cwd: '', env: boxEnv, timeoutMs: 60_000 })
       if (written.exit_code !== 0) throw new Error(`writing the marker ${marker} failed: ${written.output.slice(-2000)}`)
       jobs.ledger.put(ledgerKey, sync)
     }
-    log(`sync ${dir}: full, ${files.size} files sent in ${Date.now() - started} ms`)
-  }
-  const copy = sync
-  // Each command checks the path again, because a command of the run can replace a directory with a symlink.
-  const readFile = async (path: string, script: string, args: string[]): Promise<string> => {
-    const result = await box.exec(['bash', '-c', `${resolveFile}; ${script}`, 'bash', path, ...args], { cwd: dir, env: boxEnv, timeoutMs: 60_000 })
-    if (result.exit_code === 3) throw new Error(`read ${path}: no such file in ${dir}`)
-    if (result.exit_code === 4) throw new Error(`read ${path}: the path resolves outside ${dir}`)
-    if (result.exit_code !== 0) throw new Error(`read ${path} failed: ${result.output.slice(-2000)}`)
-    return result.output
   }
   return {
-    copyId: copy,
+    id: sync || crypto.randomUUID(),
     run(command, { timeoutMs }) {
       const options = { cwd: dir, env: boxEnv, timeoutMs }
       if (!jobs) return box.exec(['bash', '-c', command], options)
-      return jobs.runner.pause(`${dir}@${copy}:${command}`, ['bash', '-c', command], { ...options, deadline: jobs.deadline })
+      return jobs.runner.pause(`${dir}@${sync}:${command}`, ['bash', '-c', command], { ...options, deadline: jobs.deadline })
     },
-    async read(path) {
-      let depth = 0
-      for (const part of path.split('/')) {
-        if (part === '..') depth -= 1
-        else if (part !== '' && part !== '.') depth += 1
-        if (depth < 0) break
-      }
-      if (path.startsWith('/') || depth < 0) throw new Error(`read ${path}: the path is not relative to ${dir}`)
-      // The output can hold other lines, for example warnings on stderr, so each value comes after a marker.
-      const sized = await readFile(path, 'printf "size=%s\\n" "$(wc -c < "$file")"', [])
-      const size = Number(/^size=\s*(\d+)\s*$/m.exec(sized)?.[1])
-      if (!Number.isSafeInteger(size)) throw new Error(`read ${path}: no size for the file in the output ${JSON.stringify(sized.slice(-300))}`)
-      if (size > artifactSizeLimit) throw new Error(`read ${path}: the file has ${size} bytes, over the limit of ${artifactSizeLimit} bytes`)
-      const bytes = new Uint8Array(size)
-      for (let offset = 0; offset < size; offset += readChunkBytes) {
-        const output = await readFile(path, 'printf "base64=%s\\n" "$(tail -c "+$2" -- "$file" | head -c "$3" | base64 | tr -d "\\n")"', [String(offset + 1), String(readChunkBytes)])
-        const text = /^base64=([A-Za-z0-9+/=]*)$/m.exec(output)?.[1]
-        if (text === undefined) throw new Error(`read ${path}: no bytes in the output ${JSON.stringify(output.slice(-300))}`)
-        const chunk = Uint8Array.from(atob(text), (char) => char.charCodeAt(0))
-        if (chunk.length !== Math.min(readChunkBytes, size - offset)) throw new Error(`read ${path}: the file changed while the host read it`)
-        bytes.set(chunk, offset)
-      }
-      return bytes
-    },
+    read: (path) => readBoxFile(box, dir, path),
   }
 }

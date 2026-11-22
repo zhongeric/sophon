@@ -1,20 +1,24 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Ledger } from '../core/ledger.ts'
 import { callBudget, PlannedStop } from '../core/planned-stop.ts'
-import { apiKeyCredential, type Credentials, type Provider } from '../core/providers.ts'
+import { failedChecksText } from '../core/preflight.ts'
+import { apiKeyCredential, type Credential, type Credentials, type Provider } from '../core/providers.ts'
 import type { Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
-import { afterError, alarmBudgetMs, countRestart, initCounters, progressLedger } from './alarm.ts'
+import { afterError, alarmBudgetMs, countRestart, initCounters, preflightKey, progressLedger, restartAtKey } from './alarm.ts'
 import { containerBox, httpBox, type Box, type SyncStore } from './box.ts'
 import { githubComments } from './comments.ts'
 import type { WorkerSetting } from './egress.ts'
 import type { DevelopmentRuns } from './develop.ts'
 import { GitHubError, type GitHub } from './github.ts'
 import { githubAccess, type InstallationTokens } from './github-app.ts'
-import { hasOpenJobs, jobRunner, type JobRunner } from './jobs.ts'
+import { hasOpenJobs, jobRunner, resetJobStarts, type JobRunner } from './jobs.ts'
+import { addLabel } from './labels.ts'
+import { preflight, PreflightFailed, type PreflightNeeds } from './preflight.ts'
 import type { State } from './prune.ts'
 import type { ResearchRuns } from './research.ts'
 import type { PullRequestRuns } from './run.ts'
+import type { ScanBoxes } from './scan.ts'
 import { createTables, sqlFiles, sqlLedger } from './storage.ts'
 import { sqlSyncs } from './syncs.ts'
 
@@ -22,6 +26,7 @@ export type Env = {
   PULL_REQUESTS: DurableObjectNamespace<PullRequestRuns>
   DEVELOPMENT_RUNS: DurableObjectNamespace<DevelopmentRuns>
   RESEARCH_RUNS: DurableObjectNamespace<ResearchRuns>
+  SCAN_BOXES: DurableObjectNamespace<ScanBoxes>
   /** The token of the runs when the GitHub App secrets are not set. */
   GITHUB_TOKEN?: string
   /** With GITHUB_APP_PRIVATE_KEY, runs call GitHub as the App. */
@@ -46,7 +51,7 @@ export type Env = {
   MODEL_PRICES?: string
   CI_TIMEOUT_MINUTES?: string
   PAUSE_POLL_SECONDS?: string
-  /** The wall time in seconds of one alarm call before the run stops at a safe point and continues in the next call. Default: 480. */
+  /** The wall time in seconds that one alarm call plans for. A turn starts only when it fits, and its commands end by then. Default: 780. */
   ALARM_BUDGET_SECONDS?: string
   /** Endpoint overrides, for gateways and for local tests. */
   GITHUB_API_URL?: string
@@ -116,10 +121,13 @@ export function answerersOf(env: Env, configured: string[] | undefined): string[
   return (configured ?? allowed).filter((login) => allowed.includes(login.toLowerCase()))
 }
 
+function credentialFor(env: Env, provider: Provider): Credential {
+  return provider === 'claude' ? apiKeyCredential('claude', env.ANTHROPIC_API_KEY, env.ANTHROPIC_URL) : apiKeyCredential('codex', env.OPENAI_API_KEY, env.OPENAI_URL)
+}
+
 export function credentialsFor(env: Env, providers: Iterable<Provider>): Credentials {
   const credentials: Credentials = {}
-  for (const provider of providers)
-    credentials[provider] = provider === 'claude' ? apiKeyCredential('claude', env.ANTHROPIC_API_KEY, env.ANTHROPIC_URL) : apiKeyCredential('codex', env.OPENAI_API_KEY, env.OPENAI_URL)
+  for (const provider of providers) credentials[provider] = credentialFor(env, provider)
   return credentials
 }
 
@@ -139,10 +147,14 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
 
   /** The number of the PR or issue whose comments carry the run's questions and results. */
   protected abstract number(request: Request): number
+  /** The work label of this kind of run. The run adds it to its issue or PR at its start. */
+  protected abstract readonly label: string
   protected abstract runName(request: Request, stamp: string): string
   protected abstract announcement(run: string, request: Request): string
   /** Runs the work, or resumes it from the ledger. Returns whether it passed, and the comment for the end of the run. */
   protected abstract execute(run: string, request: Request, ledger: Ledger, gh: GitHub, comments: Comments, call: Call): Promise<{ passed: boolean; summary: string }>
+  /** What the preflight of the run checks (D17). `gh` is undefined when the GitHub access check failed. */
+  protected abstract preflightNeeds(request: Request, ledger: Ledger, gh: GitHub | undefined): Promise<PreflightNeeds>
 
   /** The build machine of this object: MACHINE_URL in local tests, else the object's Cloudflare Container. */
   protected box(syncs: SyncStore): Box {
@@ -151,8 +163,12 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     return containerBox(this.ctx.container, { inactivityMs: containerIdleMs, onStart: () => syncs.clear() })
   }
 
-  async start(request: Request): Promise<{ run: string; started: boolean }> {
-    const active = this.active()
+  /**
+   * Starts a run unless one is active. With `once`, also refuses when this object has a run in any state: the work
+   * sweep never starts a run again (D13 restarts runs). The check and the insert are in one call, so no start comes between.
+   */
+  async start(request: Request, options: { once?: boolean } = {}): Promise<{ run: string; started: boolean }> {
+    const active = options.once ? this.ctx.storage.sql.exec<RunRow>('select * from factory_runs order by created desc limit 1').toArray()[0] : this.active()
     if (active) return { run: active.run, started: false }
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
     const run = this.runName(request, stamp)
@@ -163,22 +179,33 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
 
   /**
    * Wakes a paused run, for example after an answer or a CI result. With \`afterError\`, also restarts a run that
-   * stopped on an error, from its ledger, once the cause is fixed. Only the admin route passes it.
+   * stopped on an error, from its ledger, once the cause is fixed, or a run that waits for its restart (D13). Only the
+   * admin route passes it.
    */
   async resume(options: { afterError?: boolean } = {}): Promise<ResumeResult> {
     const latest = this.ctx.storage.sql.exec<RunRow>('select * from factory_runs order by created desc limit 1').toArray()[0]
     if (!latest) return { reason: 'there is no run. Start a run first', resumed: false, state: null }
     const { state } = latest
+    const ledger = sqlLedger(this.ctx.storage.sql, latest.run)
     let reason = 'woke the paused run'
-    if (state === 'error' && options.afterError) {
-      const ledger = sqlLedger(this.ctx.storage.sql, latest.run)
-      ledger.put('attempts', 0)
-      ledger.put('restarts', 0)
-      this.setState(latest.run, 'queued', 'resumed after an error')
+    if (state === 'queued' && options.afterError && (ledger.get<number>(restartAtKey) ?? 0) > Date.now()) {
+      reason = 'started the run again from its ledger after the error'
+    } else if (state === 'error' && options.afterError) {
+      this.queueAfterError(latest.run)
       reason = 'started the run again from its ledger after the error'
     } else if (state !== 'paused') return { reason: notResumed[state], resumed: false, state }
     await this.ctx.storage.setAlarm(Date.now())
     return { reason, resumed: true, state }
+  }
+
+  /** Queues a run in `error` with new counts of attempts, crash restarts and job starts, and a new preflight (D17). */
+  protected queueAfterError(run: string): void {
+    const ledger = sqlLedger(this.ctx.storage.sql, run)
+    ledger.put(preflightKey, false)
+    ledger.put('attempts', 0)
+    ledger.put('restarts', 0)
+    resetJobStarts(ledger)
+    this.setState(run, 'queued', 'resumed after an error')
   }
 
   status() {
@@ -217,30 +244,57 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     let app = false
     let next: number | null = null
     try {
-      const access = await githubAccess(this.env, request.owner, request.repo, this.tokens)
+      // The preflight runs when the run leaves queued: on the first call, after an admin resume and on a D13 restart (D17).
+      const due = row.state === 'queued' && ledger.get(preflightKey) !== true
+      const access = due
+        ? await preflight({
+            container: this.ctx.container !== undefined,
+            credential: (provider) => credentialFor(this.env, provider),
+            env: this.env,
+            needs: (gh) => {
+              // An error of the needs, for example a fork PR, takes the normal error path, which posts with this client.
+              if (gh) comments = githubComments(gh, request.owner, request.repo, this.number(request))
+              return this.preflightNeeds(request, ledger, gh)
+            },
+            owner: request.owner,
+            repo: request.repo,
+            tokens: this.tokens,
+          })
+        : await githubAccess(this.env, request.owner, request.repo, this.tokens)
+      if (due) ledger.put(preflightKey, true)
       app = access.app
       const posts = githubComments(access.gh, request.owner, request.repo, this.number(request))
       comments = posts
       initCounters(ledger)
       if (row.state === 'running') countRestart(ledger)
       this.setState(row.run, 'running', '')
+      // The ledger records the attempt also when it failed, so that a failed add does not repeat at each alarm.
+      const log = (error: unknown) => console.error(`[${row.run}] the add of the label ${this.label} failed`, error)
+      await once(ledger, 'label', () => addLabel({ gh: access.gh, log, name: this.label, number: this.number(request), owner: request.owner, repo: request.repo }))
       await once(ledger, 'announced', () => posts.post(this.announcement(row.run, request)))
       const result = await this.execute(row.run, request, ledger, access.gh, posts, call)
       this.setState(row.run, result.passed ? 'passed' : 'failed', '')
       await this.killJobs(row.run, ledger, call)
       await once(ledger, 'summary', () => posts.post(result.summary))
     } catch (error) {
-      const outcome = afterError(ledger, error, { now: Date.now(), pauseSeconds: this.env.PAUSE_POLL_SECONDS })
-      if (error instanceof PlannedStop) console.log(`[${row.run}] planned stop after ${Math.round((Date.now() - startedAt) / 1_000)} s of wall time`)
-      if (outcome.attempts !== null) console.error(`[${row.run}] attempt ${outcome.attempts} failed`, error)
-      this.setState(row.run, outcome.state, outcome.note)
-      next = outcome.next
-      if (outcome.state === 'error') {
-        await this.killJobs(row.run, ledger, call)
-        const hint = error instanceof GitHubError ? (app ? ' Check the permissions of the GitHub App.' : ' Check the permissions of GITHUB_TOKEN.') : ''
-        await comments
-          ?.post(`agent-factory stopped run \`${row.run}\`: ${outcome.note}${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${target}\`.`)
-          .catch(() => undefined)
+      if (error instanceof PreflightFailed) {
+        // A failed prerequisite does not fix itself, so the run waits for the admin resume without a D13 restart (D17).
+        this.setState(row.run, 'error', error.message)
+        const text = `agent-factory did not start run \`${row.run}\`: the preflight found failed checks.\n\n<details><summary>Failed checks</summary>\n\n${failedChecksText(error.failed)}\n\n</details>\n\nAfter you fix them, continue the run with \`npm run remote -- resume ${target}\`.`
+        if (error.gh) await githubComments(error.gh, request.owner, request.repo, this.number(request)).post(text).catch(() => undefined)
+      } else {
+        const outcome = afterError(ledger, error, { now: Date.now(), pauseSeconds: this.env.PAUSE_POLL_SECONDS })
+        if (error instanceof PlannedStop) console.log(`[${row.run}] planned stop after ${Math.round((Date.now() - startedAt) / 1_000)} s of wall time`)
+        if (outcome.attempts !== null) console.error(`[${row.run}] attempt ${outcome.attempts} failed`, error)
+        this.setState(row.run, outcome.state, outcome.note)
+        next = outcome.next
+        if (outcome.state === 'error' || outcome.restart !== null) {
+          await this.killJobs(row.run, ledger, call)
+          const hint = error instanceof GitHubError ? (app ? ' Check the permissions of the GitHub App.' : ' Check the permissions of GITHUB_TOKEN.') : ''
+          // A run that starts again by itself needs nothing from the user (D13).
+          const ask = outcome.restart !== null ? '' : `${hint} After you fix the cause, continue the run from where it stopped with \`npm run remote -- resume ${target}\`.`
+          await comments?.post(`agent-factory stopped run \`${row.run}\`: ${sentence(outcome.note)}${ask}`).catch(() => undefined)
+        }
       }
     } finally {
       clearInterval(heartbeat)
@@ -256,7 +310,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     const start = async (): Promise<RunMachine> => {
       const syncs = sqlSyncs(this.ctx.storage.sql, run)
       const box = this.box(syncs)
-      const jobs = jobRunner(box, ledger)
+      const jobs = jobRunner(box, ledger, { deadline })
       await jobs.killStale()
       return { box, jobs, syncs }
     }
@@ -290,6 +344,9 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     this.ctx.storage.sql.exec('update factory_runs set state = ?, note = ? where run = ?', state, note, run)
   }
 }
+
+/** The text with a full stop at its end. */
+const sentence = (text: string) => (/[.!?]$/.test(text) ? text : `${text}.`)
 
 /** Runs `post` one time per run, even when the run resumes. */
 async function once(ledger: Ledger, key: string, post: () => Promise<unknown>): Promise<void> {

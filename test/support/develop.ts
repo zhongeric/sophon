@@ -1,15 +1,15 @@
 import { execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../../src/core/ci.ts'
 import type { MergeMethod } from '../../src/core/checks.ts'
 import type { MergeResult, PullRequests, Signing } from '../../src/core/platform.ts'
-import type { Channel } from '../../src/core/questions.ts'
-import type { Prices } from '../../src/core/usage.ts'
-import { defaultModels } from '../../src/core/workflows/code-review-loop.ts'
-import { defaultDevelopModels, develop, type DevelopInput } from '../../src/core/workflows/develop.ts'
+import { PausedError, type Channel } from '../../src/core/questions.ts'
+import { zeroTokens, type Prices } from '../../src/core/usage.ts'
+import { defaultModels, type Criterion } from '../../src/core/workflows/code-review-loop.ts'
+import { defaultDevelopModels, develop, type DevelopDeps, type DevelopInput, type ReviewRequest } from '../../src/core/workflows/develop.ts'
 import { loadRepoConfig, nodeDevelop } from '../../src/node/platform.ts'
 import { credentials, memoryChannel, module, withoutKey } from './fixture.ts'
 import type { Script } from './scripted-model.ts'
@@ -44,6 +44,24 @@ export function developRepo(config?: Record<string, unknown>, options: { merge?:
   run('remote', 'add', 'origin', origin)
   run('push', '-q', 'origin', 'main')
   return { repo, origin }
+}
+
+/** Pushes a commit with `files` to main on origin, as when another PR merges while a run works. Returns its commit ID. */
+export function pushBase(origin: string, files: Record<string, string>): string {
+  const clone = join(mkdtempSync(join(tmpdir(), 'factory-base-')), 'clone')
+  execFileSync('git', ['clone', '-q', origin, clone], { stdio: 'pipe' })
+  const run = (...args: string[]) => execFileSync('git', args, { cwd: clone, stdio: 'pipe' }).toString().trim()
+  run('config', 'user.email', 'other@example.com')
+  run('config', 'user.name', 'Other')
+  run('config', 'commit.gpgsign', 'false')
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(dirname(join(clone, path)), { recursive: true })
+    writeFileSync(join(clone, path), content)
+  }
+  run('add', '-A')
+  run('commit', '-q', '-m', 'the base moves')
+  run('push', '-q', 'origin', 'HEAD:main')
+  return run('rev-parse', 'HEAD')
 }
 
 export const sources = {
@@ -93,11 +111,13 @@ const wrongProduct = {
 /**
  * The scripted development agents. The sub builder tries to write outside its scope, the tests builder tries to
  * commit a log file and then commits a test with a wrong expectation. The host refuses that log because the test
- * fails, so the builder submits a test of sub only, and the CI fixer adds mul to it. Reviewers find nothing, unless
+ * fails, so the builder submits a test of sub only. The fixer of each repair round shows /review/repair.txt, adds mul to
+ * the test, and writes its round to test/rounds.txt, so that each round makes a commit. Reviewers find nothing, unless
  * `reviewFix`: then the bugs reviewer finds the missing mul test and the patch agent adds it.
- * With `askScope`, the intake agent raises one user question about the scope.
+ * With `askScope`, the intake agent raises one user question about the scope. The fixer of a base merge conflict shows
+ * /review/repair.txt, writes the files of `resolved` without conflict markers, checkpoints and submits.
  */
-export function developScript(options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean } = {}): Script {
+export function developScript(options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean; resolved?: Record<string, string> } = {}): Script {
   return ({ role, output, request }) => {
     if (output !== null) return { text: 'done' }
     switch (role) {
@@ -115,14 +135,33 @@ export function developScript(options: { blockSub?: boolean; reviewFix?: boolean
       case 'planner':
         return { cell: `await tools.submit_plan(${JSON.stringify(plan)})` }
       case 'builder': {
-        if (request.includes('Fix the CI failure'))
+        // The session of the fixer keeps the prompts of the earlier rounds, so the last prompt gives the round.
+        const round = [...request.matchAll(/Repair round (\d+) of/g)].at(-1)?.[1]
+        if (round && /conflict markers/.test(request.slice(request.lastIndexOf('Repair round')))) {
+          const summary = `repair ${round}: the conflicts of the base merge are resolved`
+          const resolved = Object.entries(options.resolved ?? {})
           return {
             cell: [
-              `await tools.Write({ file_path: '/repo/test/ops.test.ts', content: ${JSON.stringify(sources.test(6))} })`,
-              `await tools.checkpoint({ message: 'expect 6' })`,
-              log('mul(2, 3) is 6', 'test/ops.test.ts', ['test/ops.test.ts']),
+              `text('repair.txt: ' + await tools.Read({ file_path: '/review/repair.txt' }))`,
+              ...resolved.map(([path, content]) => `await tools.Write({ file_path: '/repo/${path}', content: ${JSON.stringify(content)} })`),
+              `await tools.checkpoint({ message: 'resolve the conflicts' })`,
+              `await tools.submit_build_log(${JSON.stringify({ summary, changes: resolved.map(([path]) => ({ path, why: summary })), tests: [], blocked: '' })})`,
             ].join('\n'),
           }
+        }
+        if (round) {
+          const summary = `repair ${round}: mul(2, 3) is 6`
+          const changes = ['test/ops.test.ts', 'test/rounds.txt'].map((path) => ({ path, why: summary }))
+          return {
+            cell: [
+              `text('repair.txt: ' + await tools.Read({ file_path: '/review/repair.txt' }))`,
+              `await tools.Write({ file_path: '/repo/test/ops.test.ts', content: ${JSON.stringify(sources.test(6))} })`,
+              `await tools.Write({ file_path: '/repo/test/rounds.txt', content: 'repair round ${round}\\n' })`,
+              `await tools.checkpoint({ message: 'repair ${round}' })`,
+              `await tools.submit_build_log(${JSON.stringify({ summary, changes, tests: ['test/ops.test.ts'], blocked: '' })})`,
+            ].join('\n'),
+          }
+        }
         const id = /Build task ([a-z]+)/.exec(request)?.[1]
         if (id === 'sub' && options.blockSub)
           return { cell: `await tools.submit_build_log({ summary: 'not built', changes: [], tests: [], blocked: 'sub needs a package that is not installed' })` }
@@ -208,6 +247,38 @@ export function fakePulls(ci: boolean[] = [false], options: { stale?: boolean; m
   return { pulls, state }
 }
 
+/** Wraps `pulls` so that the first look at the CI of the `nth` commit (from 1) pauses the run, as when CI is slow. */
+export function pauseAtCi(pulls: PullRequests, nth: number): PullRequests {
+  const seen: string[] = []
+  let paused = false
+  return {
+    ...pulls,
+    async ci(sha) {
+      if (!seen.includes(sha)) seen.push(sha)
+      if (!paused && seen.length === nth) {
+        paused = true
+        throw new PausedError(`waiting for CI on ${sha.slice(0, 12)}`)
+      }
+      return pulls.ci(sha)
+    },
+  }
+}
+
+/**
+ * Review passes that the test gives in place of the review loop, in order: each item is the failed criteria of a pass,
+ * and an empty list is a PASS. A pass makes no fixes. Each request goes to `requests`.
+ */
+export function scriptedReview(passes: Criterion[][], requests: ReviewRequest[]): DevelopDeps['review'] {
+  return async (request) => {
+    requests.push(request)
+    const failed = passes.shift()
+    if (!failed) throw new Error('no scripted review pass left')
+    const criteria = [{ name: 'Checks green', ok: true, detail: 'smoke=pass' }, ...failed]
+    const usage = { tokens: zeroTokens(), usd: 0, unpriced: [] }
+    return { pass: failed.length === 0, criteria, branch: 'factory/review', final: request.head, report: '- Triage: `TRIAGE path=full`', usage, stopped: false }
+  }
+}
+
 export type MergeCall = { pr: number; method: MergeMethod; sha: string }
 export const mergeCommit = 'c0ffee'.padEnd(40, '0')
 
@@ -228,7 +299,7 @@ export async function developInput(repo: string, runId: string, options: { issue
 /**
  * Runs the development workflow on the Node platform, with a scripted model, fake PRs and CI, and memory channels. The
  * repository has no usable key. `signing` wraps the signing of the Node platform. With `keep`, the local deletes and the
- * worktree removal do nothing, so that a test can read a worktree after the run.
+ * worktree removal do nothing, so that a test can read a worktree after the run. `review` replaces the review loop.
  */
 export async function runDevelop(
   repo: string,
@@ -242,6 +313,7 @@ export async function runDevelop(
     prices?: Prices
     signing?: (signing: Signing) => Signing
     keep?: boolean
+    review?: DevelopDeps['review']
   },
 ) {
   withoutKey(repo)
@@ -262,5 +334,5 @@ export async function runDevelop(
   })
   const branches = options.keep ? { ...deps.branches, deleteLocal: async () => {}, release: async () => {} } : deps.branches
   const signed = options.signing ? { ...deps, signing: options.signing(deps.signing) } : deps
-  return { ...(await develop(input, { ...signed, branches })), dir: deps.dir }
+  return { ...(await develop(input, { ...signed, branches, review: options.review ?? deps.review })), dir: deps.dir }
 }
