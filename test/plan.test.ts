@@ -3,14 +3,15 @@ import { test } from 'node:test'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import { targetedTests, type RepoConfig } from '../src/core/checks.ts'
 import { baseTargetedTests } from '../src/core/develop-steps.ts'
-import { checkIntake, checkPlan, checkSpec, frozenAsk, parseIssue, parseParallel, route, routeQuestions, waves, type Plan, type PlanTask } from '../src/core/plan.ts'
+import { checkIntake, checkPlan, checkSpec, frozenAsk, parseIssue, parseParallel, route, routeQuestions, submitIntake, waves, type Plan, type PlanTask } from '../src/core/plan.ts'
 
-const intake = { title: 'Add sub', summary: 'Adds sub() to src/math.ts.', slug: 'add-sub', larger: false, passes: 1, reason: 'One small function.', questions: [] }
+const intake = { title: 'Add sub', summary: 'Adds sub() to src/math.ts.', slug: 'add-sub', passes: 1, reason: 'One small function.', questions: [] }
 const answer = (id: string, text: string) => ({ id, question: id, answer: text, recommended: false })
 
-test('the intake needs a title, a branch slug, and the route with its reason', () => {
+test('the intake needs a title, a branch slug, and the route with its reason, and no larger field', () => {
   assert.throws(() => checkIntake({ ...intake, slug: 'Add Sub', passes: 3, reason: '' }), /slug must be .*\npasses must be 1 or 2\nreason is required/)
   assert.deepEqual(checkIntake(intake).questions, [])
+  assert.doesNotMatch(JSON.stringify(submitIntake.parameters), /"larger"/)
 })
 
 test('the route questions are run questions after the intake questions, and the host reads the route from the answers', () => {
@@ -18,24 +19,23 @@ test('the route questions are run questions after the intake questions, and the 
     routeQuestions(checkIntake(intake)).map((entry) => [entry.id, entry.recommendation, entry.level]),
     [
       ['Q1', 'Yes, go on', 'run'],
-      ['Q2', 'Plan now', 'run'],
-      ['Q3', 'One pass', 'run'],
+      ['Q2', 'One pass', 'run'],
     ],
   )
   // A user question of the intake agent posts the batch, so the confirmation goes to the user with the summary.
   const question = { question: 'May sub return a negative number?', why: 'sub(3, 5)', options: ['Yes', 'No, throw'], recommendation: 'Yes', level: 'user', rule: 'scope' }
-  const asked = checkIntake({ ...intake, larger: true, questions: [question] })
+  const asked = checkIntake({ ...intake, questions: [question] })
   assert.equal(routeQuestions(asked)[0]!.rule, 'scope')
   assert.deepEqual(
     routeQuestions(asked).map((entry) => [entry.id, entry.recommendation, entry.level]),
     [
       ['Q2', 'Yes, go on', 'user'],
-      ['Q3', 'Write a spec first', 'run'],
-      ['Q4', 'One pass', 'run'],
+      ['Q3', 'One pass', 'run'],
     ],
   )
-  assert.deepEqual(route(asked, []), { stop: false, spec: true, passes: 1 })
-  assert.deepEqual(route(asked, [answer('Q2', 'Yes, and also handle zero'), answer('Q3', 'Plan now'), answer('Q4', 'Two passes')]), { stop: false, spec: false, passes: 2 })
+  assert.ok(!routeQuestions(asked).some((entry) => /spec/i.test(entry.question)))
+  assert.deepEqual(route(asked, []), { stop: false, passes: 1 })
+  assert.deepEqual(route(asked, [answer('Q2', 'Yes, and also handle zero'), answer('Q3', 'Two passes')]), { stop: false, passes: 2 })
   assert.equal(route(asked, [answer('Q2', 'No, stop the run')]).stop, true)
   for (const text of ['no', 'Stop.', 'No, stop', 'no stop the run!', 'Stop the run', 'Stop the run!', ' STOP THE RUN. '])
     assert.equal(route(asked, [answer('Q2', text)]).stop, true, text)

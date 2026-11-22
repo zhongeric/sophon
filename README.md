@@ -154,7 +154,7 @@ an error that can pass starts again by itself after 30 minutes, at most three ti
 
 ```bash
 npm run remote -- start acme/app#123     # a review run on a PR (--ship, --full, --budget)
-npm run remote -- develop acme/app#45    # a development run on an issue (--base, --hotfix, --full, --parallel, --budget)
+npm run remote -- develop acme/app#45    # a development run on an issue (--base, --hotfix, --spec, --full, --parallel, --budget)
 npm run remote -- research acme/app#45   # a research run on a program issue (--base, --parallel, --budget)
 npm run remote -- resume acme/app#45     # wake a paused run, or start a run that stopped on an error
 npm run remote -- status acme/app#45     # or report

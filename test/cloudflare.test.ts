@@ -5,7 +5,7 @@ import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { moveBase, parents } from './support/base-merge.ts'
-import { developRepo, developScript, sources } from './support/develop.ts'
+import { developRepo, developScript, planTurn, sources } from './support/develop.ts'
 import { fixed, fixtureRepo, lightFixed, scriptFor } from './support/fixture.ts'
 import { mockServices } from './support/mock-services.ts'
 import { sendWebhook, startWorker, until } from './support/wrangler.ts'
@@ -45,7 +45,7 @@ test('on Cloudflare, a base-merge fixer that keeps the original tree still pushe
   const mock = await mockServices(repo, {
     botLogin: 'factory-bot', issues, name: 'app', owner: 'acme',
     script: (turn) => {
-      if (turn.role === 'planner' && !base) base = moveBase(repo, { 'src/sub.ts': 'export const sub = (a: number, b: number) => -(b - a)\n' })
+      if (planTurn(turn) && !base) base = moveBase(repo, { 'src/sub.ts': 'export const sub = (a: number, b: number) => -(b - a)\n' })
       return script(turn)
     },
   })
@@ -695,7 +695,7 @@ test('on Cloudflare, /develop asks a user question of the intake agent on the is
     const asked = await until(() => on(5).find((entry) => entry.body.includes('agent-factory:questions')), 120_000, describe)
     assert.match(asked.body, /\*\*Q1\.\*\* Add div too\?/)
     assert.match(asked.body, /\*\*Q2\.\*\* Is this the ask\?/)
-    assert.doesNotMatch(asked.body, /Write a spec before the plan\?|How many review loop passes\?/)
+    assert.doesNotMatch(asked.body, /How many review loop passes\?/)
     mock.comment('maintainer', '/answer recommended', 5)
     await sendWebhook(worker.url, secret, 'issue_comment', { ...issueComment, comment: { body: '/answer recommended', user: { login: 'maintainer' } } })
 
@@ -705,7 +705,7 @@ test('on Cloudflare, /develop asks a user question of the intake agent on the is
     assert.match(asked.body.split('\n')[0]!, /^@maintainer$/i)
     assert.doesNotMatch(done.body, /@Maintainer/i)
     assert.match(done.body, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
-    assert.match(done.body, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\*.*\n- Is this the ask\? .*\*\*Yes, go on\*\*.*\n\n## Decisions the run made\n\n- Write a spec before the plan\? \*\*Plan now\*\*/)
+    assert.match(done.body, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\*.*\n- Is this the ask\? .*\*\*Yes, go on\*\*.*\n\n## Decisions the run made\n\n- How many review loop passes\? \*\*One pass\*\*/)
   } finally {
     await worker.stop()
     await mock.close()

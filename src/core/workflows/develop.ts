@@ -1,7 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../ci.ts'
 import type { FailedFinalCheck, MergeMethod, RepoConfig } from '../checks.ts'
-import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
+import { build, plannerSession, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { alarmLines, settleAll } from '../planned-stop.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
@@ -16,12 +16,12 @@ import { StopError } from '../stop.ts'
 import { BudgetStop, belowBudget, budgetGate, checkPriced, resolveBudget, usageOf, usageSection, zeroTokens, type Prices, type RunUsage, type UsageRow } from '../usage.ts'
 import { checkAllowedModels, checkFamilySwap, decisionSections, defaultAllowedModels, loopModelIds, providersOf, type Criterion, type LoopModels, type LoopResult } from './code-review-loop.ts'
 
-export type DevelopModels = Record<'intake' | 'spec' | 'planner' | 'builder', ModelChoice>
+export type DevelopModels = Record<'spec' | 'planner' | 'builder', ModelChoice>
 
 const opus: ModelChoice = { provider: 'claude', model: 'claude-opus-5-5' }
 
-/** Intake, spec, planner and builders run on Opus 5.5, the strongest writer of the allowed models. */
-export const defaultDevelopModels: DevelopModels = { intake: opus, spec: opus, planner: { ...opus, thinking: 'high' }, builder: { ...opus, thinking: 'high' } }
+/** Spec, planner and builders run on Opus 5.5, the strongest writer of the allowed models. */
+export const defaultDevelopModels: DevelopModels = { spec: opus, planner: { ...opus, thinking: 'high' }, builder: { ...opus, thinking: 'high' } }
 
 export type DevelopInput = {
   runId: string
@@ -38,6 +38,8 @@ export type DevelopInput = {
   allowedModels?: string[]
   /** A small hotfix: the host takes every recommendation without asking. */
   hotfix?: boolean
+  /** Run the spec stage between the intake answers and the plan turn (D19). */
+  spec?: boolean
   /** The full review loop, also for a docs or tests only change. */
   full?: boolean
   /** At most this many builders at the same time. */
@@ -143,7 +145,7 @@ export function checkDevelopModels(models: DevelopModels, allowed = defaultAllow
 
 /**
  * The development workflow, steps 0 to 9, with its order and hard rules in code:
- * intake and the confirmation of the ask, a spec for a larger change, one plan, builders for the plan's tasks (in
+ * the intake turn of the planner session and the confirmation of the ask, a spec when the input asks for one, the plan turn, builders for the plan's tasks (in
  * parallel when their files do not overlap, each on its own branch), a draft PR, CI, the code review loop, CI again,
  * and a ready PR only when every criterion holds. A red CI or a failed review pass gets a repair round inside one
  * budget, and a new review pass reviews the fixes (D14). Before the ready step and the merge, the host merges a base
@@ -271,26 +273,28 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   }
   stop.finish = finish
 
-  // 0. Intake: no plan and no code before the ask is confirmed. The route questions are run questions (D11), so the run
-  // takes the recommendations of the intake agent. The run asks the user only when the intake agent raises a user question.
-  const intook = await step(ledger, 'intake', () => intake(context, 'intake', models.intake, view))
+  // 0. Intake: the first turn of the planner session (D19). No plan and no code before the ask is confirmed. The route
+  // questions are run questions (D11), so the run takes the recommendations of the planner. The run asks the user only
+  // when the planner raises a user question. The step keys are new, so a ledger from before D19 does not resume them.
+  const planner = plannerSession(context, models.planner, view)
+  const intook = await step(ledger, 'planner.intake', () => planner.intake())
   state.intake = intook
   const intakeAnswers = await ask('intake', [...intook.questions, ...routeQuestions(intook)])
   const routed = route(intook, intakeAnswers)
   state.route = routed
   if (routed.stop) return finish('stopped', [], 'You stopped the run at intake.')
 
-  // 1. Spec, for a larger change. Its decisions are one batch of questions. Only its user questions go to the user (D11).
+  // 1. Spec, only when the input asks for one. Its decisions are one batch of questions. Only its user questions go to the user (D11).
   let spec: string | null = null
-  if (routed.spec) {
+  if (input.spec) {
     const written = await step(ledger, 'spec', () => writeSpec(context, 'spec', models.spec, view))
     deps.files.write('spec.md', written.spec)
     spec = written.spec
     await ask('spec', written.decisions)
   }
 
-  // 2. Plan: one planner writes the four parts, the profile sections and the tasks (D7).
-  const planned = await step(ledger, 'plan', () => plan(context, 'plan', models.planner, view, [...new Set(active.flatMap((profile) => profile.planSections))], spec))
+  // 2. Plan: the follow-up turn of the planner session writes the four parts, the profile sections and the tasks (D7).
+  const planned = await step(ledger, 'planner.plan', () => planner.plan([...new Set(active.flatMap((profile) => profile.planSections))], spec))
   state.plan = planned
   const planText = `# Plan\n\n${renderPlan(planned, { tasks: true })}`
   deps.files.write('plan.md', planText)
@@ -600,7 +604,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
           ? `${input.hotfix ? 'hotfix' : 'standing answers'}: the host took every recommendation`
           : intakeAnswers.some((answer) => answer.decidedBy !== 'run')
             ? 'you answered the intake questions'
-            : 'the run took the recommendations of the intake agent (D11)',
+            : 'the run took the recommendations of the planner (D11)',
       },
       { name: 'Plan with its four parts', ok: true, detail: `${planned.tasks.length} tasks in ${scheduled.length} waves` },
       { name: 'Every task built', ok: true, detail: state.built.map((entry) => entry.task.id).join(', ') },
@@ -1005,7 +1009,7 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
     `- Run: ${state.input.runId}`,
     `- Source: ${state.input.source}`,
     ...(state.intake ? [`- Title: ${state.intake.title}`] : []),
-    ...(state.route ? [`- Route: ${state.route.spec ? 'spec, then plan' : 'plan'}, ${state.route.passes} review loop ${state.route.passes === 1 ? 'pass' : 'passes'}. ${state.intake?.reason ?? ''}`] : []),
+    ...(state.route ? [`- Route: ${state.input.spec ? 'spec, then plan' : 'plan'}, ${state.route.passes} review loop ${state.route.passes === 1 ? 'pass' : 'passes'}. ${state.intake?.reason ?? ''}`] : []),
     ...(state.branch ? [`- Branch: ${state.branch}${state.head ? ` at ${state.head.slice(0, 12)}` : ''}`] : []),
     ...(state.signing ? [`- ${signingLine(state.signing)}`] : []),
     ...alarms,

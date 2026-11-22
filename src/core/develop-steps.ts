@@ -37,22 +37,7 @@ function agent(context: DevelopContext, id: string, role: Role, model: ModelChoi
 const readerWorkspace = (context: DevelopContext, tree: FileSystem.FileSystem, review: Record<string, string>) =>
   createWorkspace({ repo: readOnly(guard(tree)), review: { '/ask.md': context.ask, ...decisionsFile(context.host.ledger), ...review }, guides: context.guides.mounts })
 
-/** A read-only agent that reads the ask and the repository, and returns its summary, the route and its questions. */
-export async function intake(context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem): Promise<Intake> {
-  const workspace = await readerWorkspace(context, tree, {})
-  const tools = submitOnce(context.host, `output:${id}`, submitIntake, async (input) => checkIntake(input))
-  const prompt = [
-    'Read this new ask and the repository. Nobody has planned or written code yet.',
-    '',
-    '- The ask: /review/ask.md',
-    '- The repository: /repo, at the base commit',
-    '',
-    'Call submit_intake one time.',
-  ].join('\n')
-  return runTurn(context.host, agent(context, id, developRoles.intake, model, workspace, tools), prompt, 'submit_intake')
-}
-
-/** A read-only agent that writes the spec of a larger change, and the decisions that the user can overrule. */
+/** A read-only agent that writes the spec when the user asks for one, and the decisions that the user can overrule. */
 export async function writeSpec(context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem): Promise<Spec> {
   const workspace = await readerWorkspace(context, tree, {})
   const tools = submitOnce(context.host, `output:${id}`, submitSpec, async (input) => checkSpec(input))
@@ -105,25 +90,52 @@ export function baseTargetedTests(config: RepoConfig, tree: FileSystem.FileSyste
   }
 }
 
-/** The planner: one read-only agent that writes the four plan parts, the profile sections and the tasks (D7). */
-export async function plan(context: DevelopContext, id: string, model: ModelChoice, tree: FileSystem.FileSystem, sections: string[], spec: string | null): Promise<Plan> {
-  const review = { '/plan-sections.txt': sections.join('\n'), ...(spec ? { '/spec.md': spec } : {}) }
-  const workspace = await readerWorkspace(context, tree, review)
-  const targeted = baseTargetedTests(context.config, tree)
-  const tools = submitOnce(context.host, `output:${id}`, submitPlan, async (input) => checkPlan(input, sections, (path) => isProtected(context.config, path), targeted))
-  const prompt = [
-    'Plan this confirmed ask.',
-    '',
-    '- The ask: /review/ask.md',
-    '- Decisions: /review/decisions.md',
-    ...(spec ? ['- The spec: /review/spec.md'] : []),
-    `- Required sections: /review/plan-sections.txt (${sections.length ? sections.join(', ') : 'none'})`,
-    `- Protected paths, which no task may write: ${protectedEntries(context.config).join(', ')}`,
-    '- The repository: /repo, at the base commit',
-    '',
-    'Call submit_plan one time.',
-  ].join('\n')
-  return runTurn(context.host, agent(context, id, developRoles.planner, model, workspace, tools), prompt, 'submit_plan')
+/** The agent ID of the planner session. Both turns use it, so the plan turn opens the session of the intake turn. */
+const plannerId = 'planner'
+
+/**
+ * The planner session (D19): one read-only agent with two turns. The intake turn returns the summary of the ask, the
+ * route and the questions. After the answers, the plan turn writes the four plan parts, the profile sections and the
+ * tasks (D7). Each turn has its own request ID and output key.
+ */
+export function plannerSession(context: DevelopContext, model: ModelChoice, tree: FileSystem.FileSystem) {
+  const open = (workspace: Contracts.WorkspaceHost, tools: HostTools) => agent(context, plannerId, developRoles.planner, model, workspace, tools)
+  return {
+    async intake(): Promise<Intake> {
+      const turn = { request: 'intake', key: `output:${plannerId}:intake` }
+      const workspace = await readerWorkspace(context, tree, {})
+      const tools = submitOnce(context.host, turn.key, submitIntake, async (input) => checkIntake(input))
+      const prompt = [
+        'Read this new ask and the repository. Nobody has planned or written code yet.',
+        '',
+        '- The ask: /review/ask.md',
+        '- The repository: /repo, at the base commit',
+        '',
+        'Call submit_intake one time. After the answers to the questions, the plan turn comes next in this session.',
+      ].join('\n')
+      return runTurn(context.host, open(workspace, tools), prompt, 'submit_intake', turn)
+    },
+    async plan(sections: string[], spec: string | null): Promise<Plan> {
+      const turn = { request: 'plan', key: `output:${plannerId}:plan` }
+      const review = { '/plan-sections.txt': sections.join('\n'), ...(spec ? { '/spec.md': spec } : {}) }
+      const workspace = await readerWorkspace(context, tree, review)
+      const targeted = baseTargetedTests(context.config, tree)
+      const tools = submitOnce(context.host, turn.key, submitPlan, async (input) => checkPlan(input, sections, (path) => isProtected(context.config, path), targeted))
+      const prompt = [
+        'Plan this confirmed ask.',
+        '',
+        '- The ask: /review/ask.md',
+        '- Decisions: /review/decisions.md',
+        ...(spec ? ['- The spec: /review/spec.md'] : []),
+        `- Required sections: /review/plan-sections.txt (${sections.length ? sections.join(', ') : 'none'})`,
+        `- Protected paths, which no task may write: ${protectedEntries(context.config).join(', ')}`,
+        '- The repository: /repo, at the base commit',
+        '',
+        'Call submit_plan one time.',
+      ].join('\n')
+      return runTurn(context.host, open(workspace, tools), prompt, 'submit_plan', turn)
+    },
+  }
 }
 
 export type BuildLog = {

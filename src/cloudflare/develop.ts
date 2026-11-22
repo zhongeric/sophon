@@ -27,7 +27,7 @@ import { encodePath } from './trees.ts'
  * A development run on a GitHub issue: the issue's title and body are the ask, and its comments carry the questions.
  * `budget` is the cost budget in USD.
  */
-export type DevelopRequest = { owner: string; repo: string; issue: number; by: string; base?: string; hotfix?: boolean; full?: boolean; parallel?: number; budget?: number }
+export type DevelopRequest = { owner: string; repo: string; issue: number; by: string; base?: string; hotfix?: boolean; spec?: boolean; full?: boolean; parallel?: number; budget?: number }
 
 /**
  * The development runs of one issue. The brain stays here: the ledger, the branches as trees in SQL, every agent
@@ -120,6 +120,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
       source: `${request.owner}/${request.repo}#${request.issue}`,
       issue: request.issue,
       ...(request.hotfix ? { hotfix: true } : {}),
+      ...(request.spec ? { spec: true } : {}),
       ...(request.full ? { full: true } : {}),
       ...(request.parallel ? { parallel: request.parallel } : {}),
       ...(request.budget !== undefined ? { budget: request.budget } : {}),

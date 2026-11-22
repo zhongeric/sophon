@@ -62,13 +62,14 @@ async function runsOf(env: Env, owner: string, repo: string, number: number) {
   return (researched.runs[0]?.created ?? -1) > (developed.runs[0]?.created ?? -1) ? researches : develops
 }
 
-type DevelopOptions = Pick<DevelopRequest, 'base' | 'hotfix' | 'full' | 'parallel'>
+type DevelopOptions = Pick<DevelopRequest, 'base' | 'hotfix' | 'spec' | 'full' | 'parallel'>
 
 /** The options of a development run, from the admin route's body or from the words after /develop. */
-function developOptions(source: { base?: unknown; hotfix?: unknown; full?: unknown; parallel?: unknown }): DevelopOptions {
+function developOptions(source: { base?: unknown; hotfix?: unknown; spec?: unknown; full?: unknown; parallel?: unknown }): DevelopOptions {
   return {
     ...(typeof source.base === 'string' && source.base ? { base: source.base } : {}),
     ...(source.hotfix === true ? { hotfix: true } : {}),
+    ...(source.spec === true ? { spec: true } : {}),
     ...(source.full === true ? { full: true } : {}),
     ...(Number(source.parallel) >= 1 ? { parallel: Math.floor(Number(source.parallel)) } : {}),
   }
@@ -79,6 +80,7 @@ const commandOptions = (text: string): DevelopOptions =>
     base: /--base\s+(\S+)/.exec(text)?.[1],
     full: /--full\b/.test(text),
     hotfix: /--hotfix\b/.test(text),
+    spec: /--spec\b/.test(text),
     parallel: /--parallel\s+(\d+)/.exec(text)?.[1],
   })
 

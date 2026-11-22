@@ -13,7 +13,7 @@ Commands:
   start <pr>        Start a review run on the PR (--ship: on PASS, push the fixes to the PR branch and mark it ready;
                     --full: the strict loop, also when triage allows the light or the standard loop)
   develop <issue>   Start a development run on the issue: its title and body are the ask (--base <branch>,
-                    --hotfix, --full, --parallel <n>, as in npm run develop)
+                    --hotfix, --spec, --full, --parallel <n>, as in npm run develop)
   research <issue>  Start a research run on the program issue: its title and body are the program (--base <branch>,
                     --parallel <n>)
   resume <number>   Wake a paused run of the PR or issue now, for example after you answered its questions, and
@@ -122,7 +122,7 @@ export function setting(name: string): string {
   return value
 }
 
-export type RemoteOptions = { base?: string; budget?: string; full?: boolean; hotfix?: boolean; parallel?: string; ship?: boolean }
+export type RemoteOptions = { base?: string; budget?: string; full?: boolean; hotfix?: boolean; parallel?: string; ship?: boolean; spec?: boolean }
 
 export type RemoteRequest = { body?: string; method: 'GET' | 'POST'; path: string }
 
@@ -131,7 +131,7 @@ export function remoteRequest(command: string, target: string, options: RemoteOp
   if (options.budget !== undefined && command !== 'start' && command !== 'develop' && command !== 'research')
     throw new StopError('only start, develop and research take --budget')
   if (command === 'research')
-    for (const flag of ['hotfix', 'full', 'ship'] as const) if (options[flag]) throw new StopError(`research does not take --${flag}`)
+    for (const flag of ['hotfix', 'spec', 'full', 'ship'] as const) if (options[flag]) throw new StopError(`research does not take --${flag}`)
   if (command === 'prune') {
     const { owner, repo } = parseRepo(target)
     return { method: 'POST', path: `/prune/${owner}/${repo}` }
@@ -142,7 +142,7 @@ export function remoteRequest(command: string, target: string, options: RemoteOp
   const runs = `/runs/${owner}/${repo}/${pr}`
   const post = (to: string, body: object): RemoteRequest => ({ body: JSON.stringify(body), method: 'POST', path: to })
   const requests: Record<string, () => RemoteRequest> = {
-    develop: () => post(`/develop/${owner}/${repo}/${pr}`, { base: options.base, full: options.full === true, hotfix: options.hotfix === true, parallel, ...budget }),
+    develop: () => post(`/develop/${owner}/${repo}/${pr}`, { base: options.base, full: options.full === true, hotfix: options.hotfix === true, spec: options.spec === true, parallel, ...budget }),
     report: () => ({ method: 'GET', path: `${runs}/report` }),
     research: () => post(`/research/${owner}/${repo}/${pr}`, { base: options.base, parallel, ...budget }),
     resume: () => ({ method: 'POST', path: `${runs}/resume` }),
@@ -165,6 +165,7 @@ async function main(): Promise<number> {
       hotfix: { type: 'boolean' },
       parallel: { type: 'string' },
       ship: { type: 'boolean' },
+      spec: { type: 'boolean' },
     },
   })
   const [command, target] = positionals

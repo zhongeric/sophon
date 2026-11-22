@@ -12,7 +12,7 @@ import { defaultModels, type Criterion } from '../../src/core/workflows/code-rev
 import { defaultDevelopModels, develop, type DevelopDeps, type DevelopInput, type ReviewRequest } from '../../src/core/workflows/develop.ts'
 import { loadRepoConfig, nodeDevelop } from '../../src/node/platform.ts'
 import { credentials, memoryChannel, module, withoutKey } from './fixture.ts'
-import type { Script } from './scripted-model.ts'
+import type { Script, Turn } from './scripted-model.ts'
 
 /**
  * A repository with add() on main, and a bare origin that the run pushes to. `config` replaces the checks config.
@@ -73,7 +73,7 @@ export const sources = {
   subTest: "import assert from 'node:assert/strict'\nimport { test } from 'node:test'\nimport { sub } from '../src/sub.ts'\n\ntest('sub', () => {\n  assert.equal(sub(5, 3), 2)\n})\n",
 }
 
-const intake = { title: 'Add sub and mul', summary: 'Adds sub() and mul() next to add(), with tests.', slug: 'add-sub-mul', larger: false, passes: 1, reason: 'Two small functions.', questions: [] }
+const intake = { title: 'Add sub and mul', summary: 'Adds sub() and mul() next to add(), with tests.', slug: 'add-sub-mul', passes: 1, reason: 'Two small functions.', questions: [] }
 
 /** A question about the scope of the ask, which only the user can decide (D11). */
 export const scopeQuestion = {
@@ -84,6 +84,18 @@ export const scopeQuestion = {
   level: 'user',
   rule: 'scope',
 }
+
+/** The spec that the scripted spec agent submits, with one run decision. */
+export const spec = {
+  spec: ['# Summary', 'sub and mul next to add.', '## Surfaces', 'src/', '## Edge cases', 'Negative numbers.', '## Out of scope', 'Division.', '## Decisions', 'One file for each function.'].join('\n'),
+  decisions: [{ question: 'One file for each function?', why: 'add has its own file.', options: ['Yes', 'No, one file'], recommendation: 'Yes', level: 'run' }],
+}
+
+/**
+ * True for the plan turn of the planner session. The session keeps the prompts of its earlier turns, so the last prompt
+ * of the request tells the turn.
+ */
+export const planTurn = (turn: Pick<Turn, 'role' | 'request'>) => turn.role === 'planner' && turn.request.lastIndexOf('Plan this confirmed ask.') > turn.request.lastIndexOf('Read this new ask')
 
 const task = (id: string, files: string[], depends_on: string[] = []) => ({ id, title: `Add ${id}`, work: `Build ${id}.`, files, depends_on })
 /** The plan that the scripted planner submits. */
@@ -114,7 +126,8 @@ const wrongProduct = {
  * fails, so the builder submits a test of sub only. The fixer of each repair round shows /review/repair.txt, adds mul to
  * the test, and writes its round to test/rounds.txt, so that each round makes a commit. Reviewers find nothing, unless
  * `reviewFix`: then the bugs reviewer finds the missing mul test and the patch agent adds it.
- * With `askScope`, the intake agent raises one user question about the scope. The fixer of a base merge conflict shows
+ * The planner answers the intake turn with submit_intake and the plan turn with submit_plan.
+ * With `askScope`, the intake turn raises one user question about the scope. The fixer of a base merge conflict shows
  * /review/repair.txt, writes the files of `resolved` without conflict markers, checkpoints and submits.
  * With `checkFlag`, the bugs reviewer creates that file. When the prompt names /review/check-failure.txt, the fixer shows it.
  * With `blockRepair`, the fixer of that repair round submits a blocked log and changes nothing.
@@ -133,10 +146,11 @@ export function developScript(options: { blockSub?: boolean; reviewFix?: boolean
             `await tools.submit_patch_log({ applied: [{ id: 'bugs-001', change: 'expect 6' }], skipped: [] })`,
           ].join('\n'),
         }
-      case 'intake':
-        return { cell: `await tools.submit_intake(${JSON.stringify(options.askScope ? { ...intake, questions: [scopeQuestion] } : intake)})` }
       case 'planner':
-        return { cell: `await tools.submit_plan(${JSON.stringify(plan)})` }
+        if (planTurn({ role, request })) return { cell: `await tools.submit_plan(${JSON.stringify(plan)})` }
+        return { cell: `await tools.submit_intake(${JSON.stringify(options.askScope ? { ...intake, questions: [scopeQuestion] } : intake)})` }
+      case 'spec':
+        return { cell: `await tools.submit_spec(${JSON.stringify(spec)})` }
       case 'builder': {
         // The session of the fixer keeps the prompts of the earlier rounds, so the last prompt gives the round.
         const round = [...request.matchAll(/Repair round (\d+) of/g)].at(-1)?.[1]

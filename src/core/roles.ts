@@ -17,7 +17,7 @@ export type ReviewRoleId =
   | 'questions'
   | 'light'
 
-export type DevelopRoleId = 'intake' | 'spec' | 'planner' | 'builder'
+export type DevelopRoleId = 'spec' | 'planner' | 'builder'
 
 export type ResearchRoleId = 'intake' | 'surveyor' | 'generator' | 'preregistrar' | 'skeptic' | 'late-skeptic' | 'analyst' | 'writer' | 'builder'
 
@@ -135,9 +135,9 @@ export const reviewRoles: RoleTable<ReviewRoleId> = {
 }
 
 export const developRoles: RoleTable<DevelopRoleId> = {
-  intake: { id: 'intake', guides: ['shared/factory.md', 'intake.md'], stackGuides: false, tests: false, egress: false, turnMs: minutes(2) },
   spec: { id: 'spec', guides: ['shared/factory.md', 'spec.md', 'shared/ste.md'], stackGuides: false, tests: false, egress: false, turnMs: minutes(3) },
-  planner: { id: 'planner', guides: ['shared/factory.md', 'planner.md', 'shared/ste.md'], stackGuides: true, tests: false, egress: false, turnMs: minutes(7) },
+  // One session runs the intake turn and then the plan turn (D19), so it reads both guides.
+  planner: { id: 'planner', guides: ['shared/factory.md', 'intake.md', 'planner.md', 'shared/ste.md'], stackGuides: true, tests: false, egress: false, turnMs: minutes(7) },
   // A builder turn that runs out of time continues in a new turn (D12), so its turn time only keeps it at the start of a call.
   builder: {
     id: 'builder',
