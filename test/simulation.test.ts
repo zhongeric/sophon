@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { availableParallelism } from 'node:os'
 import { test } from 'node:test'
 import { Worker } from 'node:worker_threads'
-import { failureMessage, schedule, violations, type Trace } from './support/simulation.ts'
+import { failureMessage, kindOf, schedule, violations, type Trace } from './support/simulation.ts'
 
 /**
  * The seeds that found a bug of the engine. They run each time, also when SIM_SEEDS is small. Add the seed of each
@@ -11,7 +11,7 @@ import { failureMessage, schedule, violations, type Trace } from './support/simu
 const bugSeeds: number[] = []
 
 /** A positive integer from the environment, or the default when the variable is not set. */
-function positive(name: string, fallback: number | undefined): number | undefined {
+function positive<T extends number | undefined>(name: string, fallback: T): number | T {
   const value = process.env[name]
   if (value === undefined || value === '') return fallback
   if (!/^[1-9]\d*$/.test(value)) throw new Error(`${name} must be a positive integer, not ${JSON.stringify(value)}`)
@@ -19,7 +19,7 @@ function positive(name: string, fallback: number | undefined): number | undefine
 }
 
 const only = positive('SIM_SEED', undefined)
-const count = positive('SIM_SEEDS', 200) ?? 200
+const count = positive('SIM_SEEDS', 200)
 const seeds = only !== undefined ? [only] : [...new Set([...Array.from({ length: count }, (_, index) => index + 1), ...bugSeeds])]
 
 const base: Trace = {
@@ -77,6 +77,21 @@ test('the invariant checks find each kind of violation', () => {
   }
 })
 
+test('the commits check compares the trees, also when they are real 40-hex IDs', () => {
+  const reference = { ...base, commits: { 'refs/heads/main': [`${'a'.repeat(40)} base`] } }
+  const found = violations({ ...base, commits: { 'refs/heads/main': [`${'b'.repeat(40)} base`] } }, reference)
+  assert.equal(found.length, 1, JSON.stringify(found))
+  assert.match(found[0]!, /^the commits differ from the reference/)
+  assert.deepEqual(violations(reference, reference), [])
+})
+
+test('the invariant checks fail a reference run that does not pass', () => {
+  for (const state of ['error', 'failed', 'running']) {
+    const reference = { ...base, note: 'boom', state }
+    assert.ok(violations(reference, reference).some((line) => line.startsWith(`the reference run ended ${state}, not passed: boom`)), state)
+  }
+})
+
 test('a failure message gives the seed, the faults and the command that runs only this seed', () => {
   const message = failureMessage({ faults: [{ at: 3, kind: 'die-github' }], kind: 'develop', seed: 42 }, ['no end'])
   assert.match(message, /^seed 42 \(develop run\) failed$/m)
@@ -91,19 +106,47 @@ test('a seed gives the same fault schedule each time', () => {
   assert.ok(Array.from({ length: 50 }, (_, index) => schedule(index + 1, counts)).some((faults) => faults.length > 0))
 })
 
-/** Runs a share of the seeds in a worker thread. Resolves with the failure messages. */
+/** The most wall time of one seed, with the reference runs of its worker. A seed that uses more hangs. */
+const seedLimit = 120_000
+
+/**
+ * Runs a share of the seeds in a worker thread. Resolves with the failure messages. When a seed hangs or throws, the
+ * worker stops, and the failure names that seed: the worker runs its seeds in order, so it is the seed after the last result.
+ */
 function runShare(share: number[]): Promise<string[]> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const failures: string[] = []
+    let done = 0
+    let ended = false
     const worker = new Worker(new URL('./support/simulation-worker.ts', import.meta.url), { workerData: share })
-    worker.on('message', (result: { failure: string | null }) => void (result.failure && failures.push(result.failure)))
-    worker.on('error', reject)
-    worker.on('exit', (code) => (code === 0 ? resolve(failures) : reject(new Error(`a simulation worker ended with exit code ${code}`))))
+    const end = (problem?: string) => {
+      if (ended) return
+      ended = true
+      clearTimeout(timer)
+      const seed = share[done]
+      if (problem !== undefined && seed === undefined) failures.push(`a simulation worker failed after its last seed: ${problem}`)
+      else if (problem !== undefined && seed !== undefined) {
+        failures.push([`seed ${seed} (${kindOf(seed)} run) failed`, `- ${problem}`, `rerun: SIM_SEED=${seed} node --test test/simulation.test.ts`].join('\n'))
+      }
+      void worker.terminate()
+      resolve(failures)
+    }
+    const arm = () => setTimeout(() => end(`the seed did not end in ${seedLimit / 1000} s`), seedLimit)
+    let timer = arm()
+    worker.on('message', (result: { failure: string | null }) => {
+      if (ended) return
+      done++
+      if (result.failure) failures.push(result.failure)
+      clearTimeout(timer)
+      timer = arm()
+    })
+    worker.on('error', (error) => end(`the seed threw: ${String(error)}`))
+    worker.on('exit', (code) => end(code === 0 && done === share.length ? undefined : `the worker ended with exit code ${code}`))
   })
 }
 
 test(`the runs keep their invariants under the faults of ${seeds.length} seeds`, async () => {
-  // The seeds run in worker threads, so that 200 seeds take less than 30 s.
+  // The seeds run in worker threads. With 4 threads, 200 seeds took 27 s. The mock GitHub reads refs without git processes.
   const threads = Math.max(1, Math.min(availableParallelism(), 8, seeds.length))
   const shares = Array.from({ length: threads }, (_, thread) => seeds.filter((_, index) => index % threads === thread))
   const failures = (await Promise.all(shares.map(runShare))).flat()

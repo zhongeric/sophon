@@ -6,7 +6,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
+import { DatabaseSync, type SQLInputValue, type StatementSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import type { Box, BoxResult, JobState } from '../../src/cloudflare/box.ts'
 import type { Clock } from '../../src/core/clock.ts'
@@ -97,7 +97,7 @@ function engine(generation: number): Promise<Engine> {
 }
 
 /** A seeded PRNG (mulberry32): one seed gives the same sequence each time. */
-export function prng(seed: number): () => number {
+function prng(seed: number): () => number {
   let state = seed >>> 0
   return () => {
     state = (state + 0x6d2b79f5) >>> 0
@@ -108,14 +108,14 @@ export function prng(seed: number): () => number {
   }
 }
 
-export type RunKind = 'develop' | 'review'
+type RunKind = 'develop' | 'review'
 /** The points where a fault can occur. The simulation counts each point from 1. */
-export type Point = 'storage' | 'github' | 'model' | 'box' | 'job'
-export type FaultKind = 'die-storage' | 'die-github' | 'die-model' | 'die-box' | 'budget' | 'github-500' | 'github-429' | 'lost-job' | 'deploy'
+type Point = 'storage' | 'github' | 'model' | 'box' | 'job'
+type FaultKind = 'die-storage' | 'die-github' | 'die-model' | 'die-box' | 'budget' | 'github-500' | 'github-429' | 'lost-job' | 'deploy'
 /** A fault at the `at`-th occurrence of its point. */
-export type Fault = { kind: FaultKind; at: number }
+type Fault = { kind: FaultKind; at: number }
 
-export const pointOf: Record<FaultKind, Point> = {
+const pointOf: Record<FaultKind, Point> = {
   'die-storage': 'storage',
   'die-github': 'github',
   'die-model': 'model',
@@ -128,9 +128,9 @@ export const pointOf: Record<FaultKind, Point> = {
 }
 const faultKinds = Object.keys(pointOf) as FaultKind[]
 /** The most faults of one seed. A correct engine recovers from each, so the run always ends. */
-export const maxFaults = 3
+const maxFaults = 3
 /** The alarm calls that a seed can use: this multiple of the sum of the reference count and the fault count. */
-export const callFactor = 4
+const callFactor = 4
 
 /**
  * The faults of a seed, at points that the reference run reaches. When a found bug needs a change to a recorded D or
@@ -185,16 +185,13 @@ const stamp = /\bpr-(\d+)-\d{8}-\d{6}\b/g
 /**
  * The values that a fault changes by design. Every other difference to the reference run is a finding. All masks are
  * here:
- * - the counters of planned stops and crash restarts, and the time of the last D13 restart, because the alarm calls
- *   differ (decision: the status comment check ignores these counters);
- * - the usage figures of the report (tokens and USD), because a repeated model request is real spend, and the order of
- *   the usage rows, because it is the order in which parallel steps end;
- * - the stamp in the name of a review run that a development run starts, because a fault moves the time of that
- *   call, and the commit IDs that come from that name;
- * - the commit IDs in the text, because the in-process git of a frozen tree dates its commits with the real time. The
- *   commits check compares the GitHub commits by their tree and message.
+ * - The counters of planned stops and crash restarts, and the time of the last D13 restart. The alarm calls differ.
+ * - The usage figures of the report (tokens and USD). A repeated model request is a real cost.
+ * - The order of the usage rows. It is the order in which parallel steps end.
+ * - The stamp in the name of a review run that a development run starts. A fault moves the time of that call.
+ * - The commit IDs. The stamp and the real time of the in-process git change them. The commits check keeps the trees.
  */
-export function mask(text: string): string {
+function mask(text: string): string {
   const masked = text
     .replace(/- Alarm calls: \d+ planned stops?, \d+ crash restarts?/g, '- Alarm calls: (masked)')
     .replace(/^- Restart: .*$/gm, '- Restart: (masked)')
@@ -225,6 +222,8 @@ function sortRuns(lines: string[], row: (line: string) => boolean): string[] {
 /** The invariant checks of a seed against the reference run. Returns each violation. */
 export function violations(trace: Trace, reference: Trace): string[] {
   const found: string[] = []
+  // A reference that does not pass makes each check of a seed vacuous.
+  if (reference.state !== 'passed') found.push(`the reference run ended ${reference.state ?? 'missing'}, not passed: ${reference.note}`)
   if (!terminal.includes(trace.state ?? '')) found.push(`no end: the run is ${trace.state ?? 'missing'} after ${trace.calls} alarm calls (limit ${trace.limit})`)
   else if (trace.state === 'error' && reference.state !== 'error') found.push(`the run waits with error: ${trace.note}`)
   else if (trace.state !== reference.state) found.push(`the run ended ${trace.state}, the reference ${reference.state}`)
@@ -239,17 +238,23 @@ export function violations(trace: Trace, reference: Trace): string[] {
     if (seenPosts.has(post)) found.push(`a new comment on #${issue} repeats an earlier comment: ${JSON.stringify(body.slice(0, 120))}`)
     seenPosts.add(post)
   }
-  const same = (name: string, actual: unknown, expected: unknown) => {
+  const same = (name: string, actual: unknown, expected: unknown, masks = mask) => {
     // The masks apply to each string before JSON escapes its line breaks.
-    const text = (value: unknown) => JSON.stringify(value, (_key, item: unknown) => (typeof item === 'string' ? mask(item) : item), 1)
+    const text = (value: unknown) => JSON.stringify(value, (_key, item: unknown) => (typeof item === 'string' ? masks(item) : item), 1)
     const [a, b] = [text(actual), text(expected)]
     if (a !== b) found.push(`${name} differ from the reference: ${difference(a, b)}`)
   }
   same('the report lines', trace.report, reference.report)
-  same('the commits', trace.commits, reference.commits)
+  same('the commits', trace.commits, reference.commits, maskMessage)
   same('the comments', trace.comments, reference.comments)
   found.push(...trace.errors)
   return found
+}
+
+/** Masks the message of a commit line `<tree> <message>`, but not its tree: a tree that differs is a finding. */
+function maskMessage(line: string): string {
+  const space = line.indexOf(' ')
+  return space === -1 ? line : `${line.slice(0, space)} ${mask(line.slice(space + 1))}`
 }
 
 /** The first line that differs, with the line of the reference. */
@@ -280,7 +285,7 @@ class IsolateDeath extends Error {}
 const never = <T>() => new Promise<T>(() => {})
 
 type SimObject = { name: string; kind: RunKind; db: DatabaseSync; alarm: number | null; markers: Map<string, string>; jobs: Map<string, boolean>; instance: Instance | null }
-type Instance = { id: number; object: SimObject; dead: boolean; died: Promise<'died'>; kill(): void; runs: RunsObject | null; intervals: Set<() => void> }
+type Instance = { object: SimObject; dead: boolean; died: Promise<'died'>; kill(): void; runs: RunsObject | null; intervals: Set<() => void> }
 type Current = { sim: Simulation; instance: Instance }
 /** The instance whose code runs, also across awaits: the fetch of the engine needs it. */
 const current = new AsyncLocalStorage<Current>()
@@ -299,6 +304,16 @@ globalThis.fetch = async (input, init) => {
 type ObjectStorage = ReturnType<typeof objectStorage>
 const writes = /^\s*(insert|update|delete|replace)\b/i
 
+const statements = new WeakMap<DatabaseSync, Map<string, StatementSync>>()
+/** The statement of a query, prepared one time for each database: the engine sends the same queries many times. */
+function prepared(db: DatabaseSync, query: string): StatementSync {
+  let cache = statements.get(db)
+  if (!cache) statements.set(db, (cache = new Map()))
+  let statement = cache.get(query)
+  if (!statement) cache.set(query, (statement = db.prepare(query)))
+  return statement
+}
+
 /** The SQL cursor of Durable Object storage over node:sqlite. Blobs are ArrayBuffers, as in workerd. */
 function cursor(db: DatabaseSync, query: string, bindings: unknown[]) {
   const values = bindings.map((value) => (value instanceof ArrayBuffer ? new Uint8Array(value) : value) as SQLInputValue)
@@ -307,13 +322,13 @@ function cursor(db: DatabaseSync, query: string, bindings: unknown[]) {
   let written = 0
   if (values.length === 0 && query.trim().replace(/;$/, '').includes(';')) db.exec(query)
   else {
-    const statement = db.prepare(query)
+    const statement = prepared(db, query)
     names = statement.columns().map((column) => column.name)
     if (names.length === 0) written = Number(statement.run(...values).changes)
     else {
       statement.setReturnArrays(true)
       rows = (statement.all(...values) as unknown as unknown[][]).map((row) => row.map((value) => (value instanceof Uint8Array ? new Uint8Array(value).buffer : value)))
-      if (writes.test(query)) written = Number((db.prepare('select changes() as n').get() as { n: number }).n)
+      if (writes.test(query)) written = Number((prepared(db, 'select changes() as n').get() as { n: number }).n)
     }
   }
   const object = (row: unknown[]) => Object.fromEntries(names.map((name, index) => [name, row[index]]))
@@ -497,7 +512,6 @@ class Simulation {
   readonly env: Record<string, unknown>
   calls = 0
   generation = 0
-  private instances = 0
 
   readonly faults: Fault[]
 
@@ -545,7 +559,6 @@ class Simulation {
     const instance: Instance = {
       dead: false,
       died,
-      id: ++this.instances,
       intervals: new Set(),
       kill: () => {
         instance.dead = true
@@ -570,8 +583,11 @@ class Simulation {
     return instance
   }
 
-  /** Counts a fault point, and applies the faults of the seed at it. A death at a storage write throws, as the write fails. */
-  point(point: Point, instance: Instance): Promise<void> {
+  /**
+   * Counts a fault point, and applies the faults of the seed at it. Returns the count of this occurrence. A death at a
+   * storage write throws, as the write fails.
+   */
+  point(point: Point, instance: Instance): Promise<number> {
     const at = ++this.counts[point]
     for (const fault of this.faults) {
       if (pointOf[fault.kind] !== point || fault.at !== at) continue
@@ -587,7 +603,7 @@ class Simulation {
       if (point === 'storage') throw new IsolateDeath('the isolate of this object died')
       return never()
     }
-    return Promise.resolve()
+    return Promise.resolve(at)
   }
 
   /** True when the box loses the job that starts now. */
@@ -600,8 +616,7 @@ class Simulation {
     if (instance.dead) return never()
     const path = new URL(url).pathname
     const point = path === '/v1/messages' || path === '/v1/responses' ? 'model' : 'github'
-    await this.point(point, instance)
-    const at = this.counts[point]
+    const at = await this.point(point, instance)
     const headers = new Headers(init?.headers)
     // The mock GitHub gives the status fault, because the request header names it.
     const status = this.faults.find((fault) => pointOf[fault.kind] === point && fault.at === at && fault.kind.startsWith('github-'))
@@ -705,7 +720,7 @@ const plan = {
 const buildLog = { summary: 'sub works', changes: [{ path: 'src/sub.ts', why: 'sub works' }], tests: [], blocked: '' }
 
 /** The scripted agents, short so that a seed is fast. The reviewers find nothing, so that the review passes without a patch. */
-export const script: Script = ({ role, output }) => {
+const script: Script = ({ role, output }) => {
   if (output !== null) return { text: 'done' }
   switch (role) {
     case 'intake':
@@ -734,13 +749,19 @@ export const script: Script = ({ role, output }) => {
 const reviewPr = 7
 const issue = 5
 
+/** The git reads of fixed commits, for all seeds of a thread: the repositories are copies of the templates, with the same config. */
+const gitCache = new Map<string, Buffer>()
+/** The log of each commit, by its ID. A commit ID fixes its log. */
+const commitLogs = new Map<string, string>()
+
 /** Runs one simulation: a run of `kind` with the faults, until it ends or uses `limit` alarm calls. */
-export async function simulate(seed: number, kind: RunKind, faults: Fault[], limit: number): Promise<Trace> {
+async function simulate(seed: number, kind: RunKind, faults: Fault[], limit: number): Promise<Trace> {
   const repo = mkdtempSync(join(tmpdir(), 'factory-sim-'))
   cpSync(template(kind), repo, { recursive: true })
   const sim = new Simulation(faults)
   const mock = await mockServices(repo, {
     botLogin: 'factory-bot',
+    gitCache,
     fault: (_route, headers) => {
       const fault = headers['x-sim-fault']
       if (fault === 'github-500') return { status: 500 }
@@ -773,9 +794,11 @@ export async function simulate(seed: number, kind: RunKind, faults: Fault[], lim
     const end = latest(main.db)
     const report = end ? (main.db.prepare('select text from factory_files where run = ? and name = ?').get(end.run, 'report.md') as { text: string } | undefined) : undefined
     const commits: Record<string, string[]> = {}
-    for (const ref of git(repo, 'for-each-ref', '--format=%(refname)').split('\n').filter(Boolean).sort()) {
-      const log = git(repo, 'log', '--format=%T %B%x00', ref)
-      commits[ref.replace(stamp, 'pr-$1-(stamp)')] = log.split('\0').map((line) => line.trim()).filter(Boolean)
+    for (const line of git(repo, 'for-each-ref', '--format=%(refname) %(objectname)').split('\n').filter(Boolean).sort()) {
+      const [ref = '', sha = ''] = line.split(' ')
+      let log = commitLogs.get(sha)
+      if (log === undefined) commitLogs.set(sha, (log = git(repo, 'log', '--format=%T %B%x00', sha)))
+      commits[ref.replace(stamp, 'pr-$1-(stamp)')] = log.split('\0').map((entry) => entry.trim()).filter(Boolean)
     }
     return {
       calls: sim.calls,
@@ -807,7 +830,7 @@ export async function simulate(seed: number, kind: RunKind, faults: Fault[], lim
 const referenceLimit = 1_000
 const references = new Map<RunKind, Promise<Trace>>()
 /** The reference run of a kind, with no faults. It runs one time for each kind and thread. */
-export function reference(kind: RunKind): Promise<Trace> {
+function reference(kind: RunKind): Promise<Trace> {
   let trace = references.get(kind)
   if (!trace) {
     trace = simulate(0, kind, [], referenceLimit)
