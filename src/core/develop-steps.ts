@@ -3,6 +3,7 @@ import type { FileSystem } from 'nanocode-ts/bash'
 import { runTurn, submitOnce, type AgentHost, type AgentSpec, type HostTools } from './agent.ts'
 import { baseName, callRunTests, checkTails, failureText, isProtected, protectedEntries, runChecksTool, runTestsTool, targetedTests, type CheckResult, type RepoConfig } from './checks.ts'
 import { checkIntake, checkPlan, checkSpec, inScope, submitIntake, submitPlan, submitSpec, type Intake, type Plan, type Spec } from './plan.ts'
+import { maxTaskTurns, minCommandMs } from './planned-stop.ts'
 import type { Branch, Checker, Guides } from './platform.ts'
 import { staticFindings, type Profile } from './profiles.ts'
 import { decisionsFile, decisionsLine } from './questions.ts'
@@ -191,11 +192,6 @@ export type BuildTask = {
   /** The start of each checkpoint's commit message. */
   label: string
 }
-
-/** With less time left in the alarm call, the tools of a builder start no command, and the builder submits what is left (D12). */
-const minCommandMs = 60_000
-/** The most turns of one task. Each turn after the first continues a turn whose alarm call ran out of time (D12). */
-const maxTaskTurns = 4
 
 const outOfTime = (leftMs: number) =>
   `the alarm call of this run has ${Math.max(0, Math.round(leftMs / 1000))} s left, so this turn runs no more commands. Call submit_build_log now, with what is left to do in remaining. The host continues the task in a new turn of this session.`
