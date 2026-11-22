@@ -215,7 +215,7 @@ test('ci runs only with ci commands: with the check options, after the targeted 
   assert.deepEqual((await broken.ci!(['src/math.ts'])).map(({ name, status }) => [name, status]), [['setup', 'fail']])
 })
 
-test('a rerun runs only the named checks again, with the commands of the config, and gives the names that the config does not have', async () => {
+test('a rerun runs only the named check again, with the command of the config, and gives no results for a name that the config does not have', async () => {
   const repo = memoryTree({ 'src/math.ts': 'export {}\n', 'test/math.test.ts': "import { add } from '../src/math.ts'\n" })
   const commands: string[] = []
   const machine: Machine = {
@@ -227,26 +227,29 @@ test('a rerun runs only the named checks again, with the commands of the config,
   const config: RepoConfig = { ...tsConfig, checks: { typecheck: 'npm run check', lint: 'npm run lint' }, ci: { test: 'npm test', build: 'npm run build' }, setup: 'npm ci' }
   const checker = commandChecker(repo, config, machine)
   assert.ok(checker.rerun)
-  const { results, unknown } = await checker.rerun(['lint', 'ci test', 'tests', 'e2e'], ['src/math.ts'])
+  const rerun = checker.rerun
+  const results = [
+    ...(await rerun('lint', ['src/math.ts'])),
+    ...(await rerun('ci test', ['src/math.ts'])),
+    ...(await rerun('tests', ['src/math.ts'])),
+  ]
   assert.deepEqual(
     results.map(({ name, command, status }) => [name, command, status]),
     [['lint', 'npm run lint', 'fail'], ['ci test', 'npm test', 'pass'], ['tests', "node --test 'test/math.test.ts'", 'pass']],
   )
-  assert.deepEqual(unknown, ['e2e'])
   assert.deepEqual(commands, ['npm ci', 'npm run lint', 'npm test', "node --test 'test/math.test.ts'"])
+  commands.length = 0
+  assert.deepEqual(await rerun('e2e', ['src/math.ts']), [])
+  assert.deepEqual(commands, [])
 
   // With a command for each test file, a rerun runs only the named test file, and 'tests' is not a name of that config.
-  commands.length = 0
   const each = commandChecker(repo, { ...config, tests: { pattern: '^test/[^/]+\\.test\\.ts$', command: 'node --test {test}' } }, machine)
-  const again = await each.rerun!(['test test/math.test.ts', 'tests'], ['src/math.ts'])
-  assert.deepEqual(again.results.map(({ name, command }) => [name, command]), [['test test/math.test.ts', "node --test 'test/math.test.ts'"]])
-  assert.deepEqual(again.unknown, ['tests'])
+  assert.deepEqual((await each.rerun!('test test/math.test.ts', ['src/math.ts'])).map(({ name, command }) => [name, command]), [['test test/math.test.ts', "node --test 'test/math.test.ts'"]])
+  assert.deepEqual(await each.rerun!('tests', ['src/math.ts']), [])
 
   // A failed setup stopped the checks, so its rerun runs all final checks.
-  commands.length = 0
-  const setup = await commandChecker(repo, config, machine).rerun!(['setup'], ['src/math.ts'])
-  assert.deepEqual(setup.results.map(({ name }) => name), ['typecheck', 'lint', 'tests', 'ci test', 'ci build'])
-  assert.deepEqual(setup.unknown, [])
+  const setup = await commandChecker(repo, config, machine).rerun!('setup', ['src/math.ts'])
+  assert.deepEqual(setup.map(({ name }) => name), ['typecheck', 'lint', 'tests', 'ci test', 'ci build'])
 })
 
 test('the config file and its protect entries are protected', () => {

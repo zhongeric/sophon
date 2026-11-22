@@ -186,10 +186,8 @@ Each stage below lists who does the work, what the host enforces, and where the 
 
 ### 8. CI green
 
-- All checks pass on the head SHA. A rerun of a flaky job needs no approval: the host runs a failed check again one
-  time on the same head (D14). For an Actions run, it sends `POST /repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs`,
-  which needs Actions write. A fix that needs more token scope, for example in `.github/workflows`, goes to the user as
-  a blocker.
+- All checks pass on the head SHA. A rerun of a flaky job needs no approval (D14). A fix that needs more token scope,
+  for example in `.github/workflows`, goes to the user as a blocker.
 
 ### 9. Ready for the user
 

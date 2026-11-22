@@ -144,10 +144,10 @@ export type Checker = {
   /** The `ci` commands of the config on a real machine, for the submit gates (D15). Absent without `ci` entries or without a machine. */
   ci?: (changed: string[]) => Promise<CheckResult[]>
   /**
-   * Runs the named failed final checks again on the changed files, with the commands of the config for these names (D14).
-   * `unknown` gives the names that the config does not have. These do not run.
+   * Runs the named failed final check again on the changed files, with the command of the config for this name (D14).
+   * It gives no results when the config has no command of this name.
    */
-  rerun?: (names: string[], changed: string[]) => Promise<{ results: CheckResult[]; unknown: string[] }>
+  rerun?: (name: string, changed: string[]) => Promise<CheckResult[]>
 }
 
 /** The output files of the run, such as report.md and gate-log.txt. */

@@ -1320,6 +1320,12 @@ test('Node GitHub: rerunFailedJobs posts the rerun of the failed jobs, and a 403
       reason: 'gh api repos/{owner}/{repo}/actions/runs/12/rerun-failed-jobs: gh: Resource not accessible by integration (HTTP 403)',
     })
 
+    // A primary or secondary rate limit also answers 403, but it is an error, as in the Worker.
+    gh(`printf 'gh: API rate limit exceeded for installation ID 1. (HTTP 403)' >&2\nexit 1`)
+    await assert.rejects(pulls.rerunFailedJobs(12), /API rate limit exceeded/)
+    gh(`printf 'gh: You have exceeded a secondary rate limit. (HTTP 403)' >&2\nexit 1`)
+    await assert.rejects(pulls.rerunFailedJobs(12), /secondary rate limit/)
+
     gh(`printf 'gh: Not Found (HTTP 404)' >&2\nexit 1`)
     await assert.rejects(pulls.rerunFailedJobs(12), /HTTP 404/)
   } finally {

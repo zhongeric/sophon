@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path'
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../../src/core/ci.ts'
 import type { FailedFinalCheck, MergeMethod } from '../../src/core/checks.ts'
-import type { MergeResult, PullRequests, Signing } from '../../src/core/platform.ts'
+import type { Branch, MergeResult, PullRequests, Signing } from '../../src/core/platform.ts'
 import { PausedError, type Channel } from '../../src/core/questions.ts'
 import { zeroTokens, type Prices } from '../../src/core/usage.ts'
 import { defaultModels, type Criterion } from '../../src/core/workflows/code-review-loop.ts'
@@ -330,6 +330,7 @@ export async function developInput(repo: string, runId: string, options: { issue
  * Runs the development workflow on the Node platform, with a scripted model, fake PRs and CI, and memory channels. The
  * repository has no usable key. `signing` wraps the signing of the Node platform. With `keep`, the local deletes and the
  * worktree removal do nothing, so that a test can read a worktree after the run. `review` replaces the review loop.
+ * With `remoteCommits`, each push gives a new commit with the tree of the local head, as the Worker does.
  */
 export async function runDevelop(
   repo: string,
@@ -344,6 +345,7 @@ export async function runDevelop(
     signing?: (signing: Signing) => Signing
     keep?: boolean
     review?: DevelopDeps['review']
+    remoteCommits?: boolean
   },
 ) {
   withoutKey(repo)
@@ -362,7 +364,16 @@ export async function runDevelop(
     reviewChannel: async () => memoryChannel().channel,
     runsDir,
   })
-  const branches = options.keep ? { ...deps.branches, deleteLocal: async () => {}, release: async () => {} } : deps.branches
+  const kept = options.keep ? { ...deps.branches, deleteLocal: async () => {}, release: async () => {} } : deps.branches
+  const branches = options.remoteCommits
+    ? {
+        ...kept,
+        async push(branch: Branch) {
+          const local = await kept.push(branch)
+          return execFileSync('git', ['commit-tree', `${local}^{tree}`, '-p', local, '-m', 'remote'], { cwd: repo }).toString().trim()
+        },
+      }
+    : kept
   const signed = options.signing ? { ...deps, signing: options.signing(deps.signing) } : deps
   return { ...(await develop(input, { ...signed, branches, review: options.review ?? deps.review })), dir: deps.dir }
 }

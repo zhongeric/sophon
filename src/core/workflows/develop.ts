@@ -5,7 +5,7 @@ import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } fr
 import { step, type Ledger } from '../ledger.ts'
 import { alarmLines, settleAll } from '../planned-stop.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
-import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeRefusal, PullRequests, Signing } from '../platform.ts'
+import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeRefusal, PullRequests, RerunStart, Signing } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
 import { branchesSection, pruneBranches, reasonOf, type BranchFacts, type BranchRun, type PruneResult } from '../prune.ts'
 import type { Credentials, Provider } from '../providers.ts'
@@ -120,8 +120,8 @@ type Review = { pass: boolean; head: string; final: string; branch: string; repo
 type Cause = { from: string; short: string; text: string; logs: string | null; report: string | null; checks: string | null; conflicts?: string[]; rerunnable?: Rerunnable }
 /** The failed checks of a cause on the head `head` (D14): a red CI, or the failed final checks of review pass `pass`. */
 type Rerunnable = { head: string; ci: Ci } | { head: string; pass: number; review: Review }
-/** A rerun of a failed CI job or final check on a head (D14). 'not run': the config has no command of that name. */
-type Rerun = { check: string; head: string; result: 'flaky' | 'failed' | 'refused' | 'not run'; reason?: string }
+/** A rerun of a failed CI job or final check on a head (D14). */
+type Rerun = { check: string; head: string; result: 'flaky' | 'failed' | 'refused'; reason?: string }
 type Repair = { round: number; cause: Cause; log: BuildLog }
 type BasePoint = 'ready' | 'merge'
 /** The result of a base merge, and `change`: the paths of the change before it, from the merge base to the head. */
@@ -463,11 +463,23 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     const failed = ci.jobs.filter((job) => !job.ok)
     const runs = failed.flatMap((job) => (job.run === null ? [] : [{ job, run: job.run }]))
     // A failed commit status has no run, so it cannot pass on a rerun.
-    if (failed.length === 0 || runs.length < failed.length || runs.some(({ run }) => reran.has(`run ${run}@${sha}`))) return false
+    if (runs.length < failed.length || runs.some(({ run }) => reran.has(`run ${run}@${sha}`))) return false
     const started: typeof runs = []
     for (const entry of runs) {
       reran.add(`run ${entry.run}@${sha}`)
-      const start = await step(ledger, `rerun.run.${entry.run}.${sha}`, () => pulls.rerunFailedJobs(entry.run))
+      // The host records the request before it sends it. After a lost response, a resume reads the attempt of the run
+      // and sends no second request.
+      const sent = `rerun-sent:${entry.run}@${sha}`
+      const start = await step(ledger, `rerun.run.${entry.run}.${sha}`, async (): Promise<RerunStart> => {
+        if (!ledger.get(sent)) {
+          ledger.put(sent, true)
+          return pulls.rerunFailedJobs(entry.run)
+        }
+        const jobs = await pulls.ci(sha)
+        return jobs.some((job) => job.run === entry.run && (job.attempt ?? 1) > (entry.job.attempt ?? 1))
+          ? { started: true }
+          : { started: false, reason: 'the request got no response, and the run has no new attempt' }
+      })
       if (start.started) started.push(entry)
       else state.reruns.push({ check: entry.job.name, head: sha, result: 'refused', reason: start.reason })
     }
@@ -486,8 +498,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     for (const { name } of checks) {
       reran.add(`check ${name}@${at}`)
       const result = await step(ledger, `rerun.check.${name}.${at}`, async (): Promise<Rerun['result']> => {
-        const { results, unknown } = await again([name], await dev.changedFiles(mergeBase, at))
-        if (unknown.includes(name)) return 'not run'
+        const results = await again(name, await dev.changedFiles(mergeBase, at))
         return results.length > 0 && results.every((result) => result.status !== 'fail') ? 'flaky' : 'failed'
       })
       state.reruns.push({ check: name, head: at, result })
@@ -495,15 +506,15 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     }
     return withoutChecks(review, flaky)
   }
-  // After a blocked fixer that left the head of the cause as it was, the failed checks of the cause without a rerun run
-  // again one time. It gives undefined when the run ends blocked, null when no cause remains, or the cause without the
-  // flaky checks. The step records the state of the head, because a later step can move it before a resume.
-  const afterBlock = async (cause: Cause, round: number): Promise<Cause | null | undefined> => {
+  // After a blocked fixer that left the local head `before` of the round as it was, the failed checks of the cause without
+  // a rerun run again one time. It gives undefined when the run ends blocked, null when no cause remains, or the cause
+  // without the flaky checks. The step records the state of the head, because a later step can move it before a resume.
+  const afterBlock = async (cause: Cause, round: number, before: string): Promise<Cause | null | undefined> => {
     const source = cause.rerunnable
     if (!source) return undefined
     const untouched = await step(ledger, `blocked.${round}`, async () => {
       const pending = await dev.pending()
-      return (await dev.head()) === source.head && pending.changed.length === 0 && pending.removed.length === 0
+      return (await dev.head()) === before && pending.changed.length === 0 && pending.removed.length === 0
     })
     if (!untouched) return undefined
     // `ci` is still the CI of the cause, because nothing changed the head.
@@ -557,9 +568,11 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         unrepaired = cause
         return null
       }
+      // The local head before the round. On the Worker, the pushed head of the cause is another SHA.
+      const before = await step(ledger, `local-head.repair.${state.repairs.length + 1}`, () => dev.head())
       const log = await repair(cause)
       if (log.blocked.trim()) {
-        const rest = await afterBlock(cause, state.repairs.length)
+        const rest = await afterBlock(cause, state.repairs.length, before)
         if (rest === undefined) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
         carried = rest
         continue
@@ -970,7 +983,7 @@ function reviewRow(review: Review, index: number): UsageRow {
   return { step: `review.${index + 1}`, model: 'review loop', tokens: usage.tokens, usd: usage.usd, unpriced: usage.unpriced }
 }
 
-const rerunResults: Record<Rerun['result'], string> = { flaky: 'flaky', failed: 'failed again', refused: 'refused by GitHub', 'not run': 'not run: the config has no command of this name' }
+const rerunResults: Record<Rerun['result'], string> = { flaky: 'flaky', failed: 'failed again', refused: 'refused by GitHub' }
 
 function rerunLine(rerun: Rerun): string {
   return `- ${rerun.check} on ${rerun.head.slice(0, 12)}: ${rerunResults[rerun.result]}${rerun.reason ? ` (${rerun.reason})` : ''}`
