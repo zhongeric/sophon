@@ -10,19 +10,22 @@ import { PausedError, type Channel } from '../src/core/questions.ts'
 import { StopError } from '../src/core/stop.ts'
 import { BudgetStop, recordUsage, zeroTokens, type Prices } from '../src/core/usage.ts'
 import { defaultModels } from '../src/core/workflows/code-review-loop.ts'
-import { develop, type ReviewRequest } from '../src/core/workflows/develop.ts'
+import { defaultDevelopModels, develop, developModels, type DevelopModels, type ReviewRequest } from '../src/core/workflows/develop.ts'
 import { resumeInput } from '../src/node/develop.ts'
 import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
 import { fileLedger } from '../src/node/ledger.ts'
 import { nodeDevelop } from '../src/node/platform.ts'
-import { developInput, developScript, developRepo, fakePulls, mergeCommit, pauseAtCi, plan, pushBase, runDevelop, scopeQuestion, scriptedReview, sources } from './support/develop.ts'
+import { developInput, developScript, developRepo, fakePulls, mergeCommit, pauseAtCi, plan, planTurn, pushBase, runDevelop, scopeQuestion, scriptedReview, sources, spec } from './support/develop.ts'
 import { parents } from './support/base-merge.ts'
 import { credentials, memoryChannel, module, withoutKey } from './support/fixture.ts'
 import { probeNetwork, scriptedDispatch, webSearch, type Turn } from './support/scripted-model.ts'
 import { visible, visibleLines, visibleWords } from './support/visible.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-runs-'))
+/** The turns of the planner session and of the spec agent, in order: 'intake' and 'plan' are the two turns of the planner (D19). */
+const planningTurns = (turns: Turn[]) =>
+  turns.filter((turn) => turn.output === null && (turn.role === 'planner' || turn.role === 'spec')).map((turn) => (turn.role === 'spec' ? 'spec' : planTurn(turn.request) ? 'plan' : 'intake'))
 
 test('develop: a resume fills a missing step1.cleanup model and keeps the recorded models', async () => {
   const { repo } = developRepo()
@@ -51,6 +54,12 @@ test('develop: a resume fills a missing step1.cleanup model and keeps the record
   })
 })
 
+test('developModels: drops a stale intake override and keeps spec, planner and builder', () => {
+  const builder = { provider: 'codex', model: 'gpt-6.1-sol' } as const
+  const stale = { builder, intake: { provider: 'claude', model: 'not-allowed' } } as Partial<DevelopModels>
+  assert.deepEqual(developModels(stale), { ...defaultDevelopModels, builder })
+})
+
 test('develop: intake, plan, parallel builders on their own branches, draft PR, a CI repair, the review loop, a ready PR', { timeout: 120_000 }, async () => {
   const { repo, origin } = developRepo()
   const turns: Turn[] = []
@@ -62,10 +71,18 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
   assert.equal(result.status, 'ready', result.report)
   assert.equal(result.branch, 'factory/dev-add-sub-mul')
 
-  // The intake agent raised no user question, so the run took its recommendations for the ask and the route, and asked nothing (D11).
+  // The intake turn raised no user question, so the run took its recommendations for the ask and the route, and asked nothing (D11).
   assert.deepEqual(posted, [])
   const first = (role: string) => turns.findIndex((turn) => turn.role === role)
-  assert.ok(first('intake') < first('planner') && first('planner') < first('builder'))
+  assert.ok(first('planner') < first('builder'))
+  // One planner session with two turns, the intake and the plan, and no intake session and no spec stage (D19).
+  assert.deepEqual(planningTurns(turns), ['intake', 'plan'])
+  assert.ok(!turns.some((turn) => turn.role === 'intake'))
+  const ledger = fileLedger(join(result.dir, 'state.json'))
+  assert.ok(ledger.get('session:plan'))
+  assert.equal(ledger.get('session:intake'), undefined)
+  assert.ok(ledger.get('report:plan:intake') && ledger.get('report:plan:task'))
+  assert.match(result.report, /^- Route: plan, 1 review loop pass./m)
   // The development and review roles have no egress: the cell fetch and the shell of a builder fail, and no model request
   // has the web search tool.
   const probes = turns.filter((turn) => turn.role === 'builder' && turn.output).map((turn) => turn.output).join('\n')
@@ -134,7 +151,8 @@ test('develop: intake, plan, parallel builders on their own branches, draft PR, 
 
   // The Usage section: the development agents, the review pass with the USD of all its agents, and the total.
   assert.match(result.report, /^## Usage$/m)
-  assert.match(result.report, /^\| intake \| claude-opus-5-5 \| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$0\.\d{4} \|$/m)
+  assert.match(result.report, /^\| plan \| claude-opus-5-5 \| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$0\.\d{4} \|$/m)
+  assert.doesNotMatch(result.report, /^\| intake \|/m)
   assert.match(result.report, /^\| review\.1 \| review loop \| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$0\.\d{4} \|$/m)
   assert.match(result.report, /^\| \*\*Total\*\* \| {2}\| [1-9]\d* \| 0 \| 0 \| [1-9]\d* \| \$\d+\.\d+ \|$/m)
   assert.doesNotMatch(result.report, /^Budget:/m)
@@ -739,17 +757,19 @@ test('develop: a pre-D14 CI-fix without a review enters the repair loop and resu
   assert.deepEqual(github.state.ready, [9])
 })
 
-test('develop: a user question of the intake agent pauses the run, and the run resumes without asking again or repeating the intake', { timeout: 120_000 }, async () => {
+test('develop: a user question of the intake turn pauses the run before the plan turn, and the run resumes in the same session without asking again or repeating the intake', { timeout: 120_000 }, async () => {
   const { repo } = developRepo()
   const dir = runsDir()
   const { channel, posted, replies } = memoryChannel({ intake: null })
-  const script = developScript({ askScope: true })
-  const first: Turn[] = []
-  await assert.rejects(
-    runDevelop(repo, dir, { channel, dispatch: scriptedDispatch(script, first), pulls: fakePulls().pulls, runId: 'pause' }),
-    (error: unknown) => error instanceof PausedError,
-  )
-  assert.ok(!first.some((turn) => turn.role === 'planner'))
+  // One dispatch for both runs: its tool_use IDs go on counting, as the IDs of a real model do not repeat in a session.
+  const turns: Turn[] = []
+  const dispatch = scriptedDispatch(developScript({ askScope: true }), turns)
+  await assert.rejects(runDevelop(repo, dir, { channel, dispatch, pulls: fakePulls().pulls, runId: 'pause' }), (error: unknown) => error instanceof PausedError)
+  const first = [...turns]
+  // The pause comes after the intake turn of the planner session and before its plan turn.
+  assert.deepEqual(planningTurns(first), ['intake'])
+  const session = fileLedger(join(dir, 'pause', 'state.json')).get<string>('session:plan')
+  assert.ok(session)
   // The user question goes to the user with the confirmation of the ask. The other route questions are run questions.
   assert.deepEqual(posted.map((entry) => entry.batch), ['intake'])
   assert.deepEqual(posted[0]!.questions.map((question) => [question.id, question.question, question.level, question.rule]), [
@@ -759,13 +779,16 @@ test('develop: a user question of the intake agent pauses the run, and the run r
   assert.equal(posted[0]!.questions[1]!.why, 'Adds sub() and mul() next to add(), with tests.')
 
   replies.intake = '/answer recommended'
-  const second: Turn[] = []
-  const result = await runDevelop(repo, dir, { channel, dispatch: scriptedDispatch(script, second), pulls: fakePulls().pulls, runId: 'pause' })
+  const result = await runDevelop(repo, dir, { channel, dispatch, pulls: fakePulls().pulls, runId: 'pause' })
   assert.equal(result.status, 'ready', result.report)
+  const second = turns.slice(first.length)
   assert.equal(posted.length, 1)
-  assert.ok(!second.some((turn) => turn.role === 'intake'))
+  // The resume runs only the plan turn, in the same session, so its request holds the prompt of the intake turn.
+  assert.deepEqual(planningTurns(second), ['plan'])
+  assert.equal(fileLedger(join(result.dir, 'state.json')).get('session:plan'), session)
+  assert.ok(second.find((turn) => turn.role === 'planner')!.request.includes('Read this new ask and the repository.'))
   assert.match(result.report, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
-  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\* \(recommended\)\n\n## Decisions the run made\n\n- Write a spec before the plan\?/)
+  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\* \(recommended\)\n\n## Decisions the run made\n\n- How many review loop passes\?/)
 })
 
 test('develop: a hotfix takes the recommendation of every question, and marks only the run questions as decided by the run', { timeout: 120_000 }, async () => {
@@ -775,7 +798,42 @@ test('develop: a hotfix takes the recommendation of every question, and marks on
   const result = await runDevelop(repo, runsDir(), { channel, dispatch: scriptedDispatch(developScript({ askScope: true, blockSub: true }), []), input, pulls: fakePulls().pulls, runId: 'hotfix' })
   assert.equal(result.status, 'blocked', result.report)
   assert.deepEqual(posted, [])
-  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\* \(recommended\)\n\n## Decisions the run made\n\n- Write a spec before the plan\?/)
+  assert.match(result.report, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\* \(recommended\)\n- Is this the ask\? Correct it in your own words if it is not\. \*\*Yes, go on\*\* \(recommended\)\n\n## Decisions the run made\n\n- How many review loop passes\?/)
+})
+
+test('develop: with the spec option, the spec stage runs between the two turns of the planner session, and the plan turn reads the spec', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const turns: Turn[] = []
+  const input = { ...(await developInput(repo, 'spec')), spec: true }
+  const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript({ blockSub: true }), turns), input, pulls: fakePulls().pulls, runId: 'spec' })
+  assert.equal(result.status, 'blocked', result.report)
+  assert.deepEqual(planningTurns(turns), ['intake', 'spec', 'plan'])
+  assert.equal(readFileSync(join(result.dir, 'spec.md'), 'utf8'), spec.spec)
+  const output = turns.filter((turn) => turn.role === 'planner' && turn.output).map((turn) => turn.output).join('\n')
+  assert.match(output, /spec\.md: [\s\S]*sub may return a negative number/)
+  assert.match(result.report, /^- Route: spec, then plan, 1 review loop pass\./m)
+  assert.match(result.report, /## Decisions the run made\n\n- Is this the ask\?.*\n- How many review loop passes\?.*\n- May sub return a negative number\? \*\*Yes\*\*/)
+})
+
+test('develop: a ledger from before D19 resumes with its recorded intake and spec answer, runs the spec stage, and runs no intake turn', { timeout: 120_000 }, async () => {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  // The intake session of a run before D19 recorded `larger`, and its batch had the spec route question with other IDs.
+  const intake = { title: 'Add sub and mul', summary: 'Adds sub() and mul() next to add(), with tests.', slug: 'add-sub-mul', larger: true, passes: 1, reason: 'Two small functions.', questions: [] }
+  const answers = [
+    { id: 'Q1', question: 'Is this the ask? Correct it in your own words if it is not.', answer: 'Yes, go on', recommended: true, decidedBy: 'run' },
+    { id: 'Q2', question: 'Write a spec before the plan?', answer: 'Write a spec first', recommended: true, decidedBy: 'run' },
+    { id: 'Q3', question: 'How many review loop passes?', answer: 'Two passes', recommended: false, decidedBy: 'run' },
+  ]
+  const ledger = fileLedger(join(dir, 'pre-d19', 'state.json'))
+  ledger.put('step:intake', { result: intake })
+  ledger.put('answers:intake', answers)
+  ledger.put('decisions', answers)
+  const turns: Turn[] = []
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript({ blockSub: true }), turns), pulls: fakePulls().pulls, runId: 'pre-d19' })
+  assert.equal(result.status, 'blocked', result.report)
+  assert.deepEqual(planningTurns(turns), ['spec', 'plan'])
+  assert.match(result.report, /^- Route: spec, then plan, 2 review loop passes\./m)
 })
 
 test('develop: with the standing answers of the repository, the run takes every recommendation and posts no question', { timeout: 120_000 }, async () => {
@@ -842,7 +900,7 @@ test('develop: the planner sees the protected paths, the host refuses a plan tha
     runId: 'protected-plan',
     pulls: fakePulls([false, true]).pulls,
     dispatch: scriptedDispatch((turn) => {
-      if (turn.role !== 'planner' || turn.output !== null) return script(turn)
+      if (turn.role !== 'planner' || turn.output !== null || !planTurn(turn.request)) return script(turn)
       return {
         cell: [
           `try { await tools.submit_plan(${JSON.stringify(protectedPlan)}); text('PROTECTED PLAN ACCEPTED') } catch (error) { text('plan refused: ' + error) }`,
@@ -852,7 +910,7 @@ test('develop: the planner sees the protected paths, the host refuses a plan tha
     }, turns),
   })
   assert.equal(result.status, 'ready', result.report)
-  const planner = turns.filter((turn) => turn.role === 'planner')
+  const planner = turns.filter((turn) => turn.role === 'planner' && planTurn(turn.request))
   assert.ok(planner[0]!.request.includes('Protected paths, which no task may write: .agent-factory.json, wrangler.jsonc'))
   const output = planner.map((turn) => turn.output ?? '').join('\n')
   // The output is JSON, so the quotes in the refusal can be escaped.
@@ -871,7 +929,7 @@ test('develop: the host refuses a plan that puts a targeted test of a task in an
     runId: 'split-plan',
     pulls: fakePulls([false, true]).pulls,
     dispatch: scriptedDispatch((turn) => {
-      if (turn.role !== 'planner' || turn.output !== null) return script(turn)
+      if (turn.role !== 'planner' || turn.output !== null || !planTurn(turn.request)) return script(turn)
       return {
         cell: [
           `try { await tools.submit_plan(${JSON.stringify(splitPlan)}); text('SPLIT PLAN ACCEPTED') } catch (error) { text('plan refused: ' + error) }`,
