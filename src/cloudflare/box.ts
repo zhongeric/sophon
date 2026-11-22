@@ -5,8 +5,11 @@ import { artifactSizeLimit } from '../core/artifacts.ts'
 import type { JobRunner } from './jobs.ts'
 import { tar, type TarEntry } from './tar.ts'
 
-/** The result of one command: its exit code, or null when the host killed it, and the end of its output. */
-export type BoxResult = { exit_code: number | null; output: string }
+/**
+ * The result of one command: its exit code, or null when the host killed it, and the end of its output. `ended_at`: the
+ * end of a job in ms since the epoch, by the clock of the machine.
+ */
+export type BoxResult = { exit_code: number | null; output: string; ended_at?: number }
 
 /** A job of the machine: it runs, it is not in the machine (`missing`), or it ended with its result. */
 export type JobState = { state: 'running' } | { state: 'missing' } | { state: 'done'; result: BoxResult }
@@ -176,7 +179,7 @@ export function containerBox(container: ContainerHandle, options: { inactivityMs
       // 80,000 bytes hold at least the last 20,000 characters, and the exec keeps only those. The job keeps only
       // these bytes on the disk, and a poll again reads the same bytes.
       const last = await script(`the output of job ${id}`, `${jobDir}; tail -c 80000 -- "$job/output" > "$job/output.tmp" && mv -f -- "$job/output.tmp" "$job/output" && cat -- "$job/output"`, [id])
-      return { result: commandResult(code, last, ended - started, limit), state: 'done' }
+      return { result: { ...commandResult(code, last, ended - started, limit), ended_at: ended }, state: 'done' }
     },
     async killJob(id) {
       checkJobId(id)
@@ -469,9 +472,9 @@ export async function readBoxFile(box: Box, dir: string, path: string): Promise<
 export type CleanJobs = { runner: JobRunner; ledger: Ledger; key: string; deadline: number }
 
 /**
- * Copies `tree`, which holds only the files of a commit, to the new directory `dir` of the machine. Commands of the
- * result run in `dir` without a sync. runDomainCommand runs the setup, so it does not run here. `read` gives the exact
- * bytes of a file in `dir`, also of a binary file, in base64 chunks.
+ * Copies `tree`, which holds only the files of a commit, and then `files` to the new directory `dir` of the machine.
+ * Commands of the result run in `dir` without a sync. runDomainCommand runs the setup, so it does not run here. `read`
+ * gives the exact bytes of a file in `dir`, also of a binary file, in base64 chunks.
  *
  * With `jobs`, each command is a pause-mode job, and the clean box keeps `dir` across calls: when the ledger has the
  * copy of `dir` for the step key and the marker `<dir>.sync` agrees, it does not copy again. Thus it never removes a
@@ -484,7 +487,8 @@ export async function cleanBox(
   dir: string,
   log: (line: string) => void,
   jobs?: CleanJobs,
-): Promise<Machine & { id: string; read(path: string): Promise<Uint8Array> }> {
+  files: { path: string; data: Uint8Array }[] = [],
+): Promise<Machine & { id: string; read(path: string): Promise<Uint8Array>; endedAt(): number | undefined }> {
   await box.start()
   const started = Date.now()
   const marker = `${dir}.sync`
@@ -495,8 +499,14 @@ export async function cleanBox(
   if (agrees) {
     log(`sync ${dir}: kept, 0 files sent in ${Date.now() - started} ms`)
   } else {
-    const files = await syncTree(box, tree, dir, null)
-    log(`sync ${dir}: full, ${files.size} files sent in ${Date.now() - started} ms`)
+    const synced = await syncTree(box, tree, dir, null)
+    // The files come before the marker, so that a copy without them is never kept.
+    if (files.length > 0) {
+      const archive = tar(files.map(({ data, path }) => ({ data, mode: 0o644, path, target: '', type: 'file' as const })))
+      const written = await box.exec(['tar', '-x', '-f', '-'], { cwd: dir, env: boxEnv, stdin: archive, timeoutMs: 10 * 60_000 })
+      if (written.exit_code !== 0) throw new Error(`writing the files to ${dir} failed: ${written.output.slice(-2000)}`)
+    }
+    log(`sync ${dir}: full, ${synced.size + files.length} files sent in ${Date.now() - started} ms`)
     if (jobs) {
       sync = crypto.randomUUID()
       const written = await box.exec(['bash', '-c', 'printf %s "$2" > "$1"', 'bash', marker, sync], { cwd: '', env: boxEnv, timeoutMs: 60_000 })
@@ -504,13 +514,19 @@ export async function cleanBox(
       jobs.ledger.put(ledgerKey, sync)
     }
   }
+  // The job record keeps the end of a job across calls, so that the compute meter does not count a pause.
+  let ended: number | undefined
   return {
     id: sync || crypto.randomUUID(),
-    run(command, { timeoutMs }) {
+    async run(command, { timeoutMs }) {
       const options = { cwd: dir, env: boxEnv, timeoutMs }
-      if (!jobs) return box.exec(['bash', '-c', command], options)
-      return jobs.runner.pause(`${dir}@${sync}:${command}`, ['bash', '-c', command], { ...options, deadline: jobs.deadline })
+      const result = jobs
+        ? await jobs.runner.pause(`${dir}@${sync}:${command}`, ['bash', '-c', command], { ...options, deadline: jobs.deadline })
+        : await box.exec(['bash', '-c', command], options)
+      ended = result.ended_at
+      return result
     },
+    endedAt: () => ended,
     read: (path) => readBoxFile(box, dir, path),
   }
 }

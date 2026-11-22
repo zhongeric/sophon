@@ -24,6 +24,7 @@ export const workerSettings = [
   'ADMIN_TOKEN',
   'MODELS',
   'MODEL_PRICES',
+  'CONTAINER_PRICES',
   'CI_TIMEOUT_MINUTES',
   'PAUSE_POLL_SECONDS',
   'ALARM_BUDGET_SECONDS',

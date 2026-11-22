@@ -5,7 +5,8 @@ import { join } from 'node:path'
 import type { Contracts } from 'nanocode-ts'
 import { coreSections } from '../../src/core/prereg.ts'
 import type { Channel } from '../../src/core/questions.ts'
-import type { Prices } from '../../src/core/usage.ts'
+import type { ScanBoxes } from '../../src/core/fanout.ts'
+import type { ContainerPrices, Prices } from '../../src/core/usage.ts'
 import { defaultResearchModels, research, type ResearchDeps, type ResearchInput } from '../../src/core/workflows/research.ts'
 import { nodeResearch } from '../../src/node/platform.ts'
 import { fakePulls } from './develop.ts'
@@ -33,18 +34,34 @@ export const researchConfig = {
   credentials: { 'archive.example.org': { header: 'x-api-key', secret: 'ARCHIVE_TOKEN' } },
 }
 
+/** The research config with the fan-out commands of runScript next to known and inject. */
+export const fanOutConfig = {
+  ...researchConfig,
+  commands: {
+    ...researchConfig.commands,
+    plan: 'node research/run.mjs plan {prereg}',
+    fetch: 'node research/run.mjs fetch {prereg} {target}',
+    unit: 'node research/run.mjs unit {prereg} {unit}',
+    merge: 'node research/run.mjs merge {prereg} {units}',
+  },
+}
+
 /**
  * The domain commands of the notebook. It finds analysis/<id>/ from the prereg file name, writes the rows of
  * analysis/<id>/analyze.mjs to out/<id>/, and prints its working directory, then the last-line JSON with their SHA-256.
  * analyze gives no output when the module exports analyzes = false. READS gives the reads of known and inject, as a
  * comma list. With OMIT_ANALYSIS, reproduce does not give the analysis output.
+ *
+ * The fan-out commands give the same known and inject files: plan gives the units known, inject-1 and inject-2 on the
+ * targets field-a and field-b, fetch writes data/<target>.txt, each unit checks its data file and that the holdout
+ * file is absent, and writes a part of the rows. merge joins the parts into out/<id>/known.txt and inject.txt.
  */
 export const runScript = `import { createHash } from 'node:crypto'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-const [command, prereg] = process.argv.slice(2)
+const [command, prereg, arg] = process.argv.slice(2)
 const id = /(hyp-\\d+)-v\\d+\\.md$/.exec(prereg)[1]
 const analysis = await import(pathToFileURL(resolve('analysis', id, 'analyze.mjs')).href)
 const sha = (text) => createHash('sha256').update(text).digest('hex')
@@ -55,8 +72,29 @@ const output = (name) => {
   return { [path]: sha(analysis.rows(name)) }
 }
 const reads = process.env.READS ? { reads: process.env.READS.split(',') } : {}
+const units = [{ id: 'known', targets: ['field-a'], expected_seconds: 60 }, { id: 'inject-1', targets: ['field-a'], expected_seconds: 60 }, { id: 'inject-2', targets: ['field-b'], expected_seconds: 60 }]
+const half = (text, index) => (index === 0 ? text.slice(0, Math.floor(text.length / 2)) : text.slice(Math.floor(text.length / 2)))
+const written = (path, text) => {
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, text)
+  return { [path]: sha(text) }
+}
 console.log(command + ' of ' + id + ' in ' + process.cwd())
-if (command === 'known') console.log(JSON.stringify({ recall: analysis.recall, outputs: output('known'), ...reads }))
+if (command === 'plan') console.log(JSON.stringify({ targets: ['field-a', 'field-b'], units }))
+else if (command === 'fetch') console.log(JSON.stringify({ outputs: written('data/' + arg + '.txt', 'data of ' + arg) }))
+else if (command === 'unit') {
+  const unit = units.find((entry) => entry.id === arg)
+  const target = unit.targets[0]
+  if (existsSync('research/holdout.json') || readFileSync('data/' + target + '.txt', 'utf8') !== 'data of ' + target) process.exit(1)
+  const text = arg === 'known' ? analysis.rows('known') : half(analysis.rows('inject'), arg === 'inject-1' ? 0 : 1)
+  console.log(JSON.stringify({ outputs: written('part.txt', text) }))
+} else if (command === 'merge') {
+  const manifest = JSON.parse(readFileSync(arg + '/units.json', 'utf8'))
+  if (manifest.units.some((unit) => unit.status !== 'done')) process.exit(1)
+  const part = (unit) => readFileSync(arg + '/' + unit + '/part.txt', 'utf8')
+  const known = { recall: analysis.recall, outputs: written('out/' + id + '/known.txt', part('known')) }
+  console.log(JSON.stringify({ known, inject: { outputs: written('out/' + id + '/inject.txt', part('inject-1') + part('inject-2')) } }))
+} else if (command === 'known') console.log(JSON.stringify({ recall: analysis.recall, outputs: output('known'), ...reads }))
 else if (command === 'inject') console.log(JSON.stringify({ outputs: output('inject'), ...reads }))
 else if (command === 'analyze') console.log(JSON.stringify({ outputs: analysis.analyzes === false ? {} : output('analysis') }))
 else console.log(JSON.stringify({ outputs: { ...output('known'), ...output('inject'), ...(process.env.OMIT_ANALYSIS ? {} : output('analysis')) } }))
@@ -320,6 +358,10 @@ export async function runResearch(
     pulls?: ReturnType<typeof fakePulls>
     /** Replaces the code review loop of the dossier PR. */
     review?: ResearchDeps['review']
+    containerPrices?: ContainerPrices
+    /** Wraps the local scan boxes, for example to lose a unit. */
+    scanBoxes?: (local: ScanBoxes) => ScanBoxes
+    log?: (line: string) => void
   },
 ) {
   const pulls = options.pulls ?? fakePulls()
@@ -330,8 +372,9 @@ export async function runResearch(
     env: options.env ?? { ARCHIVE_TOKEN: 'token-1' },
     fetch: options.fetch ?? archive().fetch,
     input,
-    log: () => {},
+    log: options.log ?? (() => {}),
     module,
+    ...(options.containerPrices ? { containerPrices: options.containerPrices } : {}),
     prices,
     pulls: pulls.pulls,
     repo,
@@ -339,5 +382,6 @@ export async function runResearch(
     runsDir,
   })
   if (options.review) deps.review = options.review
+  if (options.scanBoxes && deps.scanBoxes) deps.scanBoxes = options.scanBoxes(deps.scanBoxes)
   return { deps, pulls: pulls.state, result: await research(input, deps) }
 }

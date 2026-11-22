@@ -63,7 +63,7 @@ The principles of the development workflow hold. These follow from them.
 | 3 Pick | gate, held findings | the user | No spend on a hypothesis that the user did not pick. |
 | 4 Prereg | plan (one planner, D7) | one preregistrar | The core sections and the domain's sections. The host commits `prereg/<hypothesis>-v<n>.md`, records its hash, and protects the path. A change is a new version with a reason. |
 | 5 Build | build | builder, on a branch of the notebook | Writes only `analysis/<id>/`, so a prereg puts a changed search there, not in the domain's package. Checkpoints and static rules as today. |
-| 6 Calibrate | done-looks-like | host | Runs the domain's `known` and `inject` commands on the search partition. Recall under the prereg threshold goes back to the builder, in two rounds at most. After the second round, the host stops with a blocker and asks the user. After a calibration passes, the host runs `analyze` on a new clean checkout of the calibrated commit, as a detached job. A failed analysis goes back to the builder one time, in a round of its own, then the host stops with a blocker. |
+| 6 Calibrate | done-looks-like | host | Runs the domain's `known` and `inject` commands on the search partition. A fan-out config (section 6.3) replaces them: the box runs `plan` on a clean checkout, then `fetch` for each target. A plan target in the holdout file fails the round, and no unit starts. Each unit is a ledger step on a scan box, in a pool of `parallel` units (default 32). A unit over 3 times its expected time, on a lost box, or with a non-zero exit starts again on another box, at most 3 times. Then `merge` gets it as failed. `merge` on a new clean checkout gives the `known` and `inject` outputs. Recall under the prereg threshold goes back to the builder, in two rounds at most. After the second round, the host stops with a blocker and asks the user. After a calibration passes, the host runs `analyze` on a new clean checkout of the calibrated commit, as a detached job. A failed analysis goes back to the builder one time, in a round of its own, then the host stops with a blocker. |
 | 7 Sweep | none | host, on the box | Runs the domain's `sweep` command at the frozen commit in a bounded pool. Each partition is a ledger step. Results go to artifacts. |
 | 8 Screen | light reviewer | screeners on a cheap model, in batches | Each label cites an artifact. One screener labels each batch. A `not sure` label goes to a second screener on the other family. |
 | 9 Vet | full review loop | skeptic tracks. Then the analyst answers, as the patch agent does. Then late skeptics on the other family | Context-free skeptics. The evidence check on artifacts. The analyst lists every objection as addressed or conceded. A conceded critical or high objection goes to the user. The domain's checks are host findings. The skeptics, the analyst and the writer get the analysis outputs as artifacts. After analyst changes, the host runs the analysis again. A failure stops the run with a blocker. |
@@ -156,9 +156,13 @@ reads it from the base branch, so a run cannot change its own rails.
       "analyze": "python -m search.analyze {prereg}",
       "sweep": "python -m search.sweep {prereg} {partition}",
       "evaluate": "python -m search.evaluate {prereg}",
-      "reproduce": "python -m search.reproduce {prereg}"
+      "reproduce": "python -m search.reproduce {prereg}",
+      "plan": "python -m search.plan {prereg}",
+      "fetch": "python -m search.fetch {prereg} {target}",
+      "unit": "python -m search.unit {prereg} {unit}",
+      "merge": "python -m search.merge {prereg} {units}"
     },
-    "timeouts": { "known": 7200000, "analyze": 3600000, "reproduce": 7200000 },
+    "timeouts": { "known": 7200000, "analyze": 3600000, "reproduce": 7200000, "unit": 1800000 },
     "feeds": ["https://export.arxiv.org/rss/astro-ph"]
   }
 }
@@ -169,8 +173,13 @@ The egress refuses the holdout to agents from the start of the run, before a pre
 The prereg section "Holdout" refers to this file and does not define the holdout.
 
 The host takes the command strings from the base branch. It replaces `{prereg}` with the quoted path of the frozen
-prereg. `{partition}` identifies the current data partition. `feeds` are the sources of scout (section 3).
+prereg. `{partition}` identifies the current data partition. `{target}` is the quoted name of a plan target, `{unit}`
+the quoted unit ID, and `{units}` the quoted path of the units directory. `feeds` are the sources of scout (section 3).
+`plan`, `fetch`, `unit` and `merge` are optional, but a config has all four or none of them. With all four, stage 6 fans out.
+`fetch`, `unit` and `merge` must use `{target}`, `{unit}` and `{units}`.
 `timeouts` gives the timeout in ms of each domain command. A missing key takes `timeout_ms`, else 30 minutes.
+The time limit of a unit is the smallest of 3 times its `expected_seconds`, `timeouts.unit` when set, and the 60-minute box limit.
+`timeout_ms` and the 30-minute default do not apply to a unit.
 `analyze` is optional. Without it, the host runs `python analysis/<id>/analyze.py {prereg}`, where `<id>` is the hypothesis.
 
 The last line of a command output that is not empty is a JSON object:
@@ -179,7 +188,9 @@ The last line of a command output that is not empty is a JSON object:
 | --- | --- |
 | `known` | `{"recall": <number 0..1>, "outputs": {"<path>": "<sha256 hex>"}, "reads": ["<path prefix>"]}` |
 | `inject` | `{"outputs": {"<path>": "<sha256 hex>"}, "reads": ["<path prefix>"]}` |
-| `analyze`, `reproduce` | `{"outputs": {"<path>": "<sha256 hex>"}}` |
+| `analyze`, `reproduce`, `fetch`, `unit` | `{"outputs": {"<path>": "<sha256 hex>"}}` |
+| `plan` | `{"targets": ["<name>"], "units": [{"id": "<id>", "targets": ["<name>"], "expected_seconds": <number more than 0>}]}` |
+| `merge` | `{"known": <last line of known>, "inject": <last line of inject>}` |
 
 - The calibration passes only when the `known` recall is equal to or more than the `known_recall` of the prereg. The
   `inject` outputs are the artifacts for completeness and false positives.
@@ -191,6 +202,11 @@ The last line of a command output that is not empty is a JSON object:
   `analyze` does not read the holdout.
 - `reproduce` on a clean checkout must give the same hashes as the calibration and the analysis. A missing hash is a
   failure.
+- A unit ID is 1 to 64 of the characters A-Z, a-z, 0-9, `_` and `-`. Each unit target is a target of the plan. Zero
+  units is valid.
+- The units directory has `<unit id>/<output path>` for each output of each done unit, and `units.json`:
+  `{"units": [{"id": "<id>", "status": "done" | "failed", "attempts": <n>, "reason": "<text>"}]}`. Only a failed unit
+  has a `reason`.
 
 agent-factory holds the roles and their generic guides (`agents/research/*.md`). The domain's guides add to them,
 as profile guides do today.
@@ -217,8 +233,13 @@ as profile guides do today.
   - Three start paths: a `/research` comment or the `agent-research` label on a notebook issue,
     `POST /research/<owner>/<repo>/<issue>`, and `npm run remote -- research <issue>`.
 - **Local** runs the same workflow, for tests and for development of the workflow.
-- **Large sweeps** go to scan boxes: one small container with no network for each slot of a pool, in the Durable
-  Object `ScanBoxes`. The sweep does not use them yet.
+- **Scan boxes**: one small container with no network for each slot of a pool, in the Durable Object `ScanBoxes`.
+  The units of a stage 6 fan-out run on them. The sweep does not use them yet. Local runs the units on the local
+  machine, in the same pool.
+  - The first attempt of a unit runs in a lane of the pool, so that the next unit uses the same box. A retry runs on a
+    new box.
+  - The compute meter counts a unit from its start to the end of its job. After its last unit, a box stays on until its
+    inactivity timeout (the time limit of the unit plus 10 minutes). The meter does not count this time.
   - **TLS pass time on a scan box** (one pass of the droplet example): TO FILL IN AFTER DEPLOY.
 - **No mirrors.** Runs fetch queries, cutouts and per-target data. A program never copies a whole archive.
 
@@ -256,7 +277,7 @@ as profile guides do today.
 | # | Gap | Default |
 | --- | --- | --- |
 | RG1 | The box's own network access | The box reaches the network through the host egress, after setup. Until then, the report says that the holdout lock binds agents only, and that box commands can send data out of the run. |
-| RG2 | Cost (G6) | A budget per program, set at intake, with the rule of G6: a notice at the budget, and a pause with one question at two times the budget. No pause at 80%, and no stop of the fan-out. |
+| RG2 | Cost (G6) | A budget per program, set at intake, for the models and the containers (`CONTAINER_PRICES`), with the rule of G6: a notice at the budget, and a pause with one question at two times the budget. No pause at 80%, and no stop of the fan-out. |
 | RG3 | Data volume | No mirrors. Artifacts over a size limit stay on the box and are named by hash. |
 | RG4 | Archives change | Each fetch records its hash and time. `reproduce` reports a drift. |
 | RG5 | Many trials in one program | The host counts each trial. The dossier reports the count. |

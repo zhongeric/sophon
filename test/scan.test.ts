@@ -35,7 +35,12 @@ function slotFixture() {
 async function finished(slot: ReturnType<typeof scanSlot>): Promise<BoxResult> {
   for (let polls = 0; polls < 100; polls++) {
     const polled = await slot.poll()
-    if (polled.state === 'done') return polled.result
+    if (polled.state === 'done') {
+      // The end time comes from the clock of the machine, so the callers compare the other fields.
+      const { ended_at: endedAt, ...result } = polled.result
+      assert.equal(typeof endedAt, 'number')
+      return result
+    }
     assert.equal(polled.state, 'running')
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
