@@ -208,9 +208,11 @@ export type BuildTask = {
   base: string
   /**
    * In a repair round of a base merge with a conflict: the files that the merge brings, without the files that conflict.
-   * Checkpoint and submit skip these files. The builder cannot change them (D16).
+   * Checkpoint and submit skip these files when they stay unchanged (D16).
    */
   baseFiles?: string[]
+  /** The files of `baseFiles` that the fixer can change for a red CI. Other base files must stay unchanged. */
+  editableBaseFiles?: string[]
   review: Record<string, string>
   prompt: string
   /** The start of each checkpoint's commit message. */
@@ -246,6 +248,7 @@ const continuePrompt = (remaining: string) =>
 export async function build(context: DevelopContext, task: BuildTask): Promise<BuildLog> {
   const { branch, checker } = task
   const baseFiles = new Set(task.baseFiles)
+  const editableBaseFiles = new Set(task.editableBaseFiles)
   const ledger = context.host.ledger
   const startKey = `start:${task.turn.key}`
   const start = ledger.get<string>(startKey) ?? (await branch.head())
@@ -257,11 +260,14 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
   if (baseFiles.size > 0) ledger.put(baseHashesKey, baseHashes)
   const checkBaseFiles = async (gate: 'checkpoint' | 'submit') => {
     const changed: string[] = []
+    const unchanged = new Set<string>()
     for (const path of baseFiles) {
-      if (await fileHash(branch.tree, path) !== baseHashes[path]) changed.push(path)
+      if (await fileHash(branch.tree, path) === baseHashes[path]) unchanged.add(path)
+      else if (!editableBaseFiles.has(path)) changed.push(path)
     }
     if (changed.length > 0)
       throw new Error(`${gate} refused: restore the unchanged files from the base merge: ${changed.join(', ')}`)
+    return unchanged
   }
   // The time that the call has left when it is too short for a command, else null. A platform without call limits gives null.
   const shortTime = () => {
@@ -278,7 +284,7 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
     checkpoint: {
       definition: checkpointTool,
       async call(input) {
-        await checkBaseFiles('checkpoint')
+        const unchanged = await checkBaseFiles('checkpoint')
         const pending = await branch.pending()
         if (pending.changed.length === 0 && pending.diff.trim() === '') {
           // A resolved base merge can keep the tree of the head. The host commits the merge after the submit (D16).
@@ -286,10 +292,10 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
           throw new Error('nothing to commit')
         }
         // A command, for example a test run or the setup, can change files outside the scope of the builder.
-        const outside = [...pending.changed, ...pending.removed].filter((path) => !inScope(path, task.scope) && !baseFiles.has(path))
+        const outside = [...pending.changed, ...pending.removed].filter((path) => !inScope(path, task.scope) && !unchanged.has(path))
         if (outside.length > 0)
           throw new Error(`checkpoint refused: these changes are outside the files of the task, and only the user can commit them: ${outside.join(', ')}. If the task needs them, say so in blocked.`)
-        const own = (path: string) => !baseFiles.has(path)
+        const own = (path: string) => !unchanged.has(path)
         const diff = baseFiles.size === 0 ? pending.diff : diffFiles(pending.diff).filter((file) => own(file.path)).map((file) => file.section).join('')
         const problems = staticFindings(diff, pending.changed.filter(own), task.active).map(
           (finding) => `${finding.location}: ${finding.title}. ${finding.recommendation}. Line: ${finding.evidence}`,
@@ -320,7 +326,7 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
         if (shortTime() === null) throw new Error('remaining is only for a turn whose alarm call has no time left. Finish the task, or say in blocked why you cannot.')
         return log
       }
-      await checkBaseFiles('submit')
+      const unchanged = await checkBaseFiles('submit')
       const pending = await branch.pending()
       if (pending.changed.length > 0 || pending.diff.trim() !== '') throw new Error(`checkpoint first: uncommitted changes in ${pending.changed.join(', ') || 'deleted files'}`)
       const head = await branch.head()
@@ -328,7 +334,7 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       // In a base merge, the fixer can keep its side of each conflict. finishMerge then commits the merge with the tree of the start.
       if (!task.baseFiles && (head === start || changed.length === 0))
         throw new Error('no commits since the task started: checkpoint your work, or say in blocked why you cannot finish')
-      const missing = changed.filter((path) => !baseFiles.has(path) && !log.changes.some((change) => change.path.replace(/^\/repo\//, '') === path))
+      const missing = changed.filter((path) => !unchanged.has(path) && !log.changes.some((change) => change.path.replace(/^\/repo\//, '') === path))
       if (missing.length > 0) throw new Error(`list every changed file in changes: missing ${missing.join(', ')}`)
       const refuse = (cause: string, failed: CheckResult[]) =>
         new Error([`${cause}. Fix the cause, checkpoint and submit again. When you cannot fix it, submit with the reason in blocked.`, ...failureText(failed)].join('\n'))
@@ -336,7 +342,7 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       // A command with no exit code, when the call has no time left, is a stop at the end of the call (D12).
       const cut = (failed: CheckResult[]) => shortTime() !== null && failed.some((result) => result.exit_code === null)
       // The CI of the base tested the files that a base merge brings unchanged, so the gate skips them (D16).
-      const taskChanges = (await branch.changedFiles(task.base, head)).filter((path) => !baseFiles.has(path))
+      const taskChanges = (await branch.changedFiles(task.base, head)).filter((path) => !unchanged.has(path))
       const runTests = checker.tests
       const tests = runTests ? await targetedTests(branch, context.config, taskChanges) : []
       if (runTests && tests.length > 0) {

@@ -132,11 +132,11 @@ const wrongProduct = {
  * /review/repair.txt, writes the files of `resolved` without conflict markers, checkpoints and submits.
  * With `checkFlag`, the bugs reviewer creates that file. When the prompt names /review/check-failure.txt, the fixer shows it.
  * With `blockRepair`, the fixer of that repair round submits a blocked log and changes nothing. With `reproduce`, the
- * fixer of a repair round shows /review/repair.txt, runs the test `test` (it fails), writes `fix` to src/sub.ts, runs the
- * test again (it passes), checkpoints and submits.
+ * fixer of a repair round shows /review/repair.txt, runs the test `test` (it fails), writes `fix` to `path` (default
+ * src/sub.ts), runs the test again (it passes), checkpoints and submits.
  */
 export function developScript(
-  options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean; resolved?: Record<string, string>; checkFlag?: string; blockRepair?: number; reproduce?: { test: string; fix: string } } = {},
+  options: { blockSub?: boolean; reviewFix?: boolean; askScope?: boolean; resolved?: Record<string, string>; checkFlag?: string; blockRepair?: number; reproduce?: { test: string; fix: string; path?: string } } = {},
 ): Script {
   return ({ role, output, request }) => {
     if (output !== null) return { text: 'done' }
@@ -179,16 +179,16 @@ export function developScript(
         if (round && Number(round) === options.blockRepair)
           return { cell: `await tools.submit_build_log({ summary: 'not repaired', changes: [], tests: [], blocked: 'the failure does not occur here' })` }
         if (round && options.reproduce) {
-          const { test, fix } = options.reproduce
+          const { test, fix, path = 'src/sub.ts' } = options.reproduce
           const summary = `repair ${round}: sub of one number`
           return {
             cell: [
               `text('repair.txt: ' + await tools.Read({ file_path: '/review/repair.txt' }))`,
               `text('before the fix: ' + JSON.stringify(await tools.run_tests({ tests: [${JSON.stringify(test)}] })))`,
-              `await tools.Write({ file_path: '/repo/src/sub.ts', content: ${JSON.stringify(fix)} })`,
+              `await tools.Write({ file_path: ${JSON.stringify(`/repo/${path}`)}, content: ${JSON.stringify(fix)} })`,
               `text('after the fix: ' + JSON.stringify(await tools.run_tests({ tests: [${JSON.stringify(test)}] })))`,
               `await tools.checkpoint({ message: 'repair ${round}' })`,
-              `await tools.submit_build_log(${JSON.stringify({ summary, changes: [{ path: 'src/sub.ts', why: summary }], tests: [test], blocked: '' })})`,
+              `await tools.submit_build_log(${JSON.stringify({ summary, changes: [{ path, why: summary }], tests: [test], blocked: '' })})`,
             ].join('\n'),
           }
         }

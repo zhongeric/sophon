@@ -363,7 +363,8 @@ test('develop: a box check that fails one time in a review pass and passes on th
   // The pass counts as passed, so no second pass ran.
   assert.equal(requests.length, 1)
   assert.deepEqual(github.state.reruns, [])
-  const head = github.state.shas.at(-1) ?? ''
+  const head = github.state.shas.at(-1)
+  assert.ok(head)
   assert.ok(fileLedger(join(dir, 'flaky-check', 'state.json')).get(`step:rerun.check.smoke.${head}`))
   assert.match(result.report, new RegExp(`^## Reruns\n\n- smoke on ${head.slice(0, 12)}: flaky$`, 'm'))
   assert.match(result.report, /^- \[x\] Review loop PASS on the head, at least 1 pass: pass 1: PASS$/m)
@@ -675,6 +676,26 @@ test('develop: CI red only on the merge with a moved base gets the base merge be
   assert.match(result.report, /^- Round 1, CI: CI \(pull_request\) failed on [0-9a-f]{12}\. repair 1: sub of one number$/m)
 })
 
+test('develop: the fixer of a CI repair round can change a task file that the base merge before the round brought', { timeout: 240_000 }, async () => {
+  const { repo, origin } = developRepo(undefined, { merge: 'squash' })
+  const dir = runsDir()
+  const github = fakePulls([false, true])
+  const review = scriptedReview([[]], [])
+  const input = await developInput(repo, 'base-repair-task-file')
+  // The base brings a test in test/, a directory of the tasks. The fix changes that test.
+  const base = pushBase(origin, { 'test/base.test.ts': sources.baseTest })
+  const fixed = sources.baseTest.replace('sub(5)', 'sub(5, 0)')
+  const turns: Turn[] = []
+  const script = developScript({ reproduce: { test: 'test/base.test.ts', fix: fixed, path: 'test/base.test.ts' } })
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(script, turns), input, pulls: github.pulls, review, runId: 'base-repair-task-file' })
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
+  assert.deepEqual(repairRounds(turns), ['1'])
+  const [, head] = github.state.shas as [string, string]
+  assert.equal(parents(origin, parents(origin, head)[0]!)[1], base)
+  assert.equal(execFileSync('git', ['--git-dir', origin, 'show', `${head}:test/base.test.ts`]).toString(), fixed)
+})
+
 test('develop: a conflict of the base merge before a CI repair round joins that round, and the run merges', { timeout: 240_000 }, async () => {
   const { repo, origin } = developRepo(undefined, { merge: 'squash' })
   const github = fakePulls([false, true])
@@ -713,6 +734,59 @@ test('develop: a conflict of the base merge before a CI repair round joins that 
   assert.deepEqual(fileLedger(join(dir, 'base-repair-conflict', 'state.json')).get('step:finish-merge.repair.1'), { result: [] })
   assert.match(result.report, new RegExp(`^- Round 1, CI: CI \\(pull_request\\) failed on ${built.slice(0, 12)}\\. repair 1: the conflicts of the base merge are resolved$`, 'm'))
   assert.match(result.report, new RegExp(`^- Before repair round 1: ${at}, conflict in src/sub\\.ts\\. Files: docs/base\\.md, src/sub\\.ts$`, 'm'))
+})
+
+test('develop: a conflicted CI repair skips unchanged task-scoped base files but checks fixer edits', { timeout: 240_000 }, async () => {
+  const { repo, origin } = developRepo(undefined, { merge: 'squash' })
+  const github = fakePulls([false, true])
+  const input = await developInput(repo, 'base-repair-rules')
+  const base = pushBase(origin, {
+    'src/sub.ts': 'export function sub(a: number, b: number): number {\n  return -(b - a)\n}\n',
+    'test/base.log': 'base\n',
+    'test/base.test.ts': sources.baseTest,
+  })
+  const fixed = sources.baseTest.replace('sub(5)', 'sub(5, 0)')
+  const log = {
+    summary: 'resolve the conflict and fix the base test',
+    changes: ['src/sub.ts', 'test/base.test.ts'].map((path) => ({ path, why: 'repair CI' })),
+    tests: ['test/base.test.ts'],
+    blocked: '',
+  }
+  const turns: Turn[] = []
+  const script = developScript()
+  const result = await runDevelop(repo, runsDir(), {
+    input, pulls: github.pulls, review: scriptedReview([[]], []), runId: 'base-repair-rules',
+    dispatch: scriptedDispatch((turn) => {
+      if (turn.role !== 'builder' || turn.output !== null || !/Repair round 1 of/.test(turn.request)) return script(turn)
+      return {
+        cell: [
+          `await tools.Write({ file_path: '/repo/src/sub.ts', content: ${JSON.stringify(sources.sub)} })`,
+          `await tools.Write({ file_path: '/repo/test/base.log', content: 'fixer edit' })`,
+          `try { await tools.checkpoint({ message: 'edit the base log' }); text('BASE LOG EDIT COMMITTED') } catch (error) { text(String(error)) }`,
+          `await tools.Write({ file_path: '/repo/test/base.log', content: 'base\\n' })`,
+          `await tools.Write({ file_path: '/repo/test/base.test.ts', content: ${JSON.stringify(fixed.replace(', 5)', ', 6)'))} })`,
+          `await tools.checkpoint({ message: 'resolve the conflict and edit the base test' })`,
+          `try { await tools.submit_build_log(${JSON.stringify(log)}); text('FAILING BASE TEST ACCEPTED') } catch (error) { text(String(error)) }`,
+          `await tools.Write({ file_path: '/repo/test/base.test.ts', content: ${JSON.stringify(fixed)} })`,
+          `await tools.checkpoint({ message: 'fix the base test' })`,
+          `try { await tools.submit_build_log(${JSON.stringify({ ...log, changes: log.changes.slice(0, 1) })}); text('MISSING BASE EDIT ACCEPTED') } catch (error) { text(String(error)) }`,
+          `await tools.submit_build_log(${JSON.stringify(log)})`,
+        ].join('\n'),
+      }
+    }, turns),
+  })
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
+  assert.deepEqual(repairRounds(turns), ['1'])
+  const output = turns.filter((turn) => turn.role === 'builder' && /Repair round 1 of/.test(turn.request)).map((turn) => turn.output ?? '').join('\n')
+  assert.match(output, /checkpoint refused:.*test\/base.log:1: Remove test\/base.log from the change/)
+  assert.match(output, /the targeted tests failed \([^)]*test\/base.test.ts[^)]*\)/)
+  assert.match(output, /list every changed file in changes: missing test\/base.test.ts/)
+  assert.doesNotMatch(output, /BASE LOG EDIT COMMITTED|FAILING BASE TEST ACCEPTED|MISSING BASE EDIT ACCEPTED/)
+  const head = github.state.shas.at(-1) ?? ''
+  execFileSync('git', ['--git-dir', origin, 'merge-base', '--is-ancestor', base, head])
+  assert.equal(execFileSync('git', ['--git-dir', origin, 'show', `${head}:test/base.log`]).toString(), 'base\n')
+  assert.equal(execFileSync('git', ['--git-dir', origin, 'show', `${head}:test/base.test.ts`]).toString(), fixed)
 })
 
 test('develop: a resumed ledger with a repair round from before the base check of CI repairs merges no base under that round', { timeout: 240_000 }, async () => {
