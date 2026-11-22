@@ -10,10 +10,13 @@ export class GitHubError extends Error {
   readonly status: number
   /** True when GitHub refused the call because of a rate limit, not because of the credential. */
   readonly rateLimited: boolean
-  constructor(status: number, message: string, rateLimited = false) {
+  /** The text of the response, empty when the error has no response. */
+  readonly body: string
+  constructor(status: number, message: string, rateLimited = false, body = '') {
     super(message)
     this.status = status
     this.rateLimited = rateLimited
+    this.body = body
   }
 }
 
@@ -88,8 +91,10 @@ export function github(token: GitHubToken, api = 'https://api.github.com', fetch
       const wait = rateLimitWait(response, tryNumber)
       const rateLimited = wait !== undefined
       const transient = rateLimited ? wait <= maxRateLimitWaitMs : repeatable && transientStatuses.has(response.status)
-      if (!transient || last)
-        throw new GitHubError(response.status, `GitHub ${method} ${path} answered HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`, rateLimited)
+      if (!transient || last) {
+        const body = await response.text()
+        throw new GitHubError(response.status, `GitHub ${method} ${path} answered HTTP ${response.status}: ${body.slice(0, 300)}`, rateLimited, body)
+      }
       await response.body?.cancel()
       await sleep(wait ?? backoff(tryNumber))
     }

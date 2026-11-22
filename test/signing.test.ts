@@ -82,6 +82,10 @@ test('the 403 of a private repository whose plan has no rulesets or branch prote
   assert.deepEqual(branches, [{ branch: 'main', rulesets: [], classic: 'none' }])
   assert.equal(commitMode(branches, { signUnknown: true }), 'unsigned')
   assert.deepEqual(calls, [rules('main'), classic('main')])
+  // gh on the local host gives the message as text.
+  const text = { status: 403, body: 'gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)' }
+  const local = scripted({ [rules('main')]: text, [classic('main')]: text })
+  assert.deepEqual(await readSignatureRules(local.get, api, ['main']), [{ branch: 'main', rulesets: [], classic: 'none' }])
 })
 
 // A 429 or a 5xx can go away, so it is not a StopError and the run loop of the Cloudflare host tries the run again.
