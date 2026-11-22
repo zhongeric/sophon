@@ -237,25 +237,17 @@ async function testGate(context: RunContext, id: string, cuts: boolean): Promise
     const added = existing.filter((path) => pattern.test(path))
     const targeted = [...new Set([...(await targetedTests(context.repo, config, edits)), ...added])]
     const failed = targeted.length === 0 ? [] : (await tests(targeted)).filter((result) => result.status !== 'pass')
-    if (recordUntested(failed)) return pass
     if (cut(failed)) return { status: 'cut', what: 'the targeted tests' }
+    if (recordUntested(failed)) return pass
     if (failed.length > 0) return { status: 'fail', text: [`the targeted tests of your edits failed (${targeted.join(', ')}). ${gateFix}`, ...failureText(failed)].join('\n') }
   }
   if (!ci) return pass
   // A skipped {files} command is not a failure.
   const failed = (await ci(existing)).filter((result) => result.status === 'fail')
-  if (failed.length === 0 || recordUntested(failed)) return pass
+  if (failed.length === 0) return pass
   if (cut(failed)) return { status: 'cut', what: 'the ci commands' }
+  if (recordUntested(failed)) return pass
   return { status: 'fail', text: [`the ci commands failed (${failed.map((result) => result.name).join(', ')}). ${gateFix}`, ...failureText(failed)].join('\n') }
-}
-
-/** The gate again on the edits of an agent, after the end of a call cut the gate of turn `turn`. Gives the failure, or null. */
-async function regate(context: RunContext, id: string, turn: number): Promise<string | null> {
-  context.host.ledger.put(regatedKey(id), true)
-  const gate = await testGate(context, id, false)
-  const failure = gate.status === 'fail' ? gate.text : null
-  context.host.log(`${id}: the gate of turn ${turn} ran again after the cut: ${failure === null ? 'pass' : 'fail'}`)
-  return failure
 }
 
 /** The prompt of a turn after the re-gate of the last turn failed. */
@@ -299,7 +291,13 @@ async function editTurns<Log>(context: RunContext, id: string, agent: EditAgent)
     })
     const log = await runTurn<Log>(context.host, agent.spec(submit), prompt, agent.tool.name, keys)
     if (cut || ledger.get(cutKey(id, turn)) === undefined) return { log, cut }
-    const failure = await step(ledger, `regate:${id}:${turn}`, () => regate(context, id, turn))
+    const failure = await step(ledger, `regate:${id}:${turn}`, async () => {
+      ledger.put(regatedKey(id), true)
+      const gate = await testGate(context, id, false)
+      const text = gate.status === 'fail' ? gate.text : null
+      context.host.log(`${id}: the gate of turn ${turn} ran again after the cut: ${text === null ? 'pass' : 'fail'}`)
+      return text
+    })
     if (failure === null) return { log, cut }
     if (turn === maxTaskTurns) throw new Error(`${id}: the gate failed after ${maxTaskTurns} turns\n${failure}`)
     prompt = regatePrompt(failure, agent.tool.name)

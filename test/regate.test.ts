@@ -95,6 +95,27 @@ test('a cut of the targeted tests at a patch submit stops the call, and the next
   assert.match(resumed.result.report, new RegExp(`^- Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 \\(sub returns a - b\\); .*; ${regateNote}$`, 'm'))
 })
 
+test('a setup that the end of the call stops at a patch submit is a cut, not a failed setup', async () => {
+  const repo = fixtureRepo()
+  const dir = runsDir()
+  const input = await loopInput(repo, 'regate-setup')
+  const time = clock()
+  const { dispatch } = model(scriptFor({ tests: false }))
+  const cut = () => (time.end(), [killed('setup')])
+  const stopped = await loopCall(repo, dir, input, { now: time.now, checker: testRunner([cut]), dispatch })
+
+  assert.ok(stopped.error instanceof PlannedStop, String(stopped.error))
+  assert.equal(stopped.ledger.get('untested:step1.patch'), undefined)
+  assert.equal(stopped.ledger.get('cut:step1.patch:1'), true)
+
+  time.start()
+  const resumed = await loopCall(repo, dir, input, { now: time.now, checker: (real) => real, dispatch })
+  assert.ok(resumed.result, String(resumed.error))
+  assert.equal(resumed.result.pass, true, resumed.result.report)
+  assert.ok(resumed.logs.includes('step1.patch: the gate of turn 1 ran again after the cut: pass'), resumed.logs.join('\n'))
+  assert.ok(!resumed.result.report.includes('the setup failed'), resumed.result.report)
+})
+
 test('a re-gate that fails gives the same patch session one more turn, and its new log counts', async () => {
   const repo = fixtureRepo()
   const dir = runsDir()
