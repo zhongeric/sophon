@@ -11,12 +11,15 @@ import { MemoryFileSystem } from 'nanocode-ts/bash'
 import type { SqlValue } from '../src/cloudflare/artifacts.ts'
 import { artifactSizeLimit } from '../src/core/artifacts.ts'
 import { boxMachine, cleanBox, containerBox, httpBox, SetupError, syncTree, syncWithSetup, type Box, type BoxResult } from '../src/cloudflare/box.ts'
-import { reviewChecker } from '../src/cloudflare/checker.ts'
+import { ciChecker, reviewChecker } from '../src/cloudflare/checker.ts'
+import type { GitHub } from '../src/cloudflare/github.ts'
 import { jobRunner } from '../src/cloudflare/jobs.ts'
 import { createSyncTables, sqlSyncs, type SyncSql } from '../src/cloudflare/syncs.ts'
 import { commandChecker } from '../src/core/checks.ts'
+import { systemClock, type Clock } from '../src/core/clock.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import type { Checker } from '../src/core/platform.ts'
+import { PausedError } from '../src/core/questions.ts'
 import { localContainer } from './support/container.ts'
 import { mockServices } from './support/mock-services.ts'
 
@@ -318,6 +321,35 @@ test('the marker is beside the directory and holds the stored sync ID', async ()
   assert.equal(readFileSync(fixture.marker, 'utf8'), fixture.store.read('work/x')?.sync)
   assert.deepEqual(readdirSync(fixture.dir).sort(), ['a.txt', 'setup.log', 'src'])
   assert.deepEqual([...(fixture.store.read('work/x')?.files.keys() ?? [])].sort(), ['a.txt', 'src/b.ts'])
+})
+
+test('an injected clock gives the sync ID in the marker and the times in the log lines', async () => {
+  const fixture = syncFixture()
+  let time = 0
+  const clock: Clock = { ...systemClock, now: () => (time += 10), uuid: () => 'sync-1' }
+  await syncWithSetup(fixture.box, fixture.store, fixture.pending, fixture.tree, 'work/x', { command: 'true', timeoutMs: 60_000 }, (line) => fixture.lines.push(line), undefined, clock)
+  assert.equal(readFileSync(fixture.marker, 'utf8'), 'sync-1')
+  assert.equal(fixture.store.read('work/x')?.sync, 'sync-1')
+  assert.deepEqual(fixture.lines, ['sync work/x: full, 2 files sent in 10 ms', 'setup work/x: pass, 2 files in 10 ms'])
+})
+
+test('the CI checker waits for CI to start until the injected clock passes the time limit', async () => {
+  const entries = new Map<string, unknown>()
+  const ledger: Ledger = { get: <T>(key: string) => entries.get(key) as T | undefined, put: (key, value) => void entries.set(key, value) }
+  const gh: GitHub = {
+    json: async <T>(_method: string, path: string) => (path.includes('/actions/runs') ? { total_count: 0, workflow_runs: [] } : { statuses: [] }) as T,
+    raw: async () => new Response(null),
+    graphql: async () => assert.fail('the CI checker sends no GraphQL'),
+  }
+  let time = 1_000_000
+  const sha = 'abcdef1234567890'
+  const checker = ciChecker({ gh, pull: { owner: 'acme', repo: 'app', pr: 7 }, repo: { publish: async () => sha }, ledger, branch: 'factory/pr-7-x', timeoutMs: 60_000, clock: { ...systemClock, now: () => time } })
+  await assert.rejects(checker.checks([]), (error) => error instanceof PausedError && error.message === 'waiting for CI to start on abcdef123456 (factory/pr-7-x)')
+  assert.equal(ledger.get<number>(`ci-started:${sha}`), 1_000_000)
+  time += 120_000
+  const [result] = await checker.checks([])
+  assert.equal(result?.status, 'fail')
+  assert.equal(result?.output, `no CI ran on ${sha} in 2 minutes. Run CI on pushes to factory/** branches.`)
 })
 
 test('exit code 137 before the time limit is a kill, not a timeout', async () => {

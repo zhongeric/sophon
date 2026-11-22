@@ -1,3 +1,4 @@
+import { systemClock } from '../core/clock.ts'
 import { StopError } from '../core/stop.ts'
 import { github, GitHubError, type GitHub } from './github.ts'
 
@@ -13,6 +14,8 @@ export type BotLogins = Map<string, string>
 type AccessOptions = {
   /** The clock in milliseconds. Tests replace it to make a token expire. */
   now?: () => number
+  /** Waits between the tries of a request. */
+  sleep?: (ms: number) => Promise<void>
 }
 
 /** The client gets a new installation token when this time or less remains before the token expires. */
@@ -80,7 +83,7 @@ export async function githubAccess(
   const { GITHUB_APP_ID: appId, GITHUB_APP_PRIVATE_KEY: pem } = secrets
   if (!appId && !pem) {
     if (!secrets.GITHUB_TOKEN) throw new StopError('GITHUB_TOKEN is not set: set it, or set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY to use the GitHub App')
-    return { app: false, gh: github(secrets.GITHUB_TOKEN, secrets.GITHUB_API_URL ?? 'https://api.github.com') }
+    return { app: false, gh: github(secrets.GITHUB_TOKEN, secrets.GITHUB_API_URL ?? 'https://api.github.com', fetch, options) }
   }
   const { app, installation } = githubApp(secrets, cache, options)
   let id: number
@@ -110,8 +113,8 @@ export function githubApp(
     const [missing, set] = appId ? ['GITHUB_APP_PRIVATE_KEY', 'GITHUB_APP_ID'] : ['GITHUB_APP_ID', 'GITHUB_APP_PRIVATE_KEY']
     throw new StopError(`${missing} is not set: the GitHub App needs it together with ${set}`)
   }
-  const now = options.now ?? Date.now
-  const app = github(() => appJwt(appId, pem, now()), api)
+  const now = options.now ?? systemClock.now
+  const app = github(() => appJwt(appId, pem, now()), api, fetch, options)
   /** `name` names the installation in errors, for example its repository. */
   const installation = (id: number, name = `installation ${id}`) => {
     const create = async () => {
@@ -129,7 +132,7 @@ export function githubApp(
       pending ??= create().finally(() => { pending = undefined })
       return pending
     }
-    return github(token, api)
+    return github(token, api, fetch, options)
   }
   return { app, installation }
 }

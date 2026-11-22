@@ -2,6 +2,7 @@ import type { Machine } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { artifactSizeLimit } from '../core/artifacts.ts'
+import { systemClock, type Clock } from '../core/clock.ts'
 import type { JobRunner } from './jobs.ts'
 import { tar, type TarEntry } from './tar.ts'
 
@@ -331,7 +332,7 @@ export type SyncStore = {
  * of the last complete sync. The sync sends only the changes when the stored ID and the marker agree. Else it
  * copies all of the tree and runs the setup again. Before the first write, the sync removes the stored state and
  * the marker. It writes them again only after the copy and the setup pass. Thus a sync or a setup that fails part
- * of the way always gives a full copy and the setup on the next sync.
+ * of the way always gives a full copy and the setup on the next sync. `clock` gives the sync IDs and the times of the log.
  */
 export function syncWithSetup(
   box: Box,
@@ -342,8 +343,9 @@ export function syncWithSetup(
   setup: { command: string | undefined; timeoutMs: number },
   log: (line: string) => void,
   jobs?: JobRunner,
+  clock: Clock = systemClock,
 ): Promise<void> {
-  const current = (pending.get(dir) ?? Promise.resolve()).catch(() => {}).then(() => syncOnce(box, store, tree, dir, setup, log, jobs))
+  const current = (pending.get(dir) ?? Promise.resolve()).catch(() => {}).then(() => syncOnce(box, store, tree, dir, setup, log, jobs, clock))
   pending.set(dir, current)
   const done = () => {
     if (pending.get(dir) === current) pending.delete(dir)
@@ -360,9 +362,10 @@ async function syncOnce(
   setup: { command: string | undefined; timeoutMs: number },
   log: (line: string) => void,
   jobs: JobRunner | undefined,
+  clock: Clock,
 ): Promise<void> {
   await box.start()
-  const started = Date.now()
+  const started = clock.now()
   const marker = `${dir}.sync`
   const last = store.read(dir)
   const next = await manifest(tree)
@@ -375,7 +378,7 @@ async function syncOnce(
     agrees = (await box.exec(['bash', '-c', check, 'bash', marker, last.sync], { cwd: '', env: boxEnv, timeoutMs: 60_000 })).exit_code === 0
   }
   if (agrees && !writes) {
-    log(`sync ${dir}: changes, 0 files sent in ${Date.now() - started} ms`)
+    log(`sync ${dir}: changes, 0 files sent in ${clock.now() - started} ms`)
     return
   }
   store.invalidate(dir)
@@ -385,17 +388,17 @@ async function syncOnce(
   try {
     await syncTree(box, tree, dir, base, next)
   } catch (error) {
-    log(`sync ${dir}: ${kind}, ${count} files failed in ${Date.now() - started} ms`)
+    log(`sync ${dir}: ${kind}, ${count} files failed in ${clock.now() - started} ms`)
     throw error
   }
-  log(`sync ${dir}: ${kind}, ${count} files sent in ${Date.now() - started} ms`)
+  log(`sync ${dir}: ${kind}, ${count} files sent in ${clock.now() - started} ms`)
   if (!base && setup.command) {
-    const setupStarted = Date.now()
+    const setupStarted = clock.now()
     const result = await runCommand(box, jobs, setup.command, { cwd: dir, env: boxEnv, timeoutMs: setup.timeoutMs })
-    log(`setup ${dir}: ${result.exit_code === 0 ? 'pass' : 'fail'}, ${next.size} files in ${Date.now() - setupStarted} ms`)
+    log(`setup ${dir}: ${result.exit_code === 0 ? 'pass' : 'fail'}, ${next.size} files in ${clock.now() - setupStarted} ms`)
     if (result.exit_code !== 0) throw new SetupError(setup.command, result)
   }
-  const sync = crypto.randomUUID()
+  const sync = clock.uuid()
   const written = await box.exec(['bash', '-c', 'printf %s "$2" > "$1"', 'bash', marker, sync], { cwd: '', env: boxEnv, timeoutMs: 60_000 })
   if (written.exit_code !== 0) throw new Error(`writing the marker ${marker} failed: ${written.output.slice(-2000)}`)
   store.save(dir, { files: next, sync })

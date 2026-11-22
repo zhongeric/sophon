@@ -1,5 +1,6 @@
 import type { Contracts } from 'nanocode-ts'
 import { SqlFileSystem, type FileSystem } from 'nanocode-ts/bash'
+import { systemClock, type Clock } from '../core/clock.ts'
 import type { Ledger } from '../core/ledger.ts'
 import { markedFiles } from '../core/merge.ts'
 import type { Branch, Branches } from '../core/platform.ts'
@@ -116,8 +117,9 @@ type BaseMerged = { local: string; from: string; sha: string; files: string[] }
  * to GitHub through the Git Data API, so no token ever reaches the build machine. The ledger maps local commits to
  * their GitHub commits.
  */
-export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; sql: Contracts.SqlHost; ledger: Ledger; run: string; log(line: string): void }): Branches {
+export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; sql: Contracts.SqlHost; ledger: Ledger; run: string; clock?: Clock; log(line: string): void }): Branches {
   const { gh, ledger } = options
+  const clock = options.clock ?? systemClock
   const api = `/repos/${options.owner}/${options.repo}`
   const trees = () => ledger.get<Record<string, Tree>>('trees') ?? {}
   const remotes = () => ledger.get<Record<string, string>>('remotes') ?? {}
@@ -356,7 +358,7 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
       const recorded = ledger.get<string>(`view:${commit}`)
       if (recorded) return open(recorded).tree
       // A crashed download leaves a partial tree: each attempt writes a fresh scope.
-      const scope = `view:${options.run}:${commit.slice(0, 12)}:${Date.now()}`
+      const scope = `view:${options.run}:${commit.slice(0, 12)}:${clock.now()}`
       const { skipped } = await writeTarball(gh, api, open(scope).tree, commit)
       if (skipped.length > 0) options.log(`skipped ${skipped.length} files over the size limit: ${skipped.slice(0, 5).join(', ')}`)
       ledger.put(`view:${commit}`, scope)
@@ -365,7 +367,7 @@ export function sqlBranches(options: { gh: GitHub; owner: string; repo: string; 
     async branch(name, from) {
       const recorded = trees()[name]
       if (recorded) return branchOf(name, recorded)
-      const scope = `branch:${options.run}:${name}:${Date.now()}`
+      const scope = `branch:${options.run}:${name}:${clock.now()}`
       const target = open(scope)
       const view = ledger.get<string>(`view:${from}`)
       if (view) {

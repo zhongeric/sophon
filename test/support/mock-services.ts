@@ -1,6 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { constants, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -48,8 +48,16 @@ export async function mockServices(
     app?: { slug: string; installed: boolean; expiresInSeconds?: number }
     /** The text of each page that the egress route answers, by path. */
     pages?: (path: string) => string
+    /** The clock of the GitHub times, for a simulation with a fake clock. Default: Date.now. */
+    now?: () => number
+    /** The author and committer date of each commit that the mock makes, so that a simulation gets the same commit IDs each time. */
+    gitDate?: string
+    /** A fault for a request, by its route and headers: the mock answers with this status and these headers, and does nothing else. */
+    fault?: (route: string, headers: IncomingHttpHeaders) => { status: number; headers?: Record<string, string> } | undefined
   },
 ) {
+  const now = options.now ?? (() => Date.now())
+  const dated: Record<string, string> = options.gitDate ? { GIT_AUTHOR_DATE: options.gitDate, GIT_COMMITTER_DATE: options.gitDate } : {}
   const git = (args: string[], input?: Buffer, env: Record<string, string> = {}) =>
     execFileSync('git', args, { cwd: repo, env: { ...process.env, ...env }, input, maxBuffer: 64 * 1024 * 1024, stdio: 'pipe' })
   const text = (args: string[], input?: Buffer, env?: Record<string, string>) => git(args, input, env).toString().trim()
@@ -109,7 +117,7 @@ export async function mockServices(
   let installationTokens = 0
   const comment = (login: string, body: string, issue = options.pr ?? 0): MockComment => {
     const id = ++ids
-    const at = new Date(Date.now() + id).toISOString()
+    const at = new Date(now() + id).toISOString()
     const kind = pulls.has(issue) ? 'pull' : 'issues'
     const created = { body, created_at: at, html_url: `https://github.com/${options.owner}/${options.name}/${kind}/${issue}#issuecomment-${id}`, id, issue, updated_at: at, user: { login } }
     state.comments.push(created)
@@ -259,6 +267,12 @@ export async function mockServices(
     }
     state.requests.push(route)
     state.authorizations.push({ authorization: request.headers.authorization ?? '', route })
+    const fault = options.fault?.(route, request.headers)
+    if (fault) {
+      response.writeHead(fault.status, { 'content-type': 'application/json', ...fault.headers })
+      response.end(JSON.stringify({ message: `fault ${fault.status}` }))
+      return
+    }
     try {
       if (route === 'POST /v1/messages' || route === 'POST /v1/responses') {
         const reply = await dispatch(
@@ -311,7 +325,7 @@ export async function mockServices(
       if (route === `GET ${api}/installation`) return options.app?.installed ? json(response, 200, { id: 42 }) : json(response, 404, { message: 'Not Found' })
       if (options.app && route === 'GET /app') return json(response, 200, { slug: options.app.slug })
       if (options.app?.installed && route === 'POST /app/installations/42/access_tokens') {
-        const expires_at = new Date(Date.now() + (options.app.expiresInSeconds ?? 3_600) * 1_000).toISOString()
+        const expires_at = new Date(now() + (options.app.expiresInSeconds ?? 3_600) * 1_000).toISOString()
         return json(response, 201, { expires_at, token: `ghs_installation${++installationTokens}` })
       }
       // The installed App has one installation, 42, with this repository only.
@@ -360,7 +374,7 @@ export async function mockServices(
         if (sha !== shaOf(pull.head)) return json(response, 409, { message: 'Head branch was modified. Review and try the merge again.' })
         if (pull.draft) return json(response, 405, { message: 'Pull Request is still a draft' })
         // Every method merges as a squash: the tests read only the tree on main.
-        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
+        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot', ...dated }
         const commit = text(['commit-tree', `${sha}^{tree}`, '-p', shaOf('main')!, '-m', `${pull.title} (#${number})`], undefined, identity)
         git(['update-ref', 'refs/heads/main', commit])
         pull.merged = commit
@@ -436,7 +450,7 @@ export async function mockServices(
         const entry = state.comments.find((candidate) => candidate.id === Number(edited[1]))
         if (!entry) return json(response, 404, { message: 'Not Found' })
         entry.body = string(input().body, 'body')
-        entry.updated_at = new Date(Math.max(Date.now(), Date.parse(entry.created_at) + 1)).toISOString()
+        entry.updated_at = new Date(Math.max(now(), Date.parse(entry.created_at) + 1)).toISOString()
         state.edits.push({ body: entry.body, id: entry.id })
         return json(response, 200, entry)
       }
@@ -480,7 +494,7 @@ export async function mockServices(
       if (route === `POST ${api}/git/commits`) {
         const fields = input()
         const [message, parents, tree] = [string(fields.message, 'message'), strings(fields.parents, 'parents'), string(fields.tree, 'tree')]
-        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
+        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot', ...dated }
         return json(response, 201, { sha: text(['commit-tree', tree, ...parents.flatMap((parent) => ['-p', parent]), '-m', message], undefined, identity) })
       }
       if (route === `POST ${api}/merges`) {
@@ -500,7 +514,7 @@ export async function mockServices(
         } catch {
           return json(response, 409, { message: 'Merge conflict' })
         }
-        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot' }
+        const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot', ...dated }
         const commit = text(['commit-tree', tree, '-p', into, '-p', from, '-m', message], undefined, identity)
         git(['update-ref', `refs/heads/${base}`, commit])
         state.refs.set(`refs/heads/${base}`, commit)
@@ -535,7 +549,7 @@ export async function mockServices(
       }
       if (route === `GET ${api}/actions/runs` && state.ciStatus !== 200) return json(response, state.ciStatus, { message: 'Resource not accessible by personal access token' })
       if (route === `GET ${api}/actions/runs`) {
-        const created_at = new Date().toISOString()
+        const created_at = new Date(now()).toISOString()
         const run = (id: number, conclusion: string) => ({ conclusion, created_at, event: 'push', html_url: `https://github.com/ci/${id}`, id, name: 'CI', status: 'completed', workflow_id: 1 })
         // An earlier failed run of the same workflow and event, then its successful rerun: only the latest counts.
         return json(response, 200, { total_count: 2, workflow_runs: Number(url.searchParams.get('page') ?? 1) === 1 ? [run(1, 'failure'), run(2, 'success')] : [] })

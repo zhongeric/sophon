@@ -5,6 +5,7 @@ import type { Contracts } from 'nanocode-ts'
 import type { FileSystem } from 'nanocode-ts/bash'
 import { sqlBranches } from '../src/cloudflare/branches.ts'
 import { github } from '../src/cloudflare/github.ts'
+import { systemClock } from '../src/core/clock.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import { hasConflictMarkers } from '../src/core/merge.ts'
 import { git } from '../src/node/git.ts'
@@ -65,6 +66,27 @@ async function changedBranch(t: { after(fn: () => Promise<void>): void }) {
   const before = await branches.push(branch)
   return { repo, origin, branches, branch, start, before }
 }
+
+test('Cloudflare branches: the view and branch scopes take the time of the injected clock', async (t) => {
+  const { origin } = developRepo()
+  const mock = await mockServices(origin, {
+    botLogin: 'factory-bot',
+    name: 'app',
+    owner: 'acme',
+    script: () => {
+      throw new Error('this test has no model turns')
+    },
+  })
+  t.after(() => mock.close())
+  const ledger = memoryLedger()
+  const clock = { ...systemClock, now: () => 1234 }
+  const branches = sqlBranches({ clock, gh: github('token', mock.url), ledger, log: () => {}, owner: 'acme', repo: 'app', run: 'run-1', sql: sqlHost() })
+  const start = (await git(origin, 'rev-parse', 'main')).trim()
+  await branches.view(start)
+  await branches.branch('factory/dev-x', start)
+  assert.equal(ledger.get<string>(`view:${start}`), `view:run-1:${start.slice(0, 12)}:1234`)
+  assert.equal(ledger.get<Record<string, { scope: string }>>('trees')?.['factory/dev-x']?.scope, 'branch:run-1:factory/dev-x:1234')
+})
 
 test('Cloudflare branches: a clean base merge makes a merge commit with two parents on GitHub', async (t) => {
   const { repo, origin, branches, branch, start, before } = await changedBranch(t)

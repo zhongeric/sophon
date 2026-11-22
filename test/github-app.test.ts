@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { generateKeyPairSync, verify } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -106,6 +108,27 @@ test('without the App secrets, requests carry GITHUB_TOKEN and no App route is c
     await gh.json('GET', '/repos/acme/app')
     assert.deepEqual(mock.state.authorizations, [{ authorization: 'Bearer personal', route: 'GET /repos/acme/app' }])
   })
+})
+
+test('the client of githubAccess waits between its tries with the injected sleep', async () => {
+  let requests = 0
+  const server = createServer((_request, response) => {
+    requests++
+    response.writeHead(requests === 1 ? 502 : 200, { 'content-type': 'application/json' }).end('{"ok":true}')
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const waits: number[] = []
+    const sleep = async (ms: number) => {
+      waits.push(ms)
+    }
+    const { gh } = await githubAccess({ GITHUB_API_URL: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, GITHUB_TOKEN: 'personal' }, 'acme', 'app', new Map(), { sleep })
+    assert.deepEqual(await gh.json('GET', '/repos/acme/app'), { ok: true })
+    assert.equal(requests, 2)
+    assert.deepEqual(waits, [1_000])
+  } finally {
+    server.close()
+  }
 })
 
 test('with the App secrets and GITHUB_TOKEN, requests carry the installation token, never GITHUB_TOKEN', async () => {

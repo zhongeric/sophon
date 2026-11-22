@@ -57,19 +57,21 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     const log = (line: string) => console.log(`[${owner}/${repo}#${request.issue} ${run}] ${line}`)
     const sql = Sql.create(this.ctx.storage)
     const { box, syncs, jobs } = await call.machine()
+    const { clock } = this
     const setup = input.config.setup
     const pending = new Map<string, Promise<void>>()
     const checker = (branch: Branch) => {
       const dir = `work/${branch.name.replace(/[^A-Za-z0-9._-]/g, '-')}`
       // The setup runs after each full copy, so a container that came back empty installs its dependencies again.
-      const sync = () => syncWithSetup(box, syncs, pending, branch.tree, dir, { command: setup, timeoutMs: setupTimeoutMs }, log, jobs)
+      const sync = () => syncWithSetup(box, syncs, pending, branch.tree, dir, { command: setup, timeoutMs: setupTimeoutMs }, log, jobs, clock)
       return commandChecker(branch, { ...input.config, setup: undefined }, boxMachine(box, dir, sync, jobs))
     }
     const result = await develop(input, {
-      branches: sqlBranches({ gh, ledger, log, owner, repo, run, sql }),
+      branches: sqlBranches({ clock, gh, ledger, log, owner, repo, run, sql }),
       channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, notice: call.notice, pollMs: 0, waitMs: 0 }),
       checker,
       ci: { pollMs: 0, startMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000, waitMs: 0 },
+      clock,
       credentials: credentialsFor(this.env, developProviders(input.models)),
       files: sqlFiles(this.ctx.storage.sql, run),
       guides: await bundledGuides(),

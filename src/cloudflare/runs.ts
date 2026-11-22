@@ -1,4 +1,5 @@
 import { DurableObject } from 'cloudflare:workers'
+import { systemClock, type Clock } from '../core/clock.ts'
 import type { Ledger } from '../core/ledger.ts'
 import { callBudget, PlannedStop } from '../core/planned-stop.ts'
 import { failedChecksText } from '../core/preflight.ts'
@@ -146,6 +147,8 @@ export function credentialsFor(env: Env, providers: Iterable<Provider>): Credent
 export abstract class Runs<Request extends RunRequest> extends DurableObject<Env> {
   busy = false
   tokens: InstallationTokens = new Map()
+  /** The time and the random IDs of the alarm calls. A test sets a fake clock to make a run deterministic. */
+  clock: Clock = systemClock
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -182,10 +185,10 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
   async start(request: Request, options: { once?: boolean } = {}): Promise<{ run: string; started: boolean }> {
     const active = options.once ? this.ctx.storage.sql.exec<RunRow>('select * from factory_runs order by created desc limit 1').toArray()[0] : this.active()
     if (active) return { run: active.run, started: false }
-    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
+    const stamp = new Date(this.clock.now()).toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
     const run = this.runName(request, stamp)
-    this.ctx.storage.sql.exec('insert into factory_runs (run, state, note, created, request) values (?, ?, ?, ?, ?)', run, 'queued', '', Date.now(), JSON.stringify(request))
-    await this.ctx.storage.setAlarm(Date.now())
+    this.ctx.storage.sql.exec('insert into factory_runs (run, state, note, created, request) values (?, ?, ?, ?, ?)', run, 'queued', '', this.clock.now(), JSON.stringify(request))
+    await this.ctx.storage.setAlarm(this.clock.now())
     return { run, started: true }
   }
 
@@ -200,13 +203,13 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     const { state } = latest
     const ledger = sqlLedger(this.ctx.storage.sql, latest.run)
     let reason = 'woke the paused run'
-    if (state === 'queued' && options.afterError && (ledger.get<number>(restartAtKey) ?? 0) > Date.now()) {
+    if (state === 'queued' && options.afterError && (ledger.get<number>(restartAtKey) ?? 0) > this.clock.now()) {
       reason = 'started the run again from its ledger after the error'
     } else if (state === 'error' && options.afterError) {
       this.queueAfterError(latest.run)
       reason = 'started the run again from its ledger after the error'
     } else if (state !== 'paused') return { reason: notResumed[state], resumed: false, state }
-    await this.ctx.storage.setAlarm(Date.now())
+    await this.ctx.storage.setAlarm(this.clock.now())
     return { reason, resumed: true, state }
   }
 
@@ -255,12 +258,13 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
   }
 
   override async alarm(): Promise<void> {
-    const startedAt = Date.now()
+    const { clock } = this
+    const startedAt = clock.now()
     const row = this.active()
     if (!row || this.busy) return
     this.busy = true
-    const heartbeat = setInterval(() => void this.ctx.storage.setAlarm(Date.now() + heartbeatMs), heartbeatEveryMs)
-    await this.ctx.storage.setAlarm(Date.now() + heartbeatMs)
+    const stopHeartbeat = clock.every(heartbeatEveryMs, () => void this.ctx.storage.setAlarm(clock.now() + heartbeatMs))
+    await this.ctx.storage.setAlarm(clock.now() + heartbeatMs)
     const request = JSON.parse(row.request) as Request
     const budgetMs = alarmBudgetMs(this.env.ALARM_BUDGET_SECONDS)
     const stored = sqlLedger(this.ctx.storage.sql, row.run)
@@ -286,7 +290,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
         if (key.startsWith('answers:')) void shown.status?.update({ state: 'running' })
       },
     }
-    const ledger = callBudget(answered, { budgetMs, startedAt })
+    const ledger = callBudget(answered, { budgetMs, now: clock.now, startedAt })
     const notice = async (text: string) => shown.status?.update({ notice: text })
     const call = this.call(row.run, ledger, startedAt + budgetMs, notice)
     const target = `${request.owner}/${request.repo}#${this.number(request)}`
@@ -297,6 +301,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       const due = row.state === 'queued' && ledger.get(preflightKey) !== true
       const access = due
         ? await preflight({
+            clock,
             container: this.ctx.container !== undefined,
             credential: (provider) => credentialFor(this.env, provider),
             env: this.env,
@@ -309,7 +314,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
             repo: request.repo,
             tokens: this.tokens,
           })
-        : await githubAccess(this.env, request.owner, request.repo, this.tokens)
+        : await githubAccess(this.env, request.owner, request.repo, this.tokens, clock)
       if (due) ledger.put(preflightKey, true)
       app = access.app
       const posts = comments(access.gh)
@@ -339,8 +344,8 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
         // Before the first post, the status comment carries the failed checks.
         await (shown.status ?? (error.gh ? track(error.gh) : undefined))?.error(error.message, text)
       } else {
-        const outcome = afterError(ledger, error, { now: Date.now(), pauseSeconds: this.env.PAUSE_POLL_SECONDS })
-        if (error instanceof PlannedStop) console.log(`[${row.run}] planned stop after ${Math.round((Date.now() - startedAt) / 1_000)} s of wall time`)
+        const outcome = afterError(ledger, error, { now: clock.now(), pauseSeconds: this.env.PAUSE_POLL_SECONDS })
+        if (error instanceof PlannedStop) console.log(`[${row.run}] planned stop after ${Math.round((clock.now() - startedAt) / 1_000)} s of wall time`)
         if (outcome.attempts !== null) console.error(`[${row.run}] attempt ${outcome.attempts} failed`, error)
         this.setState(row.run, outcome.state, outcome.note)
         next = outcome.next
@@ -357,7 +362,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
       }
     } finally {
       await shown.status?.settle()
-      clearInterval(heartbeat)
+      stopHeartbeat()
       this.busy = false
     }
     if (next === null) await this.ctx.storage.deleteAlarm()
@@ -370,7 +375,8 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     const start = async (): Promise<RunMachine> => {
       const syncs = sqlSyncs(this.ctx.storage.sql, run)
       const box = this.box(syncs)
-      const jobs = jobRunner(box, ledger, { deadline })
+      const { now, sleep, uuid } = this.clock
+      const jobs = jobRunner(box, ledger, { deadline, now, sleep, uuid })
       await jobs.killStale()
       return { box, jobs, syncs }
     }

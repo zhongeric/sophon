@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import { AgentRuntime, type Contracts } from 'nanocode-ts'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import { openAgent, runTurn, submitOnce, type AgentHost, type AgentSpec } from '../src/core/agent.ts'
+import { systemClock } from '../src/core/clock.ts'
 import { runLock, type Egress } from '../src/core/egress.ts'
 import { StopError } from '../src/core/stop.ts'
 import { BudgetStop, usageOf } from '../src/core/usage.ts'
@@ -278,19 +279,18 @@ test('the budget check also runs before the nudge turn, so a first turn that rea
   assert.equal(host.ledger.get('retries:note:task'), undefined)
 })
 
-test('a turn longer than the turn time of its spec logs a warning, and a short turn logs none', async (t) => {
+test('a turn longer than the turn time of its spec logs a warning, and a short turn logs none', async () => {
   const run = resumeSetup()
   const lines: string[] = []
-  // Each model request moves the clock of the host 8 minutes forward.
+  // Each model request moves the injected clock of the host 8 minutes forward.
   let offset = 0
-  const realNow = Date.now.bind(Date)
-  t.mock.method(Date, 'now', () => realNow() + offset)
+  const clock = { ...systemClock, now: () => offset }
   const scripted = scriptedDispatch((turn) => (turn.output === null ? { cell: "await tools.submit_note({ note: 'done' }); text('submitted')" } : { text: 'done' }), [])
   const slow: Contracts.RuntimeOptions['dispatch'] = async (...args) => {
     offset += 8 * 60_000
     return scripted(...args)
   }
-  const host: AgentHost = { ...run.host(slow), log: (line) => lines.push(line) }
+  const host: AgentHost = { ...run.host(slow), clock, log: (line) => lines.push(line) }
   assert.deepEqual(await runTurn(host, { ...(await run.spec(host)), turnMs: 7 * 60_000 }, 'Write a note.', 'submit_note'), { note: 'done' })
   assert.equal(lines.filter((line) => /warning/.test(line)).length, 1)
   assert.match(lines.find((line) => /warning/.test(line))!, /^note: warning: turn task took \d+ s, more than the turn time of 420 s$/)
