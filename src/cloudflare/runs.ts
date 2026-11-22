@@ -379,8 +379,7 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     const start = async (): Promise<RunMachine> => {
       const syncs = sqlSyncs(this.ctx.storage.sql, run)
       const box = this.box(syncs)
-      const { now, sleep, uuid } = this.clock
-      const jobs = jobRunner(box, ledger, { deadline, now, sleep, uuid })
+      const jobs = jobRunner(box, ledger, { clock: this.clock, deadline })
       await jobs.killStale()
       return { box, jobs, syncs }
     }

@@ -1,10 +1,11 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { constants, tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { inflateSync } from 'node:zlib'
+import { dirname, join } from 'node:path'
+import { deflateSync, inflateSync } from 'node:zlib'
 import { commandResult, type BoxResult, type JobState } from '../../src/cloudflare/box.ts'
 import { probeOutputTokens } from '../../src/core/preflight.ts'
 import type { Provider } from '../../src/core/providers.ts'
@@ -53,8 +54,8 @@ export async function mockServices(
     now?: () => number
     /** The author and committer date of each commit that the mock makes, so that a simulation gets the same commit IDs each time. */
     gitDate?: string
-    /** A fault for a request, by its route and headers: the mock answers with this status and these headers, and does nothing else. */
-    fault?: (route: string, headers: IncomingHttpHeaders) => { status: number; headers?: Record<string, string> } | undefined
+    /** A fault for a request, by its headers: the mock answers with this status and these headers, and does nothing else. */
+    fault?: (headers: IncomingHttpHeaders) => { status: number; headers?: Record<string, string> } | undefined
     /**
      * The outputs of the git reads of fixed commits, by command. Mocks over repositories with the same git config can
      * share one map, so that a simulation runs git less. Default: a map for this mock only.
@@ -135,6 +136,60 @@ export async function mockServices(
       cache.set(key, output)
     }
     return output
+  }
+  /** Writes a loose object file, when the repository does not have it. */
+  const writeObject = (sha: string, file: Buffer) => {
+    if (existsSync(objectPath(sha))) return
+    mkdirSync(dirname(objectPath(sha)), { recursive: true })
+    writeFileSync(objectPath(sha), file)
+  }
+  /** The IDs of a tree and of each tree in it, from the loose objects. Null when one of them is not loose. */
+  const treesOf = (sha: string): string[] | null => {
+    let raw: Buffer
+    try {
+      raw = inflateSync(readFileSync(objectPath(sha)))
+    } catch {
+      return null
+    }
+    const found = [sha]
+    for (let at = raw.indexOf(0) + 1; at < raw.length; ) {
+      const space = raw.indexOf(0x20, at)
+      const end = raw.indexOf(0, space)
+      if (raw.subarray(at, space).toString('latin1') === '40000') {
+        const inner = treesOf(raw.subarray(end + 1, end + 21).toString('hex'))
+        if (!inner) return null
+        found.push(...inner)
+      }
+      at = end + 21
+    }
+    return found
+  }
+  /**
+   * A git write whose output and objects depend only on `key`, for mocks that share a gitCache and have fixed commit
+   * dates. The first mock runs git. The next mocks write the same loose objects without a git process, after the same
+   * check of the `inputs` that git makes.
+   */
+  const written = (key: string, inputs: string[], write: () => string, objects: (output: string) => string[] | null): string => {
+    if (gitDir === null || !options.gitCache || !options.gitDate) return write()
+    const cacheKey = `write\0${options.gitDate}\0${key}`
+    const stored = cache.get(cacheKey)
+    if (stored && inputs.every((sha) => hex.test(sha) && existsSync(objectPath(sha)))) {
+      const { files, output } = JSON.parse(stored.toString()) as { files: [string, string][]; output: string }
+      for (const [sha, file] of files) writeObject(sha, Buffer.from(file, 'base64'))
+      return output
+    }
+    const output = write()
+    const shas = objects(output)
+    if (shas) cache.set(cacheKey, Buffer.from(JSON.stringify({ files: shas.map((sha) => [sha, readFileSync(objectPath(sha)).toString('base64')]), output })))
+    return output
+  }
+  /** Writes a blob as `git hash-object -w --stdin` does. With a shared gitCache, it runs no git process. */
+  const blob = (content: Buffer): string => {
+    if (gitDir === null || !options.gitCache) return text(['hash-object', '-w', '--stdin'], content)
+    const object = Buffer.concat([Buffer.from(`blob ${content.length}\0`), content])
+    const sha = createHash('sha1').update(object).digest('hex')
+    writeObject(sha, deflateSync(object))
+    return sha
   }
   /** The commit of a ref, or the ref itself when it names no commit, so that git gives its usual answer. */
   const commitOf = (ref: string) => shaOf(ref) ?? ref
@@ -341,7 +396,7 @@ export async function mockServices(
     }
     state.requests.push(route)
     state.authorizations.push({ authorization: request.headers.authorization ?? '', route })
-    const fault = options.fault?.(route, request.headers)
+    const fault = options.fault?.(request.headers)
     if (fault) {
       response.writeHead(fault.status, { 'content-type': 'application/json', ...fault.headers })
       response.end(JSON.stringify({ message: `fault ${fault.status}` }))
@@ -548,7 +603,7 @@ export async function mockServices(
         const sha = shaOf(`refs/heads/${name}`)
         return sha ? json(response, 200, { object: { sha }, ref: `refs/heads/${name}` }) : json(response, 404, { message: 'Not Found' })
       }
-      if (route === `POST ${api}/git/blobs`) return json(response, 201, { sha: text(['hash-object', '-w', '--stdin'], Buffer.from(string(input().content, 'content'), 'base64')) })
+      if (route === `POST ${api}/git/blobs`) return json(response, 201, { sha: blob(Buffer.from(string(input().content, 'content'), 'base64')) })
       if (route === `POST ${api}/git/trees`) {
         const fields = input()
         const base_tree = string(fields.base_tree, 'base_tree')
@@ -557,20 +612,25 @@ export async function mockServices(
           const entry = object(value, `tree[${position}]`)
           return { mode: string(entry.mode, 'mode'), path: string(entry.path, 'path'), sha: entry.sha === null ? null : string(entry.sha, 'sha'), type: string(entry.type, 'type') }
         })
-        const index = join(mkdtempSync(join(tmpdir(), 'factory-index-')), 'index')
-        const env = { GIT_INDEX_FILE: index }
-        git(['read-tree', base_tree], undefined, env)
-        for (const entry of tree)
-          git(entry.sha ? ['update-index', '--add', '--cacheinfo', `${entry.mode},${entry.sha},${entry.path}`] : ['update-index', '--force-remove', entry.path], undefined, env)
-        const sha = text(['write-tree'], undefined, env)
-        rmSync(index, { force: true })
+        const inputs = [base_tree, ...tree.flatMap((entry) => (entry.sha ? [entry.sha] : []))]
+        const sha = written(JSON.stringify(['tree', base_tree, tree]), inputs, () => {
+          const index = join(mkdtempSync(join(tmpdir(), 'factory-index-')), 'index')
+          const env = { GIT_INDEX_FILE: index }
+          git(['read-tree', base_tree], undefined, env)
+          for (const entry of tree)
+            git(entry.sha ? ['update-index', '--add', '--cacheinfo', `${entry.mode},${entry.sha},${entry.path}`] : ['update-index', '--force-remove', entry.path], undefined, env)
+          const result = text(['write-tree'], undefined, env)
+          rmSync(index, { force: true })
+          return result
+        }, treesOf)
         return json(response, 201, { sha })
       }
       if (route === `POST ${api}/git/commits`) {
         const fields = input()
         const [message, parents, tree] = [string(fields.message, 'message'), strings(fields.parents, 'parents'), string(fields.tree, 'tree')]
         const identity = { GIT_AUTHOR_EMAIL: 'bot@example.com', GIT_AUTHOR_NAME: 'bot', GIT_COMMITTER_EMAIL: 'bot@example.com', GIT_COMMITTER_NAME: 'bot', ...dated }
-        return json(response, 201, { sha: text(['commit-tree', tree, ...parents.flatMap((parent) => ['-p', parent]), '-m', message], undefined, identity) })
+        const commit = () => text(['commit-tree', tree, ...parents.flatMap((parent) => ['-p', parent]), '-m', message], undefined, identity)
+        return json(response, 201, { sha: written(JSON.stringify(['commit', tree, parents, message]), [tree, ...parents], commit, (sha) => [sha]) })
       }
       if (route === `POST ${api}/merges`) {
         // A merge commit of head into the branch base, from a real 3-way merge: 204 when the branch has head, 409 for a conflict.

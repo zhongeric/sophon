@@ -1,4 +1,4 @@
-import { systemClock } from '../core/clock.ts'
+import { systemClock, type Clock } from '../core/clock.ts'
 import type { Ledger } from '../core/ledger.ts'
 import { PausedError } from '../core/questions.ts'
 import type { Box, BoxResult, JobOptions } from './box.ts'
@@ -63,18 +63,15 @@ export const hasOpenJobs = (ledger: Ledger): boolean => (ledger.get<string[]>(op
 
 /**
  * The jobs of one alarm call on `box`, in the ledger of the run. `deadline` is the end of the call budget: the command
- * of a turn ends by then, so that the agent has time to submit before Cloudflare stops the call (D12). `now`, `sleep`
- * and `uuid`, which gives the call ID and the job IDs, come from the clock of the run or of a test.
+ * of a turn ends by then, so that the agent has time to submit before Cloudflare stops the call (D12).
  */
 export function jobRunner(
   box: Box,
   ledger: Ledger,
-  options: { deadline?: number; now?: () => number; sleep?: (ms: number) => Promise<void>; uuid?: () => string; pollMs?: number } = {},
+  options: { deadline?: number; clock?: Clock; pollMs?: number } = {},
 ): JobRunner {
   const deadline = options.deadline
-  const now = options.now ?? systemClock.now
-  const sleep = options.sleep ?? systemClock.sleep
-  const uuid = options.uuid ?? systemClock.uuid
+  const { now, sleep, uuid } = options.clock ?? systemClock
   const pollMs = options.pollMs ?? 5_000
   const call = uuid()
   const describe = (record: JobRecord) => `\`${record.argv.join(' ')}\` in ${record.cwd || '/'}`

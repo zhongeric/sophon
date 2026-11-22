@@ -2,10 +2,10 @@
 // Durable Object state, a fake box and the mock GitHub, and it injects the faults of a seed. See test/simulation.test.ts.
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFileSync } from 'node:child_process'
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, sep } from 'node:path'
 import { DatabaseSync, type SQLInputValue, type StatementSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import type { Box, BoxResult, JobState } from '../../src/cloudflare/box.ts'
@@ -233,9 +233,12 @@ export function violations(trace: Trace, reference: Trace): string[] {
     seenSteps.add(step)
   }
   const seenPosts = new Set<string>()
+  // The posts without repeats: the check above reports a repeat, and the check below reports a post that differs or is missing.
+  const posts: { issue: number; body: string }[] = []
   for (const { issue, body } of trace.posts) {
     const post = `${issue} ${mask(body)}`
     if (seenPosts.has(post)) found.push(`a new comment on #${issue} repeats an earlier comment: ${JSON.stringify(body.slice(0, 120))}`)
+    else posts.push({ body, issue })
     seenPosts.add(post)
   }
   const same = (name: string, actual: unknown, expected: unknown, masks = mask) => {
@@ -247,6 +250,7 @@ export function violations(trace: Trace, reference: Trace): string[] {
   same('the report lines', trace.report, reference.report)
   same('the commits', trace.commits, reference.commits, maskMessage)
   same('the comments', trace.comments, reference.comments)
+  same('the posts', posts, reference.posts)
   found.push(...trace.errors)
   return found
 }
@@ -446,14 +450,16 @@ function fakeBox(sim: Simulation, instance: Instance): Box {
   }
 }
 
-/** The fake clock of a simulation: one time for all objects. A sleep moves the time, and ends on the next turn of the event loop. */
+/** The fake clock of a simulation: one time for all objects. The scheduler of the simulation ends each sleep and moves the time. */
 class SimClock {
   now: number
   private ids = 0
   private readonly intervals = new Set<{ next: number; ms: number; tick: () => void }>()
+  private readonly wake: (target: number, instance: Instance) => Promise<void>
 
-  constructor(start: number) {
+  constructor(start: number, wake: (target: number, instance: Instance) => Promise<void>) {
     this.now = start
+    this.wake = wake
   }
 
   advance(to: number): void {
@@ -480,14 +486,7 @@ class SimClock {
       sleep: (ms) => {
         if (instance.dead) return never()
         // Sleeps that start at the same time do not add up: two waits of 1 s at once end after 1 s.
-        const target = this.now + Math.max(0, ms)
-        return new Promise<void>((resolve) =>
-          setImmediate(() => {
-            if (instance.dead) return
-            this.advance(target)
-            resolve()
-          }),
-        )
+        return this.wake(this.now + Math.max(0, ms), instance)
       },
       uuid: () => `00000000-0000-4000-8000-${(++this.ids).toString(16).padStart(12, '0')}`,
     }
@@ -502,8 +501,18 @@ const budgetMs = 780_000
 const owner = 'acme'
 const name = 'app'
 
+/** A sleep that waits for the scheduler. */
+type Sleeper = { target: number; order: number; instance: Instance; resolve: () => void }
+/** The event loop turns without new activity after which the engine is idle. */
+const quietTurns = 3
+
+/**
+ * The simulation and its scheduler. Real socket timing must not change the order of the engine calls, so the
+ * scheduler releases one event at a time, and only when the engine is idle: first each request in the order of its
+ * send, then the sleep with the earliest end. A seed thus gives the same fault points and clock readings each time.
+ */
 class Simulation {
-  readonly clock = new SimClock(startTime)
+  readonly clock = new SimClock(startTime, (target, instance) => this.sleep(target, instance))
   readonly steps: string[] = []
   readonly posts: { issue: number; body: string }[] = []
   readonly errors: string[] = []
@@ -512,6 +521,12 @@ class Simulation {
   readonly env: Record<string, unknown>
   calls = 0
   generation = 0
+  /** Increments at each fault point, request, sleep and RPC call, so that the scheduler sees when the engine is idle. */
+  private activity = 0
+  private readonly requests: (() => Promise<void>)[] = []
+  private readonly sleepers: Sleeper[] = []
+  private sleeps = 0
+  private pumping = false
 
   readonly faults: Fault[]
 
@@ -588,6 +603,7 @@ class Simulation {
    * storage write throws, as the write fails.
    */
   point(point: Point, instance: Instance): Promise<number> {
+    this.activity++
     const at = ++this.counts[point]
     for (const fault of this.faults) {
       if (pointOf[fault.kind] !== point || fault.at !== at) continue
@@ -621,7 +637,12 @@ class Simulation {
     // The mock GitHub gives the status fault, because the request header names it.
     const status = this.faults.find((fault) => pointOf[fault.kind] === point && fault.at === at && fault.kind.startsWith('github-'))
     if (status) headers.set('x-sim-fault', status.kind)
-    const response = await realFetch(url, { ...init, headers })
+    const response = await this.request(async () => {
+      const real = await realFetch(url, { ...init, headers })
+      // The full body, so that no socket read occurs after the scheduler releases the response.
+      const body = [101, 204, 205, 304].includes(real.status) ? null : await real.arrayBuffer()
+      return new Response(body, { headers: real.headers, status: real.status, statusText: real.statusText })
+    })
     // A post counts also when the isolate died during the request, because GitHub has the comment.
     const posted = /\/issues\/(\d+)\/comments$/.exec(path)
     if (init?.method === 'POST' && posted && response.ok && typeof init.body === 'string') {
@@ -631,9 +652,68 @@ class Simulation {
     return response
   }
 
+  /** Sends a request when the scheduler releases it. Only one request is on a socket at a time. */
+  private request<T>(send: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.requests.push(() => send().then(resolve, reject))
+      this.wakeUp()
+    })
+  }
+
+  /** A sleep until `target`. The scheduler ends it after all requests, and in the order of the end times. */
+  private sleep(target: number, instance: Instance): Promise<void> {
+    return new Promise<void>((resolve) => {
+      this.sleepers.push({ instance, order: ++this.sleeps, resolve, target })
+      this.wakeUp()
+    })
+  }
+
+  private wakeUp(): void {
+    this.activity++
+    if (this.pumping) return
+    this.pumping = true
+    void this.pump()
+  }
+
+  /** Releases the waiting events, one at a time, each when the engine is idle. */
+  private async pump(): Promise<void> {
+    try {
+      for (;;) {
+        await this.settle()
+        const send = this.requests.shift()
+        if (send) {
+          await send()
+          this.activity++
+          continue
+        }
+        const live = this.sleepers.filter((sleeper) => !sleeper.instance.dead)
+        this.sleepers.length = 0
+        live.sort((a, b) => a.target - b.target || a.order - b.order)
+        const next = live.shift()
+        this.sleepers.push(...live)
+        if (!next) return
+        this.clock.advance(next.target)
+        next.resolve()
+        this.activity++
+      }
+    } finally {
+      this.pumping = false
+    }
+  }
+
+  /** Resolves when the engine is idle: some turns of the event loop pass with no new activity. */
+  async settle(): Promise<void> {
+    for (let quiet = 0; quiet < quietTurns; ) {
+      const seen = this.activity
+      await new Promise((resolve) => setImmediate(resolve))
+      quiet = this.activity === seen ? quiet + 1 : 0
+    }
+  }
+
   /** A call of a Durable Object stub: async, with structured clones of the arguments and of the result, as RPC has. */
   async rpc(pr: string, method: string, args: unknown[]): Promise<unknown> {
     const caller = current.getStore()?.instance
+    this.activity++
     await new Promise((resolve) => setImmediate(resolve))
     if (caller?.dead) return never()
     const instance = await this.instance(this.object('review', pr))
@@ -650,6 +730,7 @@ class Simulation {
   /** Runs the alarms of all objects in time order until the run of `main` ends, or `limit` calls ran. */
   async drive(main: SimObject, limit: number): Promise<void> {
     while (!terminal.includes(latest(main.db)?.state ?? '') && this.calls < limit) {
+      await this.settle()
       let next: SimObject | undefined
       for (const object of this.objects.values()) if (object.alarm !== null && (next?.alarm ?? Infinity) > object.alarm) next = object
       if (!next) break
@@ -754,15 +835,31 @@ const gitCache = new Map<string, Buffer>()
 /** The log of each commit, by its ID. A commit ID fixes its log. */
 const commitLogs = new Map<string, string>()
 
+/**
+ * The lines `<ref> <commit>` of each ref, sorted. A seed reads the loose ref files without a git process. Git reads the
+ * refs when the repository also has packed refs or the reftable format.
+ */
+function refLines(repo: string): string[] {
+  const gitDir = join(repo, '.git')
+  if (['packed-refs', 'reftable'].some((name) => existsSync(join(gitDir, name)))) return git(repo, 'for-each-ref', '--format=%(refname) %(objectname)').split('\n').filter(Boolean).sort()
+  return readdirSync(join(gitDir, 'refs'), { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => {
+      const path = join(entry.parentPath, entry.name)
+      return `${path.slice(gitDir.length + 1).split(sep).join('/')} ${readFileSync(path, 'utf8').trim()}`
+    })
+    .sort()
+}
+
 /** Runs one simulation: a run of `kind` with the faults, until it ends or uses `limit` alarm calls. */
-async function simulate(seed: number, kind: RunKind, faults: Fault[], limit: number): Promise<Trace> {
+export async function simulate(seed: number, kind: RunKind, faults: Fault[], limit: number): Promise<Trace> {
   const repo = mkdtempSync(join(tmpdir(), 'factory-sim-'))
   cpSync(template(kind), repo, { recursive: true })
   const sim = new Simulation(faults)
   const mock = await mockServices(repo, {
     botLogin: 'factory-bot',
     gitCache,
-    fault: (_route, headers) => {
+    fault: (headers) => {
       const fault = headers['x-sim-fault']
       if (fault === 'github-500') return { status: 500 }
       if (fault === 'github-429') return { headers: { 'retry-after': '1' }, status: 429 }
@@ -794,7 +891,7 @@ async function simulate(seed: number, kind: RunKind, faults: Fault[], limit: num
     const end = latest(main.db)
     const report = end ? (main.db.prepare('select text from factory_files where run = ? and name = ?').get(end.run, 'report.md') as { text: string } | undefined) : undefined
     const commits: Record<string, string[]> = {}
-    for (const line of git(repo, 'for-each-ref', '--format=%(refname) %(objectname)').split('\n').filter(Boolean).sort()) {
+    for (const line of refLines(repo)) {
       const [ref = '', sha = ''] = line.split(' ')
       let log = commitLogs.get(sha)
       if (log === undefined) commitLogs.set(sha, (log = git(repo, 'log', '--format=%T %B%x00', sha)))

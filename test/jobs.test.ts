@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import { MemoryFileSystem } from 'nanocode-ts/bash'
 import { cleanBox, type Box, type BoxResult, type JobState } from '../src/cloudflare/box.ts'
 import { jobRunner, resetJobStarts, type JobRecord } from '../src/cloudflare/jobs.ts'
+import { systemClock } from '../src/core/clock.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import { PausedError } from '../src/core/questions.ts'
 
@@ -53,11 +54,14 @@ function fakeBox(ledger: Ledger) {
 function clock() {
   const time = { now: 0, sleeps: 0, after: () => {} }
   const options = {
-    now: () => time.now,
-    sleep: async (ms: number) => {
-      time.now += ms
-      time.sleeps += 1
-      time.after()
+    clock: {
+      ...systemClock,
+      now: () => time.now,
+      sleep: async (ms: number) => {
+        time.now += ms
+        time.sleeps += 1
+        time.after()
+      },
     },
   }
   return { options, time }
@@ -152,7 +156,7 @@ test('a wait job polls until its end, and the next call kills the wait jobs of e
   assert.deepEqual(open(ledger), [])
 
   // The jobs of a call that died: a wait job of a turn, and a pause job of a host step.
-  const never = { now: () => 0, sleep: () => new Promise<void>(() => {}) }
+  const never = { clock: { ...systemClock, now: () => 0, sleep: () => new Promise<void>(() => {}) } }
   const died = jobRunner(fake.box, ledger, never)
   void died.wait(['bash', '-c', 'npm test'], { cwd: 'work/x', env: {}, timeoutMs: 60_000 })
   await assert.rejects(died.pause('clean/1:make', make, pauseOptions(0)), pauses)
@@ -277,7 +281,7 @@ test('an injected uuid gives the call ID and the job IDs, and the default gives 
     for (const id of fake.states.keys()) fake.states.set(id, { result: done, state: 'done' })
   }
   let count = 0
-  const runner = jobRunner(fake.box, ledger, { ...options, uuid: () => `id-${++count}` })
+  const runner = jobRunner(fake.box, ledger, { clock: { ...options.clock, uuid: () => `id-${++count}` } })
   const wait = { cwd: 'work/a', env: {}, timeoutMs: 60_000 }
   assert.deepEqual(await runner.wait(make, wait), done)
   assert.deepEqual(await runner.wait(make, wait), done)

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { availableParallelism } from 'node:os'
 import { test } from 'node:test'
 import { Worker } from 'node:worker_threads'
-import { failureMessage, kindOf, schedule, violations, type Trace } from './support/simulation.ts'
+import { failureMessage, kindOf, schedule, simulate, violations, type Trace } from './support/simulation.ts'
 
 /**
  * The seeds that found a bug of the engine. They run each time, also when SIM_SEEDS is small. Add the seed of each
@@ -67,6 +67,8 @@ test('the invariant checks find each kind of violation', () => {
     [{ posts: [...base.posts, { body: 'Run started', issue: 7 }] }, /^a new comment on #7 repeats an earlier comment/],
     [{ commits: { 'refs/heads/main': ['t2 base'] } }, /^the commits differ from the reference/],
     [{ comments: [] }, /^the comments differ from the reference/],
+    [{ posts: [base.posts[0]!, { body: 'Run failed', issue: 7 }, base.posts[2]!] }, /^the posts differ from the reference/],
+    [{ posts: base.posts.slice(0, 2) }, /^the posts differ from the reference/],
     [{ report: 'other' }, /^the report lines differ from the reference/],
     [{ errors: ['the alarm of x threw: y'] }, /^the alarm of x threw: y$/],
   ]
@@ -100,18 +102,30 @@ test('a failure message gives the seed, the faults and the command that runs onl
   assert.match(message, /^rerun: SIM_SEED=42 node --test test\/simulation\.test\.ts$/m)
 })
 
-test('a seed gives the same fault schedule each time', () => {
+test('some seeds get faults', () => {
   const counts = { box: 30, github: 50, job: 5, model: 20, storage: 400 }
-  for (let seed = 1; seed <= 50; seed++) assert.deepEqual(schedule(seed, counts), schedule(seed, counts))
   assert.ok(Array.from({ length: 50 }, (_, index) => schedule(index + 1, counts)).some((faults) => faults.length > 0))
+})
+
+test('a simulation with the same seed and faults gives the same counts, steps and posts', async () => {
+  const faults: Parameters<typeof simulate>[2] = [
+    { at: 2, kind: 'die-model' },
+    { at: 6, kind: 'github-429' },
+  ]
+  const first = await simulate(1, 'review', faults, 200)
+  const second = await simulate(1, 'review', faults, 200)
+  assert.equal(first.state, 'passed', first.note)
+  assert.deepEqual(second.counts, first.counts)
+  assert.deepEqual(second.steps, first.steps)
+  assert.deepEqual(second.posts, first.posts)
 })
 
 /** The most wall time of one seed, with the reference runs of its worker. A seed that uses more hangs. */
 const seedLimit = 120_000
 
 /**
- * Runs a share of the seeds in a worker thread. Resolves with the failure messages. When a seed hangs or throws, the
- * worker stops, and the failure names that seed: the worker runs its seeds in order, so it is the seed after the last result.
+ * Runs a share of the seeds in a worker thread. Resolves with the failure messages. If a seed hangs or throws, the
+ * failure names the seed after the last result.
  */
 function runShare(share: number[]): Promise<string[]> {
   return new Promise((resolve) => {
@@ -125,9 +139,8 @@ function runShare(share: number[]): Promise<string[]> {
       clearTimeout(timer)
       const seed = share[done]
       if (problem !== undefined && seed === undefined) failures.push(`a simulation worker failed after its last seed: ${problem}`)
-      else if (problem !== undefined && seed !== undefined) {
-        failures.push([`seed ${seed} (${kindOf(seed)} run) failed`, `- ${problem}`, `rerun: SIM_SEED=${seed} node --test test/simulation.test.ts`].join('\n'))
-      }
+      // The fault schedule of a seed comes from the reference run in the worker, so it is not known here.
+      else if (problem !== undefined && seed !== undefined) failures.push(failureMessage({ faults: [], kind: kindOf(seed), seed }, [problem]))
       void worker.terminate()
       resolve(failures)
     }
@@ -146,7 +159,7 @@ function runShare(share: number[]): Promise<string[]> {
 }
 
 test(`the runs keep their invariants under the faults of ${seeds.length} seeds`, async () => {
-  // The seeds run in worker threads. With 4 threads, 200 seeds took 27 s. The mock GitHub reads refs without git processes.
+  // The seeds run in worker threads. With 4 threads, 200 seeds took 22 s. The mock GitHub reads refs and writes repeated git objects without git processes.
   const threads = Math.max(1, Math.min(availableParallelism(), 8, seeds.length))
   const shares = Array.from({ length: threads }, (_, thread) => seeds.filter((_, index) => index % threads === thread))
   const failures = (await Promise.all(shares.map(runShare))).flat()
