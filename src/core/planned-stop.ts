@@ -1,5 +1,10 @@
 import type { Ledger } from './ledger.ts'
 
+/** With less time left in the alarm call, a command does not start, and a command with no exit code is a cut, not a failure (D12). */
+export const minCommandMs = 60_000
+/** The most turns of one builder task or of one patch or light agent. Each turn after the first continues a cut turn (D12). */
+export const maxTaskTurns = 4
+
 /** The host stopped the run at a safe point, because the call used its time budget. A new call continues the run. */
 export class PlannedStop extends Error {
   override name = 'PlannedStop'
