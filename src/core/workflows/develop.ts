@@ -631,24 +631,37 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
       // ledger from before this check started the round without it, so its resume does not merge under that round.
       const name = `base-check.repair.${round}`
       const started = ledger.get(`step:repair.${round}`) !== undefined || ledger.get(`step:local-head.repair.${round}`) !== undefined
-      let checked: BaseCheck | null = null
+      let merge: BaseMerge | undefined
       if (red && baseChecks && (ledger.get(`step:${name}`) !== undefined || !started)) {
+        let checked: BaseCheck
         try {
           checked = await baseCheck(name, { point: 'repair', round })
         } catch (error) {
           if (thrown(point, error)) throw error
           return unmerged(point, shown(), `the base merge failed: ${reasonOf(error)}`)
         }
-      }
-      const merge = checked?.merge ?? undefined
-      if (checked && merge) {
-        mergeBase = checked.base
-        cause = afterBaseMerge(cause, checked.base, merge)
+        if (checked.merge) {
+          merge = checked.merge
+          mergeBase = checked.base
+          cause = afterBaseMerge(cause, checked.base, merge)
+        }
       }
       // The local head before the round. On the Worker, the pushed head of the cause is another SHA.
       const before = await step(ledger, `local-head.repair.${round}`, () => dev.head())
       const log = await repair(cause, merge)
       if (log.blocked.trim()) {
+        // A clean base merge alone can fix a red CI. When the fixer left the merge commit as it was, CI tests it.
+        if (merge && merge.conflicts.length === 0) {
+          const untouched = await step(ledger, `blocked.${round}`, async () => {
+            const pending = await dev.pending()
+            return (await dev.head()) === before && pending.changed.length === 0 && pending.removed.length === 0
+          })
+          if (!untouched) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
+          head = await publish(`repair.${round}`)
+          if (merge.files.some((path) => merge.change.includes(path))) unreviewed = 'a base merge after the last pass'
+          ci = await waitCi(`ci.repair.${round}`, head)
+          continue
+        }
         // After a base merge, the tree of the round is not the tree that CI tested, so no rerun.
         const rest = merge ? undefined : await afterBlock(cause, state.repairs.length, before)
         if (rest === undefined) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)

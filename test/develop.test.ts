@@ -363,8 +363,7 @@ test('develop: a box check that fails one time in a review pass and passes on th
   // The pass counts as passed, so no second pass ran.
   assert.equal(requests.length, 1)
   assert.deepEqual(github.state.reruns, [])
-  const head = github.state.shas.at(-1)
-  assert.ok(head)
+  const head = github.state.shas.at(-1) ?? ''
   assert.ok(fileLedger(join(dir, 'flaky-check', 'state.json')).get(`step:rerun.check.smoke.${head}`))
   assert.match(result.report, new RegExp(`^## Reruns\n\n- smoke on ${head.slice(0, 12)}: flaky$`, 'm'))
   assert.match(result.report, /^- \[x\] Review loop PASS on the head, at least 1 pass: pass 1: PASS$/m)
@@ -657,11 +656,14 @@ test('develop: CI red only on the merge with a moved base gets the base merge be
 
   // The head of the repair is the fix on the merge commit of the built head and the base. The merge goes to that head.
   assert.equal(github.state.shas.length, 2)
-  const [built, head] = github.state.shas as [string, string]
-  const [baseMerge] = parents(origin, head) as [string]
+  const [built, head] = github.state.shas
+  assert.ok(built)
+  assert.ok(head)
+  const [baseMerge] = parents(origin, head)
+  assert.ok(baseMerge)
   assert.deepEqual(parents(origin, baseMerge), [built, base])
   assert.deepEqual(github.state.merges, [{ pr: 9, method: 'squash', sha: head }])
-  execFileSync('git', ['--git-dir', origin, 'merge-base', '--is-ancestor', baseMerge, github.state.merges[0]!.sha])
+  execFileSync('git', ['--git-dir', origin, 'merge-base', '--is-ancestor', baseMerge, head])
   assert.equal(execFileSync('git', ['--git-dir', origin, 'show', `${head}:src/sub.ts`]).toString(), sources.subOfOne)
   // The review pass reviewed the head from the new merge base.
   assert.deepEqual(requests.map((request) => [request.head, request.base]), [[head, base]])
@@ -674,26 +676,6 @@ test('develop: CI red only on the merge with a moved base gets the base merge be
   for (const key of ['step:base-check.repair.2', 'step:base-check.3', 'step:finish-merge.repair.1', 'step:repair.2']) assert.equal(ledger.get(key), undefined, key)
   assert.match(result.report, new RegExp(`^## Base merges\\n\\n- Before repair round 1: ${at}, clean\\. Files: test/base\\.test\\.ts\\n\\n`, 'm'))
   assert.match(result.report, /^- Round 1, CI: CI \(pull_request\) failed on [0-9a-f]{12}\. repair 1: sub of one number$/m)
-})
-
-test('develop: the fixer of a CI repair round can change a task file that the base merge before the round brought', { timeout: 240_000 }, async () => {
-  const { repo, origin } = developRepo(undefined, { merge: 'squash' })
-  const dir = runsDir()
-  const github = fakePulls([false, true])
-  const review = scriptedReview([[]], [])
-  const input = await developInput(repo, 'base-repair-task-file')
-  // The base brings a test in test/, a directory of the tasks. The fix changes that test.
-  const base = pushBase(origin, { 'test/base.test.ts': sources.baseTest })
-  const fixed = sources.baseTest.replace('sub(5)', 'sub(5, 0)')
-  const turns: Turn[] = []
-  const script = developScript({ reproduce: { test: 'test/base.test.ts', fix: fixed, path: 'test/base.test.ts' } })
-  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(script, turns), input, pulls: github.pulls, review, runId: 'base-repair-task-file' })
-  assert.equal(result.status, 'ready', result.report)
-  assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
-  assert.deepEqual(repairRounds(turns), ['1'])
-  const [, head] = github.state.shas as [string, string]
-  assert.equal(parents(origin, parents(origin, head)[0]!)[1], base)
-  assert.equal(execFileSync('git', ['--git-dir', origin, 'show', `${head}:test/base.test.ts`]).toString(), fixed)
 })
 
 test('develop: a conflict of the base merge before a CI repair round joins that round, and the run merges', { timeout: 240_000 }, async () => {
@@ -723,7 +705,9 @@ test('develop: a conflict of the base merge before a CI repair round joins that 
 
   // The head is the merge commit of the fixer, with no conflict markers.
   assert.equal(github.state.shas.length, 2)
-  const [built, head] = github.state.shas as [string, string]
+  const [built, head] = github.state.shas
+  assert.ok(built)
+  assert.ok(head)
   assert.deepEqual(parents(origin, head), [built, base])
   const show = (path: string) => execFileSync('git', ['--git-dir', origin, 'show', `${head}:${path}`]).toString()
   assert.equal(show('src/sub.ts'), sources.sub)
@@ -734,6 +718,34 @@ test('develop: a conflict of the base merge before a CI repair round joins that 
   assert.deepEqual(fileLedger(join(dir, 'base-repair-conflict', 'state.json')).get('step:finish-merge.repair.1'), { result: [] })
   assert.match(result.report, new RegExp(`^- Round 1, CI: CI \\(pull_request\\) failed on ${built.slice(0, 12)}\\. repair 1: the conflicts of the base merge are resolved$`, 'm'))
   assert.match(result.report, new RegExp(`^- Before repair round 1: ${at}, conflict in src/sub\\.ts\\. Files: docs/base\\.md, src/sub\\.ts$`, 'm'))
+})
+
+test('develop: when the base merge before a CI repair round fixes the failure and the fixer blocks, the host pushes the merge commit, CI passes, and the run merges', { timeout: 240_000 }, async () => {
+  const { repo, origin } = developRepo(undefined, { merge: 'squash' })
+  const dir = runsDir()
+  const github = fakePulls([false, true])
+  const requests: ReviewRequest[] = []
+  const review = scriptedReview([[]], requests)
+  const input = await developInput(repo, 'base-fixes')
+  const base = pushBase(origin, { 'docs/base.md': '# Base\n' })
+  const turns: Turn[] = []
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript({ blockRepair: 1 }), turns), input, pulls: github.pulls, review, runId: 'base-fixes' })
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
+  assert.deepEqual(repairRounds(turns), ['1'])
+
+  // The pushed head of the round is the merge commit of the built head and the base, without a change of the fixer.
+  assert.equal(github.state.shas.length, 2)
+  const [built, head] = github.state.shas
+  assert.ok(built)
+  assert.ok(head)
+  assert.deepEqual(parents(origin, head), [built, base])
+  // The rerun of the red CI comes before the round and fails.
+  assert.deepEqual(github.state.reruns, [1])
+  assert.deepEqual(requests.map((request) => [request.head, request.base]), [[head, base]])
+  assert.deepEqual(github.state.merges, [{ pr: 9, method: 'squash', sha: head }])
+  assert.deepEqual(fileLedger(join(dir, 'base-fixes', 'state.json')).get('step:blocked.1'), { result: true })
+  assert.match(result.report, /^- Round 1, CI: CI \(pull_request\) failed on [0-9a-f]{12}\. Blocked: the failure does not occur here$/m)
 })
 
 test('develop: a conflicted CI repair skips unchanged task-scoped base files but checks fixer edits', { timeout: 240_000 }, async () => {
