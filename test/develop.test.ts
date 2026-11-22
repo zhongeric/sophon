@@ -10,7 +10,7 @@ import { PausedError, type Channel } from '../src/core/questions.ts'
 import { StopError } from '../src/core/stop.ts'
 import { BudgetStop, recordUsage, zeroTokens, type Prices } from '../src/core/usage.ts'
 import { defaultModels } from '../src/core/workflows/code-review-loop.ts'
-import { develop, type ReviewRequest } from '../src/core/workflows/develop.ts'
+import { defaultDevelopModels, develop, developModels, type DevelopModels, type ReviewRequest } from '../src/core/workflows/develop.ts'
 import { resumeInput } from '../src/node/develop.ts'
 import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
@@ -49,6 +49,15 @@ test('develop: a resume fills a missing step1.cleanup model and keeps the record
       review: { ...recorded.models.review, step1: { ...recorded.models.review.step1, cleanup: defaultModels.step1.cleanup } },
     },
   })
+})
+
+test('develop: the develop model overrides replace the defaults, and a stale intake key stops the run', () => {
+  const builder = { provider: 'codex' as const, model: 'gpt-5.5' }
+  assert.deepEqual(developModels({ builder }), { ...defaultDevelopModels, builder })
+  assert.deepEqual(developModels(), defaultDevelopModels)
+  // As in a MODELS env or a --models file from before D19.
+  const stale = JSON.parse(JSON.stringify({ intake: builder })) as Partial<DevelopModels>
+  assert.throws(() => developModels(stale), (error: unknown) => error instanceof StopError && /unknown develop models: intake\. Use only spec, planner, builder\./.test(error.message))
 })
 
 test('develop: intake, plan, parallel builders on their own branches, draft PR, a CI repair, the review loop, a ready PR', { timeout: 120_000 }, async () => {

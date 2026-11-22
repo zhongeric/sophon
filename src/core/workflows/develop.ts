@@ -1,7 +1,7 @@
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../ci.ts'
 import type { FailedFinalCheck, MergeMethod, RepoConfig } from '../checks.ts'
-import { build, plannerSession, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
+import { build, intakeTurn, planTurn, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { alarmLines, settleAll } from '../planned-stop.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
@@ -22,6 +22,17 @@ const opus: ModelChoice = { provider: 'claude', model: 'claude-opus-5-5' }
 
 /** Spec, planner and builders run on Opus 5.5, the strongest writer of the allowed models. */
 export const defaultDevelopModels: DevelopModels = { spec: opus, planner: { ...opus, thinking: 'high' }, builder: { ...opus, thinking: 'high' } }
+
+/**
+ * The develop models of a new run: the defaults with the overrides. An unknown key, for example the old `intake`, stops
+ * the run, so that the credential and price checks do not apply to a model that never runs.
+ */
+export function developModels(overrides: Partial<DevelopModels> = {}): DevelopModels {
+  const known = Object.keys(defaultDevelopModels)
+  const unknown = Object.keys(overrides).filter((key) => !known.includes(key))
+  if (unknown.length) throw new StopError(`unknown develop models: ${unknown.join(', ')}. Use only ${known.join(', ')}.`)
+  return { ...defaultDevelopModels, ...overrides }
+}
 
 export type DevelopInput = {
   runId: string
@@ -275,9 +286,8 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
 
   // 0. Intake: the first turn of the planner session (D19). No plan and no code before the ask is confirmed. The route
   // questions are run questions (D11), so the run takes the recommendations of the planner. The run asks the user only
-  // when the planner raises a user question. The step keys are new, so a ledger from before D19 does not resume them.
-  const planner = plannerSession(context, models.planner, view)
-  const intook = await step(ledger, 'planner.intake', () => planner.intake())
+  // when the planner raises a user question.
+  const intook = await step(ledger, 'planner.intake', () => intakeTurn(context, models.planner, view))
   state.intake = intook
   const intakeAnswers = await ask('intake', [...intook.questions, ...routeQuestions(intook)])
   const routed = route(intook, intakeAnswers)
@@ -294,7 +304,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   }
 
   // 2. Plan: the follow-up turn of the planner session writes the four parts, the profile sections and the tasks (D7).
-  const planned = await step(ledger, 'planner.plan', () => planner.plan([...new Set(active.flatMap((profile) => profile.planSections))], spec))
+  const planned = await step(ledger, 'planner.plan', () => planTurn(context, models.planner, view, [...new Set(active.flatMap((profile) => profile.planSections))], spec))
   state.plan = planned
   const planText = `# Plan\n\n${renderPlan(planned, { tasks: true })}`
   deps.files.write('plan.md', planText)

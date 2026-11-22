@@ -8,7 +8,7 @@ import { checkIntake, checkPlan, checkSpec, frozenAsk, parseIssue, parseParallel
 const intake = { title: 'Add sub', summary: 'Adds sub() to src/math.ts.', slug: 'add-sub', passes: 1, reason: 'One small function.', questions: [] }
 const answer = (id: string, text: string) => ({ id, question: id, answer: text, recommended: false })
 
-test('the intake needs a title, a branch slug, and the route with its reason, and no larger field', () => {
+test('the intake needs a title, a branch slug, and the route with its reason', () => {
   assert.throws(() => checkIntake({ ...intake, slug: 'Add Sub', passes: 3, reason: '' }), /slug must be .*\npasses must be 1 or 2\nreason is required/)
   assert.deepEqual(checkIntake(intake).questions, [])
   assert.doesNotMatch(JSON.stringify(submitIntake.parameters), /"larger"/)
@@ -22,9 +22,10 @@ test('the route questions are run questions after the intake questions, and the 
       ['Q2', 'One pass', 'run'],
     ],
   )
-  // A user question of the intake agent posts the batch, so the confirmation goes to the user with the summary.
+  // A user question of the intake turn posts the batch, so the confirmation goes to the user with the summary.
   const question = { question: 'May sub return a negative number?', why: 'sub(3, 5)', options: ['Yes', 'No, throw'], recommendation: 'Yes', level: 'user', rule: 'scope' }
   const asked = checkIntake({ ...intake, questions: [question] })
+  assert.ok(!routeQuestions(asked).some((entry) => /spec/i.test(entry.question)))
   assert.equal(routeQuestions(asked)[0]!.rule, 'scope')
   assert.deepEqual(
     routeQuestions(asked).map((entry) => [entry.id, entry.recommendation, entry.level]),
@@ -33,7 +34,6 @@ test('the route questions are run questions after the intake questions, and the 
       ['Q3', 'One pass', 'run'],
     ],
   )
-  assert.ok(!routeQuestions(asked).some((entry) => /spec/i.test(entry.question)))
   assert.deepEqual(route(asked, []), { stop: false, passes: 1 })
   assert.deepEqual(route(asked, [answer('Q2', 'Yes, and also handle zero'), answer('Q3', 'Two passes')]), { stop: false, passes: 2 })
   assert.equal(route(asked, [answer('Q2', 'No, stop the run')]).stop, true)

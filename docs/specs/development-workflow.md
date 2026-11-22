@@ -400,7 +400,7 @@ Each decision records a conflict between two rules, and the choice.
 | P1 | Entry point | `npm run develop` first. GitHub issues and `/develop` on Cloudflare come in phase 3. |
 | P2 | Platform | Phase 1 runs on the local platform. |
 | P3 | Branch and PR | The work goes to `factory/dev-<slug>` from the base. The host opens a draft PR through `gh`. |
-| P4 | Larger changes | The planner recommends one or two review passes in the intake turn, with a reason. This route question is `run` level, so the run uses the recommendation (D11). A spec runs only on request (D19). |
+| P4 | Review passes | The planner recommends one or two review passes in the intake turn, with a reason. This route question is `run` level, so the run uses the recommendation (D11). A spec runs only on request (D19). |
 | P5 | Repair budget | One budget of 5 repair rounds for all causes (CI failures and failed review passes), then the run ends failed (D14). |
 | P6 | Models | Spec, planner and builders on Opus 5.5. The planner model runs both turns of the planner session. |
 | P7 | Static rules | They gate each builder checkpoint, and they are host findings in the review loop. |

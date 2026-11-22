@@ -86,7 +86,7 @@ export const scopeQuestion = {
 }
 
 /** The spec that the scripted spec agent submits, with one run decision. */
-export const spec = {
+const spec = {
   spec: ['# Summary', 'sub and mul next to add.', '## Surfaces', 'src/', '## Edge cases', 'Negative numbers.', '## Out of scope', 'Division.', '## Decisions', 'One file for each function.'].join('\n'),
   decisions: [{ question: 'One file for each function?', why: 'add has its own file.', options: ['Yes', 'No, one file'], recommendation: 'Yes', level: 'run' }],
 }

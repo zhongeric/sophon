@@ -9,7 +9,7 @@ import { commentChannel, PausedError } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget, parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
-import { defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
+import { develop, developModels, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
 import { credential } from './credentials.ts'
 import { git } from './git.ts'
@@ -157,7 +157,7 @@ async function newInput(values: Values): Promise<{ input: DevelopInput; repo: st
     base,
     baseRef,
     config,
-    models: { develop: { ...defaultDevelopModels, ...overrides.develop }, review: mergeModels(overrides.review ?? {}) },
+    models: { develop: developModels(overrides.develop), review: mergeModels(overrides.review ?? {}) },
     runId: `dev-${stamp}`,
     source: `${repo} on ${baseRef}`,
     ...(values.hotfix ? { hotfix: true } : {}),

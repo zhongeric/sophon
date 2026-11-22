@@ -93,7 +93,7 @@ test('on Cloudflare, development collects a stopped review before a budget raise
   try {
     const started = await fetch(`${worker.url}/develop/acme/app/5`, { body: JSON.stringify({ budget: 1 }), headers, method: 'POST' })
     assert.equal(started.status, 202)
-    // The intake agent raised no user question, so the first question of the run is the budget question (D11).
+    // The intake turn raised no user question, so the first question of the run is the budget question (D11).
     const asked = await until(() => on(5).find((entry) => /batch=budget\./.test(entry.body)), 300_000, describe)
     assert.ok(!on(5).some((entry) => entry.body.includes('Is this the ask?')), describe())
     assert.match(asked.body, /Raise the budget or stop the run\?/)
@@ -627,7 +627,7 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
     const issueComment = { action: 'created', comment: { body: '/develop', user: { login: 'maintainer' } }, issue: { number: 5 }, repository }
     const started = (await (await sendWebhook(worker.url, secret, 'issue_comment', issueComment)).json()) as { run: string; started: boolean }
     assert.equal(started.started, true)
-    // The intake agent raised no user question, so the run takes its recommendations and does not ask on the issue (D11).
+    // The intake turn raised no user question, so the run takes its recommendations and does not ask on the issue (D11).
     const done = await until(() => on(5).find((entry) => entry.body.startsWith('# Development run:')), 240_000, describe)
     assert.match(done.body, /^# Development run: READY/, done.body)
     assert.match(done.body, /^- Alarm calls: [1-9]\d* planned stops?, \d+ crash restarts?$/m, done.body)
@@ -675,7 +675,7 @@ test('on Cloudflare, /develop on an issue builds on the machine, opens a PR, run
   }
 })
 
-test('on Cloudflare, /develop asks a user question of the intake agent on the issue, and the /answer webhook resumes the run', { timeout: 300_000 }, async () => {
+test('on Cloudflare, /develop asks a user question of the intake turn on the issue, and the /answer webhook resumes the run', { timeout: 300_000 }, async () => {
   const { repo } = developRepo({
     checks: { machine: 'test -f .setup-done' },
     setup: 'touch .setup-done',
@@ -706,6 +706,44 @@ test('on Cloudflare, /develop asks a user question of the intake agent on the is
     assert.doesNotMatch(done.body, /@Maintainer/i)
     assert.match(done.body, /^- \[x\] Ask confirmed: you answered the intake questions$/m)
     assert.match(done.body, /## Your decisions\n\n- Add div too\? \*\*No, only sub and mul\*\*.*\n- Is this the ask\? .*\*\*Yes, go on\*\*.*\n\n## Decisions the run made\n\n- How many review loop passes\? \*\*One pass\*\*/)
+  } finally {
+    await worker.stop()
+    await mock.close()
+  }
+})
+
+test('on Cloudflare, /develop --spec and the spec option of the admin route run the spec session after the intake turn and before the plan turn', { timeout: 300_000 }, async () => {
+  const { repo } = developRepo({
+    checks: { machine: 'test -f .setup-done' },
+    setup: 'touch .setup-done',
+    stack: 'TypeScript',
+    tests: { command: 'env -u NODE_TEST_CONTEXT node --test {tests}', pattern: '\\.test\\.ts$' },
+  })
+  const ask = { body: 'Add sub and mul next to add, with tests.', title: 'Add sub and mul' }
+  const mock = await mockServices(repo, { botLogin: 'factory-bot', issues: { 5: ask, 6: ask }, name: 'app', owner: 'acme', script: developScript() })
+  const worker = await startFor(mock, { ...vars(mock), MACHINE_URL: `${mock.url}/machine` })
+  const describe = () => `turns: ${JSON.stringify(mock.state.turns.map((turn) => turn.role))}\nworker:\n${worker.output().slice(-4000)}`
+  // The runs start one after the other, so the turns of a run are the turns after its start.
+  const specBeforePlan = async (from: number) => {
+    await until(() => mock.state.turns.slice(from).find(planTurn), 120_000, describe)
+    const turns = mock.state.turns.slice(from)
+    const intake = turns.findIndex((turn) => turn.role === 'planner' && !planTurn(turn))
+    const spec = turns.findIndex((turn) => turn.role === 'spec')
+    const plan = turns.findIndex(planTurn)
+    assert.ok(intake >= 0 && intake < spec && spec < plan, describe())
+    assert.match(turns[plan]!.request, /- The spec: \/review\/spec\.md/)
+  }
+  try {
+    const issueComment = { action: 'created', comment: { body: '/develop --spec', user: { login: 'maintainer' } }, issue: { number: 5 }, repository }
+    const commented = (await (await sendWebhook(worker.url, secret, 'issue_comment', issueComment)).json()) as { started: boolean }
+    assert.equal(commented.started, true)
+    await specBeforePlan(0)
+
+    const from = mock.state.turns.length
+    const headers = { authorization: 'Bearer admin', 'content-type': 'application/json' }
+    const started = (await (await fetch(`${worker.url}/develop/acme/app/6`, { body: JSON.stringify({ spec: true }), headers, method: 'POST' })).json()) as { started: boolean }
+    assert.equal(started.started, true)
+    await specBeforePlan(from)
   } finally {
     await worker.stop()
     await mock.close()
