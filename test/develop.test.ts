@@ -327,6 +327,109 @@ test('develop: a ci command that fails in the final checks of a review pass give
   assert.match(result.report, /^- Round 1, review pass 1: failed: Checks green\. repair 1: mul\(2, 3\) is 6$/m)
 })
 
+/** A box check that failed in the final checks of a review pass. The config runs it again with a command that passes. */
+const flakySmoke = { name: 'smoke', command: 'node -e "process.exit(0)"', output: 'EADDRINUSE: address already in use' }
+
+test('develop: a box check that fails one time in a review pass and passes on the rerun uses no repair round, and the run merges', { timeout: 240_000 }, async () => {
+  const { repo } = developRepo(undefined, { merge: 'squash' })
+  const dir = runsDir()
+  const github = fakePulls([true])
+  const requests: ReviewRequest[] = []
+  const turns: Turn[] = []
+  const review = scriptedReview([{ checks: [flakySmoke] }], requests)
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), turns), pulls: github.pulls, review, runId: 'flaky-check' })
+
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
+  assert.deepEqual(repairRounds(turns), [])
+  // The pass counts as passed, so no second pass ran.
+  assert.equal(requests.length, 1)
+  assert.deepEqual(github.state.reruns, [])
+  const head = github.state.shas.at(-1) ?? ''
+  assert.ok(fileLedger(join(dir, 'flaky-check', 'state.json')).get(`step:rerun.check.smoke.${head}`))
+  assert.match(result.report, new RegExp(`^## Reruns\n\n- smoke on ${head.slice(0, 12)}: flaky$`, 'm'))
+  assert.match(result.report, /^- \[x\] Review loop PASS on the head, at least 1 pass: pass 1: PASS$/m)
+})
+
+test('develop: a GitHub CI that fails one time and passes on the rerun sends one rerun request, uses no repair round, and the run merges', { timeout: 240_000 }, async () => {
+  const { repo } = developRepo(undefined, { merge: 'squash' })
+  const github = fakePulls([false], { rerun: ['pass'] })
+  const turns: Turn[] = []
+  const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript(), turns), pulls: github.pulls, review: scriptedReview([[]], []), runId: 'flaky-ci' })
+
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
+  assert.deepEqual(repairRounds(turns), [])
+  assert.deepEqual(github.state.reruns, [1])
+  assert.equal(github.state.shas.length, 1)
+  const head = (github.state.shas[0] ?? '').slice(0, 12)
+  assert.match(result.report, new RegExp(`^## Reruns\n\n- CI \\(pull_request\\) on ${head}: flaky$`, 'm'))
+  assert.match(result.report, new RegExp(`^- \\[x\\] CI green on the head: ${head}: CI \\(pull_request\\)=pass$`, 'm'))
+})
+
+test('develop: a fixer that blocks gets a rerun of the failed box check, and the next round gets the cause without the flaky check', { timeout: 240_000 }, async () => {
+  const { repo } = developRepo(undefined, { merge: 'squash' })
+  const github = fakePulls([true])
+  const requests: ReviewRequest[] = []
+  const intentGap = { name: 'Intent reviewer affirms the original ask', ok: false, detail: 'no test checks mul(2, 3)' }
+  const review = scriptedReview([{ failed: [intentGap], checks: [flakySmoke] }, []], requests)
+  const turns: Turn[] = []
+  const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript({ blockRepair: 1 }), turns), pulls: github.pulls, review, runId: 'blocked-flaky' })
+
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(result.merge, { method: 'squash', sha: mergeCommit })
+  assert.deepEqual(repairRounds(turns), ['1', '2'])
+  // Only round 2 read its cause: the intent gap without the flaky check.
+  const read = repairTexts(turns)
+  assert.equal(read.length, 1)
+  assert.match(read[0] ?? '', /- Intent reviewer affirms the original ask: no test checks mul\(2, 3\)/)
+  assert.doesNotMatch(read[0] ?? '', /Checks green|check-failure/)
+  const second = turns.find((turn) => turn.role === 'builder' && turn.output === null && /Repair round 2 of/.test(turn.request))?.request ?? ''
+  assert.doesNotMatch(second.slice(second.lastIndexOf('Repair round')), /check-failure/)
+  assert.equal(requests.length, 2)
+  const head = (github.state.shas[0] ?? '').slice(0, 12)
+  assert.match(result.report, new RegExp(`^## Reruns\n\n- smoke on ${head}: flaky$`, 'm'))
+  assert.match(result.report, /^- Round 1, review pass 1: failed: Checks green, Intent reviewer affirms the original ask\. Blocked: the failure does not occur here$/m)
+  assert.match(result.report, /^- Round 2, review pass 1: failed: Intent reviewer affirms the original ask\. repair 2: mul\(2, 3\) is 6$/m)
+})
+
+test('develop: a rerun that GitHub refuses with 403 is in the report, and the repair round runs as before', { timeout: 240_000 }, async () => {
+  const { repo } = developRepo()
+  const github = fakePulls([false, true], { rerun: [403] })
+  const turns: Turn[] = []
+  const result = await runDevelop(repo, runsDir(), { dispatch: scriptedDispatch(developScript(), turns), pulls: github.pulls, review: scriptedReview([[]], []), runId: 'refused-rerun' })
+
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(github.state.reruns, [1])
+  assert.deepEqual(repairRounds(turns), ['1'])
+  const head = (github.state.shas[0] ?? '').slice(0, 12)
+  assert.match(result.report, new RegExp(`^- CI \\(pull_request\\) on ${head}: refused by GitHub \\(Resource not accessible by integration\\)$`, 'm'))
+  assert.match(result.report, new RegExp(`^- Round 1, CI: CI \\(pull_request\\) failed on ${head}\\. repair 1: mul\\(2, 3\\) is 6$`, 'm'))
+})
+
+test('develop: a resume after a rerun request waits for the new attempt and sends no second request', { timeout: 240_000 }, async () => {
+  const { repo } = developRepo()
+  const dir = runsDir()
+  const github = fakePulls([false], { rerun: ['pass'] })
+  // The first look at CI after the rerun request pauses the run, as when the new attempt is slow.
+  const pulls = {
+    ...github.pulls,
+    async ci(sha: string) {
+      if (github.state.reruns.length > 0) throw new PausedError(`waiting for CI on ${sha.slice(0, 12)}`)
+      return github.pulls.ci(sha)
+    },
+  }
+  await assert.rejects(runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), []), pulls, review: scriptedReview([[]], []), runId: 'rerun-resume' }), PausedError)
+  assert.deepEqual(github.state.reruns, [1])
+
+  const turns: Turn[] = []
+  const result = await runDevelop(repo, dir, { dispatch: scriptedDispatch(developScript(), turns), pulls: github.pulls, review: scriptedReview([[]], []), runId: 'rerun-resume' })
+  assert.equal(result.status, 'ready', result.report)
+  assert.deepEqual(github.state.reruns, [1])
+  assert.deepEqual(repairRounds(turns), [])
+  assert.match(result.report, /^- CI \(pull_request\) on [0-9a-f]{12}: flaky$/m)
+})
+
 test('develop: a review that fails 6 times ends failed after 5 repair rounds, does not merge, and a resume starts no round 6', { timeout: 300_000 }, async () => {
   const { repo } = developRepo(undefined, { merge: 'squash' })
   const dir = runsDir()
@@ -1192,6 +1295,33 @@ test('Node GitHub: failureLog returns a link when gh fails', async () => {
     const job = { name: 'CI', run: 12, url: 'https://ci.example/12', created: new Date().toISOString(), done: true, ok: false }
     assert.equal(await pulls.failureLog(job), 'No log: see https://ci.example/12 (gh run view: log expired)')
     assert.equal(await pulls.failureLog({ ...job, run: null }), 'No log: see https://ci.example/12')
+  } finally {
+    if (path === undefined) delete process.env.PATH
+    else process.env.PATH = path
+  }
+})
+
+test('Node GitHub: rerunFailedJobs posts the rerun of the failed jobs, and a 403 of gh is a refusal result', async () => {
+  const dir = runsDir()
+  const calls = join(dir, 'calls')
+  const gh = (script: string) => writeFileSync(join(dir, 'gh'), `#!/bin/sh\necho "$*" >> "${calls}"\n${script}\n`, { mode: 0o755 })
+  const path = process.env.PATH
+  process.env.PATH = `${dir}:${path ?? ''}`
+  try {
+    const pulls = ghPullRequests(dir, 'main')
+    gh(`printf '%s' '{}'`)
+    assert.deepEqual(await pulls.rerunFailedJobs(12), { started: true })
+    assert.deepEqual(readFileSync(calls, 'utf8').split('\n').filter(Boolean), ['api repos/{owner}/{repo}/actions/runs/12/rerun-failed-jobs --method POST'])
+
+    // Without Actions write, GitHub refuses with 403: a result, not an error.
+    gh(`printf 'gh: Resource not accessible by integration (HTTP 403)' >&2\nexit 1`)
+    assert.deepEqual(await pulls.rerunFailedJobs(12), {
+      started: false,
+      reason: 'gh api repos/{owner}/{repo}/actions/runs/12/rerun-failed-jobs: gh: Resource not accessible by integration (HTTP 403)',
+    })
+
+    gh(`printf 'gh: Not Found (HTTP 404)' >&2\nexit 1`)
+    await assert.rejects(pulls.rerunFailedJobs(12), /HTTP 404/)
   } finally {
     if (path === undefined) delete process.env.PATH
     else process.env.PATH = path

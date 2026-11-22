@@ -16,7 +16,7 @@ Status: phases 1 and 2 are built. The Worker calls GitHub as the App `sophon-fac
 | --- | --- |
 | Name | `sophon-factory`, private to `zhongeric` |
 | Installed on | `zhongeric/sophon` and `zhongeric/droplet` |
-| Permissions | Contents, Pull requests and Issues: read and write. Actions, Commit statuses and Checks: read. |
+| Permissions | Contents, Pull requests, Issues and Actions: read and write (rerun-failed-jobs needs Actions write). Commit statuses and Checks: read. |
 | Events | Issue comments, Issues, Pull requests, Workflow runs, Statuses, Check suites. The webhook is off until phase 3. |
 | Secrets | `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` on the Worker. The key is PKCS#8, as Web Crypto needs. |
 

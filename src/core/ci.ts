@@ -1,7 +1,11 @@
-/** One CI job of a commit: a GitHub Actions workflow run, or a commit status. `created` is when GitHub created it. */
-export type CiJob = { name: string; url: string; done: boolean; ok: boolean; run: number | null; created: string }
+/**
+ * One CI job of a commit: a GitHub Actions workflow run, or a commit status. `created` is when GitHub created it.
+ * `attempt` is the attempt of a run, which a rerun increases. A commit status, and a job of an older ledger, has none,
+ * which counts as 1.
+ */
+export type CiJob = { name: string; url: string; done: boolean; ok: boolean; run: number | null; created: string; attempt?: number }
 
-type WorkflowRun = { id: number; workflow_id: number; event: string; name: string; status: string; conclusion: string | null; html_url: string; created_at: string }
+type WorkflowRun = { id: number; workflow_id: number; event: string; name: string; status: string; conclusion: string | null; html_url: string; created_at: string; run_attempt?: number }
 type Status = { context: string; state: string; target_url: string | null; created_at: string }
 
 const passing = new Set(['success', 'neutral', 'skipped'])
@@ -34,6 +38,7 @@ export async function readCi(get: <T>(path: string) => Promise<T>, api: string, 
       ok: passing.has(run.conclusion ?? ''),
       run: run.id,
       created: run.created_at,
+      attempt: run.run_attempt ?? 1,
     })),
     ...statuses.map((status) => ({
       name: status.context,
