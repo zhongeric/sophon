@@ -10,7 +10,7 @@ import { PausedError, type Channel } from '../src/core/questions.ts'
 import { StopError } from '../src/core/stop.ts'
 import { BudgetStop, recordUsage, zeroTokens, type Prices } from '../src/core/usage.ts'
 import { defaultModels } from '../src/core/workflows/code-review-loop.ts'
-import { develop, type ReviewRequest } from '../src/core/workflows/develop.ts'
+import { defaultDevelopModels, develop, developModels, type DevelopModels, type ReviewRequest } from '../src/core/workflows/develop.ts'
 import { resumeInput } from '../src/node/develop.ts'
 import { git, gitBranches, worktreePath } from '../src/node/git.ts'
 import { ghPullRequests } from '../src/node/github.ts'
@@ -52,6 +52,12 @@ test('develop: a resume fills a missing step1.cleanup model and keeps the record
       review: { ...recorded.models.review, step1: { ...recorded.models.review.step1, cleanup: defaultModels.step1.cleanup } },
     },
   })
+})
+
+test('developModels: drops a stale intake override and keeps spec, planner and builder', () => {
+  const builder = { provider: 'codex', model: 'gpt-6.1-sol' } as const
+  const stale = { builder, intake: { provider: 'claude', model: 'not-allowed' } } as Partial<DevelopModels>
+  assert.deepEqual(developModels(stale), { ...defaultDevelopModels, builder })
 })
 
 test('develop: intake, plan, parallel builders on their own branches, draft PR, a CI repair, the review loop, a ready PR', { timeout: 120_000 }, async () => {

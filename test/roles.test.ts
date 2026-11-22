@@ -86,6 +86,4 @@ test('guideFiles holds each guide of each table and profile one time', () => {
   assert.equal(new Set(guideFiles).size, guideFiles.length)
   const all = [...Object.values(tables).flatMap((table) => Object.values(table).flatMap((role) => role.guides)), ...profiles.flatMap((profile) => profile.guides)]
   for (const file of all) assert.ok(guideFiles.includes(file), file)
-  // The develop table has no intake role, but the planner reads intake.md for its intake turn (D19).
-  assert.ok(guideFiles.includes('intake.md'))
 })

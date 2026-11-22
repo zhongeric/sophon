@@ -24,6 +24,12 @@ const opus: ModelChoice = { provider: 'claude', model: 'claude-opus-5-5' }
 /** Spec, planner and builders run on Opus 5.5, the strongest writer of the allowed models. */
 export const defaultDevelopModels: DevelopModels = { spec: opus, planner: { ...opus, thinking: 'high' }, builder: { ...opus, thinking: 'high' } }
 
+/** The development models with the overrides. The planner model runs the intake turn (D19), so a stale `intake` key goes away. */
+export function developModels(overrides: Partial<DevelopModels> = {}): DevelopModels {
+  const { spec, planner, builder } = { ...defaultDevelopModels, ...overrides }
+  return { spec, planner, builder }
+}
+
 export type DevelopInput = {
   runId: string
   /** The ask, verbatim. */
@@ -145,15 +151,14 @@ export function checkDevelopModels(models: DevelopModels, allowed = defaultAllow
 }
 
 /**
- * The development workflow, steps 0 to 9, with its order and hard rules in code:
- * the intake turn of the planner session and the confirmation of the ask, a spec with the spec option, the plan turn of the
- * same session (D19), builders for the plan's tasks (in
- * parallel when their files do not overlap, each on its own branch), a draft PR, CI, the code review loop, CI again,
- * and a ready PR only when every criterion holds. A red CI or a failed review pass gets a repair round inside one
- * budget, and a new review pass reviews the fixes (D14). Before the ready step and the merge, the host merges a base
- * that moved (D16). Every step is in the ledger, so the same run ID
- * resumes after a pause or a crash without repeating finished steps. When the user stops the run at the cost budget, the
- * run ends as stopped with its report.
+ * The development workflow, steps 0 to 9, with its order and hard rules in code: the intake turn of the planner session
+ * and the confirmation of the ask, a spec with the spec option, the plan turn of the same session (D19), builders for
+ * the plan's tasks (in parallel when their files do not overlap, each on its own branch), a draft PR, CI, the code
+ * review loop, CI again, and a ready PR only when every criterion holds. A red CI or a failed review pass gets a repair
+ * round inside one budget, and a new review pass reviews the fixes (D14). Before the ready step and the merge, the host
+ * merges a base that moved (D16). Every step is in the ledger, so the same run ID resumes after a pause or a crash
+ * without repeating finished steps. When the user stops the run at the cost budget, the run ends as stopped with its
+ * report.
  */
 export async function develop(input: DevelopInput, deps: DevelopDeps): Promise<DevelopResult> {
   const stop: { finish?: Finish } = {}

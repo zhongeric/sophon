@@ -71,14 +71,16 @@ const oldSpecOption = 'Write a spec first'
 /**
  * Reads the route from the answers to the host's questions. Free text that corrects the ask becomes a decision for the planner.
  * A correction can start with "No,". The stop option, "no", "stop", and "stop the run" stop the run.
- * `spec` is the spec option of the run, false by default. A batch from before D19 has the spec route question, with other question IDs, so the
- * host reads each answer by its question text first, and the old spec answer also gives a spec (D19). Research changes the
- * text of the confirm question, so the ID is the fallback, but not in a batch from before D19.
+ * `spec` is the spec option of the run, false by default. Only the answers to the host questions count.
+ * For a batch from before D19, the host uses question text and the recorded spec answer (D19). That batch has the spec route
+ * question at the ID of the passes question. Research changes the text of the confirm question, so the ID is the fallback.
  */
 export function route(intake: Intake, answers: Answer[], spec = false): Route {
-  const byText = (question: string) => answers.find((answer) => answer.question === question)?.answer
-  const oldSpec = byText(oldSpecQuestion)
-  const byId = (id: string) => (oldSpec === undefined ? answers.find((answer) => answer.id === id)?.answer : undefined)
+  const own = new Set(intake.questions.map((question) => question.id))
+  const host = answers.filter((answer) => !own.has(answer.id))
+  const byText = (question: string) => host.find((answer) => answer.question === question)?.answer
+  const oldSpec = host.find((answer) => answer.id === `Q${intake.questions.length + 2}` && answer.question === oldSpecQuestion)?.answer
+  const byId = (id: string) => (oldSpec === undefined ? host.find((answer) => answer.id === id)?.answer : undefined)
   const [confirm, passes] = routeQuestions(intake).map((question) => byText(question.question) ?? byId(question.id) ?? question.recommendation)
   return {
     stop: confirm === confirmOptions[1] || /^\s*(no([\s,]+stop(\s+the\s+run)?)?|stop(\s+the\s+run)?)[.!]?\s*$/i.test(confirm!),

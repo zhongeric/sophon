@@ -137,7 +137,7 @@ export async function plan(context: DevelopContext, model: ModelChoice, tree: Fi
     ...submitOnce(context.host, `output:${plannerId}`, submitPlan, async (input) => checkPlan(input, sections, (path) => isProtected(context.config, path), targeted)),
   }
   const prompt = [
-    'Plan this confirmed ask. This is the plan turn: the intake is done, and /review/decisions.md has the answers to its questions.',
+    'Plan this confirmed ask. This is the plan turn.',
     '',
     '- The ask: /review/ask.md',
     '- Decisions: /review/decisions.md',

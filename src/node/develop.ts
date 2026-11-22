@@ -9,7 +9,7 @@ import { commentChannel, PausedError } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { parseBudget, parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
-import { defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
+import { develop, developModels, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
 import { fileChannel, gh, ghComments, terminalChannel } from './channels.ts'
 import { credential } from './credentials.ts'
 import { git } from './git.ts'
@@ -38,7 +38,7 @@ Options:
   --run <id>             Resume a run; the other options come from its ledger
   --runs-dir <path>      Where runs live (default: <agent-factory>/runs)
   --hotfix               A small hotfix: take every recommendation without asking
-  --spec                 Write a spec before the plan. The spec stage runs only with this option.
+  --spec                 Write a spec before the plan
   --full                 The strict review loop, also when triage allows the light or the standard loop
   --parallel <n>         At most n builders at the same time (default 3)
   --issue <n>            The issue that the PR closes: the PR body says Closes #<n>. The report stays on the PR.
@@ -133,7 +133,7 @@ export function resumeInput(runsDir: string, runId: string): { input: DevelopInp
   const input = ledger.get<DevelopInput>('input')
   const repo = ledger.get<string>('repo')
   if (!input || !repo) throw new StopError(`run ${runId} has no recorded input`)
-  return { input: { ...input, models: { ...input.models, review: mergeModels(input.models.review) } }, repo }
+  return { input: { ...input, models: { develop: developModels(input.models.develop), review: mergeModels(input.models.review) } }, repo }
 }
 
 type Values = Record<string, string | boolean | undefined>
@@ -157,7 +157,7 @@ async function newInput(values: Values): Promise<{ input: DevelopInput; repo: st
     base,
     baseRef,
     config,
-    models: { develop: { ...defaultDevelopModels, ...overrides.develop }, review: mergeModels(overrides.review ?? {}) },
+    models: { develop: developModels(overrides.develop), review: mergeModels(overrides.review ?? {}) },
     runId: `dev-${stamp}`,
     source: `${repo} on ${baseRef}`,
     ...(values.hotfix ? { hotfix: true } : {}),

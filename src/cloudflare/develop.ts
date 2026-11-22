@@ -7,7 +7,7 @@ import { commentChannel, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
-import { cutReport, defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
+import { cutReport, develop, developModels, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
 import { statusHeader } from './announcements.ts'
 import { boxMachine, syncWithSetup } from './box.ts'
 import { sqlBranches } from './branches.ts'
@@ -100,7 +100,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
   private models(): DevelopInput['models'] {
     type Overrides = Partial<LoopModels> & { develop?: Partial<DevelopModels> }
     const overrides = this.env.MODELS ? (JSON.parse(this.env.MODELS) as Overrides) : {}
-    return { develop: { ...defaultDevelopModels, ...overrides.develop }, review: mergeModels(overrides) }
+    return { develop: developModels(overrides.develop), review: mergeModels(overrides) }
   }
 
   /** The run's input: the issue is the ask, verbatim. The checks and rails come from the base branch. */

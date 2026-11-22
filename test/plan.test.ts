@@ -56,6 +56,12 @@ test('a batch from before D19 gives its spec answer and its passes by question t
   assert.equal(route(checkIntake(intake), [answer('Q2', 'Write a spec before the plan?', 'Yes, a short one')], false).spec, true)
 })
 
+test('an intake question with the text of the spec route question from before D19 gives no spec', () => {
+  const own = { question: 'Write a spec before the plan?', why: 'The ask is large.', options: ['Write a spec first', 'Plan now'], recommendation: 'Write a spec first', level: 'run' }
+  const asked = checkIntake({ ...intake, questions: [own] })
+  assert.deepEqual(route(asked, [answer('Q1', own.question, 'Write a spec first')], false), { stop: false, spec: false, passes: 1 })
+})
+
 test('an answer to a route question with other text, as the confirm question of research, counts by its question ID', () => {
   assert.equal(route(checkIntake(intake), [answer('Q1', 'Is this the program? Correct it in your own words if it is not.', 'Stop the run')]).stop, true)
 })
