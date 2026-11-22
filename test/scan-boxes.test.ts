@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { localScanBoxes } from '../src/node/scan-boxes.ts'
+import { localScanBoxes, writeInputs } from '../src/node/scan-boxes.ts'
 
 test('local scan boxes: setup creates files and environment for each fresh unit checkout', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'scan-boxes-'))
@@ -53,6 +53,79 @@ test('local scan boxes: a failed setup prevents the unit command', async () => {
     assert.equal(existsSync(join(dir, 'run', 'u1', 'output')), false)
   } finally {
     await boxes.kill('run/u1')
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('local scan boxes: the unit time limit starts after the setup, and only the timer limits a unit', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scan-boxes-'))
+  const boxes = localScanBoxes(dir, { stack: 'python', checks: {}, setup: 'sleep 0.6 # dependencies' })
+  try {
+    assert.equal(boxes.maxUnitMs, 2 ** 31 - 1)
+    await boxes.start('run/u1', { command: 'true', inputs: [], timeoutMs: 300 })
+    let state = await boxes.poll('run/u1')
+    while (state.state === 'running') {
+      await new Promise((done) => setTimeout(done, 10))
+      state = await boxes.poll('run/u1')
+    }
+    assert.equal(state.state, 'done')
+    if (state.state !== 'done') throw new Error('the unit is missing')
+    assert.equal(state.result.exit_code, 0, state.result.output)
+  } finally {
+    await boxes.kill('run/u1')
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('local scan boxes: a background helper does not delay a unit without setup', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scan-boxes-'))
+  const boxes = localScanBoxes(dir, { stack: 'python', checks: {} })
+  const pidFile = join(dir, 'run', 'u1', 'pid')
+  try {
+    await boxes.start('run/u1', {
+      command: `sleep 60 >/dev/null 2>&1 & echo $! > pid; printf '{"outputs":{}}\\n'`,
+      inputs: [],
+      timeoutMs: 1_000,
+    })
+    let state = await boxes.poll('run/u1')
+    while (state.state === 'running') {
+      await new Promise((done) => setTimeout(done, 10))
+      state = await boxes.poll('run/u1')
+    }
+    assert.equal(state.state, 'done')
+    if (state.state !== 'done') throw new Error('the unit is missing')
+    assert.equal(state.result.exit_code, 0, state.result.output)
+    assert.equal(state.result.output, '{"outputs":{}}\n')
+  } finally {
+    await boxes.kill('run/u1')
+    if (existsSync(pidFile)) {
+      try {
+        process.kill(Number(readFileSync(pidFile, 'utf8').trim()), 'SIGKILL')
+      } catch {
+        // The helper already ended.
+      }
+    }
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('writeInputs: a path through a committed symlink is refused', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scan-boxes-'))
+  try {
+    const root = join(dir, 'checkout')
+    const outside = join(dir, 'outside')
+    mkdirSync(root)
+    mkdirSync(outside)
+    symlinkSync(outside, join(root, '.agent-factory'))
+    symlinkSync(join(outside, 'file'), join(root, 'link'))
+    const data = new TextEncoder().encode('unit output')
+    assert.throws(() => writeInputs(root, [{ path: '.agent-factory/units/u1/out', data }]), /symlink \.agent-factory/)
+    assert.throws(() => writeInputs(root, [{ path: 'link', data }]), /symlink link/)
+    assert.equal(existsSync(join(outside, 'units')), false)
+    assert.equal(existsSync(join(outside, 'file')), false)
+    writeInputs(root, [{ path: 'units/u1/out', data }])
+    assert.equal(readFileSync(join(root, 'units', 'u1', 'out'), 'utf8'), 'unit output')
+  } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })

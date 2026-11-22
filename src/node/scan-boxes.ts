@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { commandOptions, type RepoConfig } from '../core/checks.ts'
 import type { InputFile, ScanBoxes, ScanPoll } from '../core/fanout.ts'
@@ -48,19 +48,31 @@ function hookExit(): void {
   }
 }
 
-/** Writes each file under `root`, with its directories. */
+/** Writes each file under `root`, with its directories. A path through a symlink under `root`, for example of a checkout, is an error. */
 export function writeInputs(root: string, files: InputFile[]): void {
   for (const file of files) {
     const path = inside(root, file.path)
+    let current = root
+    for (const part of relative(root, path).split(sep)) {
+      current = join(current, part)
+      let link: boolean
+      try {
+        link = lstatSync(current).isSymbolicLink()
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') break
+        throw error
+      }
+      if (link) throw new Error(`the path ${file.path} goes through the symlink ${relative(root, current)}`)
+    }
     mkdirSync(dirname(path), { recursive: true })
     writeFileSync(path, file.data)
   }
 }
 
 /**
- * The scan boxes of this machine: each slot is a directory under `dir`, and each unit is a process of this Node
- * process, with the check environment of the config, so no host secret. The local machine has no box limit, so a start
- * is never full. After a restart of the host, each job of an earlier process is missing.
+ * The scan boxes of this machine. Each slot is a directory under `dir`. Units get the check environment, without host secrets.
+ * The setup of the config runs in the shell of each unit, and a start returns after the setup, so the unit time limit starts there.
+ * A start is never full. A host restart loses all jobs.
  */
 export function localScanBoxes(dir: string, config: RepoConfig, options: { pollMs?: number } = {}): ScanBoxes {
   const jobs = new Map<string, Job>()
@@ -81,7 +93,8 @@ export function localScanBoxes(dir: string, config: RepoConfig, options: { pollM
   }
   return {
     instance: null,
-    maxUnitMs: 60 * 60 * 1000,
+    // The local machine has no unit limit. This value only keeps the timer correct: setTimeout fires at once above it.
+    maxUnitMs: 2 ** 31 - 1,
     pollMs: options.pollMs ?? 1000,
     async start(slot, unit) {
       const root = slotDir(slot)
@@ -92,8 +105,9 @@ export function localScanBoxes(dir: string, config: RepoConfig, options: { pollM
       writeInputs(root, unit.inputs)
       const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => names.has(name)))
       hookExit()
-      const command = config.setup ? `{\n${config.setup}\n} && {\n${unit.command}\n}` : unit.command
-      const child = spawn('bash', ['-c', command], { cwd: root, detached: true, env, stdio: ['ignore', 'pipe', 'pipe'] })
+      // After the setup, the shell writes to descriptor 3. The setup and the unit do not get descriptor 3.
+      const command = config.setup ? `{\n${config.setup}\n} 3>&- && {\nprintf ready >&3\nexec 3>&-\n${unit.command}\n}` : unit.command
+      const child = spawn('bash', ['-c', command], { cwd: root, detached: true, env, stdio: config.setup ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'] })
       const pid = child.pid
       if (pid !== undefined) groups.add(pid)
       const job: Job = { id: crypto.randomUUID(), child, closed: Promise.resolve() }
@@ -104,19 +118,32 @@ export function localScanBoxes(dir: string, config: RepoConfig, options: { pollM
       child.stdout?.on('data', collect)
       child.stderr?.on('data', collect)
       let timedOut = false
+      let ready: () => void = () => {}
+      const setupDone = new Promise<void>((done) => {
+        ready = () => done()
+      })
       job.closed = new Promise<void>((done) => {
-        const timer = setTimeout(() => {
-          timedOut = true
-          output += `\n[host] killed after ${unit.timeoutMs} ms`
-          try {
-            if (pid !== undefined) process.kill(-pid, 'SIGKILL')
-          } catch {
-            // The process group already ended.
-          }
-        }, unit.timeoutMs)
+        const limit = (ms: number, what: string) =>
+          setTimeout(() => {
+            timedOut = true
+            output += `\n[host] ${what} killed after ${ms} ms`
+            try {
+              if (pid !== undefined) process.kill(-pid, 'SIGKILL')
+            } catch {
+              // The process group already ended.
+            }
+          }, ms)
+        let timer = config.setup ? limit(commandOptions(config).timeoutMs, 'the setup was') : limit(unit.timeoutMs, 'the unit was')
+        if (!config.setup) ready()
+        child.stdio[3]?.once('data', () => {
+          clearTimeout(timer)
+          timer = limit(unit.timeoutMs, 'the unit was')
+          ready()
+        })
         const end = (code: number | null) => {
           if (job.result !== undefined) return
           clearTimeout(timer)
+          ready()
           if (pid !== undefined) groups.delete(pid)
           job.result = { exit_code: timedOut ? null : code, output, ended_at: Date.now() }
           done()
@@ -128,6 +155,7 @@ export function localScanBoxes(dir: string, config: RepoConfig, options: { pollM
         child.on('close', end)
       })
       jobs.set(slot, job)
+      await setupDone
       return { job: job.id }
     },
     async poll(slot): Promise<ScanPoll> {

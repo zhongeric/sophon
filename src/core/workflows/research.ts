@@ -192,8 +192,10 @@ export type ResearchDeps = {
   log(line: string): void
 }
 
-/** A clean checkout with read access to its output files. Its ID stays the same only when the checkout stays. */
-/** `endedAt`: the end of the last command in ms since the epoch, when the box keeps it across a pause. */
+/**
+ * A clean checkout with read access to its output files. Its ID stays the same only when the checkout stays.
+ * `endedAt`: the end of the last command in ms since the epoch, when the box keeps it across a pause.
+ */
 type ResearchBox = Machine & { id: string; read(path: string): Promise<Uint8Array>; endedAt?(): number | undefined }
 
 /** A frozen prereg as the ledger records it. */
@@ -292,7 +294,6 @@ type FanOutRound = {
   plan: string
   fetch: string[]
   units: UnitsManifest['units']
-  failed: string[]
   retries: number
   conflicts: UnitConflict[]
 }
@@ -873,13 +874,19 @@ async function keepOutputs(deps: ResearchDeps, box: ResearchBox, run: DomainRun,
 }
 
 /**
- * Runs a command on a run box under a compute entry `key`, when the platform meters run boxes. A planned stop or a pause
- * keeps the entry open, because the next call continues the same job. The entry ends at the end of the job when the box
- * keeps it, so that the time of a pause after the job does not count.
+ * Runs a command on a run box under a compute entry of `step` and the box copy, when the platform meters run boxes. A
+ * planned stop or a pause keeps the entry open, because the next call on the same copy continues the same job. A new
+ * copy runs the command again, so it gets a new entry, and the open entry of the earlier copy ends. The entry ends at
+ * the end of the job when the box keeps it, so that the time of a pause after the job does not count.
  */
-async function metered<T>(deps: ResearchDeps, key: string, box: Pick<ResearchBox, 'endedAt'>, run: () => Promise<T>): Promise<T> {
+async function metered<T>(deps: ResearchDeps, step: string, box: Pick<ResearchBox, 'id' | 'endedAt'>, run: () => Promise<T>): Promise<T> {
   if (!deps.compute) return run()
-  startCompute(deps.ledger, key, key, deps.compute.runBox)
+  const key = `${step}.${box.id}`
+  const lastKey = `metered:${step}`
+  const last = deps.ledger.get<string>(lastKey)
+  if (last !== undefined && last !== key) finishCompute(deps.ledger, last)
+  deps.ledger.put(lastKey, key)
+  startCompute(deps.ledger, key, step, deps.compute.runBox)
   let result: T
   try {
     result = await run()
@@ -979,7 +986,7 @@ async function fanOutRound(stages: Stages, analysis: Analysis, at: { key: string
     }
     return { plan, fetch, fetched, units, reason: '', tail: '' }
   })
-  const fanout: FanOutRound = { plan: planned.plan, fetch: planned.fetch, units: [], failed: [], retries: 0, conflicts: [] }
+  const fanout: FanOutRound = { plan: planned.plan, fetch: planned.fetch, units: [], retries: 0, conflicts: [] }
   if (planned.reason) {
     return { round, head, recall: null, threshold, known: [], inject: [], outputs: {}, reads: { known: null, inject: null }, pass: false, reason: planned.reason, tail: planned.tail, fanout }
   }
@@ -1001,7 +1008,6 @@ async function fanOutRound(stages: Stages, analysis: Analysis, at: { key: string
   })
   const keys = new Set(planned.units.map((unit) => unitKey({ commit: head, prereg }, unit.id)))
   fanout.units = unitsManifest(results).units
-  fanout.failed = results.filter((result) => result.status === 'failed').map((result) => result.id)
   fanout.retries = results.reduce((sum, result) => sum + Math.max(0, result.attempts - 1), 0)
   fanout.conflicts = unitConflicts(ledger).filter((conflict) => keys.has(conflict.key))
   const box = await deps.cleanBox(head, `${key}.merge`, await unitsFiles(results, deps.egress.artifacts))

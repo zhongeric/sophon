@@ -8,7 +8,7 @@ import { pool } from './pool.ts'
 import { parseUnitOutput, unitCommand, type DomainOutputs, type PlanUnit, type UnitsManifest } from './research-commands.ts'
 import { finishCompute, startCompute, type InstanceSpec } from './usage.ts'
 
-/** A file that the host writes into a unit directory or a checkout, by its path relative to the root. */
+/** A file that the host writes into a unit directory or a checkout, by its path relative to the root. It has no mode, so it is not executable. */
 export type InputFile = { path: string; data: Uint8Array }
 
 /**
@@ -38,19 +38,22 @@ export type ScanBoxes = {
 export const defaultUnitParallel = 32
 
 /** A unit starts again on another box at most this many times. Then it fails. */
-export const maxRestarts = 3
+const maxRestarts = 3
 
 /** Where merge finds the unit files in its checkout, in place of {units} (UnitsManifest). */
 export const unitsDir = '.agent-factory/units'
 
 /** The result of one unit. `outputs` maps each output path to its SHA-256, which is also its artifact ID. */
-export type UnitResult = { id: string; status: 'done' | 'failed'; attempts: number; reason?: string; outputs: DomainOutputs }
+type UnitResult = { id: string; status: 'done' | 'failed'; attempts: number; reason?: string; outputs: DomainOutputs }
 
 /** A later result of a unit key with another SHA-256 than the first result. The run keeps the first result. */
 export type UnitConflict = { key: string; unit: string; first: string; second: string }
 
-/** One attempt of a unit, recorded before the first poll. `reason` marks a failure. `alive` keeps its slot busy. */
-type Attempt = { slot: string; job: string; startedAt: number; reason?: string; alive?: true }
+/**
+ * One attempt of a unit, recorded before the first poll. `seenAt`: the last poll that saw the job run, kept at most once
+ * a minute. `reason` marks a failure. `alive` keeps its slot busy.
+ */
+type Attempt = { slot: string; startedAt: number; seenAt?: number; reason?: string; alive?: true }
 
 /** `endedAt`: the end of the job that the box gave. `alive`: the kill of the job failed, so the job can still run. */
 type Outcome = ({ outputs: DomainOutputs } | { reason: string }) & { endedAt?: number; alive?: true }
@@ -88,7 +91,7 @@ export function slotName(runId: string, unitId: string, attempt: number): string
  * The slot of a lane of the pool. A first attempt runs in a free lane, so that the next unit uses the same box and a
  * pool of `parallel` units keeps at most `parallel` lane boxes. The slot part has no '-', so a retry slot is never a lane.
  */
-export function laneName(runId: string, lane: number): string {
+function laneName(runId: string, lane: number): string {
   return `${poolPart(runId)}/lane_${lane}`
 }
 
@@ -119,20 +122,55 @@ export async function recordUnitResult(ledger: Ledger, key: string, result: Unit
 /** Each second result of the run. */
 export const unitConflicts = (ledger: Ledger): UnitConflict[] => ledger.get<UnitConflict[]>(conflictsKey) ?? []
 
-/** The plain files of a tree, except the paths of `exclude` and .git, by path relative to the root. */
-export async function treeInputs(tree: FileSystem.FileSystem, exclude: string[]): Promise<InputFile[]> {
-  const files: InputFile[] = []
+/** Keep each symlink target so that fetched data also replaces the bytes of its aliases. */
+type TreeInputFile = InputFile & { linkedPaths?: string[] }
+
+/**
+ * The files of a tree, except the paths of `exclude` and .git, by path relative to the root. A symlink to a file of the
+ * tree gives the bytes of that file. Another symlink is an error, because the unit would not see the checkout of the run box.
+ */
+export async function treeInputs(tree: FileSystem.FileSystem, exclude: string[]): Promise<TreeInputFile[]> {
+  const files: TreeInputFile[] = []
   const walk = async (dir: string): Promise<void> => {
     for (const name of await tree.list(`/${dir}`)) {
       if (name === '.git') continue
       const path = dir === '' ? name : `${dir}/${name}`
       const stat = tree.lstat ? await tree.lstat(`/${path}`) : await tree.stat(`/${path}`)
       if (stat?.kind === 'directory') await walk(path)
-      else if (stat?.kind === 'file' && !exclude.includes(path)) files.push({ path, data: await tree.read(`/${path}`) })
+      else if (exclude.includes(path)) continue
+      else if (stat?.kind === 'file') files.push({ path, data: await tree.read(`/${path}`) })
+      else if (stat?.kind === 'symlink') {
+        const target = await linkedFile(tree, path)
+        if (target === null) throw new Error(`the commit has the symlink ${path}, but a unit gets only a symlink to a file of the commit`)
+        if (!exclude.includes(target.path)) files.push({ path, data: await tree.read(`/${target.path}`), linkedPaths: target.links })
+      }
     }
   }
   await walk('')
   return files
+}
+
+/** The file path and the symlink targets, or null if the chain leaves the tree or ends at no file. */
+async function linkedFile(tree: FileSystem.FileSystem, path: string): Promise<{ path: string; links: string[] } | null> {
+  let current = path
+  const links: string[] = []
+  for (let hop = 0; hop < 40; hop++) {
+    const target = await tree.readlink?.(`/${current}`)
+    if (!target || target.startsWith('/')) return null
+    const parts = current.split('/').slice(0, -1)
+    for (const part of target.split('/')) {
+      if (part === '..') {
+        if (parts.pop() === undefined) return null
+      } else if (part !== '' && part !== '.') parts.push(part)
+    }
+    current = parts.join('/')
+    if (parts.length === 0 || parts[0] === '.git') return null
+    links.push(current)
+    const stat = tree.lstat ? await tree.lstat(`/${current}`) : null
+    if (stat?.kind === 'file') return { path: current, links }
+    if (stat?.kind !== 'symlink') return null
+  }
+  return null
 }
 
 /** The bytes of an artifact. A missing artifact is an error, because the ledger recorded its ID. */
@@ -143,12 +181,16 @@ async function artifactBytes(artifacts: Artifacts, id: string, what: string): Pr
 }
 
 /** The inputs of a unit: the commit files, and the data files of its targets at their fetch paths, in place of a commit file. */
-export function unitInputs(files: () => Promise<InputFile[]>, fetched: Record<string, DomainOutputs>, artifacts: Artifacts): (unit: PlanUnit) => Promise<InputFile[]> {
+export function unitInputs(files: () => Promise<TreeInputFile[]>, fetched: Record<string, DomainOutputs>, artifacts: Artifacts): (unit: PlanUnit) => Promise<InputFile[]> {
   return async (unit) => {
     const data = new Map<string, Uint8Array>()
     for (const target of unit.targets)
       for (const [path, sha] of Object.entries(fetched[target] ?? {})) data.set(path, await artifactBytes(artifacts, sha, `fetch ${target} ${path}`))
-    return [...(await files()).filter((file) => !data.has(file.path)), ...[...data].map(([path, bytes]) => ({ path, data: bytes }))]
+    const commitFiles = (await files()).filter((file) => !data.has(file.path)).map((file) => {
+      const replacement = file.linkedPaths?.find((path) => data.has(path))
+      return { path: file.path, data: (replacement === undefined ? undefined : data.get(replacement)) ?? file.data }
+    })
+    return [...commitFiles, ...[...data].map(([path, bytes]) => ({ path, data: bytes }))]
   }
 }
 
@@ -263,7 +305,7 @@ async function runUnit(unit: PlanUnit, key: string, fanOut: FanOut, lanes: Lanes
         // The box can start the job before the error.
         const alive = !(await kill(fanOut, slot, unit.id))
         if (!alive) lanes.free(slot)
-        ledger.put(attemptsKey, [...attempts, { slot, job: '', startedAt: now(), reason, ...(alive ? { alive: true as const } : {}) } satisfies Attempt])
+        ledger.put(attemptsKey, [...attempts, { slot, startedAt: now(), reason, ...(alive ? { alive: true as const } : {}) } satisfies Attempt])
         fanOut.log(`unit ${unit.id}, attempt ${number}: ${reason}`)
         continue
       }
@@ -271,13 +313,15 @@ async function runUnit(unit: PlanUnit, key: string, fanOut: FanOut, lanes: Lanes
         await pause()
         continue
       }
-      attempt = { slot, job: started.job, startedAt: now() }
+      attempt = { slot, startedAt: now() }
       ledger.put(attemptsKey, [...attempts, attempt])
       startCompute(ledger, `${key}.${number}`, `unit.${fanOut.prereg.hypothesis}.${fanOut.round}.${unit.id}.${number}`, boxes.instance, attempt.startedAt)
     }
+    const current = attempt
+    const seen = (at: number) => ledger.put(attemptsKey, [...attempts.slice(0, number - 1), { ...current, seenAt: at } satisfies Attempt])
     let outcome: Outcome
     try {
-      outcome = await follow(attempt, limit, unit.id, fanOut, now, pause)
+      outcome = await follow(attempt, limit, unit.id, command, fanOut, now, pause, seen)
     } catch (error) {
       // A planned stop keeps the meter open: the job still runs, and the next call polls it again.
       if (!(error instanceof PlannedStop)) finishCompute(ledger, `${key}.${number}`, now())
@@ -292,9 +336,23 @@ async function runUnit(unit: PlanUnit, key: string, fanOut: FanOut, lanes: Lanes
   }
 }
 
-/** Polls one attempt until it ends. On exit 0, it checks the last line and keeps each output file as an artifact. */
-async function follow(attempt: Attempt, limit: number, id: string, fanOut: FanOut, now: () => number, pause: () => Promise<void>): Promise<Outcome> {
+/**
+ * Polls one attempt until it ends. On exit 0, it checks the last line and keeps each output file as an artifact. A lost
+ * job ends at the last poll that saw it run, so that the time before a resume does not count as compute.
+ */
+async function follow(
+  attempt: Attempt,
+  limit: number,
+  id: string,
+  command: string,
+  fanOut: FanOut,
+  now: () => number,
+  pause: () => Promise<void>,
+  seen: (at: number) => void,
+): Promise<Outcome> {
   const { boxes } = fanOut
+  let seenAt = attempt.seenAt ?? attempt.startedAt
+  let keptAt = seenAt
   for (;;) {
     let polled: ScanPoll
     try {
@@ -302,8 +360,13 @@ async function follow(attempt: Attempt, limit: number, id: string, fanOut: FanOu
     } catch (error) {
       return stop(fanOut, attempt.slot, id, `the poll failed: ${message(error)}`)
     }
-    if (polled.state === 'missing') return { reason: `the box of ${attempt.slot} lost the job` }
+    if (polled.state === 'missing') return { reason: `the box of ${attempt.slot} lost the job`, endedAt: seenAt }
     if (polled.state === 'running') {
+      seenAt = now()
+      if (seenAt - keptAt >= 60_000) {
+        seen(seenAt)
+        keptAt = seenAt
+      }
       if (now() - attempt.startedAt <= limit) {
         await pause()
         continue
@@ -322,8 +385,7 @@ async function follow(attempt: Attempt, limit: number, id: string, fanOut: FanOu
         const bytes = await boxes.read(attempt.slot, path)
         if ((await artifactId(bytes)) !== hash) return { reason: `the unit output ${path} does not match its SHA-256 ${hash}`, ...ended }
         const labels = { hypothesis: fanOut.prereg.hypothesis, unit: id, round: String(fanOut.round), path }
-        const source = { command: unitCommand(fanOut.config, fanOut.prereg.path, id) }
-        outputs[path] = await fanOut.artifacts.put(bytes, { source, media_type: 'application/octet-stream', labels })
+        outputs[path] = await fanOut.artifacts.put(bytes, { source: { command }, media_type: 'application/octet-stream', labels })
       } catch (error) {
         return { reason: `the unit output ${path}: ${message(error)}`, ...ended }
       }

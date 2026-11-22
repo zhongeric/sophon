@@ -145,10 +145,18 @@ function domainJson(name: DomainCommand, value: Record<string, unknown>, problem
 
 const unitId = /^[A-Za-z0-9_-]{1,64}$/
 
-/** A list of non-empty strings without repeats, or null with the problem in `problems`. */
+/**
+ * A list of non-empty strings without repeats, or null with the problem in `problems`. A name with spaces at a
+ * start or an end is refused, because the holdout check compares exact names (RG1).
+ */
 function names(value: unknown, key: string, problems: string[]): string[] | null {
   if (!Array.isArray(value) || !value.every((item) => typeof item === 'string' && item.trim() !== '')) {
     problems.push(`${key} must be a list of non-empty strings`)
+    return null
+  }
+  const padded = value.filter((item) => item !== item.trim())
+  if (padded.length > 0) {
+    problems.push(`${key} has names with spaces at the start or the end: ${padded.map((item) => JSON.stringify(item)).join(', ')}`)
     return null
   }
   const repeated = value.filter((item, index) => value.indexOf(item) !== index)

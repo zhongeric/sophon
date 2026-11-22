@@ -273,6 +273,8 @@ test('a bad plan fails with the problem and the tail', async () => {
     [ok({ targets: ['T-1'], units: [unit({}), unit({ expected_seconds: 5 })] }), /units\[1\]\.id repeats the unit ID u1/],
     [ok({ targets: ['T-1'], units: [unit({ targets: ['T-1', 'T-9'] })] }), /units\[0\]\.targets has T-9, which is not in targets/],
     [ok({ targets: ['T-1'], units: [unit({ targets: 'T-1' })] }), /units\[0\]\.targets must be a list of non-empty strings/],
+    [ok({ targets: ['T-1 ', ' T-2'], units: [] }), /targets has names with spaces at the start or the end: "T-1 ", " T-2"/],
+    [ok({ targets: ['T-1'], units: [unit({ targets: ['T-1 '] })] }), /units\[0\]\.targets has names with spaces/],
   ]
   for (const id of ['', 'a/b', '../x', 'a.b', 'a b', 'x'.repeat(65), 7]) cases.push([ok({ targets: ['T-1'], units: [unit({ id })] }), /units\[0\]\.id must match/])
   for (const seconds of [0, -1, '60', null]) cases.push([ok({ targets: ['T-1'], units: [unit({ expected_seconds: seconds })] }), /units\[0\]\.expected_seconds must be a finite positive number/])

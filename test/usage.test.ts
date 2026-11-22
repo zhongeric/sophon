@@ -501,7 +501,7 @@ test('CONTAINER_PRICES needs both non-negative prices, and an instance entry nee
   stops(JSON.stringify({ gib_second: 0 }), /vcpu_second must be a non-negative number/)
   stops(JSON.stringify({ ...containerPrices, gib_second: -1 }), /gib_second must be a non-negative number/)
   stops(JSON.stringify({ ...containerPrices, vcpu_second: '1' }), /vcpu_second must be a non-negative number/)
-  stops(JSON.stringify({ ...containerPrices, vcpu_second: 1e999 }), /vcpu_second must be a non-negative number/)
+  stops('{"vcpu_second": 1e999, "gib_second": 0}', /vcpu_second must be a non-negative number/)
   stops(JSON.stringify({ ...containerPrices, instances: [] }), /instances must be an object/)
   stops(JSON.stringify({ ...containerPrices, instances: { big: 1 } }), /instances\.big must be an object/)
   stops(JSON.stringify({ ...containerPrices, instances: { big: { vcpu_second: 1, gib_second: 1, disk: 1 } } }), /instances\.big\.disk is not a known key/)

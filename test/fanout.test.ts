@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import type { RepoConfig } from '../src/core/checks.ts'
 import {
@@ -8,6 +11,7 @@ import {
   recordUnitResult,
   runUnits,
   slotName,
+  treeInputs,
   unitConflicts,
   unitInputs,
   unitsFiles,
@@ -20,6 +24,7 @@ import { PlannedStop } from '../src/core/planned-stop.ts'
 import type { PlanUnit } from '../src/core/research-commands.ts'
 import type { ResearchConfig } from '../src/core/research.ts'
 import { computeOf } from '../src/core/usage.ts'
+import { diskFileSystem } from '../src/node/disk.ts'
 import { memoryArtifacts } from './support/artifacts.ts'
 
 const research: ResearchConfig = {
@@ -315,6 +320,71 @@ test('fanout: a resume ends the compute entry at the end time of the job, not at
   const [result] = await runUnits([unit('u1')], options)
   assert.equal(result?.status, 'done')
   assert.deepEqual(computeOf(ledger).map((row) => row.seconds), [2])
+})
+
+test('fanout: a lost job ends its compute entry at the last poll that saw it run', async () => {
+  const { boxes } = fakeBoxes({})
+  const ledger = memoryLedger()
+  let polls = 0
+  let kept: number | undefined
+  // The job runs for 90 polls. Then the host is down for one hour, and the next poll finds no job.
+  const losing: ScanBoxes = {
+    ...boxes,
+    maxUnitMs: 600_000,
+    async poll(slot) {
+      if (slot !== 'run-1/lane_0') return boxes.poll(slot)
+      polls += 1
+      if (polls <= 90) return { state: 'running' }
+      kept = ledger.get<{ seenAt?: number }[]>(`attempts.unit.c0ffee.${'a'.repeat(64)}.u1`)?.[0]?.seenAt
+      clock.now += 3_600_000
+      return { state: 'missing' }
+    },
+  }
+  const { options, clock } = fanOut(losing, ledger)
+  const start = clock.now
+  const [result] = await runUnits([{ ...unit('u1'), expected_seconds: 100 }], options)
+  assert.equal(result?.status, 'done')
+  assert.equal(computeOf(ledger)[0]?.seconds, 89)
+  // The ledger keeps the last running poll at most once a minute, for a resume.
+  assert.equal(kept, start + 60_000)
+})
+
+test('fanout: unit inputs give a symlink to a commit file as its bytes, and refuse other symlinks', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'factory-fanout-'))
+  mkdirSync(join(root, 'research'))
+  mkdirSync(join(root, 'sub'))
+  writeFileSync(join(root, 'a.txt'), 'a')
+  writeFileSync(join(root, 'research/holdout.json'), '[]')
+  symlinkSync('a.txt', join(root, 'b.txt'))
+  symlinkSync('../b.txt', join(root, 'sub/c.txt'))
+  symlinkSync('research/holdout.json', join(root, 'holdout-link'))
+  const files = await treeInputs(diskFileSystem(root), ['research/holdout.json'])
+  assert.deepEqual(
+    files.map((file) => [file.path, new TextDecoder().decode(file.data)]).sort(),
+    [['a.txt', 'a'], ['b.txt', 'a'], ['sub/c.txt', 'a']],
+  )
+  symlinkSync('sub', join(root, 'data'))
+  await assert.rejects(treeInputs(diskFileSystem(root), ['research/holdout.json']), /the symlink data,/)
+})
+
+test('fanout: fetched data replaces symlink aliases for each unit without changing the commit inputs', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'factory-fanout-'))
+  mkdirSync(join(root, 'sub'))
+  writeFileSync(join(root, 'a.csv'), 'old')
+  symlinkSync('a.csv', join(root, 'b.csv'))
+  symlinkSync('../b.csv', join(root, 'sub/c.csv'))
+  const files = await treeInputs(diskFileSystem(root), [])
+  const artifacts = memoryArtifacts()
+  const put = (text: string) => artifacts.put(bytes(text), { source: { command: 'nb fetch' }, media_type: 'application/octet-stream' })
+  const inputs = unitInputs(async () => files, {
+    a: { 'a.csv': await put('new') },
+    b: { 'b.csv': await put('alias') },
+  }, artifacts)
+  const contents = async (targets: string[]) =>
+    (await inputs(unit('u1', targets))).map((file) => [file.path, new TextDecoder().decode(file.data)]).sort()
+  assert.deepEqual(await contents(['a']), [['a.csv', 'new'], ['b.csv', 'new'], ['sub/c.csv', 'new']])
+  assert.deepEqual(await contents(['a', 'b']), [['a.csv', 'new'], ['b.csv', 'alias'], ['sub/c.csv', 'alias']])
+  assert.deepEqual(await contents([]), [['a.csv', 'old'], ['b.csv', 'old'], ['sub/c.csv', 'old']])
 })
 
 test('fanout: a planned stop keeps the compute entry of the attempt open', async () => {

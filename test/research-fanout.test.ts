@@ -7,14 +7,17 @@ import type { ScanBoxes } from '../src/core/fanout.ts'
 import type { Ledger } from '../src/core/ledger.ts'
 import { runDomainCommand } from '../src/core/research-commands.ts'
 import { StopError } from '../src/core/stop.ts'
-import { memoryChannel } from './support/fixture.ts'
-import { fanOutConfig, notebook, researchInput, researchScript, runResearch } from './support/research.ts'
+import { research } from '../src/core/workflows/research.ts'
+import { nodeResearch } from '../src/node/platform.ts'
+import { fakePulls } from './support/develop.ts'
+import { credentials, memoryChannel, module } from './support/fixture.ts'
+import { archive, fanOutConfig, notebook, prices, researchInput, researchScript, runResearch } from './support/research.ts'
 import { scriptedDispatch, type Turn } from './support/scripted-model.ts'
 
 const runsDir = () => mkdtempSync(join(tmpdir(), 'factory-fanout-runs-'))
 const config = { checks: { smoke: 'true' }, research: fanOutConfig }
 
-type Round = { head: string; pass: boolean; outputs: Record<string, string>; fanout?: { retries: number; failed: string[]; units: { id: string; attempts: number }[] } }
+type Round = { head: string; pass: boolean; outputs: Record<string, string>; fanout?: { retries: number; units: { id: string; status: string; attempts: number }[] } }
 
 /** The local scan boxes, but the first poll of the first attempt of inject-2 kills the job and tells that the box lost it. */
 function losing(local: ScanBoxes): ScanBoxes {
@@ -55,7 +58,7 @@ test('research fan-out: a lost unit starts again, and merge gives the hashes of 
   assert.match(cap?.why ?? '', /The compute cost is unknown until stage 6 runs plan\./)
   const rounds = calibrations(deps.ledger)
   assert.equal(rounds[0]?.fanout?.retries, 1)
-  assert.deepEqual(rounds[0]?.fanout?.failed, [])
+  assert.deepEqual(rounds[0]?.fanout?.units.filter((unit) => unit.status === 'failed'), [])
   assert.deepEqual(rounds[0]?.fanout?.units.map((unit) => [unit.id, unit.attempts]), [['known', 1], ['inject-1', 1], ['inject-2', 2]])
   const final = rounds.at(-1)
   assert.equal(final?.pass, true)
@@ -81,4 +84,49 @@ test('research fan-out: a budget without CONTAINER_PRICES stops before any work'
     (error) => error instanceof StopError && /CONTAINER_PRICES is not set/.test(error.message),
   )
   assert.equal(turns.length, 0)
+})
+
+test('research fan-out: a plan that runs again on a new copy adds its seconds to the compute meter', { timeout: 300_000 }, async () => {
+  const { repo, base } = notebook({ config })
+  const runs = runsDir()
+  const input = researchInput(base, 'f3')
+  const { channel } = memoryChannel({ pick: '/answer\nQ1: a' })
+  const deps = await nodeResearch({
+    channel,
+    credentials,
+    dispatch: scriptedDispatch(researchScript(), []),
+    env: { ARCHIVE_TOKEN: 'token-1' },
+    fetch: archive().fetch,
+    input,
+    log: () => {},
+    module,
+    prices,
+    pulls: fakePulls().pulls,
+    repo,
+    reviewChannel: async () => memoryChannel().channel,
+    runsDir: runs,
+  })
+  // The first fetch stops the call after plan finished, so the plan step is not recorded and runs again on resume.
+  let stopped = false
+  const cleanBox = deps.cleanBox
+  deps.cleanBox = async (commit, key, files) => {
+    const box = await cleanBox(commit, key, files)
+    return {
+      ...box,
+      async run(command, options) {
+        if (!stopped && command.includes(' fetch ')) {
+          stopped = true
+          throw new Error('interrupted after plan')
+        }
+        return box.run(command, options)
+      },
+    }
+  }
+  await assert.rejects(research(input, deps), /interrupted after plan/)
+  const { result, deps: resumed } = await runResearch(repo, runs, input, { channel, dispatch: scriptedDispatch(researchScript(), []) })
+  assert.equal(result.status, 'ready', result.report)
+  const entries = Object.values(resumed.ledger.get<{ entries: Record<string, { step: string; endedAt?: number }> }>('compute')?.entries ?? {})
+  const plans = entries.filter((entry) => entry.step === 'calibrate.hyp-001.1.plan')
+  assert.equal(plans.length, 2)
+  assert.ok(plans.every((entry) => entry.endedAt !== undefined))
 })
