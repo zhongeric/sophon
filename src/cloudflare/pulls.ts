@@ -1,4 +1,4 @@
-import { readCi } from '../core/ci.ts'
+import { failureExcerpt, readCi } from '../core/ci.ts'
 import { mergePull } from '../core/merge.ts'
 import type { PullRequests } from '../core/platform.ts'
 import { GitHubError, type GitHub } from './github.ts'
@@ -39,7 +39,7 @@ export function githubPulls(gh: GitHub, owner: string, repo: string, baseRef: st
       const { jobs } = await gh.json<{ jobs: Job[] }>('GET', `${api}/actions/runs/${job.run}/jobs?per_page=100`)
       const logs: string[] = []
       for (const failed of jobs.filter((entry) => entry.conclusion === 'failure'))
-        logs.push(`### ${failed.name}\n${(await (await gh.raw(`${api}/actions/jobs/${failed.id}/logs`, 'application/vnd.github+json')).text()).slice(-logTailChars)}`)
+        logs.push(`### ${failed.name}\n${failureExcerpt(await (await gh.raw(`${api}/actions/jobs/${failed.id}/logs`, 'application/vnd.github+json')).text(), logTailChars)}`)
       return logs.join('\n\n') || `No failed job log: see ${job.url}`
     },
     async rerunFailedJobs(run) {

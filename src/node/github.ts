@@ -1,4 +1,4 @@
-import { readCi } from '../core/ci.ts'
+import { failureExcerpt, readCi } from '../core/ci.ts'
 import { mergePull } from '../core/merge.ts'
 import type { PullRequests } from '../core/platform.ts'
 import { gh } from './channels.ts'
@@ -37,7 +37,7 @@ export function ghPullRequests(repo: string, baseRef: string): PullRequests {
     async failureLog(job) {
       if (job.run === null) return `No log: see ${job.url}`
       try {
-        return (await run(['run', 'view', String(job.run), '--log-failed'])).slice(-logTailChars)
+        return failureExcerpt(await run(['run', 'view', String(job.run), '--log-failed']), logTailChars)
       } catch (error) {
         // The run can still go on, the log can be expired, or the failed check can have no step log.
         return `No log: see ${job.url} (${error instanceof Error ? error.message : String(error)})`.slice(0, logTailChars)
