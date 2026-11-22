@@ -264,11 +264,29 @@ export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine)
     if (hasCi(config)) results.push(...(await ci(changed)))
     return results
   }
+  // Each command comes from the config by the name of its result, never from a recorded command.
+  const rerun: NonNullable<Checker['rerun']> = async (name, changed) => {
+    // A failed setup stopped the checks before they ran, so its rerun runs all final checks.
+    if (name === 'setup') return checks(changed)
+    const each = config.tests?.command.includes('{tests}') === false
+    const check = Object.hasOwn(config.checks, name) ? config.checks[name] : undefined
+    const ciKey = name.slice('ci '.length)
+    const ciCheck = name.startsWith('ci ') && config.ci && Object.hasOwn(config.ci, ciKey) ? config.ci[ciKey] : undefined
+    const known = check !== undefined || ciCheck !== undefined || (name === 'tests' && config.tests && !each) || (name.startsWith('test ') && each)
+    if (!known) return []
+    const failed = await setup()
+    if (failed) return [failed]
+    if (check !== undefined) return runNamed({ [name]: check }, changed, '')
+    if (ciCheck !== undefined) return runNamed({ [ciKey]: ciCheck }, changed, 'ci ')
+    if (name === 'tests') return runTests(await targetedTests(repo, config, changed))
+    return runTests([name.slice('test '.length)])
+  }
   return {
     checks,
     tests: config.tests ? runTests : null,
     agentChecks: (changed) => checks(changed, { tests: false }),
     ...(hasCi(config) ? { ci } : {}),
+    rerun,
   }
 }
 
@@ -310,6 +328,12 @@ export const runChecksTool = (files: string, more = ''): Contracts.HostTool => (
 /** The result of run_checks for an agent: each status and the end of its output. */
 export const checkTails = (results: CheckResult[]) =>
   results.map(({ name, status, exit_code, output }) => ({ name, status, exit_code, output: output.slice(-checkOutputTailChars) }))
+
+/** A failed check with the end of its output, cut as the refusal of a submit cuts it. */
+export type FailedFinalCheck = { name: string; command: string; output: string }
+
+export const failedChecks = (results: CheckResult[]): FailedFinalCheck[] =>
+  results.filter((result) => result.status === 'fail').map(({ name, command, output }) => ({ name, command, output: output.slice(-checkOutputTailChars) }))
 
 /** The failed checks or tests in the refusal of a submit: the name, the exit code and the end of the output of each. */
 export const failureText = (failed: CheckResult[]): string[] =>

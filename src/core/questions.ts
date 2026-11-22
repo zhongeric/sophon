@@ -264,9 +264,10 @@ export type Comments = {
 /**
  * Questions as a PR comment. Only later, unedited replies from `answerers` count, because answers reach
  * the patch agents and the gate. `waitMs` keeps polling before the run pauses.
- * The first line mentions each answerer that is not a bot, so that GitHub notifies them.
+ * The first line mentions each answerer that is not a bot, so that GitHub notifies them. With `notice`, a notice goes
+ * there instead of into a new comment, for example into the status comment of a Cloudflare run (D21).
  */
-export function commentChannel(options: { comments: Comments; answerers: string[]; waitMs: number; pollMs: number }): Channel {
+export function commentChannel(options: { comments: Comments; answerers: string[]; waitMs: number; pollMs: number; notice?: (text: string) => Promise<void> }): Channel {
   const answerers = new Set(options.answerers.map((login) => login.toLowerCase()))
   const read = async (posted: Posted, questions: Question[]) => {
     const replies = (await options.comments.list()).filter(
@@ -301,7 +302,8 @@ export function commentChannel(options: { comments: Comments; answerers: string[
     where: (posted) => posted.ref,
     // A notice needs no answer, so it has no questions marker and no mentions.
     async notice(_runId, text) {
-      await options.comments.post(text)
+      if (options.notice) await options.notice(text)
+      else await options.comments.post(text)
     },
   }
 }

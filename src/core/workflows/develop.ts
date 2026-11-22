@@ -1,11 +1,11 @@
 import type { Contracts } from 'nanocode-ts'
 import type { CiJob } from '../ci.ts'
-import type { MergeMethod, RepoConfig } from '../checks.ts'
+import type { FailedFinalCheck, MergeMethod, RepoConfig } from '../checks.ts'
 import { build, intake, plan, writeSpec, type BuildLog, type DevelopContext } from '../develop-steps.ts'
 import { step, type Ledger } from '../ledger.ts'
 import { alarmLines, settleAll } from '../planned-stop.ts'
 import { frozenAsk, renderPlan, route, routeQuestions, waves, type Intake, type Plan, type PlanTask, type Route } from '../plan.ts'
-import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeRefusal, PullRequests, Signing } from '../platform.ts'
+import type { AgentStore, Branch, Branches, Checker, Files, Guides, MergeRefusal, PullRequests, RerunStart, Signing } from '../platform.ts'
 import { forbiddenPaths, presentProfiles, profilesById } from '../profiles.ts'
 import { branchesSection, pruneBranches, reasonOf, type BranchFacts, type BranchRun, type PruneResult } from '../prune.ts'
 import type { Credentials, Provider } from '../providers.ts'
@@ -108,14 +108,20 @@ const clockSkewMs = 30_000
 const defaultParallel = 3
 
 type Ci = { sha: string; state: 'pass' | 'fail' | 'none'; jobs: CiJob[]; failures: string }
-/** A review pass. Records of older runs have no usage, which counts as zero, and no failed criteria. */
-type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage; failed?: Criterion[] }
+/** A review pass. Records of older runs have no usage, which counts as zero, and no failed criteria or failed checks. */
+type Review = { pass: boolean; head: string; final: string; branch: string; report: string; usage?: RunUsage; failed?: Criterion[]; failedChecks?: FailedFinalCheck[] }
 /**
  * The cause of a repair round. `from` is 'CI' or 'review pass N', `short` is one line for the prompt and the report,
  * `text` is /review/repair.txt, `logs` is /review/ci-failure.txt when CI failed, and `report` is
- * /review/review-report.md when a review pass failed. `conflicts` are the files that conflict in a base merge.
+ * /review/review-report.md when a review pass failed. `checks` is /review/check-failure.txt when final checks of a
+ * review pass failed. `conflicts` are the files that conflict in a base merge. `rerunnable` holds the failed checks
+ * that a rerun can pass.
  */
-type Cause = { from: string; short: string; text: string; logs: string | null; report: string | null; conflicts?: string[] }
+type Cause = { from: string; short: string; text: string; logs: string | null; report: string | null; checks: string | null; conflicts?: string[]; rerunnable?: Rerunnable }
+/** The failed checks of a cause on the head `head` (D14): a red CI, or the failed final checks of review pass `pass`. */
+type Rerunnable = { head: string; ci: Ci } | { head: string; pass: number; review: Review }
+/** A rerun of a failed CI job or final check on a head (D14). */
+type Rerun = { check: string; head: string; result: 'flaky' | 'failed' | 'refused'; reason?: string }
 type Repair = { round: number; cause: Cause; log: BuildLog }
 type BasePoint = 'ready' | 'merge'
 /** The result of a base merge, and `change`: the paths of the change before it, from the merge base to the head. */
@@ -171,7 +177,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   const { ledger, branches, pulls } = deps
   const models = input.models.develop
   // What the report shows. Each stage fills its part.
-  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, signing: null, head: null, pr: null, built: [], repairs: [], cis: [], reviews: [], stoppedReview: null, baseMerges: [], mergeTries: [] }
+  const state: ReportState = { input, intake: null, route: null, plan: null, branch: null, signing: null, head: null, pr: null, built: [], repairs: [], cis: [], reviews: [], stoppedReview: null, baseMerges: [], mergeTries: [], reruns: [] }
   const spentPasses = () => [...state.reviews, ...(state.stoppedReview ? [state.stoppedReview] : [])]
   // A hotfix, or the standing answers of the repository, takes every recommendation (D11).
   const recommend = input.hotfix === true || input.config.questions === 'recommended'
@@ -356,8 +362,8 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     state.head = sha
     return sha
   }
-  const waitCi = async (name: string, sha: string): Promise<Ci> => {
-    const result = await watchCi(ledger, pulls, deps.ci, name, sha)
+  const waitCi = async (name: string, sha: string, after?: Map<number, number>): Promise<Ci> => {
+    const result = await watchCi(ledger, pulls, deps.ci, name, sha, after)
     state.cis.push(result)
     return result
   }
@@ -381,7 +387,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         const remaining = limit === undefined ? {} : { budget: 2 * limit - budget.spent() + (state.stoppedReview?.usage?.usd ?? 0) }
         const loop = await deps.review({ runId: `${input.runId}-review-${pass}`, ask: frozen, head: at, base, branch: branchName, full: input.full === true, pr: state.pr!.number, ...remaining })
         const failed = loop.criteria.filter((criterion) => !criterion.ok)
-        const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage, failed }
+        const result: Review = { pass: loop.pass, head: at, final: loop.final, branch: loop.branch, report: loop.report, usage: loop.usage, failed, failedChecks: loop.failedChecks }
         if (!loop.stopped) return result
         ledger.put(stoppedKey, result)
         state.stoppedReview = result
@@ -395,7 +401,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
   }
 
   // The repair loop (D14, G6). CI failures and failed review passes share one repair budget. CI runs after each round,
-  // and no review pass runs while CI is red.
+  // and no review pass runs while CI is red. Before a round and after a blocked fixer, the failed checks run again one time.
   // The fixes of a repair always go through a new review pass. All control comes from ledger steps, so a resumed run
   // replays the loop and repeats no round.
   // A ledger from before D14 has review passes after its CI-fix rounds. The repair rounds make new commits that those
@@ -436,6 +442,7 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
           '/plan.md': planText,
           '/repair.txt': cause.text,
           ...(cause.logs === null ? {} : { '/ci-failure.txt': cause.logs }),
+          ...(cause.checks === null ? {} : { '/check-failure.txt': cause.checks }),
           ...(cause.report === null ? {} : { '/review-report.md': cause.report }),
         },
         prompt: repairPrompt(round, cause),
@@ -446,13 +453,94 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
     return log
   }
 
+  // The checks that ran again, as keys of the check and the head: at most one rerun for each (D14). A resumed run
+  // replays the same rerun steps in the same order, so it fills the same keys and sends no request again.
+  const reran = new Set<string>()
+  // A red CI of Actions runs only, without a rerun on its commit: one rerun request for each failed run, then the CI of
+  // a newer attempt of each started run. It replaces `ci` and gives true, or gives false when no run started.
+  const rerunCi = async (): Promise<boolean> => {
+    const sha = ci.sha
+    const failed = ci.jobs.filter((job) => !job.ok)
+    const runs = failed.flatMap((job) => (job.run === null ? [] : [{ job, run: job.run }]))
+    // A failed commit status has no run, so it cannot pass on a rerun.
+    if (runs.length < failed.length || runs.some(({ run }) => reran.has(`run ${run}@${sha}`))) return false
+    const started: typeof runs = []
+    for (const entry of runs) {
+      reran.add(`run ${entry.run}@${sha}`)
+      // The host records the request before it sends it. After a lost response, a resume reads the attempt of the run
+      // and sends no second request.
+      const sent = `rerun-sent:${entry.run}@${sha}`
+      const start = await step(ledger, `rerun.run.${entry.run}.${sha}`, async (): Promise<RerunStart> => {
+        if (!ledger.get(sent)) {
+          ledger.put(sent, true)
+          return pulls.rerunFailedJobs(entry.run)
+        }
+        const jobs = await pulls.ci(sha)
+        return jobs.some((job) => job.run === entry.run && (job.attempt ?? 1) > (entry.job.attempt ?? 1))
+          ? { started: true }
+          : { started: false, reason: 'the request got no response, and the run has no new attempt' }
+      })
+      if (start.started) started.push(entry)
+      else state.reruns.push({ check: entry.job.name, head: sha, result: 'refused', reason: start.reason })
+    }
+    if (started.length === 0) return false
+    ci = await waitCi(`ci.rerun.${sha}`, sha, new Map(started.map(({ job, run }) => [run, job.attempt ?? 1])))
+    for (const { job, run } of started) state.reruns.push({ check: job.name, head: sha, result: ci.jobs.some((now) => now.run === run && now.ok) ? 'flaky' : 'failed' })
+    return true
+  }
+  // The failed final checks of a review pass without a rerun on `at`: each runs again one time on the development
+  // branch. It gives the review without the flaky checks, or null when no check ran again.
+  const rerunChecks = async (review: Review, at: string): Promise<Review | null> => {
+    const checks = (review.failedChecks ?? []).filter((check) => !reran.has(`check ${check.name}@${at}`))
+    const again = deps.checker(dev).rerun
+    if (checks.length === 0 || !again) return null
+    const flaky: string[] = []
+    for (const { name } of checks) {
+      reran.add(`check ${name}@${at}`)
+      const result = await step(ledger, `rerun.check.${name}.${at}`, async (): Promise<Rerun['result']> => {
+        const results = await again(name, await dev.changedFiles(mergeBase, at))
+        return results.length > 0 && results.every((result) => result.status !== 'fail') ? 'flaky' : 'failed'
+      })
+      state.reruns.push({ check: name, head: at, result })
+      if (result === 'flaky') flaky.push(name)
+    }
+    return withoutChecks(review, flaky)
+  }
+  // After a blocked fixer that left the local head `before` of the round as it was, the failed checks of the cause without
+  // a rerun run again one time. It gives undefined when the run ends blocked, null when no cause remains, or the cause
+  // without the flaky checks. The step records the state of the head, because a later step can move it before a resume.
+  const afterBlock = async (cause: Cause, round: number, before: string): Promise<Cause | null | undefined> => {
+    const source = cause.rerunnable
+    if (!source) return undefined
+    const untouched = await step(ledger, `blocked.${round}`, async () => {
+      const pending = await dev.pending()
+      return (await dev.head()) === before && pending.changed.length === 0 && pending.removed.length === 0
+    })
+    if (!untouched) return undefined
+    // `ci` is still the CI of the cause, because nothing changed the head.
+    if ('ci' in source) return (await rerunCi()) && ci.state === 'pass' ? null : undefined
+    const rest = await rerunChecks(source.review, source.head)
+    if (!rest || (rest.failedChecks ?? []).length > 0) return undefined
+    if (!rest.pass) return reviewCause(source.pass, rest, source.head)
+    state.reviews[source.pass - 1] = rest
+    return null
+  }
+
   // Runs until CI and the review passes hold on the head, or the budget is used. It returns the end of a blocked run.
   const repairLoop = async (): Promise<DevelopResult | null> => {
+    // The cause that a rerun after a blocked fixer leaves for the next round.
+    let carried: Cause | null = null
     for (;;) {
       if (ci.state === 'none') return finish('blocked', [], noCi(ci.sha), true)
       let cause: Cause
-      if (ci.state === 'fail') cause = ciCause(ci)
-      else if (state.reviews.length < routed.passes || state.reviews.at(-1)?.pass !== true || unreviewed !== null) {
+      if (carried) {
+        cause = carried
+        carried = null
+      } else if (ci.state === 'fail') {
+        // The rerun comes before the check of the budget, so a flaky job uses no round.
+        if (await rerunCi()) continue
+        cause = ciCause(ci)
+      } else if (state.reviews.length < routed.passes || state.reviews.at(-1)?.pass !== true || unreviewed !== null) {
         const pass = state.reviews.length + 1
         const review = await reviewPass(pass, head, mergeBase)
         unreviewed = null
@@ -464,7 +552,13 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
           head = await publish(`review.${pass}`)
         }
         if (review.pass) continue
-        cause = reviewCause(pass, review)
+        // When only checks failed, they run again first. When they pass, the pass counts as passed.
+        const rest = onlyChecks(review) ? await rerunChecks(review, head) : null
+        if (rest?.pass) {
+          state.reviews[pass - 1] = rest
+          continue
+        }
+        cause = reviewCause(pass, rest ?? review, head)
       } else if (ci.sha !== head) {
         // 7 and 8. CI on the head after the last PASS.
         ci = await waitCi(`ci.final.${state.reviews.length}`, head)
@@ -474,8 +568,15 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
         unrepaired = cause
         return null
       }
+      // The local head before the round. On the Worker, the pushed head of the cause is another SHA.
+      const before = await step(ledger, `local-head.repair.${state.repairs.length + 1}`, () => dev.head())
       const log = await repair(cause)
-      if (log.blocked.trim()) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
+      if (log.blocked.trim()) {
+        const rest = await afterBlock(cause, state.repairs.length, before)
+        if (rest === undefined) return finish('blocked', [], `The repair is blocked: ${log.blocked}`)
+        carried = rest
+        continue
+      }
       head = await publish(`repair.${state.repairs.length}`)
       unreviewed = 'a repair after the last pass'
       ci = await waitCi(`ci.repair.${state.repairs.length}`, head)
@@ -647,9 +748,10 @@ async function developSteps(input: DevelopInput, deps: DevelopDeps, stop: { fini
  * Waits for the CI of a commit. A commit can already have CI from another branch, for example the review loop's
  * branch, while the runs of the push to the run's branch and of the PR have not started yet. So the host waits for
  * a job that started after the push, and takes the older jobs alone only after a grace period. A result without CI
- * is not recorded, so a resumed run looks again.
+ * is not recorded, so a resumed run looks again. After a rerun, `after` gives the failed attempt of each run that ran
+ * again, and only a newer attempt of each counts. The push does not apply then.
  */
-async function watchCi(ledger: Ledger, pulls: PullRequests, timing: DevelopDeps['ci'], name: string, sha: string): Promise<Ci> {
+async function watchCi(ledger: Ledger, pulls: PullRequests, timing: DevelopDeps['ci'], name: string, sha: string, after?: Map<number, number>): Promise<Ci> {
   const recorded = ledger.get<Ci>(`ci:${name}`)
   if (recorded) return recorded
   const startedKey = `ci-started:${sha}`
@@ -660,7 +762,10 @@ async function watchCi(ledger: Ledger, pulls: PullRequests, timing: DevelopDeps[
   for (;;) {
     const jobs = await pulls.ci(sha)
     const fresh = jobs.some((job) => Date.parse(job.created) >= pushedAt - clockSkewMs)
-    if (jobs.length > 0 && jobs.every((job) => job.done) && (fresh || Date.now() - pushedAt >= ciGraceMs)) {
+    const ready = after
+      ? [...after].every(([run, attempt]) => jobs.some((job) => job.run === run && (job.attempt ?? 1) > attempt))
+      : fresh || Date.now() - pushedAt >= ciGraceMs
+    if (jobs.length > 0 && jobs.every((job) => job.done) && ready) {
       const failed = jobs.filter((job) => !job.ok)
       const logs = await Promise.all(failed.map(async (job) => `## ${job.name}\n${job.url}\n\n${await pulls.failureLog(job)}`))
       const ci: Ci = { sha, state: failed.length > 0 ? 'fail' : 'pass', jobs, failures: logs.join('\n\n') }
@@ -698,6 +803,7 @@ function repairPrompt(round: number, cause: Cause): string {
     '- The causes: /review/repair.txt',
     ...(cause.conflicts ? [`- The files that conflict: ${cause.conflicts.join(', ')}. The merge of the base is in progress in /repo.`] : []),
     ...(cause.logs === null ? [] : ['- The CI logs: /review/ci-failure.txt']),
+    ...(cause.checks === null ? [] : ['- The output of the failed checks: /review/check-failure.txt']),
     ...(cause.report === null ? [] : ['- The report of the review pass, with the findings that the patch agents skipped: /review/review-report.md']),
     '- The plan: /review/plan.md',
     '- The ask: /review/ask.md',
@@ -717,6 +823,7 @@ function mergeCause(base: string, conflicts: string[]): Cause {
     text: [`# The merge of the base ${at} has conflicts`, '', ...conflicts.map((path) => `- ${path}`), '', 'The merge is in progress. Your checkpoint commits it.', ''].join('\n'),
     logs: null,
     report: null,
+    checks: null,
     conflicts,
   }
 }
@@ -733,15 +840,19 @@ function ciCause(ci: Ci): Cause {
     text: [`# CI failed on ${at}`, '', ...failed.map((job) => `- ${job.name}: ${job.url}`), '', 'The logs: /review/ci-failure.txt', ''].join('\n'),
     logs: ci.failures,
     report: null,
+    checks: null,
+    rerunnable: { head: ci.sha, ci },
   }
 }
 
 /**
  * A failed review pass as a repair cause: its failed criteria, with the intent gaps and the refused rejections in their
- * details. The report of the pass gives the skipped findings with their reasons and the checks.
+ * details. The report of the pass gives the skipped findings with their reasons and the checks. Each failed final check
+ * goes to /review/check-failure.txt with its command and the end of its output. `head` is the head of the checks.
  */
-function reviewCause(pass: number, review: Review): Cause {
+function reviewCause(pass: number, review: Review, head: string): Cause {
   const failed = review.failed ?? []
+  const checks = review.failedChecks ?? []
   return {
     from: `review pass ${pass}`,
     short: failed.length > 0 ? `failed: ${failed.map((criterion) => criterion.name).join(', ')}` : 'FAIL',
@@ -750,10 +861,29 @@ function reviewCause(pass: number, review: Review): Cause {
       '',
       ...(failed.length > 0 ? failed.map((criterion) => `- ${criterion.name}: ${criterion.detail}`) : ['- The record of the pass has no failed criteria.']),
       '',
+      ...(checks.length > 0 ? ['The output of the failed checks: /review/check-failure.txt', ''] : []),
     ].join('\n'),
     logs: null,
     report: review.report,
+    checks: checks.length > 0 ? checks.map((check) => `--- ${check.name}: ${check.command} ---\n${check.output}\n`).join('\n') : null,
+    rerunnable: { head, pass, review },
   }
+}
+
+/** The name of the criterion of the final checks in the review loop. */
+const checksGreen = 'Checks green'
+
+/** True when the final checks are the only failed criterion of a review pass. */
+const onlyChecks = (review: Review) => (review.failed ?? []).length > 0 && (review.failed ?? []).every((criterion) => criterion.name === checksGreen)
+
+/** A review pass without the `flaky` checks. When no failed criterion remains, the pass counts as passed (D14). */
+function withoutChecks(review: Review, flaky: string[]): Review {
+  const checks = (review.failedChecks ?? []).filter((check) => !flaky.includes(check.name))
+  const failed = (review.failed ?? []).flatMap((criterion) =>
+    criterion.name !== checksGreen ? [criterion] : checks.length > 0 ? [{ ...criterion, detail: `failed: ${checks.map((check) => check.name).join(', ')}` }] : [],
+  )
+  // A record of an older run has no failed criteria, so it never counts as passed here.
+  return { ...review, pass: review.failed !== undefined && failed.length === 0, failed, failedChecks: checks }
 }
 
 function renderTask(task: PlanTask, built: { task: PlanTask; log: BuildLog }[]): string {
@@ -844,12 +974,19 @@ type ReportState = {
   stoppedReview: Review | null
   baseMerges: BaseCheck[]
   mergeTries: RecordedMerge[]
+  reruns: Rerun[]
 }
 
 /** One row of the Usage section for a review pass, with the tokens and USD of all its agents. */
 function reviewRow(review: Review, index: number): UsageRow {
   const usage = review.usage ?? { tokens: zeroTokens(), usd: 0, unpriced: [] }
   return { step: `review.${index + 1}`, model: 'review loop', tokens: usage.tokens, usd: usage.usd, unpriced: usage.unpriced }
+}
+
+const rerunResults: Record<Rerun['result'], string> = { flaky: 'flaky', failed: 'failed again', refused: 'refused by GitHub' }
+
+function rerunLine(rerun: Rerun): string {
+  return `- ${rerun.check} on ${rerun.head.slice(0, 12)}: ${rerunResults[rerun.result]}${rerun.reason ? ` (${rerun.reason})` : ''}`
 }
 
 function renderReport(state: ReportState, status: DevelopStatus, criteria: Criterion[], note: string, answers: Answer[], usage: string[], branches: string[], alarms: string[]): string {
@@ -907,6 +1044,7 @@ function renderReport(state: ReportState, status: DevelopStatus, criteria: Crite
           '',
         ]
       : []),
+    ...(state.reruns.length > 0 ? ['## Reruns', '', ...state.reruns.map(rerunLine), ''] : []),
     ...(state.baseMerges.length > 0
       ? [
           '## Base merges',

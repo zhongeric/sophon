@@ -200,6 +200,10 @@ const maxTaskTurns = 4
 const outOfTime = (leftMs: number) =>
   `the alarm call of this run has ${Math.max(0, Math.round(leftMs / 1000))} s left, so this turn runs no more commands. Call submit_build_log now, with what is left to do in remaining. The host continues the task in a new turn of this session.`
 
+/** What is left when the end of the alarm call cut the tests or the ci commands of a submit. */
+const cutGate = (what: string) =>
+  `The end of the alarm call stopped ${what} of your submit before they finished. Call submit_build_log again at the start of this turn, so that the host runs them with the time of a new call.`
+
 /** The prompt of a turn that continues a task after the last turn ran out of time. */
 const continuePrompt = (remaining: string) =>
   [
@@ -216,7 +220,8 @@ const continuePrompt = (remaining: string) =>
  * The host refuses a checkpoint that breaks a static rule or adds a forbidden path.
  * The host refuses a completed log with uncommitted work, or when a targeted test or a ci command (D15) on the changes since `base` fails.
  * A blocked log can report uncommitted work, and runs no tests. When the alarm call has less than `minCommandMs` left, the
- * agent submits what is left in `remaining`, and the next turn continues the task (D12).
+ * agent submits what is left in `remaining`, and the next turn continues the task (D12). When the end of the call stops
+ * the tests or the ci commands of a submit, the host accepts the log with `remaining`, because the stop is not a failure.
  */
 export async function build(context: DevelopContext, task: BuildTask): Promise<BuildLog> {
   const { branch, checker } = task
@@ -308,11 +313,14 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       const refuse = (cause: string, failed: CheckResult[]) =>
         new Error([`${cause}. Fix the cause, checkpoint and submit again. When you cannot fix it, submit with the reason in blocked.`, ...failureText(failed)].join('\n'))
       const setupFailed = (failed: CheckResult[]) => failed.some(({ name }) => name === 'setup')
+      // A command with no exit code, when the call has no time left, is a stop at the end of the call (D12).
+      const cut = (failed: CheckResult[]) => shortTime() !== null && failed.some((result) => result.exit_code === null)
       const taskChanges = await branch.changedFiles(task.base, head)
       const runTests = checker.tests
       const tests = runTests ? await targetedTests(branch, context.config, taskChanges) : []
       if (runTests && tests.length > 0) {
         const failed = (await command(() => runTests(tests))).filter((result) => result.status !== 'pass')
+        if (cut(failed)) return { ...log, remaining: cutGate('the targeted tests') }
         if (failed.length > 0)
           throw refuse(setupFailed(failed) ? `the setup failed, so the targeted tests (${tests.join(', ')}) did not run` : `the targeted tests failed (${tests.join(', ')})`, failed)
       }
@@ -321,6 +329,7 @@ export async function build(context: DevelopContext, task: BuildTask): Promise<B
       // A skipped {files} command is not a failure.
       const failed = (await command(() => ci(taskChanges))).filter((result) => result.status === 'fail')
       if (failed.length === 0) return log
+      if (cut(failed)) return { ...log, remaining: cutGate('the ci commands') }
       throw refuse(setupFailed(failed) ? 'the setup failed, so the ci commands did not run' : `the ci commands failed (${failed.map(({ name }) => name).join(', ')})`, failed)
     }),
   })

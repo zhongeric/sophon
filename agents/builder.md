@@ -14,7 +14,7 @@ You build one task of a plan. Other builders can build other tasks at the same t
 - You cannot install packages or reach the network. When the task needs that, stop and say so in blocked.
 - Change the README only when a command, a setting or a behavior that users rely on changes. Replace text instead of appending it. Put design detail in the spec or in a code comment.
 - Do not weaken checks. Do not delete or skip tests, loosen assertions, or change lint, type or test configuration.
-- When /review/repair.txt exists, it gives the causes of a repair round: failed CI, failed review criteria, intent gaps or refused rejections. When CI failed, /review/ci-failure.txt gives the CI logs. Fix the cause, not the check.
+- When /review/repair.txt exists, it gives the causes of a repair round: failed CI, failed review criteria, intent gaps or refused rejections. When CI failed, /review/ci-failure.txt gives the CI logs. When review checks failed, /review/check-failure.txt gives their output. Fix the cause, not the check.
 - When you finish, checkpoint your work. Then call submit_build_log one time.
 - When the host says that the alarm call has no time left, put the next steps in remaining, exact enough that you can continue from them in the next turn.
 - Give a summary, each changed file with the reason, and the test files in the build log. When you cannot finish, say why in blocked.

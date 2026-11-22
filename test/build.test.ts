@@ -254,6 +254,39 @@ test('build: with less than a minute left in the call, the tools run no command,
   assert.match(second.request, /Build task add\./)
 })
 
+test('build: when the end of the call stops the targeted tests of a submit, the host accepts the log with remaining, and the next turn runs them again', { timeout: 60_000 }, async () => {
+  let left = 200_000
+  let runs = 0
+  // The first test run uses the rest of the call, and the box stops it at the end of the call.
+  const { machine } = fakeMachine(() => {
+    if (++runs > 1) return pass
+    left = 5_000
+    return { exit_code: null, output: 'ok 1 - add\n[host] killed after 195000 ms' }
+  })
+  const script: Script = (turn) => {
+    if (turn.output !== null) return { text: 'done' }
+    if (!/What is left:/.test(turn.request)) return { cell: [write, checkpoint, trySubmit].join('\n') }
+    left = 600_000
+    return { cell: trySubmit }
+  }
+  const { calls, host, result } = await buildWith({ cell: '', machine, script, timeLeft: () => left })
+
+  assert.match(host.ledger.get<{ remaining: string }>('output:build.add')?.remaining ?? '', /The end of the alarm call stopped the targeted tests/)
+  assert.deepEqual(calls.tests, [['test/add.test.ts'], ['test/add.test.ts']])
+  assert.equal(result.blocked, '')
+  assert.equal(result.remaining, undefined)
+})
+
+test('build: a test run with no exit code while the call has time is a failure, as before', { timeout: 60_000 }, async () => {
+  let runs = 0
+  const { machine } = fakeMachine(() => (++runs > 1 ? pass : { exit_code: null, output: '[host] killed after 1800000 ms' }))
+  const cell = [write, checkpoint, trySubmit, trySubmit].join('\n')
+  const { output, result } = await buildWith({ cell, machine, timeLeft: () => 600_000 })
+  assert.match(output, /submit refused: Error: the targeted tests failed/)
+  assert.match(output, /LOG ACCEPTED/)
+  assert.equal(result.remaining, undefined)
+})
+
 test('build: remaining is refused while the call has time, also on a platform without call limits', { timeout: 60_000 }, async () => {
   const { machine } = fakeMachine(() => pass)
   const cell = [write, checkpoint, `try { ${log('', 'more work')} } catch (error) { text('remaining refused: ' + error) }`, trySubmit].join('\n')

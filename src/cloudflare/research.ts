@@ -11,7 +11,7 @@ import { parseContainerPrices, parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
 import { cutReport } from '../core/workflows/develop.ts'
 import { defaultResearchModels, research, researchProviders, type ResearchInput, type ResearchModels } from '../core/workflows/research.ts'
-import { researchAnnouncement } from './announcements.ts'
+import { statusHeader } from './announcements.ts'
 import { sqlArtifacts } from './artifacts.ts'
 import { boxEnv, boxMachine, cleanBox, syncWithSetup } from './box.ts'
 import { commitTree, sqlBranches } from './branches.ts'
@@ -54,7 +54,7 @@ export class ResearchRuns extends Runs<ResearchRequest> {
   }
 
   protected announcement(run: string, request: ResearchRequest) {
-    return researchAnnouncement(run, request.by)
+    return statusHeader('research', run, request.by)
   }
 
   protected async execute(run: string, request: ResearchRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call) {
@@ -73,7 +73,7 @@ export class ResearchRuns extends Runs<ResearchRequest> {
     }
     const result = await research(input, {
       branches: sqlBranches({ gh, ledger, log, owner, repo, run, sql }),
-      channel: commentChannel({ answerers: answerersOf(this.env, config.answerers), comments, pollMs: 0, waitMs: 0 }),
+      channel: commentChannel({ answerers: answerersOf(this.env, config.answerers), comments, notice: call.notice, pollMs: 0, waitMs: 0 }),
       checker,
       // A new directory for each step key, so that no file of an earlier command is in it. Only the last one stays. A replay
       // of the step, for example after a pause on its job, keeps the directory of the key and its files.
@@ -115,7 +115,9 @@ export class ResearchRuns extends Runs<ResearchRequest> {
       scanBoxes: scanPool(this.env.SCAN_BOXES),
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
-    return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
+    // The user merges the dossier PR of a ready run (D21).
+    const needsUser = result.status !== 'ready' || result.pr !== null
+    return { needsUser, passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
   }
 
   protected async preflightNeeds(_request: ResearchRequest, ledger: Ledger): Promise<PreflightNeeds> {

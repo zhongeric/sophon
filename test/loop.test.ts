@@ -243,6 +243,7 @@ test('with ci and no tests, the host refuses a patch log while a ci command fail
   assert.match(result.report, /Step 1 patch: commit [0-9a-f]{12}; applied: bugs-001 \(sub returns a - b\); skipped: clean-001 \(inlining adds nothing\)$/m)
   // On Node, the final checks also run ci.
   assert.match(result.report, /ci sub/)
+  assert.deepEqual(result.failedChecks, [])
 })
 
 test('a patch agent that changed no files runs no ci', async () => {
@@ -253,6 +254,22 @@ test('a patch agent that changed no files runs no ci', async () => {
 
   assert.deepEqual(calls, [])
   assert.match(result.report, /Step 1 patch: no commit; applied: none; skipped: bugs-001 \(callers depend on the sum\); clean-001 \(inlining adds nothing\)$/m)
+})
+
+test('a ci command that fails in the final checks gives the failed check with the end of its output', async () => {
+  const repo = fixtureRepo()
+  const command = `node -e "console.log('START ' + 'filler '.repeat(1000)); console.log('the cause is at the end'); process.exit(1)"`
+  const input = await ciInput(repo, 'ci-final-fail', { long: command })
+  const result = await runLoop(repo, 'ci-final-fail', runsDir(), { input, dispatch: scriptedDispatch(scriptFor({ rejectBug: true, tests: false }), []) })
+
+  assert.equal(result.pass, false, result.report)
+  assert.deepEqual(result.criteria.find((criterion) => criterion.name === 'Checks green')?.detail, 'failed: ci long')
+  assert.deepEqual(result.failedChecks?.map(({ name, command }) => ({ name, command })), [{ name: 'ci long', command }])
+  const output = result.failedChecks?.[0]?.output ?? ''
+  assert.equal(output.length, 4_000)
+  assert.match(output, /the cause is at the end\n$/)
+  assert.doesNotMatch(output, /START/)
+  assert.deepEqual(fileLedger(join(result.dir, 'state.json')).get<{ failedChecks: unknown }>('result')?.failedChecks, result.failedChecks)
 })
 
 test('a failed setup at the ci gate accepts the log, and the report says that the tests did not run', async () => {
@@ -369,10 +386,22 @@ test('a resumed run whose fix branch the prune deleted returns its result withou
   const closed = (real: Repo): Repo => ({ ...real, pullState: async () => 'closed' })
   const first = await runLoop(repo, 'ended', dir, { dispatch: scriptedDispatch(scriptFor({ rejectBug: true, tests: true }), []), input, repo: closed })
   assert.equal(hasBranch(repo, 'factory/ended'), false)
+  assert.ok(first.failedChecks.length > 0)
 
   const turns: Turn[] = []
   const second = await runLoop(repo, 'ended', dir, { dispatch: scriptedDispatch(script, turns), input, repo: closed })
   assert.deepEqual(second, first)
+  assert.deepEqual(turns, [])
+
+  // An older ended record has no failedChecks field.
+  const ledger = fileLedger(join(first.dir, 'state.json'))
+  const recorded = ledger.get<Record<string, unknown>>('ended')
+  assert.ok(recorded)
+  const { failedChecks: _failedChecks, ...old } = recorded
+  ledger.put('ended', old)
+  const third = await runLoop(repo, 'ended', dir, { dispatch: scriptedDispatch(script, turns), input, repo: closed })
+  assert.deepEqual(third, { ...first, failedChecks: [] })
+  assert.deepEqual(third.failedChecks, [])
   assert.deepEqual(turns, [])
 })
 

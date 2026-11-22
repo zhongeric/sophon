@@ -51,7 +51,7 @@ function fixingReview(repo: string, files: Record<string, string>): ResearchDeps
     git('add', '-A')
     git('commit', '-q', '-m', 'review fix')
     const usage = { tokens: { input: 0, cached: 0, cache_write: 0, output: 0 }, usd: 0, unpriced: [] }
-    return { pass: true, criteria: [], branch, final: git('rev-parse', 'HEAD').trim(), report: '- Triage: full', usage, stopped: false }
+    return { pass: true, criteria: [], branch, final: git('rev-parse', 'HEAD').trim(), report: '- Triage: full', usage, stopped: false, failedChecks: [] }
   }
 }
 

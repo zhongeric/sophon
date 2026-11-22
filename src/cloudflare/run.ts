@@ -1,13 +1,13 @@
 import { Sql } from 'nanocode-ts/cloudflare'
 import module from 'nanocode-ts/nanocode_wasm.wasm'
-import { commandChecker, hasCi, type RepoConfig } from '../core/checks.ts'
+import { commandChecker, hasCi, type FailedFinalCheck, type RepoConfig } from '../core/checks.ts'
 import type { Ledger } from '../core/ledger.ts'
 import type { Checker } from '../core/platform.ts'
 import { commentChannel, commentLimit, type Comments } from '../core/questions.ts'
 import { StopError } from '../core/stop.ts'
 import { parsePrices, zeroTokens, type RunUsage } from '../core/usage.ts'
 import { allowedModelsFrom, codeReviewLoop, mergeModels, providersOf, type LoopInput, type LoopModels, type LoopResult } from '../core/workflows/code-review-loop.ts'
-import { reviewAnnouncement } from './announcements.ts'
+import { statusHeader } from './announcements.ts'
 import { boxMachine, syncWithSetup } from './box.ts'
 import { ciChecker, reviewChecker } from './checker.ts'
 import { baseConfig } from './config.ts'
@@ -43,7 +43,12 @@ export class PullRequestRuns extends Runs<StartRequest> {
   }
 
   protected announcement(run: string, request: StartRequest) {
-    return reviewAnnouncement(run, request.by)
+    return statusHeader('review', run, request.by)
+  }
+
+  /** A review that a development or research run started has the ask of its parent, and the parent reports to the user. */
+  protected override reportsToParent(request: StartRequest) {
+    return request.ask !== undefined
   }
 
   /** The result of a review run, with its fixes as a commit on GitHub, or what the run waits for. */
@@ -53,13 +58,14 @@ export class PullRequestRuns extends Runs<StartRequest> {
     if (row.state === 'error') return { error: row.note }
     if (row.state !== 'passed' && row.state !== 'failed') return { waiting: `review run ${run} is ${row.state}${row.note ? `: ${row.note}` : ''}` }
     const ledger = sqlLedger(this.ctx.storage.sql, run)
-    // A run that finished before the usage records has no usage and no stop at the budget.
-    const result = ledger.get<{ pass: boolean; criteria: LoopResult['criteria']; final: string; usage?: RunUsage; stopped?: boolean }>('result')!
+    // A run that finished before the usage records has no usage and no stop at the budget, and an older run has no failed checks.
+    const result = ledger.get<{ pass: boolean; criteria: LoopResult['criteria']; final: string; usage?: RunUsage; stopped?: boolean; failedChecks?: FailedFinalCheck[] }>('result')!
     const published = ledger.get<{ local: string; sha: string }>('published')
     const headSha = ledger.get<{ headSha: string }>('snapshot')!.headSha
     return {
       branch: `factory/${run}`,
       criteria: result.criteria,
+      failedChecks: result.failedChecks ?? [],
       final: published?.local === result.final ? published.sha : headSha,
       pass: result.pass,
       report: sqlFiles(this.ctx.storage.sql, run).read('report.md') ?? '',
@@ -94,7 +100,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
     const ci = ciChecker({ branch, gh, ledger, pull, repo, timeoutMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000 })
     const machine = input.config.tests || hasCi(input.config) ? await call.machine() : undefined
     const result = await codeReviewLoop(input, {
-      channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, pollMs: 0, waitMs: 0 }),
+      channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, notice: call.notice, pollMs: 0, waitMs: 0 }),
       checker: machine ? machineChecker(machine, run, repo, input.config, ci, log) : ci,
       credentials: credentialsFor(this.env, providersOf(input.models)),
       files: sqlFiles(this.ctx.storage.sql, run),
@@ -108,7 +114,7 @@ export class PullRequestRuns extends Runs<StartRequest> {
       signing: { apply: signing.apply, check: (branches) => signing.check([...branches, branch]) },
       store: { record: () => {}, scope: (agent) => `${run}/${agent}`, sql },
     })
-    return { passed: result.pass, summary: summary(run, result) }
+    return { needsUser: !this.reportsToParent(request) && !result.pass, passed: result.pass, summary: summary(run, result) }
   }
 
   /** The base config, when it is not recorded, says whether the run tests on the build container. A fork PR stops here. */

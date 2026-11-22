@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { developAnnouncement, reviewAnnouncement } from '../src/cloudflare/announcements.ts'
+import { statusHeader } from '../src/cloudflare/announcements.ts'
+import { renderStatus } from '../src/cloudflare/status.ts'
 import { renderPlan } from '../src/core/plan.ts'
 import { commentLimit, render, type Answer, type Question } from '../src/core/questions.ts'
 import { defaultModels } from '../src/core/workflows/code-review-loop.ts'
@@ -102,10 +103,11 @@ test('the question comment has the marker, one line about how to answer, then ev
   assert.ok(lines.includes('- a) up (recommended)') && lines.includes('- b) no'))
 })
 
-test('each start comment is one line', () => {
-  for (const text of [developAnnouncement('dev-5-1', 'maintainer'), reviewAnnouncement('pr-7-1', 'maintainer')]) {
+test('each status comment has a one-line header after its state that says where questions come', () => {
+  for (const text of [statusHeader('development', 'dev-5-1', 'maintainer'), statusHeader('review', 'pr-7-1', 'maintainer')]) {
     assert.doesNotMatch(text, /\n/)
     assert.doesNotMatch(text, /@/)
-    assert.match(text, /^agent-factory started (development|review) run `(dev-5-1|pr-7-1)` for `maintainer`\. .*`\/answer`/)
+    assert.match(text, /^agent-factory (development|review) run `(dev-5-1|pr-7-1)` for `maintainer`\. Questions come here\. .*`\/answer`/)
+    assert.equal(renderStatus(text, { state: 'running' }), `- State: running\n\n${text}`)
   }
 })

@@ -120,10 +120,10 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 - **Results** are in `runs/<run>/`: `report.md`, `gate-log.txt`, the ledger, and the journal of each agent. Review
   fixes stay on `factory/<run>`. The run deletes it at its end after `--ship` or a closed PR.
 - **Models:** `--models file.json` sets the model of each role.
-- **Budget:** `--budget <usd>` sets a soft limit on the spend of a run: a notice at the budget, and at two times the
-  budget a question to raise it or stop. `/answer recommended` raises it to two times the spend. `MODEL_PRICES` is JSON
-  with the USD per million tokens of each model ID (`input`, `cached_input`, `cache_write`, `output`). `CONTAINER_PRICES`
-  is `{"vcpu_second": <usd>, "gib_second": <usd>, "instances": {"<type>": <override of both>}}`. Reports show the usage.
+- **Budget:** `--budget <usd>` sets a soft limit on the spend of a run: a notice at the budget (on Cloudflare, in the
+  status comment), and at two times the budget a question to raise it or stop. `/answer recommended` raises it to two
+  times the spend. `MODEL_PRICES` is JSON with the USD per million tokens of each model ID (`input`, `cached_input`,
+  `cache_write`, `output`). `CONTAINER_PRICES` is `{"vcpu_second": <usd>, "gib_second": <usd>, "instances": {"<type>": <override of both>}}`. Reports show the usage.
 - **Issues:** `npm run develop -- --issue <n>` puts `Closes #<n>` in the PR body, so the merge closes the issue.
 - **Commits:** the host commits unsigned, unless a GitHub rule requires signed commits on a branch that the run pushes.
   Then signing must work without a prompt.
@@ -133,8 +133,8 @@ npm run review -- --run <id>                     # resume a run, also with npm r
 You need Workers Paid, Containers for development runs, research runs and review runs whose config has tests, and
 Docker on the machine that deploys. When you set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`, the Worker calls
 GitHub as that GitHub App. The key must be PKCS#8 (`openssl pkcs8 -topk8 -nocrypt`). Without them, the Worker uses
-`GITHUB_TOKEN`, a fine-grained token with read and write access to Contents, Pull requests and Issues, and read access
-to Actions and Commit statuses. Each target repository needs CI on pull requests and on pushes to `factory/**`. Fork
+`GITHUB_TOKEN`, a fine-grained token with read and write access to Contents, Pull requests, Issues and Actions, and read
+access to Commit statuses. Each target repository needs CI on pull requests and on pushes to `factory/**`. Fork
 PRs are refused, because that CI would run fork code with the repository secrets.
 
 ```bash
@@ -159,6 +159,7 @@ npm run remote -- research acme/app#45   # a research run on a program issue (--
 npm run remote -- resume acme/app#45     # wake a paused run, or start a run that stopped on an error
 npm run remote -- status acme/app#45     # or report
 npm run remote -- prune acme/app         # delete the merged, applied and stranded factory/* branches
+npm run remote -- inbox                  # the questions, stops, failures and PRs to merge that wait for you (needs the App)
 npm run metrics                          # CPU, memory and network of each build container
 ```
 
@@ -176,7 +177,7 @@ resume it after a crash. Development and research runs run their commands, and r
 tests, in a Cloudflare Container that has no secrets. Commits and pushes go through the GitHub API.
 The object keeps the sync state of each container directory in SQL, so after a restart the next sync sends only the
 changed files and does not run the setup again.
-A development PR says `Closes #<issue>`.
+A development PR says `Closes #<issue>`. A run edits one status comment. It posts a new comment only when you must act.
 
 ## Layout
 

@@ -8,7 +8,7 @@ import { StopError } from '../core/stop.ts'
 import { parsePrices } from '../core/usage.ts'
 import { allowedModelsFrom, mergeModels, type LoopModels } from '../core/workflows/code-review-loop.ts'
 import { cutReport, defaultDevelopModels, develop, developProviders, type DevelopInput, type DevelopModels } from '../core/workflows/develop.ts'
-import { developAnnouncement } from './announcements.ts'
+import { statusHeader } from './announcements.ts'
 import { boxMachine, syncWithSetup } from './box.ts'
 import { sqlBranches } from './branches.ts'
 import type { GitHub } from './github.ts'
@@ -47,7 +47,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
   }
 
   protected announcement(run: string, request: DevelopRequest) {
-    return developAnnouncement(run, request.by)
+    return statusHeader('development', run, request.by)
   }
 
   protected async execute(run: string, request: DevelopRequest, ledger: Ledger, gh: GitHub, comments: Comments, call: Call) {
@@ -67,7 +67,7 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     }
     const result = await develop(input, {
       branches: sqlBranches({ gh, ledger, log, owner, repo, run, sql }),
-      channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, pollMs: 0, waitMs: 0 }),
+      channel: commentChannel({ answerers: answerersOf(this.env, input.config.answerers), comments, notice: call.notice, pollMs: 0, waitMs: 0 }),
       checker,
       ci: { pollMs: 0, startMs: Number(this.env.CI_TIMEOUT_MINUTES ?? defaultCiTimeoutMinutes) * 60_000, waitMs: 0 },
       credentials: credentialsFor(this.env, developProviders(input.models)),
@@ -84,7 +84,9 @@ export class DevelopmentRuns extends Runs<DevelopRequest> {
     })
     // A run that waits for the user, for example for CI, stops on an error, so that a restart starts it again from its ledger (D13).
     if (result.resume) throw new StopError(result.resume, { transient: true })
-    return { passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
+    // A ready PR without a merge waits for the user to merge it (D21).
+    const needsUser = result.status !== 'ready' || result.merge === null
+    return { needsUser, passed: result.status === 'ready', summary: cutReport(result.report, `(cut: see the report of run \`${run}\`)`) }
   }
 
   protected async preflightNeeds(request: DevelopRequest, ledger: Ledger, gh: GitHub | undefined): Promise<PreflightNeeds> {
