@@ -98,6 +98,9 @@ export type MergeResult = { merged: true; sha: string } | { merged: false; reaso
  */
 export type MergeRefusal = 'stale' | 'other'
 
+/** The start of a rerun of the failed jobs of an Actions run. GitHub refuses it with 403 without Actions write. */
+export type RerunStart = { started: true } | { started: false; reason: string }
+
 /** The pull requests and the CI of the repository on GitHub. */
 export type PullRequests = {
   /** Opens a draft PR from `head` to the base branch, or returns the open PR of `head`. */
@@ -110,6 +113,11 @@ export type PullRequests = {
   ci(sha: string): Promise<CiJob[]>
   /** The end of the log of a failed job, for the agent that fixes it. */
   failureLog(job: CiJob): Promise<string>
+  /**
+   * Starts the failed jobs of Actions run `run` again, as a new attempt. It needs Actions write. A 403 of GitHub is a
+   * refusal result, not an error.
+   */
+  rerunFailedJobs(run: number): Promise<RerunStart>
 }
 
 /** Whether the commits of a run are signed. Each platform has its own. */
@@ -135,6 +143,11 @@ export type Checker = {
   agentChecks?: (changed: string[]) => Promise<CheckResult[]>
   /** The `ci` commands of the config on a real machine, for the submit gates (D15). Absent without `ci` entries or without a machine. */
   ci?: (changed: string[]) => Promise<CheckResult[]>
+  /**
+   * Runs the named failed final check again on the changed files, with the command of the config for this name (D14).
+   * It gives no results when the config has no command of this name.
+   */
+  rerun?: (name: string, changed: string[]) => Promise<CheckResult[]>
 }
 
 /** The output files of the run, such as report.md and gate-log.txt. */

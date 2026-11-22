@@ -262,6 +262,36 @@ test('a refused PR merge of a resumed run returns the merge when GitHub already 
   await assert.rejects(pulls.merge(7, { method: 'squash', sha: 'f00d' }), refusal)
 })
 
+test('a rerun of the failed jobs posts to the run, and a 403 that is not a rate limit is a refusal result', async () => {
+  const refused = new GitHubError(403, 'GitHub POST /repos/acme/app/actions/runs/12/rerun-failed-jobs answered HTTP 403: Resource not accessible by integration')
+  const limited = new GitHubError(403, 'API rate limit exceeded', true)
+  const missing = new GitHubError(404, 'Not Found')
+  const { calls, stub } = stubbed({}, refused, limited, missing)
+  const pulls = githubPulls(stub, 'acme', 'app', 'main')
+  assert.deepEqual(await pulls.rerunFailedJobs(12), { started: true })
+  assert.deepEqual(calls, [{ method: 'POST', path: '/repos/acme/app/actions/runs/12/rerun-failed-jobs', body: undefined }])
+  // The refusal is a result, so it never reaches the stop for a refused credential.
+  assert.deepEqual(await pulls.rerunFailedJobs(12), { started: false, reason: refused.message })
+  await assert.rejects(pulls.rerunFailedJobs(12), limited)
+  await assert.rejects(pulls.rerunFailedJobs(12), missing)
+})
+
+test('the CI of a commit gives the attempt of each Actions run, and no attempt for a commit status', async () => {
+  const created_at = '2026-11-01T00:00:00Z'
+  const run = { id: 7, workflow_id: 1, event: 'pull_request', name: 'CI', status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/app/actions/runs/7', created_at, run_attempt: 2 }
+  const status = { context: 'deploy', state: 'failure', target_url: null, created_at }
+  const { calls, stub } = stubbed({ total_count: 1, workflow_runs: [run] }, { statuses: [status] })
+  const jobs = await githubPulls(stub, 'acme', 'app', 'main').ci('f00d')
+  assert.deepEqual(calls.map((call) => call.path), ['/repos/acme/app/actions/runs?head_sha=f00d&per_page=100&page=1', '/repos/acme/app/commits/f00d/status'])
+  assert.deepEqual(
+    jobs.map(({ name, run, attempt }) => ({ name, run, attempt })),
+    [
+      { name: 'CI (pull_request)', run: 7, attempt: 2 },
+      { name: 'deploy', run: null, attempt: undefined },
+    ],
+  )
+})
+
 test('a branch delete accepts a ref that is not there, but not a refused delete', async () => {
   const ref = '/repos/acme/app/git/refs/heads/factory/dev-x'
   const missing = stubbed(new GitHubError(422, 'Reference does not exist'), new GitHubError(404, 'Not Found'))

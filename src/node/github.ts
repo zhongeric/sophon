@@ -43,5 +43,16 @@ export function ghPullRequests(repo: string, baseRef: string): PullRequests {
         return `No log: see ${job.url} (${error instanceof Error ? error.message : String(error)})`.slice(0, logTailChars)
       }
     },
+    async rerunFailedJobs(id) {
+      try {
+        await run(['api', `repos/{owner}/{repo}/actions/runs/${id}/rerun-failed-jobs`, '--method', 'POST'])
+        return { started: true }
+      } catch (error) {
+        // Without Actions write, GitHub refuses the rerun with 403. A rate limit also answers 403, but it is an error, as in
+        // the Worker (GitHubError.rateLimited).
+        if (httpStatus(error) !== 403 || /rate limit/i.test(error instanceof Error ? error.message : String(error))) throw error
+        return { started: false, reason: error instanceof Error ? error.message : String(error) }
+      }
+    },
   }
 }

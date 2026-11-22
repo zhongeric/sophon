@@ -264,11 +264,29 @@ export function commandChecker(repo: Tree, config: RepoConfig, machine: Machine)
     if (hasCi(config)) results.push(...(await ci(changed)))
     return results
   }
+  // Each command comes from the config by the name of its result, never from a recorded command.
+  const rerun: NonNullable<Checker['rerun']> = async (name, changed) => {
+    // A failed setup stopped the checks before they ran, so its rerun runs all final checks.
+    if (name === 'setup') return checks(changed)
+    const each = config.tests?.command.includes('{tests}') === false
+    const check = Object.hasOwn(config.checks, name) ? config.checks[name] : undefined
+    const ciKey = name.slice('ci '.length)
+    const ciCheck = name.startsWith('ci ') && config.ci && Object.hasOwn(config.ci, ciKey) ? config.ci[ciKey] : undefined
+    const known = check !== undefined || ciCheck !== undefined || (name === 'tests' && config.tests && !each) || (name.startsWith('test ') && each)
+    if (!known) return []
+    const failed = await setup()
+    if (failed) return [failed]
+    if (check !== undefined) return runNamed({ [name]: check }, changed, '')
+    if (ciCheck !== undefined) return runNamed({ [ciKey]: ciCheck }, changed, 'ci ')
+    if (name === 'tests') return runTests(await targetedTests(repo, config, changed))
+    return runTests([name.slice('test '.length)])
+  }
   return {
     checks,
     tests: config.tests ? runTests : null,
     agentChecks: (changed) => checks(changed, { tests: false }),
     ...(hasCi(config) ? { ci } : {}),
+    rerun,
   }
 }
 
