@@ -19,8 +19,11 @@ const pageSize = 100
  * GitHub's answer for a private repository whose plan has no rulesets and no branch protection. On such a plan no rule
  * can require signatures, so the answer means no rule.
  */
-const planLimited = (answer: GitHubAnswer): boolean =>
-  answer.status === 403 && isObject(answer.body) && typeof answer.body.message === 'string' && answer.body.message.startsWith('Upgrade to GitHub Pro')
+const planLimited = ({ status, body }: GitHubAnswer): boolean => {
+  // The Cloudflare host gives the JSON body, and gh on the local host gives its message text.
+  const message = typeof body === 'string' ? body : isObject(body) && typeof body.message === 'string' ? body.message : ''
+  return status === 403 && message.includes('Upgrade to GitHub Pro')
+}
 
 /**
  * Reads the rulesets and the classic protection that require signed commits on each branch. `api` is the
