@@ -66,3 +66,13 @@ test('scan pool: a box is a standard-4 with the unit limit of a scan slot', () =
   assert.equal(pool.maxUnitMs, maxUnitMs)
   assert.ok(pool.pollMs >= 1_000 && pool.pollMs <= 10_000)
 })
+
+test('scan pool: the slots have no egress, so an egress job is refused before a call, and a unit job carries no egress', async () => {
+  const { calls, namespace } = fakeNamespace()
+  const pool = scanPool(namespace)
+  assert.equal(pool.egress, false)
+  await assert.rejects(pool.start('run-1-fetch/t_1-1', { command: 'fetch', inputs: [], timeoutMs: 1_000, egress: true }), /have no egress, so the job of run-1-fetch\/t_1-1 cannot start/)
+  assert.deepEqual(calls, [])
+  await pool.start('run-1-sweep/u1-1', { command: 'unit', inputs: [], timeoutMs: 1_000 })
+  assert.deepEqual(calls, [{ args: ['run-1-sweep/u1-1', { argv: ['bash', '-c', 'unit'], inputs: [], timeoutMs: 1_000 }], method: 'start', object: 'run-1-sweep/u1-1' }])
+})

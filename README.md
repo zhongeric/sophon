@@ -91,8 +91,8 @@ For another stack, or to change a default, add `.agent-factory.json` at the root
 - `protect` lists paths that agents cannot write. A `*` matches inside one path segment.
 - `env` lists extra environment variables for the checks. `guides` mounts reference material at `/guides/<name>`.
 - `answerers` limits who can answer questions. `research` configures a research notebook. Its commands print a JSON
-  last line, `research.timeouts` gives their timeouts in ms, and `plan`, `fetch`, `unit` and `merge` fan out stage 6
-  in a pool of `--parallel` units, default 32 ([spec, 6.3](docs/specs/research-workflow.md#63-the-domain-in-the-notebook)).
+  last line, `research.timeouts` gives their timeouts in ms, `plan`, `fetch`, `unit` and `merge` fan out stage 6 in a
+  pool of `--parallel` units (default 32), and `research.sweep` runs stage 7, only locally ([spec, 6.3](docs/specs/research-workflow.md#63-the-domain-in-the-notebook), RG11).
 - Targeted tests are the changed test files, and the test files whose import lines name a changed file. A changed
   file that no test imports gets the test files that have its base name as a word. The `run_checks` of builders,
   patch agents and light agents runs only the checks. Their targeted tests run one time, when they submit their log.

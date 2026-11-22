@@ -3,6 +3,7 @@ import { lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { commandOptions, type RepoConfig } from '../core/checks.ts'
 import type { InputFile, ScanBoxes, ScanPoll } from '../core/fanout.ts'
+import { sweepEgressServer } from './sweep-egress.ts'
 
 const outputTailChars = 20_000
 const slotPattern = /^[A-Za-z0-9_-]{1,64}\/[A-Za-z0-9_-]{1,64}$/
@@ -72,10 +73,16 @@ export function writeInputs(root: string, files: InputFile[]): void {
 /**
  * The scan boxes of this machine. Each slot is a directory under `dir`. Units get the check environment, without host secrets.
  * The setup of the config runs in the shell of each unit, and a start returns after the setup, so the unit time limit starts there.
- * A start is never full. A host restart loses all jobs.
+ * A start is never full. A host restart loses all jobs. With an `egress` handler, a job started with `egress: true` gets
+ * AGENT_FACTORY_EGRESS, the base URL of a local proxy over the handler. The local machine has no network isolation.
  */
-export function localScanBoxes(dir: string, config: RepoConfig, options: { pollMs?: number } = {}): ScanBoxes {
+export function localScanBoxes(
+  dir: string,
+  config: RepoConfig,
+  options: { pollMs?: number; egress?: (request: Request) => Promise<Response> } = {},
+): ScanBoxes {
   const jobs = new Map<string, Job>()
+  const proxy = options.egress && sweepEgressServer(options.egress)
   const names = new Set(commandOptions(config).env)
   const slotDir = (slot: string) => {
     if (!slotPattern.test(slot)) throw new Error(`the slot ${slot} is not <pool>/<slot> with parts of [A-Za-z0-9_-]{1,64}`)
@@ -96,7 +103,9 @@ export function localScanBoxes(dir: string, config: RepoConfig, options: { pollM
     // The local machine has no unit limit. This value only keeps the timer correct: setTimeout fires at once above it.
     maxUnitMs: 2 ** 31 - 1,
     pollMs: options.pollMs ?? 1000,
+    egress: proxy !== undefined,
     async start(slot, unit) {
+      if (unit.egress && !proxy) throw new Error(`the local scan boxes have no egress, so the job of ${slot} cannot start`)
       const root = slotDir(slot)
       const previous = jobs.get(slot)
       if (previous) await stop(previous)
@@ -104,6 +113,7 @@ export function localScanBoxes(dir: string, config: RepoConfig, options: { pollM
       mkdirSync(root, { recursive: true })
       writeInputs(root, unit.inputs)
       const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => names.has(name)))
+      if (unit.egress && proxy) env.AGENT_FACTORY_EGRESS = await proxy.url()
       hookExit()
       // After the setup, the shell writes to descriptor 3. The setup and the unit do not get descriptor 3.
       const command = config.setup ? `{\n${config.setup}\n} 3>&- && {\nprintf ready >&3\nexec 3>&-\n${unit.command}\n}` : unit.command

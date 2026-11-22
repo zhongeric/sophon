@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { parseRepoConfig } from '../src/core/checks.ts'
-import { fansOut, fillCommand, loadResearchDomain, parseResearchConfig, type ResearchConfig, type ResearchFiles } from '../src/core/research.ts'
+import { defaultSweepFetchParallel, defaultSweepFetchRate, fansOut, fillCommand, loadResearchDomain, parseResearchConfig, type ResearchConfig, type ResearchFiles } from '../src/core/research.ts'
 import { StopError } from '../src/core/stop.ts'
 
 const source = '.agent-factory.json on main'
@@ -18,9 +18,16 @@ const example = {
   commands: {
     known: 'python -m search.known {prereg}',
     inject: 'python -m search.inject {prereg}',
-    sweep: 'python -m search.sweep {prereg} {partition}',
     evaluate: 'python -m search.evaluate {prereg}',
     reproduce: 'python -m search.reproduce {prereg}',
+  },
+  sweep: {
+    plan: 'python -m sweep.plan {prereg}',
+    fetch: 'python -m sweep.fetch {prereg} {target}',
+    unit: 'python -m sweep.unit {prereg} {unit}',
+    merge: 'python -m sweep.merge {prereg} {units}',
+    fetch_rate: 5,
+    fetch_parallel: 16,
   },
   timeouts: { known: 7_200_000, reproduce: 7_200_000 },
   feeds: ['https://export.arxiv.org/rss/astro-ph'],
@@ -58,7 +65,8 @@ test('research must be an object, and unknown keys are errors at each level', ()
   rejects(null, 'research', /must be an object/)
   rejects([], 'research', /must be an object/)
   rejects('research', 'research', /must be an object/)
-  rejects(research({ sweep: 'x' }), 'research.sweep', /not a known key/)
+  rejects(research({ sweep: 'x' }), 'research.sweep', /must be an object/)
+  rejects(research({ screen: 'x' }), 'research.screen', /not a known key/)
   rejects(research({ lenses: { ...example.lenses, writer: ['x'] } }), 'research.lenses.writer', /not a known key/)
   rejects(commands({ screen: 'x' }), 'research.commands.screen', /not a known key/)
   rejects(research({ lenses: undefined }), 'research.lenses', /must be an object/)
@@ -84,18 +92,14 @@ test('lenses and prereg sections are non-empty lists of non-empty strings', () =
   rejects(research({ prereg_sections: ['Holdout', null] }), 'research.prereg_sections[1]', /non-empty string/)
 })
 
-test('commands need known, inject, evaluate and reproduce, and use only {prereg}, and {partition} only in sweep', () => {
-  const { sweep: _, ...required } = example.commands
-  assert.deepEqual(parse(research({ commands: required }))?.commands, required)
-  assert.equal('sweep' in (parse(research({ commands: required }))?.commands ?? {}), false)
+test('commands need known, inject, evaluate and reproduce, and use only {prereg}', () => {
+  assert.deepEqual(parse(example)?.commands, example.commands)
   assert.deepEqual(parse(commands({ known: 'make known', inject: 'make inject' }))?.commands.known, 'make known')
   for (const name of ['known', 'inject', 'evaluate', 'reproduce']) {
     rejects(commands({ [name]: undefined }), `research.commands.${name}`, /non-empty string/)
     rejects(commands({ [name]: '' }), `research.commands.${name}`, /non-empty string/)
     rejects(commands({ [name]: 'run {partition}' }), `research.commands.${name}`, /placeholder \{partition\}, but only \{prereg\} are permitted/)
   }
-  rejects(commands({ sweep: '' }), 'research.commands.sweep', /non-empty string/)
-  rejects(commands({ sweep: 'run {prereg} {target}' }), 'research.commands.sweep', /placeholder \{target\}, but only \{prereg\} and \{partition\}/)
   rejects(commands({ known: 'run {Prereg}' }), 'research.commands.known', /placeholder \{Prereg\}/)
 })
 
@@ -115,7 +119,38 @@ test('the example of section 6.3 in the spec parses, and it fans out', () => {
   assert.ok(json, 'section 6.3 has no JSON example')
   const parsed = parse((JSON.parse(json) as { research: unknown }).research)
   assert.deepEqual(parsed?.commands, { ...example.commands, analyze: 'python -m search.analyze {prereg}', ...fanOut })
+  assert.deepEqual(parsed?.sweep, example.sweep)
   assert.equal(parsed && fansOut(parsed), true)
+})
+
+const sweep = (patch: Record<string, unknown>) => research({ sweep: { ...example.sweep, ...patch } })
+
+test('research.sweep has plan, fetch, unit and merge, with a default fetch rate and fetch pool', () => {
+  const { fetch_rate: _rate, fetch_parallel: _parallel, ...commandsOnly } = example.sweep
+  assert.deepEqual(parse(research({ sweep: commandsOnly }))?.sweep, { ...commandsOnly, fetch_rate: defaultSweepFetchRate, fetch_parallel: defaultSweepFetchParallel })
+  assert.equal(defaultSweepFetchRate, 5)
+  assert.equal(defaultSweepFetchParallel, 16)
+  assert.deepEqual(parse(sweep({ fetch_rate: 0.5, fetch_parallel: 3 }))?.sweep, { ...example.sweep, fetch_rate: 0.5, fetch_parallel: 3 })
+  assert.equal('sweep' in (parse(research({ sweep: undefined })) ?? {}), false)
+  assert.equal(fansOut(parseResearchConfig(example, source)), false)
+})
+
+test('research.sweep checks each command, its placeholders, the fetch rate and the fetch pool', () => {
+  const permitted: [string, string][] = [['plan', '\{prereg\}'], ['fetch', '\{prereg\} and \{target\}'], ['unit', '\{prereg\} and \{unit\}'], ['merge', '\{prereg\} and \{units\}']]
+  for (const [name, only] of permitted) {
+    rejects(sweep({ [name]: undefined }), `research.sweep.${name}`, /non-empty string/)
+    rejects(sweep({ [name]: '' }), `research.sweep.${name}`, /non-empty string/)
+    rejects(sweep({ [name]: 'run {prereg} {partition}' }), `research.sweep.${name}`, new RegExp(`placeholder \\{partition\\}, but only ${only} are permitted`))
+  }
+  for (const [name, required] of [['fetch', 'target'], ['unit', 'unit'], ['merge', 'units']] as const)
+    rejects(sweep({ [name]: 'run {prereg}' }), `research.sweep.${name}`, new RegExp(`must use the placeholder \\{${required}\\}`))
+  for (const rate of [0, -1, Number.POSITIVE_INFINITY, '5', null]) rejects(sweep({ fetch_rate: rate }), 'research.sweep.fetch_rate', /finite number/)
+  for (const parallel of [0, -2, 1.5, '16', null]) rejects(sweep({ fetch_parallel: parallel }), 'research.sweep.fetch_parallel', /positive integer/)
+  rejects(sweep({ partition: 'x' }), 'research.sweep.partition', /not a known key/)
+})
+
+test('research.commands.sweep is removed, and its error names research.sweep', () => {
+  rejects(commands({ sweep: 'python -m search.sweep {prereg} {partition}' }), 'research.commands.sweep', /research\.sweep/)
 })
 
 test('plan, fetch, unit and merge are optional together, each with its own placeholders, and the config then fans out', () => {

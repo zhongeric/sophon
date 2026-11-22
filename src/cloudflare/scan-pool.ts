@@ -23,6 +23,8 @@ const capacityError = /no container instance that can be provided|maximum number
 /**
  * The scan boxes of a research run on Cloudflare: one ScanBoxes object for each slot name. A start that the container
  * capacity refuses is `full`, so that the fan-out waits. Each other error goes to the fan-out as a lost box.
+ * The slots have no egress: the outbound HTTP interception of Cloudflare Containers is not in the installed Worker
+ * types, so a slot cannot send its requests to the run egress. Thus a sweep config stops at the start (gap RG11).
  */
 export function scanPool<Id>(namespace: ScanNamespace<Id>, pollMs = 5_000): ScanBoxes {
   const slot = (name: string) => namespace.get(namespace.idFromName(name))
@@ -30,7 +32,9 @@ export function scanPool<Id>(namespace: ScanNamespace<Id>, pollMs = 5_000): Scan
     instance: standard4,
     maxUnitMs,
     pollMs,
-    async start(name, { command, inputs, timeoutMs }) {
+    egress: false,
+    async start(name, { command, inputs, timeoutMs, egress }) {
+      if (egress) throw new Error(`the scan slots have no egress, so the job of ${name} cannot start`)
       try {
         return await slot(name).start(name, { argv: ['bash', '-c', command], inputs, timeoutMs })
       } catch (error) {

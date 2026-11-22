@@ -22,7 +22,7 @@ import {
 import { step, type Ledger } from '../ledger.ts'
 import { route, routeQuestions } from '../plan.ts'
 import { PlannedStop } from '../planned-stop.ts'
-import type { AgentStore, Branch, Branches, Checker, Files, Guides, PullRequests } from '../platform.ts'
+import type { AgentStore, Branch, Branches, Checker, DataStore, Files, Guides, PullRequests } from '../platform.ts'
 import { pool } from '../pool.ts'
 import { freezePrereg, type Prereg } from '../prereg.ts'
 import { presentProfiles, profilesById, type Profile } from '../profiles.ts'
@@ -67,6 +67,7 @@ import {
   type ResearchIntake,
   type VetRound,
 } from '../research-steps.ts'
+import { runSweep, type SweepResult } from '../research-sweep.ts'
 import { fansOut, type ResearchDomain } from '../research.ts'
 import type { ModelChoice } from '../roles.ts'
 import { StopError } from '../stop.ts'
@@ -183,8 +184,10 @@ export type ResearchDeps = {
   review(request: ReviewRequest): Promise<LoopResult>
   domain: ResearchDomain
   egress: EgressHost
-  /** The boxes of the units of a fan-out config. A fan-out config without them stops the run. */
+  /** The boxes of the units of a fan-out config and of the sweep. A fan-out config or a sweep config without them stops the run. */
   scanBoxes?: ScanBoxes
+  /** The store of the sweep data files (RG3). A sweep config without it stops the run. */
+  data?: DataStore
   /** USD per vCPU second and GiB second, from CONTAINER_PRICES. */
   containerPrices?: ContainerPrices
   /** With it, the run meters each domain command on a run box of this instance (null: the local machine). */
@@ -330,6 +333,8 @@ type Analysis = {
   builds: BuildLog[]
   calibrations: CalibrationRound[]
   runs: AnalysisRun[]
+  /** Stage 7, only for a sweep config. */
+  sweep?: SweepResult
   rounds: VetRound[]
   answers: HeldAnswer[]
   dossier: Dossier | null
@@ -352,15 +357,20 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   } catch (error) {
     throw new StopError(error instanceof Error ? error.message : String(error))
   }
-  const fanOut = fansOut(domain.config)
-  if (fanOut && !deps.scanBoxes) throw new StopError('the research config has plan, fetch, unit and merge, but this platform gives no scan boxes for the units')
+  const sweeps = domain.config.sweep !== undefined
+  const fanOut = fansOut(domain.config) || sweeps
+  if (fansOut(domain.config) && !deps.scanBoxes) throw new StopError('the research config has plan, fetch, unit and merge, but this platform gives no scan boxes for the units')
+  if (sweeps && !deps.scanBoxes) throw new StopError('the research config has research.sweep, but this platform gives no scan boxes for the sweep')
+  if (sweeps && deps.scanBoxes?.egress !== true)
+    throw new StopError('the research config has research.sweep, but the scan boxes of this platform give no egress to the sweep fetches')
+  if (sweeps && !deps.data) throw new StopError('the research config has research.sweep, but this platform gives no data store for the sweep files (SWEEP_DATA)')
   const prices = deps.prices ?? {}
   // After the intake, the recorded budget is the cap, so that a resume keeps the cap or a later raise.
   const capped = ledger.get<Cap>(capKey)
   const recordedBudget = capped ? (capped.usd ?? undefined) : input.budget
   const checkPrices = () => {
     checkPriced(researchModelIds(models), prices)
-    if (fanOut && deps.containerPrices === undefined) throw new StopError('the run has a budget and a fan-out config, but CONTAINER_PRICES is not set')
+    if (fanOut && deps.containerPrices === undefined) throw new StopError('the run has a budget and a fan-out or sweep config, but CONTAINER_PRICES is not set')
   }
   if (resolveBudget(ledger, recordedBudget, input.budgetOverride) !== undefined) checkPrices()
   const state: ReportState = {
@@ -456,13 +466,12 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
   // 0. Intake: no survey before the user confirms the program and sets the cost cap.
   const intook = await step(ledger, 'intake', () => researchIntake(context, 'intake', models.intake))
   state.intake = intook
-  // Without a price for each model, and for a fan-out config also CONTAINER_PRICES, a cap cannot work, so the question recommends no cap.
-  // The intake comes before stage 6 runs plan, so the compute cost is not known yet. Stage 6 posts the estimate as a budget notice.
+  // Without a price for each model, and for a fan-out or sweep config also CONTAINER_PRICES, a cap cannot work, so the question recommends no cap.
   const modelsPriced = researchModelIds(models).every((model) => model in prices)
   const notes = [
     ...(modelsPriced ? [] : ['MODEL_PRICES has no price for some models of this run, and a cap needs a price for each model.']),
-    ...(fanOut && !deps.containerPrices ? ['CONTAINER_PRICES is not set, and a cap with a fan-out config needs it.'] : []),
-    ...(fanOut ? ['The compute cost is unknown until stage 6 runs plan.'] : []),
+    ...(fanOut && !deps.containerPrices ? ['CONTAINER_PRICES is not set, and a cap with a fan-out or sweep config needs it.'] : []),
+    ...(fanOut ? [`The compute cost is unknown until stage ${fansOut(domain.config) ? 6 : 7} runs plan.`] : []),
   ]
   const priced = modelsPriced && (!fanOut || deps.containerPrices !== undefined)
   const [confirm, capAsk] = hostQuestions(intook, priced ? (budget.limit() ?? defaultCap) : undefined, notes)
@@ -551,7 +560,9 @@ async function researchSteps(input: ResearchInput, deps: ResearchDeps, stop: { f
         const outside = await outsidePaths(branch, (path) => path === `dossier/${hypothesis}.md`)
         if (outside.length > 0) throw new AnalysisScopeError(`Before the dossier of ${hypothesis}, the run branch has uncommitted changes: ${outside.join(', ')}. ${notPushed}`)
         await branch.tree.mkdir('/dossier')
-        await branch.tree.write(`/dossier/${hypothesis}.md`, new TextEncoder().encode(renderDossier(hypothesis, dossier, analysis.rounds, analysis.answers, finalAnalysis(analysis).outputs)))
+        // After a sweep, the host trial count replaces the trials of the writer (RG5).
+        const written = analysis.sweep ? { ...dossier, trials: analysis.sweep.trials } : dossier
+        await branch.tree.write(`/dossier/${hypothesis}.md`, new TextEncoder().encode(renderDossier(hypothesis, written, analysis.rounds, analysis.answers, finalAnalysis(analysis).outputs)))
         await branch.commit(`agent-factory: dossier ${hypothesis} (${input.runId})`)
         return branch.head()
       })
@@ -692,6 +703,13 @@ async function analyze(stages: Stages, analysis: Analysis): Promise<End> {
     }
     analyzed = await runAnalysis(stages, analysis)
     if (!analyzed.pass) return { status: 'blocked', note: `${analysisLine(hypothesis, analyzed)}. ${notPushed}` }
+  }
+
+  // 7. The sweep at the analyzed commit, one time for each prereg. A failure ends the run without a builder round.
+  if (deps.domain.config.sweep) {
+    const swept = await step(ledger, `sweep.${hypothesis}`, () => sweep(stages, analysis, analyzed.head))
+    analysis.sweep = swept
+    if (swept.reason) return { status: 'blocked', note: `The sweep of ${hypothesis} failed: ${oneLine(swept.reason)}. ${notPushed}` }
   }
 
   // 9. The skeptics, then the late skeptics. The analyst answers each round that has objections.
@@ -940,6 +958,44 @@ async function calibrate(stages: Stages, analysis: Analysis): Promise<Calibratio
   })
   analysis.calibrations.push(calibration)
   return calibration
+}
+
+/** Stage 7 for one frozen prereg at `head`, on the scan boxes with egress for the fetches and the data store (RG3). */
+function sweep(stages: Stages, analysis: Analysis, head: string): Promise<SweepResult> {
+  const { deps, input, context } = stages
+  const { hypothesis, path, sha256 } = analysis.freeze
+  // researchSteps stops at the start when a sweep config has no scan boxes with egress or no data store.
+  const boxes = deps.scanBoxes!
+  let commitFiles: Promise<InputFile[]> | undefined
+  return runSweep({
+    ledger: deps.ledger,
+    config: deps.config,
+    boxes,
+    store: deps.data!,
+    artifacts: deps.egress.artifacts,
+    runId: input.runId,
+    commit: head,
+    prereg: { hypothesis, path, sha256 },
+    holdoutTargets: deps.domain.holdout.targets,
+    parallel: input.parallel ?? defaultUnitParallel,
+    cleanBox: (key, files) => deps.cleanBox(head, key, files),
+    files: () => (commitFiles ??= deps.branches.view(head).then((tree) => treeInputs(tree, [deps.domain.config.holdout]))),
+    check: async () => {
+      await context.host.beforeTurn?.()
+    },
+    notice: async (seconds, units) => {
+      const notice = `The sweep plan of ${hypothesis} has ${units} units of ${seconds} expected seconds. The expected compute cost is ${computeEstimate(seconds, boxes, deps)}.`
+      deps.log(`budget notice: ${notice}`)
+      // The notice only informs, and the run log has it, so a failed post does not stop the run.
+      try {
+        await deps.channel.notice?.(input.runId, notice)
+      } catch (error) {
+        deps.log(`budget notice failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    },
+    meter: (name, box, run) => metered(deps, name, box, run),
+    log: deps.log,
+  })
 }
 
 /** The plan and the fetched data of one fan-out round. `reason` and `tail` are set when plan or a fetch failed. */
@@ -1294,6 +1350,15 @@ function fanOutLines(fanout: FanOutRound): string[] {
   ]
 }
 
+function sweepLines(sweep: SweepResult): string[] {
+  const list = (items: { name: string; reason: string }[]) => items.map((item) => `${item.name} (${oneLine(item.reason)})`).join(', ') || 'none'
+  return [
+    `- Sweep: ${sweep.reason ? `FAIL: ${oneLine(sweep.reason)}` : 'PASS'}, plan output ${sweep.plan}, ${sweep.units} units, ${sweep.retries} retries, ${sweep.trials} trials, candidate table ${sweep.table ?? 'none'}`,
+    `  - Failed units: ${list(sweep.failedUnits.map((unit) => ({ name: unit.id, reason: unit.reason })))}`,
+    `  - Failed targets: ${list(sweep.failedTargets.map((target) => ({ name: target.target, reason: target.reason })))}`,
+  ]
+}
+
 function analysisLines(analysis: Analysis): string[] {
   const { hypothesis } = analysis.freeze
   return [
@@ -1308,6 +1373,7 @@ function analysisLines(analysis: Analysis): string[] {
       (run) =>
         `- Analysis round ${run.round} at ${run.head.slice(0, 12)}: ${run.pass ? 'PASS' : 'FAIL'}, analyze output ${run.command}, output files ${run.files.join(', ') || 'none'}${run.pass ? '' : `. ${oneLine(run.reason)}`}`,
     ),
+    ...(analysis.sweep ? sweepLines(analysis.sweep) : []),
     ...objectionLines(analysis.rounds, analysis.answers),
     ...(analysis.dossier ? [`- Dossier: dossier/${hypothesis}.md, outcome ${analysis.dossier.outcome}`] : []),
     ...analysis.reproductions.flatMap(reproductionLines),

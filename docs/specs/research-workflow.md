@@ -64,7 +64,7 @@ The principles of the development workflow hold. These follow from them.
 | 4 Prereg | plan (one planner, D7) | one preregistrar | The core sections and the domain's sections. The host commits `prereg/<hypothesis>-v<n>.md`, records its hash, and protects the path. A change is a new version with a reason. |
 | 5 Build | build | builder, on a branch of the notebook | Writes only `analysis/<id>/`, so a prereg puts a changed search there, not in the domain's package. Checkpoints and static rules as today. |
 | 6 Calibrate | done-looks-like | host | Runs the domain's `known` and `inject` commands on the search partition. A fan-out config (section 6.3) replaces them: the box runs `plan` on a clean checkout, then `fetch` for each target. A plan target in the holdout file fails the round, and no unit starts. Each unit is a ledger step on a scan box, in a pool of `parallel` units (default 32). A unit over 3 times its expected time, on a lost box, or with a non-zero exit starts again on another box, at most 3 times. Then `merge` gets it as failed. `merge` on a new clean checkout gives the `known` and `inject` outputs. Recall under the prereg threshold goes back to the builder, in two rounds at most. After the second round, the host stops with a blocker and asks the user. After a calibration passes, the host runs `analyze` on a new clean checkout of the calibrated commit, as a detached job. A failed analysis goes back to the builder one time, in a round of its own, then the host stops with a blocker. |
-| 7 Sweep | none | host, on the box | Runs the domain's `sweep` command at the frozen commit in a bounded pool. Each partition is a ledger step. Results go to artifacts. |
+| 7 Sweep | none | host, on scan boxes | Runs one time for each frozen prereg, after the analysis passes. The sweep `plan` runs on a clean checkout. A plan target in the holdout file fails the sweep before any fetch. `fetch` runs for each target on a scan box with egress, in a pool of `fetch_parallel`. `unit` runs for each unit on a scan box without egress. Each fetch and each unit is a ledger step, with 3 restarts at most. A unit whose fetch failed fails without a start. `merge` on a new clean checkout gives the candidate table, an artifact. The data files go to the data store. A failed sweep stops the run with a blocker. |
 | 8 Screen | light reviewer | screeners on a cheap model, in batches | Each label cites an artifact. One screener labels each batch. A `not sure` label goes to a second screener on the other family. |
 | 9 Vet | full review loop | skeptic tracks. Then the analyst answers, as the patch agent does. Then late skeptics on the other family | Context-free skeptics. The evidence check on artifacts. The analyst lists every objection as addressed or conceded. A conceded critical or high objection goes to the user. The domain's checks are host findings. The skeptics, the analyst and the writer get the analysis outputs as artifacts. After analyst changes, the host runs the analysis again. A failure stops the run with a blocker. |
 | 10 Holdout | none | host | The egress refuses the holdout to agents from the start of the run. It refuses the holdout to box commands only after RG1. The host permits only `evaluate` in stage 10 and `reproduce` in stage 11 to read the holdout. In this stage, the host runs the domain's `evaluate` command on the holdout, with the frozen prereg. Its output is the outcome: recovered, inconsistent, excluded or insufficient. |
@@ -154,13 +154,20 @@ reads it from the base branch, so a run cannot change its own rails.
       "known": "python -m search.known {prereg}",
       "inject": "python -m search.inject {prereg}",
       "analyze": "python -m search.analyze {prereg}",
-      "sweep": "python -m search.sweep {prereg} {partition}",
       "evaluate": "python -m search.evaluate {prereg}",
       "reproduce": "python -m search.reproduce {prereg}",
       "plan": "python -m search.plan {prereg}",
       "fetch": "python -m search.fetch {prereg} {target}",
       "unit": "python -m search.unit {prereg} {unit}",
       "merge": "python -m search.merge {prereg} {units}"
+    },
+    "sweep": {
+      "plan": "python -m sweep.plan {prereg}",
+      "fetch": "python -m sweep.fetch {prereg} {target}",
+      "unit": "python -m sweep.unit {prereg} {unit}",
+      "merge": "python -m sweep.merge {prereg} {units}",
+      "fetch_rate": 5,
+      "fetch_parallel": 16
     },
     "timeouts": { "known": 7200000, "analyze": 3600000, "reproduce": 7200000, "unit": 1800000 },
     "feeds": ["https://export.arxiv.org/rss/astro-ph"]
@@ -173,10 +180,14 @@ The egress refuses the holdout to agents from the start of the run, before a pre
 The prereg section "Holdout" refers to this file and does not define the holdout.
 
 The host takes the command strings from the base branch. It replaces `{prereg}` with the quoted path of the frozen
-prereg. `{partition}` identifies the current data partition. `{target}` is the quoted name of a plan target, `{unit}`
+prereg. `{target}` is the quoted name of a plan target, `{unit}`
 the quoted unit ID, and `{units}` the quoted path of the units directory. `feeds` are the sources of scout (section 3).
 `plan`, `fetch`, `unit` and `merge` are optional, but a config has all four or none of them. With all four, stage 6 fans out.
 `fetch`, `unit` and `merge` must use `{target}`, `{unit}` and `{units}`.
+`sweep` is optional. It has the stage 7 commands, with the same placeholders and timeout keys. `fetch_rate` is the
+limit of egress requests in each second (default 5). `fetch_parallel` is the size of the fetch pool (default 16).
+A sweep `fetch` gets `AGENT_FACTORY_EGRESS`. A request to `$AGENT_FACTORY_EGRESS/<host>/<path>?<query>` goes to
+`https://<host>/<path>?<query>` through the host egress. No other command gets this variable.
 `timeouts` gives the timeout in ms of each domain command. A missing key takes `timeout_ms`, else 30 minutes.
 The time limit of a unit is the smallest of 3 times its `expected_seconds`, `timeouts.unit` when set, and the 60-minute box limit.
 `timeout_ms` and the 30-minute default do not apply to a unit.
@@ -188,9 +199,11 @@ The last line of a command output that is not empty is a JSON object:
 | --- | --- |
 | `known` | `{"recall": <number 0..1>, "outputs": {"<path>": "<sha256 hex>"}, "reads": ["<path prefix>"]}` |
 | `inject` | `{"outputs": {"<path>": "<sha256 hex>"}, "reads": ["<path prefix>"]}` |
-| `analyze`, `reproduce`, `fetch`, `unit` | `{"outputs": {"<path>": "<sha256 hex>"}}` |
+| `analyze`, `reproduce`, `fetch`, `unit`, sweep `fetch` | `{"outputs": {"<path>": "<sha256 hex>"}}` |
 | `plan` | `{"targets": ["<name>"], "units": [{"id": "<id>", "targets": ["<name>"], "expected_seconds": <number more than 0>}]}` |
 | `merge` | `{"known": <last line of known>, "inject": <last line of inject>}` |
+| sweep `unit` | `{"outputs": {"<path>": "<sha256 hex>"}, "tls_passes": <integer 0 or more>}` |
+| sweep `merge` | `{"candidates": [<JSON object>]}` |
 
 - The calibration passes only when the `known` recall is equal to or more than the `known_recall` of the prereg. The
   `inject` outputs are the artifacts for completeness and false positives.
@@ -218,7 +231,7 @@ as profile guides do today.
   step is reused.
 - `src/core/prereg.ts`: `submit_prereg` and the freeze.
 - `src/core/claims.ts`: the submit tools of the survey, hypotheses, labels, objections and the dossier.
-- `src/core/sweep.ts`: partitions and the candidate table.
+- `src/core/research-sweep.ts`: the stage 7 sweep, the candidate table and the trial count.
 - `src/cloudflare`: `ResearchRuns` and `/research` on a notebook issue.
 - `src/core/workflows/scout.ts`, and its cron trigger in `src/cloudflare` (phase R4).
 
@@ -234,8 +247,11 @@ as profile guides do today.
     `POST /research/<owner>/<repo>/<issue>`, and `npm run remote -- research <issue>`.
 - **Local** runs the same workflow, for tests and for development of the workflow.
 - **Scan boxes**: one small container with no network for each slot of a pool, in the Durable Object `ScanBoxes`.
-  The units of a stage 6 fan-out run on them. The sweep does not use them yet. Local runs the units on the local
-  machine, in the same pool.
+  The units of a stage 6 fan-out and of the stage 7 sweep run on them. A sweep `fetch` runs in a pool of its own, and
+  reaches the network only through the host egress. The sweep data files go to the R2 bucket `SWEEP_DATA`. The scan
+  slots on Cloudflare have no egress yet, because the installed Worker types do not have the outbound HTTP interception
+  of Containers. Thus a sweep config stops at the start there (RG11). Local runs the units on the local machine, in the same
+  pools, with an egress proxy on 127.0.0.1 and a directory for the data files. Local has no network isolation.
   - The first attempt of a unit runs in a lane of the pool, so that the next unit uses the same box. A retry runs on a
     new box.
   - The compute meter counts a unit from its start to the end of its job. After its last unit, a box stays on until its
@@ -247,6 +263,8 @@ as profile guides do today.
 
 - **Agents reach the network** through the host egress only: the domain's origins, GET and query requests, each one
   logged as an artifact. The egress sets a maximum size for each request.
+- **Sweep fetch requests** go through the same host egress, with the holdout lock and at most `fetch_rate` requests
+  in each second. The egress logs each request. The response bodies go to the data store.
 - **The box reaches the network directly** today (`enableInternet`), for setup. The holdout lock thus binds agents and
   not commands. Also, a box command can send notebook data or holdout data out of the run.
   Gap RG1 closes these two problems.
@@ -278,14 +296,15 @@ as profile guides do today.
 | --- | --- | --- |
 | RG1 | The box's own network access | The box reaches the network through the host egress, after setup. Until then, the report says that the holdout lock binds agents only, and that box commands can send data out of the run. |
 | RG2 | Cost (G6) | A budget per program, set at intake, for the models and the containers (`CONTAINER_PRICES`), with the rule of G6: a notice at the budget, and a pause with one question at two times the budget. No pause at 80%, and no stop of the fan-out. |
-| RG3 | Data volume | No mirrors. Artifacts over a size limit stay on the box and are named by hash. |
+| RG3 | Data volume | No mirrors. Artifacts over a size limit stay on the box and are named by hash. The sweep data files go to the data store by SHA-256: R2 on Cloudflare, a directory locally. Their provenance records stay in the run artifacts (SQLite on Cloudflare). |
 | RG4 | Archives change | Each fetch records its hash and time. `reproduce` reports a drift. |
-| RG5 | Many trials in one program | The host counts each trial. The dossier reports the count. |
+| RG5 | Many trials in one program | The host counts the trials of the sweep: the targets and the `tls_passes` of each done unit. The dossier shows this count in place of the count of the writer. |
 | RG6 | Submission to outside bodies | A later workflow with a `/go` for an exact scope. |
 | RG7 | New developments: papers, alerts and data releases | Scout (section 3), in phase R4. A proposal becomes a program only when the user labels it. |
-| RG8 | Large sweeps on a rented machine | Not in R0. Large sweeps use scan boxes (section 7). The sweep sends units to them in a later change. A remote box for a rented machine is a later change. |
+| RG8 | Large sweeps on a rented machine | Not in R0. The sweep runs on scan boxes (section 7). A remote box for a rented machine is a later change. |
 | RG9 | Programs in one notebook share the holdout | After the first outcome, the holdout is not blind to later programs. The dossier reports the count of holdout tests across the notebook. |
 | RG10 | Web search and the holdout | Web search runs at the provider, so the lock cannot refuse the holdout to it, and the egress does not log it (RD9). The report says that the holdout lock does not bind web search. |
+| RG11 | Sweep egress on Cloudflare | The Cloudflare scan slots have no egress, because the installed Worker types do not have the outbound HTTP interception of Containers. Until they have it, a sweep config stops at the start on Cloudflare, and stage 7 runs only locally. |
 
 ## 11. Build plan
 

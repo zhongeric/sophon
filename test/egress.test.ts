@@ -638,3 +638,26 @@ test('checkEgress accepts web_search while the lock has a pending pattern: web s
   checkEgress({ ...base, web_search: true }, checkHost(lock))
   assert.deepEqual(lock.pending(), ['https://api.example.com/holdout'])
 })
+
+test('with bodies, the body goes to the data store and not to artifacts, and the provenance and the log line stay', async () => {
+  const bodies = new Map<string, Uint8Array>()
+  const run = setup()
+  run.host.bodies = {
+    put: async (bytes) => {
+      const id = sha256(bytes)
+      bodies.set(id, bytes)
+      return id
+    },
+    get: async (id) => bodies.get(id) ?? null,
+  }
+  const response = await run.egress('https://api.example.com/data')
+  const id = sha256('ok')
+  assert.equal(response.headers.get('x-artifact-id'), id)
+  assert.equal(await response.text(), 'ok')
+  assert.deepEqual([...bodies.keys()], [id])
+  const stored = await run.artifacts.list()
+  assert.equal(stored.length, 1)
+  assert.equal(stored[0]?.id, response.headers.get('x-provenance-id'))
+  assert.equal(JSON.parse(new TextDecoder().decode((await run.artifacts.get(stored[0]!.id))!)).body, id)
+  assert.deepEqual(run.lines, [`researcher: egress GET https://api.example.com/data 200 artifact ${id} provenance ${stored[0]?.id}`])
+})

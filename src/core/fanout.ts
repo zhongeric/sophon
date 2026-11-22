@@ -1,11 +1,21 @@
 import type { FileSystem } from 'nanocode-ts/bash'
 import { artifactId } from './artifacts.ts'
-import type { RepoConfig } from './checks.ts'
+import { commandOptions, type RepoConfig } from './checks.ts'
 import { step, type Ledger } from './ledger.ts'
 import { PlannedStop } from './planned-stop.ts'
-import type { Artifacts } from './platform.ts'
+import type { Artifacts, DataStore } from './platform.ts'
 import { pool } from './pool.ts'
-import { parseUnitOutput, unitCommand, type DomainOutputs, type PlanUnit, type UnitsManifest } from './research-commands.ts'
+import {
+  parseSweepFetchOutput,
+  parseSweepUnitOutput,
+  parseUnitOutput,
+  sweepFetchCommand,
+  sweepUnitCommand,
+  unitCommand,
+  type DomainOutputs,
+  type PlanUnit,
+  type UnitsManifest,
+} from './research-commands.ts'
 import { finishCompute, startCompute, type InstanceSpec } from './usage.ts'
 
 /** A file that the host writes into a unit directory or a checkout, by its path relative to the root. It has no mode, so it is not executable. */
@@ -26,8 +36,10 @@ export type ScanBoxes = {
   instance: InstanceSpec | null
   maxUnitMs: number
   pollMs: number
+  /** True when a job started with `egress: true` gets AGENT_FACTORY_EGRESS, the base URL of the host egress proxy. */
+  egress?: boolean
   /** Starts a unit in a clean slot, after the end of the last job of the slot. `full`: no box is free now, so the caller waits and tries again. */
-  start(slot: string, unit: { inputs: InputFile[]; command: string; timeoutMs: number }): Promise<{ job: string } | { full: true }>
+  start(slot: string, unit: { inputs: InputFile[]; command: string; timeoutMs: number; egress?: true }): Promise<{ job: string } | { full: true }>
   poll(slot: string): Promise<ScanPoll>
   kill(slot: string): Promise<void>
   /** The bytes of an output file of the last unit of the slot. */
@@ -43,8 +55,11 @@ const maxRestarts = 3
 /** Where merge finds the unit files in its checkout, in place of {units} (UnitsManifest). */
 export const unitsDir = '.agent-factory/units'
 
-/** The result of one unit. `outputs` maps each output path to its SHA-256, which is also its artifact ID. */
-type UnitResult = { id: string; status: 'done' | 'failed'; attempts: number; reason?: string; outputs: DomainOutputs }
+/**
+ * The result of one job: a unit, or a sweep fetch with the target as its ID. `outputs` maps each output path to its
+ * SHA-256, which is also its ID in the store. Only a done sweep unit has `tls_passes`.
+ */
+export type UnitResult = { id: string; status: 'done' | 'failed'; attempts: number; reason?: string; outputs: DomainOutputs; tls_passes?: number }
 
 /** A later result of a unit key with another SHA-256 than the first result. The run keeps the first result. */
 export type UnitConflict = { key: string; unit: string; first: string; second: string }
@@ -56,7 +71,7 @@ export type UnitConflict = { key: string; unit: string; first: string; second: s
 type Attempt = { slot: string; startedAt: number; seenAt?: number; reason?: string; alive?: true }
 
 /** `endedAt`: the end of the job that the box gave. `alive`: the kill of the job failed, so the job can still run. */
-type Outcome = ({ outputs: DomainOutputs } | { reason: string }) & { endedAt?: number; alive?: true }
+type Outcome = ({ outputs: DomainOutputs; tls_passes?: number } | { reason: string }) & { endedAt?: number; alive?: true }
 
 const conflictsKey = 'unit-conflicts'
 
@@ -83,16 +98,20 @@ function shortHash(text: string): string {
  * plan unit ID matches [A-Za-z0-9_-]{1,64} (planJson), so only a long slot part needs the hash.
  */
 export function slotName(runId: string, unitId: string, attempt: number): string {
-  const slot = `${unitId}-${attempt}`
-  return `${poolPart(runId)}/${slot.length <= 64 ? slot : `${unitId.slice(0, 40)}-${shortHash(unitId)}-${attempt}`}`
+  return poolSlot(poolPart(runId), unitId, attempt)
+}
+
+function poolSlot(pool: string, id: string, attempt: number): string {
+  const slot = `${id}-${attempt}`
+  return `${pool}/${slot.length <= 64 ? slot : `${id.slice(0, 40)}-${shortHash(id)}-${attempt}`}`
 }
 
 /**
  * The slot of a lane of the pool. A first attempt runs in a free lane, so that the next unit uses the same box and a
  * pool of `parallel` units keeps at most `parallel` lane boxes. The slot part has no '-', so a retry slot is never a lane.
  */
-function laneName(runId: string, lane: number): string {
-  return `${poolPart(runId)}/lane_${lane}`
+function laneName(pool: string, lane: number): string {
+  return `${pool}/lane_${lane}`
 }
 
 const poolPart = (runId: string) => runId.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64) || 'run'
@@ -174,14 +193,14 @@ async function linkedFile(tree: FileSystem.FileSystem, path: string): Promise<{ 
 }
 
 /** The bytes of an artifact. A missing artifact is an error, because the ledger recorded its ID. */
-async function artifactBytes(artifacts: Artifacts, id: string, what: string): Promise<Uint8Array> {
+async function artifactBytes(artifacts: Pick<Artifacts, 'get'>, id: string, what: string): Promise<Uint8Array> {
   const bytes = await artifacts.get(id)
   if (!bytes) throw new Error(`the artifact ${id} of ${what} is missing`)
   return bytes
 }
 
 /** The inputs of a unit: the commit files, and the data files of its targets at their fetch paths, in place of a commit file. */
-export function unitInputs(files: () => Promise<TreeInputFile[]>, fetched: Record<string, DomainOutputs>, artifacts: Artifacts): (unit: PlanUnit) => Promise<InputFile[]> {
+export function unitInputs(files: () => Promise<TreeInputFile[]>, fetched: Record<string, DomainOutputs>, artifacts: Pick<Artifacts, 'get'>): (unit: PlanUnit) => Promise<InputFile[]> {
   return async (unit) => {
     const data = new Map<string, Uint8Array>()
     for (const target of unit.targets)
@@ -200,7 +219,7 @@ export function unitsManifest(results: UnitResult[]): UnitsManifest {
 }
 
 /** The files of the units directory for merge: each output file of each done unit, and units.json. */
-export async function unitsFiles(results: UnitResult[], artifacts: Artifacts): Promise<InputFile[]> {
+export async function unitsFiles(results: UnitResult[], artifacts: Pick<Artifacts, 'get'>): Promise<InputFile[]> {
   const files: InputFile[] = []
   for (const result of results)
     for (const [path, sha] of Object.entries(result.outputs))
@@ -233,32 +252,154 @@ export const unitKey = (fanOut: Pick<FanOut, 'commit' | 'prereg'>, unit: string)
 
 /** Runs the units in a pool of `parallel` scan boxes, each unit as a ledger step, and gives the results in plan order. */
 export function runUnits(units: PlanUnit[], fanOut: FanOut): Promise<UnitResult[]> {
-  const lanes = unitLanes(units, fanOut)
-  return pool(units, fanOut.parallel, (unit) => {
-    const key = unitKey(fanOut, unit.id)
-    return step(fanOut.ledger, key, () => runUnit(unit, key, fanOut, lanes))
+  const lanes = jobLanes(units.map((unit) => unitKey(fanOut, unit.id)), poolPart(fanOut.runId), fanOut.ledger)
+  return runJobs(units, fanOut.parallel, fanOut, lanes, (unit) => {
+    const command = unitCommand(fanOut.config, fanOut.prereg.path, unit.id)
+    return {
+      id: unit.id,
+      name: unit.id,
+      kind: 'unit',
+      key: unitKey(fanOut, unit.id),
+      meter: (number) => `unit.${fanOut.prereg.hypothesis}.${fanOut.round}.${unit.id}.${number}`,
+      limit: attemptLimit(unit.expected_seconds, fanOut.config.research?.timeouts?.unit, fanOut.boxes.maxUnitMs),
+      command,
+      retrySlot: (number) => slotName(fanOut.runId, unit.id, number),
+      inputs: () => fanOut.inputs(unit),
+      parse: parseUnitOutput,
+      keep: (path, bytes) => {
+        const labels = { hypothesis: fanOut.prereg.hypothesis, unit: unit.id, round: String(fanOut.round), path }
+        return fanOut.artifacts.put(bytes, { source: { command }, media_type: 'application/octet-stream', labels })
+      },
+    }
+  })
+}
+
+/**
+ * What the jobs of one stage 7 sweep need. The data files of the fetches and of the units go to `store`, not to the
+ * artifacts (RG3). `wait` and `now` replace the timer and the clock in tests.
+ */
+export type SweepJobs = {
+  ledger: Ledger
+  boxes: ScanBoxes
+  store: DataStore
+  config: RepoConfig
+  runId: string
+  commit: string
+  prereg: { hypothesis: string; path: string; sha256: string }
+  log(line: string): void
+  wait?: (ms: number) => Promise<void>
+  now?: () => number
+}
+
+/** One sweep fetch. `id` is the part of its slot names and of its ledger key (sweepFetchId). */
+type SweepTarget = { target: string; id: string }
+
+/**
+ * The job ID of the sweep fetch of a target: stable, different for each target, and valid in a slot name for any
+ * target name. It has no '-', so a retry slot is never a lane.
+ */
+export const sweepFetchId = async (target: string): Promise<string> => `t_${(await artifactId(new TextEncoder().encode(target))).slice(0, 32)}`
+
+/** The ledger steps of the sweep. They differ from the stage 6 keys, and a new commit or a new prereg gives new keys. */
+const sweepFetchKey = (sweep: Pick<SweepJobs, 'commit' | 'prereg'>, id: string) => `sweep-fetch.${sweep.commit}.${sweep.prereg.sha256}.${id}`
+const sweepUnitKey = (sweep: Pick<SweepJobs, 'commit' | 'prereg'>, unit: string) => `sweep-unit.${sweep.commit}.${sweep.prereg.sha256}.${unit}`
+
+/** The pool parts of the sweep. Fetch slots and unit slots differ, so a box that ran an egress job never runs a unit. */
+const sweepPool = (runId: string, kind: 'fetch' | 'unit') => `${poolPart(runId).slice(0, 58)}-${kind === 'fetch' ? 'fetch' : 'sweep'}`
+
+/**
+ * Runs the sweep fetch of each target in a pool of `parallel` scan boxes with egress, each fetch as a ledger step, and
+ * gives the results in target order. A result has the target name as its ID. The time limit is research.timeouts.fetch,
+ * else the timeout of the checks, and at most the box limit.
+ */
+export function runSweepFetches(targets: SweepTarget[], parallel: number, inputs: () => Promise<InputFile[]>, sweep: SweepJobs): Promise<UnitResult[]> {
+  const slots = sweepPool(sweep.runId, 'fetch')
+  const lanes = jobLanes(targets.map((target) => sweepFetchKey(sweep, target.id)), slots, sweep.ledger)
+  const timeout = sweep.config.research?.timeouts?.fetch ?? commandOptions(sweep.config).timeoutMs
+  return runJobs(targets, parallel, sweep, lanes, ({ target, id }) => ({
+    id,
+    name: target,
+    kind: 'fetch',
+    key: sweepFetchKey(sweep, id),
+    meter: (number) => `sweep-fetch.${sweep.prereg.hypothesis}.${id}.${number}`,
+    limit: Math.max(1, Math.min(timeout, sweep.boxes.maxUnitMs)),
+    command: sweepFetchCommand(sweep.config, sweep.prereg.path, target),
+    egress: true,
+    retrySlot: (number) => poolSlot(slots, id, number),
+    inputs,
+    parse: parseSweepFetchOutput,
+    keep: (_path, bytes) => sweep.store.put(bytes),
+  }))
+}
+
+/** Runs the sweep units in a pool of `parallel` scan boxes without egress, as runUnits, and keeps their tls_passes. */
+export function runSweepUnits(units: PlanUnit[], parallel: number, inputs: (unit: PlanUnit) => Promise<InputFile[]>, sweep: SweepJobs): Promise<UnitResult[]> {
+  const slots = sweepPool(sweep.runId, 'unit')
+  const lanes = jobLanes(units.map((unit) => sweepUnitKey(sweep, unit.id)), slots, sweep.ledger)
+  return runJobs(units, parallel, sweep, lanes, (unit) => ({
+    id: unit.id,
+    name: unit.id,
+    kind: 'unit',
+    key: sweepUnitKey(sweep, unit.id),
+    meter: (number) => `sweep-unit.${sweep.prereg.hypothesis}.${unit.id}.${number}`,
+    limit: attemptLimit(unit.expected_seconds, sweep.config.research?.timeouts?.unit, sweep.boxes.maxUnitMs),
+    command: sweepUnitCommand(sweep.config, sweep.prereg.path, unit.id),
+    retrySlot: (number) => poolSlot(slots, unit.id, number),
+    inputs: () => inputs(unit),
+    parse: parseSweepUnitOutput,
+    keep: (_path, bytes) => sweep.store.put(bytes),
+  }))
+}
+
+/** What each job of a pool needs from the run. */
+type Runner = Pick<FanOut, 'ledger' | 'boxes' | 'log' | 'wait' | 'now'>
+
+/**
+ * One job on a scan box: a stage 6 unit, a sweep fetch or a sweep unit. `id` is the part of its slot names, `name` the
+ * name in its result and its log lines. `meter` gives the step name of an attempt for the compute meter. `keep` stores
+ * one output file and gives its ID, the SHA-256 of the bytes.
+ */
+type Job = {
+  id: string
+  name: string
+  kind: 'unit' | 'fetch'
+  key: string
+  meter(number: number): string
+  limit: number
+  command: string
+  egress?: true
+  retrySlot(number: number): string
+  inputs(): Promise<InputFile[]>
+  parse(output: string): { json: { outputs: DomainOutputs; tls_passes?: number }; problem: null } | { json: null; problem: string }
+  keep(path: string, bytes: Uint8Array): Promise<string>
+}
+
+/** Runs the jobs of the items in a pool of `parallel`, each job as a ledger step, and gives the results in item order. */
+function runJobs<T>(items: T[], parallel: number, runner: Runner, lanes: Lanes, job: (item: T) => Job): Promise<UnitResult[]> {
+  return pool(items, parallel, (item) => {
+    const spec = job(item)
+    return step(runner.ledger, spec.key, () => runJob(spec, runner, lanes))
   })
 }
 
 type Lanes = { take(): string; free(slot: string): void }
 
 /**
- * The lanes of one fan-out. A lane stays busy until its job ends. A resume also keeps the slots of failed kills busy,
+ * The lanes of one pool of jobs. A lane stays busy until its job ends. A resume also keeps the slots of failed kills busy,
  * even when a later attempt finished.
  */
-function unitLanes(units: PlanUnit[], fanOut: FanOut): Lanes {
+function jobLanes(keys: string[], pool: string, ledger: Ledger): Lanes {
   const busy = new Set<string>()
-  for (const unit of units) {
-    const key = unitKey(fanOut, unit.id)
-    const attempts = fanOut.ledger.get<Attempt[]>(`attempts.${key}`) ?? []
+  for (const key of keys) {
+    const attempts = ledger.get<Attempt[]>(`attempts.${key}`) ?? []
     for (const attempt of attempts) if (attempt.alive) busy.add(attempt.slot)
     const last = attempts.at(-1)
-    if (last && last.reason === undefined && !fanOut.ledger.get(`unit-result.${key}`)) busy.add(last.slot)
+    if (last && last.reason === undefined && !ledger.get(`unit-result.${key}`)) busy.add(last.slot)
   }
   return {
     take() {
       for (let lane = 0; ; lane++) {
-        const slot = laneName(fanOut.runId, lane)
+        const slot = laneName(pool, lane)
         if (busy.has(slot)) continue
         busy.add(slot)
         return slot
@@ -269,22 +410,21 @@ function unitLanes(units: PlanUnit[], fanOut: FanOut): Lanes {
 }
 
 /**
- * Runs one unit until it is done, or until it failed 1 + maxRestarts times. Over the time limit, a lost box, a non-zero
+ * Runs one job until it is done, or until it failed 1 + maxRestarts times. Over the time limit, a lost box, a non-zero
  * exit, a bad last line and a hash mismatch each fail the attempt. The first attempt runs in a lane, and each next attempt
  * goes to a new slot. A full pool is not an attempt. A replay polls the job of the last recorded attempt and does not
  * start it again.
  */
-async function runUnit(unit: PlanUnit, key: string, fanOut: FanOut, lanes: Lanes): Promise<UnitResult> {
-  const { ledger, boxes } = fanOut
-  const now = fanOut.now ?? Date.now
-  const wait = fanOut.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+async function runJob(job: Job, runner: Runner, lanes: Lanes): Promise<UnitResult> {
+  const { ledger, boxes } = runner
+  const now = runner.now ?? Date.now
+  const wait = runner.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   const pause = async () => {
     ledger.safePoint?.(boxes.pollMs)
     await wait(boxes.pollMs)
   }
+  const { key } = job
   const attemptsKey = `attempts.${key}`
-  const limit = attemptLimit(unit.expected_seconds, fanOut.config.research?.timeouts?.unit, boxes.maxUnitMs)
-  const command = unitCommand(fanOut.config, fanOut.prereg.path, unit.id)
   let inputs: InputFile[] | undefined
   let lane: string | undefined
   for (;;) {
@@ -293,20 +433,20 @@ async function runUnit(unit: PlanUnit, key: string, fanOut: FanOut, lanes: Lanes
     let number = attempts.length
     if (attempt === undefined || attempt.reason !== undefined) {
       if (attempts.length > maxRestarts)
-        return { id: unit.id, status: 'failed', attempts: attempts.length, reason: `${attempts.length} attempts failed. The last reason: ${attempt?.reason ?? ''}`, outputs: {} }
+        return { id: job.name, status: 'failed', attempts: attempts.length, reason: `${attempts.length} attempts failed. The last reason: ${attempt?.reason ?? ''}`, outputs: {} }
       number = attempts.length + 1
-      const slot = number === 1 ? (lane ??= lanes.take()) : slotName(fanOut.runId, unit.id, number)
-      inputs ??= await fanOut.inputs(unit)
+      const slot = number === 1 ? (lane ??= lanes.take()) : job.retrySlot(number)
+      inputs ??= await job.inputs()
       let started: { job: string } | { full: true }
       try {
-        started = await boxes.start(slot, { inputs, command, timeoutMs: limit })
+        started = await boxes.start(slot, { inputs, command: job.command, timeoutMs: job.limit, ...(job.egress ? { egress: true as const } : {}) })
       } catch (error) {
         const reason = `the start failed: ${message(error)}`
         // The box can start the job before the error.
-        const alive = !(await kill(fanOut, slot, unit.id))
+        const alive = !(await kill(runner, job, slot))
         if (!alive) lanes.free(slot)
         ledger.put(attemptsKey, [...attempts, { slot, startedAt: now(), reason, ...(alive ? { alive: true as const } : {}) } satisfies Attempt])
-        fanOut.log(`unit ${unit.id}, attempt ${number}: ${reason}`)
+        runner.log(`${job.kind} ${job.name}, attempt ${number}: ${reason}`)
         continue
       }
       if ('full' in started) {
@@ -315,13 +455,13 @@ async function runUnit(unit: PlanUnit, key: string, fanOut: FanOut, lanes: Lanes
       }
       attempt = { slot, startedAt: now() }
       ledger.put(attemptsKey, [...attempts, attempt])
-      startCompute(ledger, `${key}.${number}`, `unit.${fanOut.prereg.hypothesis}.${fanOut.round}.${unit.id}.${number}`, boxes.instance, attempt.startedAt)
+      startCompute(ledger, `${key}.${number}`, job.meter(number), boxes.instance, attempt.startedAt)
     }
     const current = attempt
     const seen = (at: number) => ledger.put(attemptsKey, [...attempts.slice(0, number - 1), { ...current, seenAt: at } satisfies Attempt])
     let outcome: Outcome
     try {
-      outcome = await follow(attempt, limit, unit.id, command, fanOut, now, pause, seen)
+      outcome = await follow(attempt, job, runner, now, pause, seen)
     } catch (error) {
       // A planned stop keeps the meter open: the job still runs, and the next call polls it again.
       if (!(error instanceof PlannedStop)) finishCompute(ledger, `${key}.${number}`, now())
@@ -330,27 +470,22 @@ async function runUnit(unit: PlanUnit, key: string, fanOut: FanOut, lanes: Lanes
     // A job ends after its start and before this poll, also when the clock of the box is not the clock of the host.
     finishCompute(ledger, `${key}.${number}`, Math.min(now(), Math.max(attempt.startedAt, outcome.endedAt ?? now())))
     if (!outcome.alive) lanes.free(attempt.slot)
-    if ('outputs' in outcome) return recordUnitResult(ledger, key, { id: unit.id, status: 'done', attempts: number, outputs: outcome.outputs })
+    if ('outputs' in outcome) {
+      const passes = outcome.tls_passes === undefined ? {} : { tls_passes: outcome.tls_passes }
+      return recordUnitResult(ledger, key, { id: job.name, status: 'done', attempts: number, outputs: outcome.outputs, ...passes })
+    }
     ledger.put(attemptsKey, [...attempts.slice(0, number - 1), { ...attempt, reason: outcome.reason, ...(outcome.alive ? { alive: true } : {}) }])
-    fanOut.log(`unit ${unit.id}, attempt ${number}: ${outcome.reason}`)
+    runner.log(`${job.kind} ${job.name}, attempt ${number}: ${outcome.reason}`)
   }
 }
 
 /**
- * Polls one attempt until it ends. On exit 0, it checks the last line and keeps each output file as an artifact. A lost
+ * Polls one attempt until it ends. On exit 0, it checks the last line and keeps each output file with `keep`. A lost
  * job ends at the last poll that saw it run, so that the time before a resume does not count as compute.
  */
-async function follow(
-  attempt: Attempt,
-  limit: number,
-  id: string,
-  command: string,
-  fanOut: FanOut,
-  now: () => number,
-  pause: () => Promise<void>,
-  seen: (at: number) => void,
-): Promise<Outcome> {
-  const { boxes } = fanOut
+async function follow(attempt: Attempt, job: Job, runner: Runner, now: () => number, pause: () => Promise<void>, seen: (at: number) => void): Promise<Outcome> {
+  const { boxes } = runner
+  const { limit, kind } = job
   let seenAt = attempt.seenAt ?? attempt.startedAt
   let keptAt = seenAt
   for (;;) {
@@ -358,7 +493,7 @@ async function follow(
     try {
       polled = await boxes.poll(attempt.slot)
     } catch (error) {
-      return stop(fanOut, attempt.slot, id, `the poll failed: ${message(error)}`)
+      return stop(runner, job, attempt.slot, `the poll failed: ${message(error)}`)
     }
     if (polled.state === 'missing') return { reason: `the box of ${attempt.slot} lost the job`, endedAt: seenAt }
     if (polled.state === 'running') {
@@ -371,43 +506,43 @@ async function follow(
         await pause()
         continue
       }
-      return stop(fanOut, attempt.slot, id, `the unit ran over its time limit of ${limit} ms`)
+      return stop(runner, job, attempt.slot, `the ${kind} ran over its time limit of ${limit} ms`)
     }
     const { exit_code: exitCode, output, ended_at: endedAt } = polled.result
     const ended = endedAt === undefined ? {} : { endedAt }
-    if (exitCode === null) return { reason: `the unit did not finish in its time limit of ${limit} ms`, ...ended }
-    if (exitCode !== 0) return { reason: `the unit exited with code ${exitCode}`, ...ended }
-    const parsed = parseUnitOutput(output)
+    if (exitCode === null) return { reason: `the ${kind} did not finish in its time limit of ${limit} ms`, ...ended }
+    if (exitCode !== 0) return { reason: `the ${kind} exited with code ${exitCode}`, ...ended }
+    const parsed = job.parse(output)
     if (parsed.problem !== null) return { reason: parsed.problem, ...ended }
     const outputs: DomainOutputs = {}
     for (const [path, hash] of Object.entries(parsed.json.outputs)) {
       try {
         const bytes = await boxes.read(attempt.slot, path)
-        if ((await artifactId(bytes)) !== hash) return { reason: `the unit output ${path} does not match its SHA-256 ${hash}`, ...ended }
-        const labels = { hypothesis: fanOut.prereg.hypothesis, unit: id, round: String(fanOut.round), path }
-        outputs[path] = await fanOut.artifacts.put(bytes, { source: { command }, media_type: 'application/octet-stream', labels })
+        if ((await artifactId(bytes)) !== hash) return { reason: `the ${kind} output ${path} does not match its SHA-256 ${hash}`, ...ended }
+        outputs[path] = await job.keep(path, bytes)
       } catch (error) {
-        return { reason: `the unit output ${path}: ${message(error)}`, ...ended }
+        return { reason: `the ${kind} output ${path}: ${message(error)}`, ...ended }
       }
     }
-    return { outputs, ...ended }
+    const passes = parsed.json.tls_passes === undefined ? {} : { tls_passes: parsed.json.tls_passes }
+    return { outputs, ...passes, ...ended }
   }
 }
 
 /** Kills the job of a slot as a best-effort step: a failed kill goes to the log and gives false. */
-async function kill(fanOut: FanOut, slot: string, id: string): Promise<boolean> {
+async function kill(runner: Runner, job: Job, slot: string): Promise<boolean> {
   try {
-    await fanOut.boxes.kill(slot)
+    await runner.boxes.kill(slot)
     return true
   } catch (error) {
-    fanOut.log(`unit ${id}: the kill of ${slot} failed: ${message(error)}`)
+    runner.log(`${job.kind} ${job.name}: the kill of ${slot} failed: ${message(error)}`)
     return false
   }
 }
 
 /** Kills the job of a failed attempt. */
-async function stop(fanOut: FanOut, slot: string, id: string, reason: string): Promise<Outcome> {
-  return (await kill(fanOut, slot, id)) ? { reason } : { reason, alive: true }
+async function stop(runner: Runner, job: Job, slot: string, reason: string): Promise<Outcome> {
+  return (await kill(runner, job, slot)) ? { reason } : { reason, alive: true }
 }
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error))

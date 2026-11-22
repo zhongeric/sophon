@@ -8,12 +8,18 @@ import {
   calibrationVerdict,
   compareReproduction,
   needsRecalibration,
+  parseSweepFetchOutput,
+  parseSweepUnitOutput,
   parseUnitOutput,
   preregThreshold,
   runDomainCommand,
   runFetch,
   runMerge,
   runPlan,
+  runSweepMerge,
+  runSweepPlan,
+  sweepFetchCommand,
+  sweepUnitCommand,
   unitCommand,
 } from '../src/core/research-commands.ts'
 import type { ResearchConfig } from '../src/core/research.ts'
@@ -391,4 +397,57 @@ test('plan, fetch and merge take their own timeouts from research.timeouts, and 
   const failed = await runPlan({ ...fanOutConfig, setup: 'make setup' }, fakeMachine({ 'make setup': { exit_code: 2, output: 'no compiler' } }).machine, prereg)
   assert.match(failed.problem ?? '', /the setup make setup exited with code 2/)
   await assert.rejects(runPlan(config, other.machine, prereg), /has no plan command/)
+})
+
+const sweepResearch: ResearchConfig = {
+  ...fanOutResearch,
+  sweep: { plan: 'sw plan {prereg}', fetch: 'sw fetch {prereg} {target}', unit: 'sw unit {prereg} {unit}', merge: 'sw merge {prereg} {units}', fetch_rate: 5, fetch_parallel: 16 },
+  timeouts: { plan: 60_000, merge: 900_000 },
+}
+const sweepConfig: RepoConfig = { ...config, research: sweepResearch }
+
+test('the sweep commands come from research.sweep, quoted as in stage 6, with the plan and merge timeouts', async () => {
+  const { machine, calls } = fakeMachine({ 'sw plan': ok({ targets: ['T-1'], units: [{ id: 'u1', targets: ['T-1'], expected_seconds: 5 }] }), 'sw merge': ok({ candidates: [{ id: 'T-1', score: 3 }] }) })
+  const planned = await runSweepPlan(sweepConfig, machine, "prereg/it's.md")
+  assert.equal(planned.command, `sw plan 'prereg/it'\\''s.md'`)
+  assert.deepEqual(planned.json, { targets: ['T-1'], units: [{ id: 'u1', targets: ['T-1'], expected_seconds: 5 }] })
+  assert.equal(sweepFetchCommand(sweepConfig, prereg, "T'1"), `sw fetch '${prereg}' 'T'\\''1'`)
+  assert.equal(sweepUnitCommand(sweepConfig, prereg, 'u1'), `sw unit '${prereg}' 'u1'`)
+  const merged = await runSweepMerge(sweepConfig, machine, prereg, '.agent-factory/units')
+  assert.equal(merged.command, `sw merge '${prereg}' '.agent-factory/units'`)
+  assert.deepEqual(merged.json, { candidates: [{ id: 'T-1', score: 3 }] })
+  assert.deepEqual(calls.map(({ timeoutMs }) => timeoutMs), [60_000, 900_000])
+  assert.equal(unitCommand(sweepConfig, prereg, 'u1'), `nb unit '${prereg}' 'u1'`)
+  assert.throws(() => sweepUnitCommand(fanOutConfig, prereg, 'u1'), /has no sweep unit command/)
+  await assert.rejects(runSweepPlan(fanOutConfig, machine, prereg), /has no sweep plan command/)
+})
+
+test('a sweep fetch gives file outputs, and a sweep unit gives file outputs and tls_passes', () => {
+  assert.deepEqual(parseSweepFetchOutput(JSON.stringify({ outputs: { 'data/T-1.txt': hash('A') } })), { json: { outputs: { 'data/T-1.txt': hash('a') } }, problem: null })
+  assert.match(parseSweepFetchOutput(JSON.stringify({ outputs: { '../x': hash('a') } })).problem ?? '', /the last line of fetch: the output path \.\.\/x must be relative/)
+  const unit = (json: unknown) => parseSweepUnitOutput(`scanned\n${JSON.stringify(json)}\n`)
+  assert.deepEqual(unit({ outputs: { 'out/u1.csv': hash('c') }, tls_passes: 4 }), { json: { outputs: { 'out/u1.csv': hash('c') }, tls_passes: 4 }, problem: null })
+  assert.deepEqual(unit({ outputs: {}, tls_passes: 0 }), { json: { outputs: {}, tls_passes: 0 }, problem: null })
+  for (const passes of [undefined, -1, 1.5, '3', null])
+    assert.equal(unit({ outputs: {}, tls_passes: passes }).problem, 'the last line of unit: tls_passes must be an integer of 0 or more', String(passes))
+  assert.equal(parseSweepUnitOutput('').problem, 'unit printed nothing, but its last line must be a JSON object')
+})
+
+test('a sweep merge gives a list of JSON objects, else a problem with the tail', async () => {
+  const merge = (reply: Reply) => runSweepMerge(sweepConfig, fakeMachine({ 'sw merge': reply }).machine, prereg, 'units')
+  assert.deepEqual((await merge(ok({ candidates: [] }))).json, { candidates: [] })
+  const cases: [Reply, RegExp][] = [
+    [ok({}), /^the last line of merge: candidates must be a list of JSON objects$/],
+    [ok({ candidates: { id: 'T-1' } }), /^the last line of merge: candidates must be a list of JSON objects$/],
+    [ok({ candidates: [{ id: 'T-1' }, 'T-2', [1]] }), /^the last line of merge: candidates\[1\] must be a JSON object, candidates\[2\] must be a JSON object$/],
+    [{ exit_code: 3, output: 'Traceback: merge broke' }, /^merge exited with code 3$/],
+  ]
+  for (const [reply, reason] of cases) {
+    const result = await merge(reply)
+    assert.equal(result.json, null, reason.source)
+    if (result.problem === null) continue
+    assert.match(result.problem, reason)
+    assert.ok(result.tail.startsWith(`--- merge: sw merge '${prereg}' 'units' (exit code ${reply.exit_code})\n`), result.tail)
+    assert.ok(result.tail.includes(reply.output.trim()), result.tail)
+  }
 })
