@@ -1,4 +1,4 @@
-// The status comment of a Cloudflare run (D21). This module has no runtime imports, so that a Node test can import it.
+// The status comment of a Cloudflare run (D21). This module has no Worker imports, so that a Node test can import it.
 import type { Ledger } from '../core/ledger.ts'
 import { commentLimit } from '../core/questions.ts'
 import type { StatusComments } from './comments.ts'
@@ -11,6 +11,8 @@ export const statusKeys = {
   body: 'status:body',
   /** The note of the last error that the run gave to the user. */
   error: 'status:error',
+  /** The URL of the comment with that error, or null when the status comment carries its text. */
+  errorLink: 'status:error-link',
   /** The StatusView of the run. */
   view: 'status:view',
   /** The URL of the new comment with the result summary, for a result that needs the user. */
@@ -47,16 +49,16 @@ export type StatusView = {
   details?: string
 }
 
-/** The body of the status comment, at most commentLimit characters. */
+/** The body of the status comment, at most commentLimit characters. The state comes first, so that a preview shows it. */
 export function renderStatus(header: string, view: StatusView): string {
   const head = [
-    header,
-    '',
     `- State: ${stateText[view.state]}${view.cause ? `: ${view.cause}` : ''}`,
     ...(view.stage ? [`- Stage: \`${view.stage}\``] : []),
     ...(view.restartAt ? [`- Restart: ${view.restartAt}`] : []),
     ...(view.notice ? [`- Budget: ${view.notice}`] : []),
     ...(view.link ? [`- Details: ${view.link}`] : []),
+    '',
+    header,
   ].join('\n')
   const body = view.details ? `${head}\n\n${cut(view.details, commentLimit - head.length - 2)}` : head
   return body.slice(0, commentLimit)
@@ -73,7 +75,7 @@ function cut(text: string, room: number): string {
 }
 
 /** The stage of a step key: the step name before its first '.' or ':'. */
-export const stageOf = (key: string) => key.slice('step:'.length).split(/[.:]/)[0] ?? ''
+const stageOf = (key: string) => key.slice('step:'.length).split(/[.:]/)[0] ?? ''
 
 /** The ledger with a call of `onStage` after each put of a step key. */
 export function stageLedger(ledger: Ledger, onStage: (stage: string) => void): Ledger {
@@ -96,7 +98,7 @@ export type RunStatus = {
   /**
    * Gives a note that needs the user: a new comment with `text`, and the status comment links to it. Without a status
    * comment, or for a run that reports to its parent run, the status comment carries `text` instead. The same note
-   * as the last one does nothing.
+   * as the last one posts nothing, and only shows the error again when the status comment moved on.
    */
   error(note: string, text: string): Promise<void>
   /** Waits for each queued post and edit. */
@@ -165,7 +167,14 @@ export function runStatus(options: {
       }),
     error: (note, text) =>
       enqueue(async () => {
-        if (ledger.get(statusKeys.error) === note) return
+        if (ledger.get(statusKeys.error) === note) {
+          const current = view()
+          if (current.state === 'error' && current.cause === note) return
+          const link = ledger.get<string | null>(statusKeys.errorLink)
+          set(link ? { cause: note, link, state: 'error' } : { cause: note, details: text, state: 'error' })
+          await sync()
+          return
+        }
         let link: string | undefined
         if (!options.quiet && ledger.get(statusKeys.comment))
           try {
@@ -175,7 +184,10 @@ export function runStatus(options: {
           }
         set(link ? { cause: note, link, state: 'error' } : { cause: note, details: text, state: 'error' })
         // The note counts as given when a comment carries it. Else the same note tries again.
-        if ((await sync()) || link) ledger.put(statusKeys.error, note)
+        if ((await sync()) || link) {
+          ledger.put(statusKeys.errorLink, link ?? null)
+          ledger.put(statusKeys.error, note)
+        }
       }),
     settle: () => enqueue(async () => {}),
   }

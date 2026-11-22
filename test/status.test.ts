@@ -66,7 +66,7 @@ test('a run that pauses, stops, restarts and ends has one status comment with an
   await run.status.update({ details: '# Development run: READY', state: 'passed' })
   await run.status.settle()
 
-  const statusPosts = run.posts.filter((post) => post.body.startsWith(header))
+  const statusPosts = run.posts.filter((post) => post.body.startsWith('- State: '))
   assert.equal(statusPosts.length, 1)
   assert.ok(run.edits.length >= 4, String(run.edits.length))
   assert.ok(run.edits.every((edit) => edit.id === 1))
@@ -79,24 +79,28 @@ test('a run that pauses, stops, restarts and ends has one status comment with an
   assert.ok(bodies.some((body) => body.includes('- State: stopped on an error: HTTP 403') && body.includes('- Details: https://github.com/acme/app/issues/5#issuecomment-2')))
   assert.ok(bodies.some((body) => body.includes('(restart 1 of 3)')))
   const last = bodies.at(-1)!
-  assert.ok(last.startsWith(`${header}\n\n- State: complete with PASS\n- Stage: \`build\`\n- Restart: 2026-11-22T11:00:00.000Z\n- Budget: The run spent about $10.00`), last)
+  assert.ok(last.startsWith('- State: complete with PASS\n- Stage: `build`\n- Restart: 2026-11-22T11:00:00.000Z\n- Budget: The run spent about $10.00'), last)
+  assert.ok(last.includes(`continues.\n\n${header}\n\n`), last)
   assert.ok(last.endsWith('\n\n# Development run: READY'))
   assert.deepEqual(run.logs, [])
 })
 
-test('the same error note posts and edits nothing, and a different note posts and edits', async () => {
+test('the same error note posts nothing, edits only after progress, and a different note posts and edits', async () => {
   const run = setup()
   await run.status.update({ state: 'running' })
   await run.status.error('the run died', 'stopped: the run died')
   const [posts, edits] = [run.posts.length, run.edits.length]
+  await run.status.error('the run died', 'stopped: the run died')
+  assert.equal(run.posts.length + run.edits.length, posts + edits)
   await run.status.update({ state: 'running' })
   await run.status.error('the run died', 'stopped: the run died')
-  // The comparison does not reset after progress: the edit to running is the only new call.
+  // After progress, the same note posts nothing, and one edit shows the stop again with the earlier link.
   assert.equal(run.posts.length, posts)
-  assert.equal(run.edits.length, edits + 1)
+  assert.equal(run.edits.length, edits + 2)
+  assert.ok(run.edits.at(-1)!.body.startsWith('- State: stopped on an error: the run died\n- Details: https://github.com/acme/app/issues/5#issuecomment-2\n'))
   await run.status.error('HTTP 403', 'stopped: HTTP 403')
   assert.equal(run.posts.length, posts + 1)
-  assert.equal(run.edits.length, edits + 2)
+  assert.equal(run.edits.length, edits + 3)
   assert.equal(run.map.get(statusKeys.error), 'HTTP 403')
 })
 
@@ -135,7 +139,7 @@ test('a run from before the status comment, with posted:announced and no ID, pos
   const run = setup({ 'posted:announced': true })
   await run.status.update({ state: 'running' })
   assert.equal(run.posts.length, 1)
-  assert.ok(run.posts[0]!.body.startsWith(header))
+  assert.equal(run.posts[0]!.body, `- State: running\n\n${header}`)
 })
 
 test('an unchanged body makes no call, so a paused run that polls edits nothing', async () => {
@@ -170,5 +174,5 @@ test('the status comment is cut to the comment limit, and the cut closes an open
   const body = renderStatus(header, { details: `<details><summary>Report</summary>\n\n${'x'.repeat(commentLimit)}\n\n</details>`, state: 'passed' })
   assert.ok(body.length <= commentLimit)
   assert.ok(body.endsWith('\n\n</details>\n\n(cut)'))
-  assert.ok(body.startsWith(`${header}\n\n- State: complete with PASS`))
+  assert.ok(body.startsWith(`- State: complete with PASS\n\n${header}\n\n<details>`))
 })

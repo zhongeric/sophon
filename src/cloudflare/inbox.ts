@@ -96,9 +96,7 @@ export async function listInbox(source: InboxSource): Promise<Inbox> {
           continue
         }
         for (const issue of issues.filter((found) => kindFits(kind, found))) {
-          // The guard of the sweep does not check html_url, so the link of the issue or PR is checked here.
-          const fields: unknown = issue
-          const page = isRecord(fields) && typeof fields.html_url === 'string' ? fields.html_url : ''
+          const page = issue.html_url ?? ''
           try {
             for (const entry of await source.entries(kind, owner, repo, issue.number))
               items.push({ cause: entry.cause, kind: entry.kind, link: entry.link ?? page, number: issue.number, repository: `${owner}/${repo}` })

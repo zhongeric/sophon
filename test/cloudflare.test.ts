@@ -101,7 +101,7 @@ test('on Cloudflare, development collects a stopped review before a budget raise
     // The stopped review spent more than twice the budget: the notice went into the status comment, not into a new comment (D21).
     const noticed = on(5).filter((entry) => /of its budget of \$1\.00\. The run continues\./.test(entry.body))
     assert.deepEqual(noticed.map((entry) => entry.id), [on(5)[0]?.id], describe())
-    assert.match(noticed[0]!.body, /^agent-factory development run /)
+    assert.match(noticed[0]!.body, /^- State: [^]*\n\nagent-factory development run /)
     const pull = [...mock.state.pulls.keys()][0]
     assert.ok(pull !== undefined, describe())
     const first = await status(pull)
@@ -167,7 +167,7 @@ test('on Cloudflare, a development run whose review run waits with error restart
     await until(async () => ((await latest(5))[0]?.state === 'error' ? true : undefined), 120_000, describe)
     await until(() => on(5).find((entry) => entry.body.includes('npm run remote -- resume')), 30_000, describe)
     // One status comment for the run: each restart is an edit of it, and only the final stop is a new comment (D21).
-    const statuses = on(5).filter((entry) => entry.body.startsWith('agent-factory development run '))
+    const statuses = on(5).filter((entry) => entry.body.includes('\n\nagent-factory development run '))
     assert.equal(statuses.length, 1, describe())
     const edits = mock.state.edits.filter((edit) => edit.id === statuses[0]!.id)
     for (const restart of [1, 2, 3]) assert.ok(edits.some((edit) => edit.body.includes(`(restart ${restart} of 3)`)), describe())

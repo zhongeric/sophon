@@ -103,11 +103,11 @@ test('the question comment has the marker, one line about how to answer, then ev
   assert.ok(lines.includes('- a) up (recommended)') && lines.includes('- b) no'))
 })
 
-test('each status comment starts with a one-line header that says where questions come', () => {
+test('each status comment has a one-line header after its state that says where questions come', () => {
   for (const text of [developAnnouncement('dev-5-1', 'maintainer'), reviewAnnouncement('pr-7-1', 'maintainer')]) {
     assert.doesNotMatch(text, /\n/)
     assert.doesNotMatch(text, /@/)
     assert.match(text, /^agent-factory (development|review) run `(dev-5-1|pr-7-1)` for `maintainer`\. Questions come here\. .*`\/answer`/)
-    assert.ok(renderStatus(text, { state: 'running' }).startsWith(`${text}\n\n- State: running`))
+    assert.equal(renderStatus(text, { state: 'running' }), `- State: running\n\n${text}`)
   }
 })

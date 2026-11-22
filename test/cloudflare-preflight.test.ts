@@ -41,7 +41,7 @@ async function failedPreflight(mock: Mock, worker: Worker, pr: number): Promise<
   const describe = () => `comments: ${JSON.stringify(mock.state.comments.map((c) => [c.issue, c.body.slice(0, 300)]))}\nworker:\n${worker.output().slice(-3000)}`
   await fetch(`${worker.url}/runs/acme/app/${pr}`, { body: '{}', headers: admin, method: 'POST' })
   const failed = await until(() => on().find((entry) => entry.body.includes('did not start run')), 60_000, describe)
-  assert.match(failed.body, new RegExp(`^agent-factory review run \`pr-${pr}-[^\`]+\` for \`[^\`]+\`\\.`))
+  assert.match(failed.body, new RegExp(`^- State: stopped on an error: [^]*?\n\nagent-factory review run \`pr-${pr}-[^\`]+\` for \`[^\`]+\`\\.`))
   assert.match(failed.body, new RegExp(`\n\nagent-factory did not start run \`pr-${pr}-[^\`]+\`: the preflight found failed checks\\.\n\n<details><summary>Failed checks</summary>\n\n- \\*\\*`))
   assert.match(failed.body, /\n\n<\/details>\n\nAfter you fix them/)
   assert.match(failed.body, new RegExp(`After you fix them, continue the run with \`npm run remote -- resume acme/app#${pr}\`\\.$`))

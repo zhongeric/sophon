@@ -226,15 +226,19 @@ export abstract class Runs<Request extends RunRequest> extends DurableObject<Env
     return { runs, result: latest ? (sqlLedger(this.ctx.storage.sql, latest.run).get('result') ?? null) : null }
   }
 
-  /** The items of the latest run that wait for the user, for the inbox (D21). A run that reports to its parent run gives none. */
+  /**
+   * The items of the latest run that wait for the user, for the inbox (D21). A run that reports to its parent run gives
+   * only its open question batches: the parent run shows its stop and its result.
+   */
   inbox(): InboxEntry[] {
     const latest = this.ctx.storage.sql.exec<RunRow>('select * from factory_runs order by created desc limit 1').toArray()[0]
-    if (!latest || this.reportsToParent(JSON.parse(latest.request) as Request)) return []
+    if (!latest) return []
     const batches = this.ctx.storage.sql
       .exec<{ key: string }>("select key from factory_ledger where run = ? and key like 'posted:%'", latest.run)
       .toArray()
       .map((row) => row.key.slice('posted:'.length))
-    return runEntries(latest, sqlLedger(this.ctx.storage.sql, latest.run), batches)
+    const entries = runEntries(latest, sqlLedger(this.ctx.storage.sql, latest.run), batches)
+    return this.reportsToParent(JSON.parse(latest.request) as Request) ? entries.filter((entry) => entry.kind === 'question') : entries
   }
 
   /** The state and the ship flag of a run, for the prune of its branches, or null when this object has no such run. */

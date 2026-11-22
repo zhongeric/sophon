@@ -22,7 +22,7 @@ export type WorkSweep = {
 }
 
 export type Repository = { name: string; owner: { login: string } }
-export type Issue = { number: number; pull_request?: unknown }
+export type Issue = { number: number; html_url?: string; pull_request?: unknown }
 type IssueEvent = { event: string; label?: { name: string } | null; actor?: { login: string } | null }
 
 const pageSize = 100
@@ -32,7 +32,8 @@ export const isRecord = (value: unknown): value is Record<string, unknown> => ty
 export const isInstallation = (value: unknown): value is { id: number } => isRecord(value) && Number.isInteger(value.id)
 export const isRepository = (value: unknown): value is Repository =>
   isRecord(value) && typeof value.name === 'string' && isRecord(value.owner) && typeof value.owner.login === 'string'
-export const isIssue = (value: unknown): value is Issue => isRecord(value) && Number.isInteger(value.number)
+export const isIssue = (value: unknown): value is Issue =>
+  isRecord(value) && Number.isInteger(value.number) && (value.html_url === undefined || typeof value.html_url === 'string')
 /** The issue list also gives PRs. Only a PR takes a review, and only an issue takes a development or a research run. */
 export const kindFits = (kind: WorkKind, issue: Issue) => (kind === 'review') === Boolean(issue.pull_request)
 /** The repositories of an installation: GitHub puts the list in the repositories field of its answer. */
